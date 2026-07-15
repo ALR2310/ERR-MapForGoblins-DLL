@@ -11,6 +11,7 @@
 // that row ptr; the inject layer matches it to one of our CategoryRow::p.
 #include "goblin_maphover.hpp"
 
+#include "goblin_map_timing.hpp"
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -66,6 +67,11 @@ namespace
 
     void *placename_detour(void *panel, void *item, void *map_area)
     {
+        // This hook fires once per frame on the game UI thread while the world map
+        // is open (the dialog's per-frame Update calls it, item may be null) - it is
+        // the per-frame driver for fast_map_open's deferred-relayout replay.
+        goblin::map_timing::on_map_frame();
+
         void *row = nullptr;
         if (item)
         {

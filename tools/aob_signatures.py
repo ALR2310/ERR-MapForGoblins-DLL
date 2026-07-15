@@ -244,13 +244,6 @@ SIGNATURES = [
         "refs": ["goblin_map_timing.cpp:169"],
     },
     {
-        "name": "map_ce390_hook",
-        "pattern": "40 53 48 83 EC 50 33 C0 89 54 24 48 4C 8D 81 C8 00 00 00 89",
-        "slot": None,
-        "critical": False,
-        "refs": ["goblin_map_timing.cpp:173"],
-    },
-    {
         "name": "map_wmd_dtor_hook",
         "pattern": "48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 30 "
                    "48 C7 45 F0 FE FF FF FF 48 89 9C 24 88 00 00 00 48 8B F1 48 8D 05 "
@@ -260,6 +253,113 @@ SIGNATURES = [
         "refs": ["goblin_map_timing.cpp:177"],
         "note": "Ends in a build-specific lea disp (B7 A3 16 02); expected to "
                 "shift on a game update - non-critical by design.",
+    },
+    # ---- Stall-probe cost counters (debug_logging diagnostics) - non-critical ----
+    {
+        "name": "stallprobe_widget_a",
+        "pattern": "48 89 5C 24 10 48 89 74 24 18 55 57 41 54 41 56 41 57 48 8D 6C 24 C9 48 81 EC "
+                   "A0 00 00 00 48 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Per-marker map-widget virtual (v1.16 entry 0x1410dbb70, vtable slot "
+                "0x142cbc840). Pass-through cost counter only; a miss disables that counter.",
+    },
+    {
+        "name": "stallprobe_widget_b",
+        "pattern": "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D "
+                   "6C 24 D1 48 81 EC 90 00 00 00 48 8B 41 08",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Per-marker map-widget virtual (v1.16 entry 0x1410dbea0, vtable slot "
+                "0x142cbc848) - the reopen pin-construction hot path. Counter only.",
+    },
+    {
+        "name": "stallprobe_widget_c",
+        "pattern": "48 89 5C 24 20 4C 89 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D AC",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Per-marker map-widget virtual (v1.16 entry 0x1410dc260, vtable slot "
+                "0x142cbc850). Counter only.",
+    },
+    {
+        "name": "stallprobe_typed_find",
+        "pattern": "40 53 41 55 41 57 48 83 EC 30 33 DB 4C 8B F9 89 5C 24 58 4C 8B EA 48 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Typed-find walk (v1.16 entry 0x14113feb0, TRUE entry - never the "
+                "0x14113feda continuation). Counter only.",
+    },
+    {
+        "name": "stallprobe_child_step",
+        "pattern": "48 89 6C 24 18 48 89 74 24 20 41 56 48 83 EC 20 8B A9 B8 00 00 00 4C 8B F1 "
+                   "48 8B B1 E0 00 00 00 C1 ED 03 40 80 E5 01 48",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Per-frame child-step loop (v1.16 entry 0x1411d3980) - walks every "
+                "marker widget per frame; the while-map-open fps cost. Counter only.",
+    },
+    {
+        "name": "stallprobe_xform_get",
+        "pattern": "48 89 74 24 10 57 48 83 EC 20 48 8B FA 48 8B F1 48 8B 51 50 48 85 D2 0F",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Widget transform getter (v1.16 entry 0x14117e140): full matrix "
+                "decompose when cache [this+0x50] is null, cheap copy when cached. "
+                "Counter tests the refresh-fills-the-cache hypothesis.",
+    },
+    {
+        "name": "stallprobe_item_proc",
+        "pattern": "40 53 56 57 48 83 EC 20 48 8B F9 83 CA FF 48 81 C1 88 00 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx batch per-movie-slot processor (v1.16 entry 0x140d716a0), runs "
+                "on a worker. Counter only.",
+    },
+    {
+        "name": "stallprobe_next_capture",
+        "pattern": "48 89 5C 24 20 57 41 56 41 57 48 83 EC 20 48 8B 19 4D 8B F8 4C 8B F2 48",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx render next-capture / display-tree changelist apply (v1.16 entry "
+                "0x1411577b0). Counter only.",
+    },
+    {
+        "name": "stallprobe_movie_display",
+        "pattern": "48 89 5C 24 18 48 89 74 24 20 57 41 56 41 57 48 81 EC 80 00 00 00 48 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx movie display/draw (v1.16 entry 0x14115cde0). Counter only.",
+    },
+    {
+        "name": "stallprobe_batch_job",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 49 8B F8 48 8B F2 "
+                   "E8 01 C4 FE FF 83",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx render batch job entry (v1.16 0x140d7d720, worker thread). "
+                "Counter only. Contains a build-specific rel32 (E8 01 C4 FE FF) - "
+                "expected to shift on a game update; non-critical by design.",
+    },
+    {
+        "name": "stallprobe_job_poll",
+        "pattern": "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 FB A6 08 01 85 C0 0F",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Generic 'async job done?' poll (v1.16 entry 0x140e811c0); the map UI "
+                "thread waits in it ~140ms after close. Spy logs (caller, job vtable) "
+                "during capture windows. Contains a build-specific rel32 (E8 FB A6 08 "
+                "01) - expected to shift on a game update; non-critical by design.",
     },
     {
         "name": "map_placename_update",

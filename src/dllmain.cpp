@@ -21,6 +21,7 @@
 #include "goblin_map_timing.hpp"
 #include "goblin_gfx_probe.hpp"
 #include "goblin_maphover.hpp"
+#include "goblin_stall_probe.hpp"
 #include "goblin_worldmap_probe.hpp"
 
 #include "version.h"
@@ -114,6 +115,7 @@ static void init_overlay()          { goblin::overlay::setup(); }
 static void init_map_timing()       { goblin::map_timing::setup(); }
 static void init_gfx_probe()        { goblin::gfx_probe::setup(); }
 static void init_maphover()         { goblin::maphover::setup(); }
+static void init_stall_probe()      { goblin::stall_probe::setup(); }
 static void init_worldmap_probe()   { goblin::worldmap_probe::setup(); }
 
 static void safe_init_step(InitFn fn, const char *name)
@@ -221,6 +223,7 @@ static void setup_mod()
     safe_init_step(&init_overlay,         "overlay::setup");
     safe_init_step(&init_map_timing,      "map_timing::setup");
     safe_init_step(&init_maphover,        "maphover::setup");  // marker hover detection (hide/overlay)
+    safe_init_step(&init_stall_probe,     "stall_probe::setup");  // debug-only map stall cost counters
     safe_init_step(&init_worldmap_probe,  "worldmap_probe::setup");  // fold non-overworld markers for overlay rings
 
     try

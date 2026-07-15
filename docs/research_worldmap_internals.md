@@ -400,6 +400,272 @@ Residual cost (the hard floor, accepted): per-marker pin construction (typed-fin
 refcount, ~600ms with ~7000 markers) runs once per open and could not be cut safely. The
 small black flash on open is the game's own native map transition, not ours.
 
+## fast_map_open regression found + fixed (2026-07-14)
+
+The shipped ce390-gate redesign (introduced when the overlay moved to its own window and
+on_present() stopped existing) had TWO defects that together made fast_map_open a near
+no-op - matching user reports of "map still stutters on open, every open":
+
+1. The amortize pump was driven from the ce390 detour at gate[0]. That site fires once
+   per MARKER during the build pass (the dispatcher runs refresh + 3x ce390 per marker),
+   NOT once per frame. So each marker's just-queued relayout was replayed by the very
+   next marker's gate hit - i.e. the whole "deferred" queue executed inside the build
+   frame. No amortization at all.
+2. The g_built latch counted only refreshes executed through the detour's fall-through
+   path (g_refresh_n). With fastMapOpen ON every map-site refresh is queued and replayed
+   by amortize_pump - which did NOT increment the counter. The latch never flipped, so
+   every reopen re-paid the full relayout + inline ce390 cost forever.
+
+First fix attempt (same day, REVERTED): drive the pump + latch once per frame from the
+maphover placename hook, time-budgeted. This made the deferral actually work for the
+first time - and immediately crashed on a live save: AV read at 0xFFFFFFFFFFFFFFFF
+inside the refresh fn (exe+0x10D97C6 = 0x1410d97b0+0x16, `mov rdx,[rax+0x10]` with
+rax from a poisoned widget+0x20), dump eldenring.exe.18176.dmp. Root cause: the game
+rebuilds the marker WIDGETS WITHOUT running the WorldMapDialog dtor whenever
+WorldMapPointParam rows change under an open map - and our own collected/kindling
+watcher does exactly that live (the crash timeline: map open 21:18:41, "[COLLECTED]
+Refresh: 1454 hidden" 21:18:44.762 = param areaNo flips on 1454 rows -> in-place widget
+rebuild -> the 7375-entry replay queue held raw pointers to the freed widgets -> replay
+-> AV). Manual hide, category toggles and live-loot refresh hit the same path. There is
+NO non-racy invalidation point for a cross-frame queue of raw widget pointers (the free
+happens between enqueue and any observable rebuild signal). CONCLUSION: defer-and-replay
+of the map relayout is structurally unsafe in this mod - do not resurrect it. 2.0.5
+never crashed this way only because its pump executed the queue inside the same build
+frame (i.e. the deferral never actually deferred).
+
+Final fix (shipped): fastMapOpen = pure Patch D - the map-callsite refresh is skipped
+UNCONDITIONALLY (no queue, no replay, no latch); ce390 hook removed entirely (its
+latched "reopen" skip was never field-validated: the dialog + widgets are recreated
+every open (R1), so a reopen IS a fresh build - skipping child-list passes there risks
+the documented blank-marker failure). The dispatcher-callsite AOB + the WMD-dtor hook
+remain (skip gate + stall-probe close trigger).
+
+Correction to the 2026-06-18 runtime chain: the reopen call chain frame "0x2520900"
+resolves to the CRT's acosf (FUN_142520730) - a stack-scan false positive. The deeper
+frames of that chain are unreliable; only the leaf attribution (typed-find 0x14113feb0
+called from 0x1410dc010 inside 0x1410dbea0) is confirmed by decompile
+(scratch/pinbuild_decomp.log). The three per-marker map-widget virtual methods
+0x1410dbb70 / 0x1410dbea0 / 0x1410dc260 sit in consecutive vtable slots at
+0x142cbc840/848/850 and have NO static callers (virtual dispatch only).
+
+First probe data (user's ERR save, 9201 markers mapped, map-open burst window 1.5s,
+crash session 2026-07-14 21:18): the open stall is NOT typed-find/widget registration -
+during the window widget-b ran 2018 calls / 1.4 ms total and typed-find 380 calls /
+0.1 ms (the old "589ms typed-find reopen cost" attribution does not hold for the
+current build). Sample split: 322 exe / 448 ntdll / 233 other. The biggest bucket
+(exe+0xE82F31 frame0 x246, rip cluster exe+0xE82EC1..F31) resolved to FUN_140e829c0 -
+the FD4 frame pacer (QPC loop + FD4Singleton assert, "patch116" source path;
+scratch/hotspot_decomp.log): that is normal BETWEEN-FRAME idle wait, meaning the 1.5s
+window mostly contained ordinarily-paced frames, not one long stall - do NOT read the
+ntdll share as "all heap". Genuine heap work funnels through the game allocator thunk
+FUN_141ed6280 (frame0 exe+0x1ED628E x100; callers cluster around the 0x141eb9exx
+allocator family). The 233 "other" samples (non-exe/non-ntdll modules) are unattributed
+(could be our DLL / other mods / driver) - the probe should log them by module next
+round. Widget-b's real callers: exe+0xD7FB47 / 0xD7FC3F inside FUN_140d7f9d0 and
+exe+0xD7F9BF inside its 136-byte neighbor FUN_140d7f940 (called from 0x14074ab93 /
+0xd7fa38 - the 0x74a810 map update entry family, matching the old chain). A clean
+non-crashing session (open + close windows) is still needed for real attribution of
+both the open stall and the post-close free drain.
+
+Round-2 probe data (clean session 2026-07-14 22:26, Patch-D build, ~9000 markers) -
+full attribution of the two remaining symptoms (scratch/hotspot2_decomp.log):
+
+- OPEN one-time cost: the register burst is real at full scale - widget-b
+  (0x1410dbea0) 34143 calls / 306.8 ms inclusive, typed-find 13881 / 280.9 ms, ~all
+  from ret exe+0xD7F9BF (call inside FUN_140d7f940, the 136-byte neighbor of
+  FUN_140d7f9d0; both under the 0x74a810 map update entry). The round-1 "typed-find is
+  cheap" reading came from a truncated window in the crash session. The matching
+  UNREGISTER burst runs at close: 32619 calls / 297.2 ms in a close window.
+- WHILE-OPEN fps drain: the UI thread is ~80% busy while the map is open. Hottest:
+  FUN_1411d3980 (0x1411d39d0 rip cluster, up to ~32% of exe samples) = per-frame
+  child-step loop: walks the marker container ([this+0xD8] entries stride 0x10, count
+  [this+0xE0]), for each entry with byte[+0x6A] sign bit set calls vtbl+0x348 then
+  vtbl+0x340 (result 1 -> FUN_1411d19d0, -1 -> sets bit 0x400000). Second:
+  FUN_14117e140 (rips 0x117E154/0x117E252) = transform getter - full matrix decompose
+  (2x sqrt + atan2 via FUN_14253dbec/FUN_14253a724) when cache ptr [this+0x50] is
+  null, cheap memcpy when cached; called per marker from the dispatcher region
+  (sites 0x1410de35b/0x1410df2e7/0x1410df58b). HYPOTHESIS to test: the skipped
+  map-site refresh is what populates that transform cache, i.e. Patch D may trade
+  the one-time relayout for a per-frame decompose. Third: exe+0x5F9445 = the event
+  flag bit-reader (per-frame textEnable/Disable re-eval).
+- POST-CLOSE microfreeze: exe+0x1F0B93B (~95-100 of ~2040 samples per close window
+  ~= 140 ms, matches the historic 155 ms) resolved to FUN_141f0b8d0 =
+  DLConditionSignal::Wait (WaitForSingleObject, "DLConditionSignal.cpp") - the map
+  UI thread WAITS while a WORKER thread does the actual release work. The round-1
+  external profiler saw the heap frees because it sampled a different thread. The
+  worker is not yet identified -> probe v2 adds an all-thread sweep (toolhelp
+  enumeration, one pass every ~20ms, ntdll-busy threads ranked with their exe-.text
+  frame0) during every capture window, plus counters on child-step (0x1411d3980)
+  and xform-get (0x14117e140), plus frames filtered to exe .text only (round-1
+  frame1 entries like exe+0x3D82818 were .data noise).
+
+Round-3 probe data (2026-07-15 00:13 session) + the shipped accelerator:
+
+- xform-cache hypothesis REFUTED: 1.2M xform-get calls averaged ~0.07us = all on the
+  cached path. Patch D's refresh skip does NOT cause per-frame matrix decompose.
+- child-step quantified: ~1.3M calls / 3s (~7300/frame, recursive tree walk - ret
+  0x11D3A11 is its own +0x348 recursion, 0x10DE772 the dispatcher-side caller);
+  real cost ~1-2 ms/frame -> striping would buy little; parked as plan C.
+- Sweep v1 design flaw: parked worker-pool threads sit in ntdll waits with a frozen
+  rip and flooded the "ntdll-busy" ranking (95/95 with frame0 = DLConditionSignal::
+  Wait). v3 counts only samples whose rip MOVED since the thread's previous pass and
+  logs per-thread top ntdll OFFSETS + exe frame0.
+- THE BIG ONE - typed-find pointer-scan is O(N^2) per burst, and the engine has a
+  revalidated result-cache we can pre-seed. FUN_14113feb0 mode=1 (the widget-b site,
+  ret = widget-b entry + 0x178): checks container[4] FIRST - locks the cached entry,
+  compares the object pointer against the query, returns it on match - and only then
+  falls back to the O(N) scan; the result is stored back to container[4] raw (no
+  refcount held on the cache). Both the open register burst and the close unregister
+  burst visit pins in container order, so the next query's entry is ~always at the
+  last hit's index+1. SHIPPED (goblin_stall_probe.cpp, "sequential predictor",
+  gated on fastMapOpen + that one return address): before calling the original,
+  write the index+1 entry (same null/+0x6B-bit guards as the engine's scan) into
+  container[4]; the engine validates and returns it O(1) on a correct guess, scans
+  as before on a wrong one - engine code decides the result either way. One O(N)
+  resync locates the result after each miss. Expected: ~280ms -> ~30-40ms for BOTH
+  bursts. Effectiveness is logged per capture window as "find-predictor H hits / M
+  misses" - if hits dominate, the lever worked; if misses dominate, the sequential
+  hypothesis is wrong for this container and the predictor is a no-op (no harm).
+
+Round-4 (2026-07-15 01:09 session, predictor build dc4bb8bc) - where the FELT costs
+actually live (scratch/hotspot3_decomp.log):
+
+- The 30k+ register/unregister bursts are EPISODIC (first build, rebuilds after param
+  changes), not per-open: this session had almost none (widget-b 20-30 calls/window,
+  one 4.5k teardown tail) yet the user still felt both symptoms. The predictor works
+  where it fires (hits logged; the caught tail ran at 0.34us/call vs 20us cold) but
+  it addresses the episodic cost, not the felt one. NOTE an unexplained gate anomaly:
+  one window counted 1162 typed-find calls from ret exe+0x10DC018 while the predictor
+  saw only 64 gated calls in the same period - possibly small-container teardown-tail
+  calls arriving while fastMapOpen read false, or a gate-address mismatch; add a
+  gate-seen counter next round before trusting predictor coverage numbers.
+- FELT OPEN cost = the first-frames build storm: child-step at ~2x steady rate
+  (213-364ms inclusive per 1.5s window) + xform-get 60-110ms + allocation churn via
+  the job executor FUN_1416c5a10 (exe+0x16C5EEC) and lock/alloc thunks 0x1ED62xx.
+- FELT CLOSE cost = an async teardown JOB: the UI thread polls/waits via
+  FUN_140e811c0 ("job done?" = DLConditionSignal wait on job+0x10, 12 callers) for
+  ~140ms while worker threads run the teardown; workers dequeue via FUN_141afb000
+  (task-queue pop under lock thunks FUN_141ed6210/6280). CORRECTION: the constant
+  worker-side nt+0x1600F4 from exe+0x1AFB0A5 is most likely task-queue LOCK
+  CONTENTION, not heap free/coalesce - the old "ntdll+0x1600f0 = heap" label was an
+  offline guess for a different ntdll build. The teardown job's body (what exactly
+  eats the ~140ms for ~9k pins) is still unattributed - next: sample the worker tids
+  that go active right at close with full stack scans, or hook FUN_140e811c0 to
+  identify WHICH job object the map close waits on and trace its vtable.
+- Realistic remaining levers, in order: (1) identify + slim the teardown job's per-pin
+  work; (2) pool the 0x110 pin allocs (single site 0x140a82d09) to cut its free part;
+  (3) product-level: a "map performance" option capping the densest categories
+  (gathering nodes are ~40% of rows) - reduces N everywhere (build, per-frame step,
+  teardown, render); (4) accept ~140ms as the floor for 9k injected markers.
+
+Round-5 (2026-07-15 02:24 session, gate-seen counter + job-poll spy) - both round-4
+unknowns resolved:
+
+- Predictor coverage "anomaly" was a miscount + a discovery: pred_update did not
+  count result==0 calls, and gate-seen showed ~13.9k burst lookups vs 40-80 counted -
+  i.e. the register/unregister bursts are dominated by NEGATIVE existence checks
+  ("is this object already in the container?" -> full O(~7300) scan proves absence,
+  x13.9k = the ~280ms). The engine has no negative-result cache to seed, so the
+  sequential predictor cannot address the burst cost by design; it still accelerates
+  the found-result minority. The only full fix would be a shadow set + result
+  interception at the gated site - but that makes OUR code decide engine results
+  (any desync with unseen removals = wrong result/crash). Shelved: possible, danger.
+- Job-poll spy: every observed poll is a PER-FRAME async-job poll (dominant job
+  vtable exe+0x2BFC048; ret sites exe+0x37E556 / 0x61F6A8 / 0xB8C72D / 0xB5630B /
+  0xD78A07, plus null-job polls at 0xBFBFA5 / 0xD78578 / 0xD790FA), at ~57-60
+  polls/s in open, close and quiet windows alike. There is NO close-specific job
+  object; the post-close freeze is one of these SAME per-frame polls blocking ONCE
+  for ~140ms. Call counts cannot identify it -> the spy now records per-(ret,vt)
+  total and MAX poll duration; the site with max ~= 140ms in a close window is the
+  freeze. Then: decompile that caller to see which subsystem's job it waits for.
+- Pin free path (scratch/allocpaths_decomp.log): the pin alloc helper 0x141eb9ed0
+  is a virtual dispatch allocator->vtbl[+0x50] (address-range-arena bookkeeping -
+  do NOT substitute a foreign slab); but WorldMapPointPinData's deleting-dtor
+  FUN_14087be40 frees via global operator delete(ptr, 0x310) per pin. A
+  range-checked delete-hook pool is feasible, but 7375 deletes account for
+  single-digit ms of the ~140ms freeze - shelved as low-yield.
+
+Round-6 (2026-07-15 10:54 session, timed job spy) - THE POST-CLOSE FREEZE, FULLY
+NAMED (scratch/closejob_decomp.log, closejob2_decomp.log):
+
+- The blocking poll: ret exe+0xD78A07, job vt exe+0x2BFC048 - max 138-157ms exactly
+  once per close window, 0.1ms everywhere else. Caller = FUN_140d789c0, the
+  per-frame movie-batch scheduler: (1) WAITS INFINITE (FUN_140e811c0(singleton+8,
+  -1)) for the PREVIOUS frame's batch job; (2) collects up to 32 dirty items (flag
+  item+0x80, sorted by item+0x20) from the manager array (mgr+0x9d8/count +0xbe0);
+  (3) allocates the batch array from the PER-FRAME ARENA (DAT_1447ef360 indexed by
+  frame counter +0x708) and enqueues FUN_140d7d720 via the task system
+  (FUN_141aea9a0). The job (FUN_140d7d720) takes the manager lock (+0x10) and runs
+  FUN_140d716a0 per item - the GFx movie batch update on a worker.
+- The freeze mechanism: at map close (+~1s, when the close transition finishes and
+  refs drop) the worldmap movie's item does its heavy release inside that batch job
+  (~140ms for ~9k live display objects); the NEXT frame's scheduler waits INFINITE
+  for it on the game thread = the felt hitch.
+- Why "skip the wait" is NOT safe: the batch array lives in the per-frame arena;
+  the wait guarantees the job finishes before the arena slot recycles. Skipping it
+  = the worker reads recycled arena memory. The wait is load-bearing; do not patch
+  it out.
+- Verdict: the post-close hitch is the serialized destruction cost of ~9k Scaleform
+  display objects, structurally coupled to the frame scheduler. Pure-DLL-safe
+  reductions: fewer live display objects (category toggles already scale it;
+  a "map performance" preset would formalize it). A speculative future direction:
+  shift the movie release into the map-close fade (where a hitch is invisible)
+  instead of ~1s later - requires finding the ref-drop trigger; not attempted.
+
+Round-7 (release-in-fade expedition, static pass; scratch/releasepath*_decomp.log):
+
+- The batch item processor FUN_140d716a0 is the GFx RENDER side per movie slot:
+  item+0x98 = pending render ticks (lock item+0x88); movie view at *(item+8)+0x968;
+  per tick: view->vtbl+0x98() -> FUN_1411577b0(item+0x30, handle, 0) = NEXT-CAPTURE
+  (apply the accumulated display-tree changelist) -> FUN_1411578d0 take ->
+  FUN_14115cde0 = movie DISPLAY (draw; viewport/scissor math - NOT a command
+  dispatcher as first guessed). So the working theory for the close ~140ms: the
+  advance side destroys the movie's display list at ref-drop (fade end), producing
+  a ~9k-removal changelist, and the next batch job pays for it inside next-capture
+  (or the draw). Timing counters added on all three (item-proc / next-capture /
+  movie-display, slots 6-8 + per-slot max) to pin the exact function.
+- Release-in-fade design consequence: "enqueue the release command earlier" is not
+  a thing (no command queue); the lever is making the display-list DESTRUCTION
+  happen at fade START (when WMD dtor fires - we hook it) instead of fade end.
+  Candidate: drive removal of the marker sprites ourselves via the display-list
+  machinery we already use in gfx_probe - same total cost, paid inside the fade
+  where a hitch is invisible. Prerequisites before attempting: (1) confirm via the
+  new counters WHERE the 140ms lives; (2) prove the fade does not read the removed
+  objects (else use-after-free); (3) check the game's own teardown tolerates
+  already-removed objects (double-remove).
+
+Round-8 (2026-07-15 13:52, module attribution) - EXPEDITION VERDICT, FINAL:
+
+- batch-job (0x140d7d720) max 1.4ms while the 0xD78A07 wait is 124-147ms -> the
+  scheduler waits on the frame-sync, not on CPU work. Dense adaptive sweep found no
+  thread with ~140ms of exe work. Module attribution names the missing time: on the
+  UI thread during close windows win32u.dll x75-76 (present/sync syscalls) +
+  nvwgf2umx.dll x43-48 (NVIDIA user-mode driver) + D3D12Core; the driver also tops
+  the all-thread active sweep. CONCLUSION: the post-close microfreeze is the
+  DRIVER-SIDE destruction of the map movie's GPU resources (meshes/textures for
+  ~9k icons/glyphs), stalling the render frame-sync the game-thread scheduler waits
+  on (mirror of the known ~180ms driver tail on open).
+- Why release-in-fade is DEAD: the fade displays the movie, so its GPU resources
+  must live until fade end by design; early destruction would blank/corrupt the
+  fade. The engine-level fix (snapshot last frame, free behind it) is not
+  injectable from a DLL. Driver frees cannot be paced from our side either.
+- FINAL LEVERS for both remaining symptoms (open tail + close microfreeze), both
+  proportional to live marker count: the product-level "map performance" option
+  (cap densest categories); nothing else within pure-DLL safety. Everything above
+  this line is measured, not assumed - 8 instrumentation rounds, one crash
+  (defer-replay, root-caused), three false theories killed by data (typed-find
+  reopen cost, xform-cache, CPU-side teardown job).
+
+New diagnostics (goblin_stall_probe, debug_logging-gated, zero cost otherwise):
+- a sampling profiler over the map UI thread, triggered at map-open build bursts
+  (1.5s window) and at map close (3s window, catches the ~1s-later deferred ntdll
+  heap-free stall); logs exe+RVA histograms of rip + the first exe stack frames.
+- pass-through cost counters on the three virtual methods + typed-find (AOB-resolved,
+  patterns verified unique): calls / inclusive ms / real return-address histogram,
+  active only inside a capture window. The return addresses identify the true
+  per-marker driver loop - the missing piece for the soft-populate (amortized pin
+  build) design and for pacing the post-close free drain.
+
 ## World->screen projection: transform fields (STATIC RE, 2026-06-20)
 
 Pure static disasm (capstone) of the WorldMapDialog code cluster [0x1409B0000,0x1409E8000].

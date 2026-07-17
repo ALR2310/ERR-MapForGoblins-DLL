@@ -1108,12 +1108,29 @@ namespace
             g_v3_native.settle_frames = 0;
         }
         if (initial)
-            // Visible rows build FIRST: creation capacity per map session is
-            // finite (pulse pool x per-pass materialization), so any shortfall
-            // must land on rows the player cannot currently see anyway.
-            std::stable_partition(
+            // Seed build order = draw order (append = on top), so sort by:
+            // (1) visible rows FIRST - the pulse pool is finite and any
+            //     shortfall must land on rows the player cannot see anyway;
+            // (2) row id DESCENDING - the registry z-order contract is
+            //     "lower row id draws on top" (row_id_registry LAYER_ORDER),
+            //     so lower ids must be created LAST;
+            // (3) a cleared-badge twin right AFTER its base row - the badge
+            //     draws above its own icon.
+            std::stable_sort(
                 g_v3_native.pending.begin(), g_v3_native.pending.end(),
-                [](const goblin::NativeMarkerPoint &p) { return p.visible; });
+                [](const goblin::NativeMarkerPoint &a,
+                   const goblin::NativeMarkerPoint &b) {
+                    if (a.visible != b.visible)
+                        return a.visible > b.visible;
+                    const uint64_t ab =
+                        a.original_row_id & ~goblin::NATIVE_CLEARED_KEY_BIT;
+                    const uint64_t bb =
+                        b.original_row_id & ~goblin::NATIVE_CLEARED_KEY_BIT;
+                    if (ab != bb)
+                        return ab > bb;
+                    return (a.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT) <
+                           (b.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT);
+                });
         if (initial)
             spdlog::info("[v3native] item categories layer={} seedParentCount={}; "
                          "migrated={} visible={} requested={}",
@@ -1318,14 +1335,21 @@ namespace
             return;
         g_v3_native.in_factory = true;
 
-        // Step 1: queue up to BATCH records on this live ctx. Rows that cannot
-        // even be requested fail immediately (skip-for-session: they stay in
-        // `queued` so the refresh cannot re-add them).
-        uint32_t issued = 0;
-        while (issued < V3_FACTORY_BATCH &&
+        // Per-item synchronous pipeline: queue ONE record, run the engine's
+        // materialization driver, transfer the child, neutralize the record -
+        // then the next item, up to BATCH per pulse. Strictly one in flight
+        // keeps the per-icon SHARED tag legal: its depth is re-patched only
+        // after the previous record was decoded and neutralized. (The 16-wide
+        // variant needed a fresh tag per request - ~9.4k extra movie-heap
+        // allocations that all came back as close-teardown frees.)
+        uint32_t target_levels = 0;
+        const uintptr_t target_root = v3_parent_root(g_v3_native.parent, target_levels);
+        uint32_t attempts = 0;
+        while (attempts < V3_FACTORY_BATCH &&
                g_v3_native.frame_budget != 0 &&
                g_v3_native.pending_index < g_v3_native.pending.size())
         {
+            ++attempts;
             const auto point = g_v3_native.pending[g_v3_native.pending_index++];
             --g_v3_native.frame_budget;
             float mx = 0.0f, mz = 0.0f;
@@ -1343,20 +1367,19 @@ namespace
                 continue;
             }
             const uint16_t depth = g_v3_native.next_depth++;
-            // Register the slot BEFORE issuing the request: the engine
-            // materializes the child SYNCHRONOUSLY inside the Execute call
-            // (request and capture share a millisecond in every good session),
-            // so the PlaceObject hook must already see this slot armed.
-            auto &s = g_v3_factory_slots[issued];
+            // Arm the slot BEFORE issuing: capture can fire synchronously
+            // inside the Execute call.
+            auto &s = g_v3_factory_slots[0];
             s = V3FactorySlot{};
             s.depth = depth;
             s.char_id = char_id;
             s.point = point;
             s.map_x = mx;
             s.map_z = mz;
-            ++g_v3_factory_active;
+            g_v3_factory_active = 1;
             const uintptr_t node = goblin::gfx_probe::create_native_icon_instance(
                 point.source_icon_id, depth, live_ctx, frame);
+            bool ok = false;
             if (!v3_heap_ptr(node))
             {
                 static uint32_t s_no_node_logged = 0;
@@ -1364,91 +1387,66 @@ namespace
                     spdlog::warn("[v3native] request produced no timeline node "
                                  "(row={} depth={})",
                                  point.original_row_id, depth);
-                if (s.held && v3_heap_ptr(s.child))
-                {
-                    uint32_t rb = 0, ra = 0;
-                    v3_drop_held_ref(s.child, rb, ra);
-                }
-                s = V3FactorySlot{};
-                --g_v3_factory_active;
-                ++g_v3_native.failed;
-                continue;
-            }
-            s.node = node;
-            ++issued;
-        }
-        if (issued == 0)
-        {
-            g_v3_native.in_factory = false;
-            return;
-        }
-
-        // Step 2: materialize ALL queued records right now with the engine's
-        // own driver (some may already have materialized synchronously inside
-        // Execute - the driver call covers the rest; the capture hook fills
-        // the armed slots either way).
-        const uint32_t mat_exc =
-            v3_guarded_materialize(live_ctx, static_cast<uintptr_t>(sprite));
-        if (mat_exc)
-        {
-            static bool s_mat_exc_logged = false;
-            if (!s_mat_exc_logged)
-            {
-                s_mat_exc_logged = true;
-                spdlog::warn("[v3native] materialize driver seh=0x{:08X}", mat_exc);
-            }
-        }
-
-        // Step 3+4: transfer every captured child into the marker parent, then
-        // neutralize OUR record at that depth so the engine's own later pass
-        // cannot re-process it and spawn a duplicate inside the host sprite.
-        uint32_t target_levels = 0;
-        const uintptr_t target_root = v3_parent_root(g_v3_native.parent, target_levels);
-        for (auto &s : g_v3_factory_slots)
-        {
-            if (s.depth == UINT32_MAX)
-                continue;
-            bool ok = false;
-            if (!s.held || !v3_heap_ptr(s.child))
-            {
-                static uint32_t s_uncaptured_logged = 0;
-                if (s_uncaptured_logged++ < 4)
-                    spdlog::warn("[v3native] record not materialized by driver "
-                                 "(row={} depth={})",
-                                 s.point.original_row_id, s.depth);
-            }
-            else if (!v3_heap_ptr(target_root) || target_root != s.root)
-            {
-                ++g_v3_native.wrong_contexts;
-                spdlog::warn("[v3native] child root changed: childRoot=0x{:X} "
-                             "targetRoot=0x{:X}",
-                             s.root, target_root);
             }
             else
             {
-                if (s.point.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT)
+                s.node = node;
+                if (!s.held || !v3_heap_ptr(s.child))
                 {
-                    for (float &m : s.basis)
-                        m *= V3_BADGE_SCALE;
-                    s.base_tx = s.base_tx * V3_BADGE_SCALE + V3_BADGE_OFF_X;
-                    s.base_ty = s.base_ty * V3_BADGE_SCALE + V3_BADGE_OFF_Y;
+                    const uint32_t mat_exc = v3_guarded_materialize(
+                        live_ctx, static_cast<uintptr_t>(sprite));
+                    if (mat_exc)
+                    {
+                        static bool s_mat_exc_logged = false;
+                        if (!s_mat_exc_logged)
+                        {
+                            s_mat_exc_logged = true;
+                            spdlog::warn("[v3native] materialize driver seh=0x{:08X}",
+                                         mat_exc);
+                        }
+                    }
                 }
-                const uint32_t exc = v3_guarded_attach(g_v3_native.wrapper, s.child);
-                uint64_t child_parent = 0;
-                v3_read64(s.child + 0x38, child_parent);
-                const bool attached = exc == 0 && child_parent == g_v3_native.parent;
-                const bool positioned = attached &&
-                    v3_position_child(s.child,
-                                      s.point.visible ? s.map_x : V3_HIDDEN_MAP_POS,
-                                      s.point.visible ? s.map_z : V3_HIDDEN_MAP_POS,
-                                      s.base_tx, s.base_ty, s.basis,
-                                      g_v3_native.cur_fx, g_v3_native.cur_fy);
-                if (!positioned)
-                    spdlog::warn("[v3native] attach failed: seh=0x{:08X} "
-                                 "parent=0x{:X} expected=0x{:X}",
-                                 exc, child_parent, g_v3_native.parent);
+                if (!s.held || !v3_heap_ptr(s.child))
+                {
+                    static uint32_t s_uncaptured_logged = 0;
+                    if (s_uncaptured_logged++ < 4)
+                        spdlog::warn("[v3native] record not materialized by driver "
+                                     "(row={} depth={})",
+                                     s.point.original_row_id, s.depth);
+                }
+                else if (!v3_heap_ptr(target_root) || target_root != s.root)
+                {
+                    ++g_v3_native.wrong_contexts;
+                    spdlog::warn("[v3native] child root changed: childRoot=0x{:X} "
+                                 "targetRoot=0x{:X}",
+                                 s.root, target_root);
+                }
                 else
-                    ok = true;
+                {
+                    if (s.point.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT)
+                    {
+                        for (float &m : s.basis)
+                            m *= V3_BADGE_SCALE;
+                        s.base_tx = s.base_tx * V3_BADGE_SCALE + V3_BADGE_OFF_X;
+                        s.base_ty = s.base_ty * V3_BADGE_SCALE + V3_BADGE_OFF_Y;
+                    }
+                    const uint32_t exc = v3_guarded_attach(g_v3_native.wrapper, s.child);
+                    uint64_t child_parent = 0;
+                    v3_read64(s.child + 0x38, child_parent);
+                    const bool attached = exc == 0 && child_parent == g_v3_native.parent;
+                    const bool positioned = attached &&
+                        v3_position_child(s.child,
+                                          s.point.visible ? s.map_x : V3_HIDDEN_MAP_POS,
+                                          s.point.visible ? s.map_z : V3_HIDDEN_MAP_POS,
+                                          s.base_tx, s.base_ty, s.basis,
+                                          g_v3_native.cur_fx, g_v3_native.cur_fy);
+                    if (!positioned)
+                        spdlog::warn("[v3native] attach failed: seh=0x{:08X} "
+                                     "parent=0x{:X} expected=0x{:X}",
+                                     exc, child_parent, g_v3_native.parent);
+                    else
+                        ok = true;
+                }
             }
             if (s.held && v3_heap_ptr(s.child))
             {
@@ -1476,21 +1474,27 @@ namespace
                 if (created == 1 || created % 256 == 0 ||
                     g_v3_native.pending_index >= g_v3_native.pending.size())
                     spdlog::info("[v3native] category progress: created={}/{} "
-                                 "failed={} lastRow={} srcIconId={} "
+                                 "failed={} lastRow={}{} srcIconId={} "
                                  "map=({:.1f},{:.1f})",
                                  created, g_v3_native.pending.size(),
-                                 g_v3_native.failed, s.point.original_row_id,
+                                 g_v3_native.failed,
+                                 s.point.original_row_id &
+                                     ~goblin::NATIVE_CLEARED_KEY_BIT,
+                                 (s.point.original_row_id &
+                                  goblin::NATIVE_CLEARED_KEY_BIT)
+                                     ? "(badge)"
+                                     : "",
                                  s.point.source_icon_id, s.map_x, s.map_z);
             }
             else
             {
                 ++g_v3_native.failed;
             }
-            goblin::gfx_probe::remove_native_icon_record(
-                static_cast<uint16_t>(s.depth), live_ctx, frame);
+            if (v3_heap_ptr(node))
+                goblin::gfx_probe::remove_native_icon_record(depth, live_ctx, frame);
             s = V3FactorySlot{};
+            g_v3_factory_active = 0;
         }
-        g_v3_factory_active = 0;
         g_v3_native.in_factory = false;
     }
 

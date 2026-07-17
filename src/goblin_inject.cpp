@@ -579,8 +579,19 @@ std::vector<goblin::HighlightPoint> goblin::focus_highlight_points()
         // Only ring markers whose icon is actually shown: not collected/hidden, and not
         // gated off by a group-2 ENABLE flag (switched-chest absent variant / pre-event area).
         if (row_is_hidden(cr) || row_group2_gate_off(cr.p)) continue;
+        // Coordinates/layer come from the CAPTURED native_* fields, NOT from the
+        // live row: migrated rows run with dispMask zeroed (stock widget
+        // suppression), so a live read derives layer "none" and the overlay's
+        // per-layer filter drops every ring (the v2.0.6 focus-ring regression).
         HighlightPoint hp{};
-        if (row_marker_info(cr.p, hp)) out.push_back(hp);
+        hp.area = cr.native_area;
+        hp.layer = cr.native_layer;
+        hp.gx = cr.native_gx;
+        hp.gz = cr.native_gz;
+        hp.px = cr.native_px;
+        hp.pz = cr.native_pz;
+        if (hp.area == 99) continue; // parked/hidden coordinate trick
+        out.push_back(hp);
     }
     return out;
 }
@@ -1413,12 +1424,17 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
                        cr.p});
         // Twin checkmark point for defeat-capable rows (bosses/NPC/hawks/...):
         // the native path has no stock completion overlay, so a second
-        // lightweight child with the green check icon rides the same coords
-        // and shows only while the base icon is shown AND the defeat flag is
-        // set. (hide_killed_bosses=ON instead hides the base row through
+        // lightweight child with the green check icon rides the same coords.
+        // LAZY: emitted only once the defeat flag IS set - every attached
+        // child costs driver-side teardown time (~8us) even when never drawn,
+        // and most of the ~1900 defeat-capable rows are alive at any moment.
+        // A row defeated mid-session gets its badge at the next map rebuild
+        // (the factory cannot create children outside a build burst anyway;
+        // the queue watchdog quietly drops the interim request).
+        // (hide_killed_bosses=ON instead hides the base row through
         // textDisableFlagId - the twin follows it down via `visible`.)
         const unsigned cleared_flag = cr.p->clearedEventFlagId;
-        if (cleared_flag != 0)
+        if (cleared_flag != 0 && goblin::flag_is_set(cleared_flag))
             out.push_back({cr.original_row_id | NATIVE_CLEARED_KEY_BIT,
                            static_cast<int>(goblin::generated::CLEARED_ICON_ID),
                            cr.native_area, cr.native_layer,

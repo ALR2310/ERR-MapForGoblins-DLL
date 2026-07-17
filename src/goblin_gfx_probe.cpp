@@ -1321,16 +1321,24 @@ uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint1
     uintptr_t child = 0;
     __try
     {
-        // A FRESH tag per request - never a shared cached one. The engine's
-        // deferred materialization re-decodes the placement FROM THE TAG, so a
-        // per-icon cached tag re-patched to a new depth each call makes every
-        // in-flight record decode the LAST depth (the stage-4 batch failure:
-        // 8 records, one tag, one surviving match). Movie-heap allocation,
-        // reclaimed with the movie at teardown.
-        const auto &e = goblin::generated::MAP_ICON_TAGS[tag_index];
-        const uint64_t tag =
-            build_clean_place_tag(static_cast<uint16_t>(inject_base() + tag_index),
-                                  depth, e.matrix, e.matrixLen);
+        // Per-icon cached tag (movie heap; the cache is cleared per movie load
+        // at the 13507 hook, so no stale cross-generation pointers). Records
+        // decode their placement FROM the tag, so a shared tag is only legal
+        // while no in-flight record can observe a later depth re-patch - the
+        // factory guarantees that by finishing each record (materialize +
+        // neutralize) before the next request touches this icon's tag. The
+        // one-shot-tag era (~9.4k extra movie-heap allocations per session)
+        // existed to survive deferred decode and is no longer needed.
+        uint64_t tag = g_native_place_tags[tag_index];
+        if (!tag)
+        {
+            const auto &e = goblin::generated::MAP_ICON_TAGS[tag_index];
+            tag = build_clean_place_tag(static_cast<uint16_t>(inject_base() + tag_index),
+                                        depth, e.matrix, e.matrixLen);
+            g_native_place_tags[tag_index] = tag;
+        }
+        if (tag)
+            safe_copy(reinterpret_cast<void *>(tag + 0xa), &depth, 2);
         const uint64_t vt = tag ? rq(tag) : 0;
         const uint64_t execute = vt ? rq(vt + 0x30) : 0;
         if (!execute) return 0;

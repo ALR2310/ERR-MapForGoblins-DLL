@@ -1,6 +1,7 @@
 #include "goblin_map_timing.hpp"
 
 #include "goblin_config.hpp"
+#include "goblin_gfx_probe.hpp"
 #include "goblin_stall_probe.hpp"
 #include "modutils.hpp"
 
@@ -63,18 +64,29 @@ namespace
 
     void *wmd_dtor_detour(void *self)
     {
+        // The V3 test child belongs to this display tree and is destroyed by the
+        // engine below. Drop every cached pointer first and re-arm creation for the
+        // next WorldMapDialog instance.
+        goblin::stall_probe::on_map_close();
+
         // Map closing. Profile the deferred post-close heap-release stall (~1s after
         // close) when debug_logging is on; the dtor runs on the map UI thread we
         // need to sample.
         goblin::stall_probe::capture("map-close teardown", 3000);
-        return o_wmd_dtor(self);
+        void *ret = o_wmd_dtor(self);
+        // Re-arm only AFTER teardown: doing it before could let an ExecuteTag fired
+        // by destruction mistake the dying dialog for a fresh map.
+        goblin::gfx_probe::v3_on_map_close();
+        return ret;
     }
 }
 
 void goblin::map_timing::on_map_frame()
 {
-    // No per-frame work remains (the deferred-relayout replay was removed - see the
-    // header comment). Kept as a stable entry point for future frame-driven logic.
+    // The shipping fast-map path has no deferred per-frame work. The debug V3 native
+    // marker experiment uses this stable UI-thread callback to counter-scale its one
+    // transplanted child during zoom; it is a single atomic gate otherwise.
+    goblin::stall_probe::on_map_frame();
 }
 
 void goblin::map_timing::setup()

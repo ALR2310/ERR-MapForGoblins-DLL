@@ -2042,9 +2042,43 @@ static void seh_resize(UINT w, UINT h)
 // cursor is over one of OUR markers, show a small fixed top-left panel with the
 // marker's name + its height relative to the player. Never captures input; renders
 // in the menu-closed path so it coexists with normal play.
-static void draw_hover_tooltip()
+// Our V3 native markers have no engine pin, so the game's hover routine can
+// never report them. Equivalent focus test: project every visible native
+// marker of the current layer and pick the one nearest the map reticle
+// (screen centre), within a pin-sized radius. Public wrapper
+// goblin::overlay::native_hover_row() lives past the anonymous namespace.
+static void *native_hover_row_impl()
 {
-    void *row = goblin::maphover::hovered_row();
+    const int layer = goblin::maphover::map_layer();
+    if (layer < 0 || layer > 2) return nullptr;
+    goblin::mapproject::MapView view;
+    if (!goblin::mapproject::read_view(view)) return nullptr;
+    const goblin::mapproject::Calib &c = goblin::mapproject::calib();
+    const float cw = static_cast<float>(g_back_w ? g_back_w : 1920);
+    const float chh = static_cast<float>(g_back_h ? g_back_h : 1080);
+    const float cx = cw * 0.5f, cy = chh * 0.5f;
+    constexpr float PICK_RADIUS = 26.0f; // ~native pin focus feel
+    float best = PICK_RADIUS * PICK_RADIUS;
+    void *best_row = nullptr;
+    for (const auto &p : goblin::native_marker_snapshot(layer))
+    {
+        if (!p.visible || !p.rowptr) continue;
+        float sx = 0, sy = 0;
+        if (!goblin::mapproject::project(p.area, p.gx, p.gz, p.px, p.pz,
+                                         view, c, cw, chh, sx, sy))
+            continue;
+        const float dx = sx - cx, dy = sy - cy;
+        if (dx * dx + dy * dy < best)
+        {
+            best = dx * dx + dy * dy;
+            best_row = p.rowptr;
+        }
+    }
+    return best_row;
+}
+
+static void draw_hover_tooltip(void *row)
+{
     if (!row) return;
     // Don't keep a tooltip on a marker that just got hidden (manual hide / pickup): its
     // icon + highlight are gone, so the label must go too - even if the game still reports
@@ -2462,8 +2496,13 @@ void overlay_thread()
         update_menu_toggle();
 
         const bool open = g_menu_open.load();
+        void *hover_row = goblin::maphover::hovered_row();
+        if (!hover_row && !open && goblin::config::enableHoverInfo)
+            // V3 native markers have no engine pin - our own reticle-distance
+            // hover keeps the tooltip working for migrated categories.
+            hover_row = native_hover_row_impl();
         const bool hovering = !open && goblin::config::enableHoverInfo &&
-                              goblin::maphover::hovered_row() != nullptr;
+                              hover_row != nullptr;
         // Only paint while the game (a window in our own process) is the foreground
         // app. Our window is HWND_TOPMOST, so without this an alt-tab to another app
         // would leave the menu/hover panel drawn over whatever is now in front, with
@@ -2543,7 +2582,7 @@ void overlay_thread()
             ImGui::GetIO().MouseDrawCursor = false;
             if (projecting) draw_map_highlights();
             if (projecting) draw_focus_banner_onscreen();  // mirror the "showing only" filter text on screen
-            if (hovering) draw_hover_tooltip();
+            if (hovering) draw_hover_tooltip(hover_row);
             ImGui::Render();
             render_frame(true);
         }
@@ -2590,6 +2629,8 @@ void teardown()
 } // namespace
 
 bool goblin::overlay::key_down(int vk) { return kd(vk); }
+
+void *goblin::overlay::native_hover_row() { return native_hover_row_impl(); }
 
 bool goblin::overlay::gamepad_mask_down(uint16_t mask)
 {

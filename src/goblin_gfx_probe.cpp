@@ -6,10 +6,13 @@
 #include "generated/goblin_item_icons.hpp"       // goblin::generated::ANON_ICON_ID
 #include "goblin_inject.hpp"   // goblin::remap_injected_icons (point markers at our injected frames)
 #include "goblin_diag.hpp"     // goblin::diag inject-status registry (overlay Debug readout)
+#include "goblin_maphover.hpp" // map_dialog() - the V3 spike only fires while the map is open
+#include "goblin_stall_probe.hpp"
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -197,6 +200,10 @@ namespace
     std::atomic<uint32_t> g_logo_charid{0};
     std::atomic<bool> g_logo_placed{false};
     std::atomic<uint64_t> g_worldmap_ctx{0}; // the worldmap movie's load ctx (captured at its 13507)
+    uint64_t g_native_place_tags[ICON_MAP_SIZE]{};
+    constexpr uint32_t SPRITE171_RM2_CAP = 4096;
+    uint64_t g_sprite171_rm2_tags[SPRITE171_RM2_CAP]{};
+    std::atomic<uint32_t> g_sprite171_rm2_count{0};
     uint32_t logo_charid() { return inject_base() + (uint32_t)goblin::generated::MAP_ICON_TAG_COUNT; }
 
     void *registrar_detour(void *rcx, void *rdx, void *r8, void *r9)
@@ -333,6 +340,9 @@ namespace
         return o_ctor(self, cdef);
     }
 
+    // V3 stage 1: one-shot gate for the top-down layer walk in tick() (below).
+    std::atomic<int> g_layer_dumped{0}; // reset on map close, walk once per open
+
     void *adddisp_detour(void *rcx, void *rdx, void *r8, void *r9)
     {
         g_adddisp_calls.fetch_add(1, std::memory_order_relaxed);
@@ -377,6 +387,7 @@ namespace
     uint64_t build_clean_place_tag(uint16_t cid, uint16_t dp, const unsigned char *mtx, unsigned mlen); // below
     uint64_t build_remove_tag(uint16_t depth);                                // defined below
     void capture_tag_vtables(uint64_t sd);                                    // defined below
+    void capture_sprite171_rm2_tags(uint64_t sd);                              // defined below
     uint32_t append_icon_frame(uint64_t sd, uint16_t newCharId, const unsigned char *mat, unsigned matLen); // defined below
     uint32_t compute_safe_base(uint64_t movieDef, uint32_t count);            // defined below (self-healing)
 #ifdef MFG_DUMP_FRAMES
@@ -520,6 +531,9 @@ namespace
             // images), then append a frame per icon and remap markers to the injected iconIds.
             uint32_t base = compute_safe_base(ctx, (uint32_t)goblin::generated::MAP_ICON_TAG_COUNT + 1);
             g_inject_base.store(base, std::memory_order_relaxed);
+            // PlaceObject tags embed the bitmap charId, whose collision-safe
+            // base is recomputed for every loaded movie.
+            memset(g_native_place_tags, 0, sizeof(g_native_place_tags));
             g_worldmap_ctx.store(ctx, std::memory_order_relaxed); // scope sprite-246 logo to THIS movie
             uint64_t sub = rq(ctx + 0x18);
             uint64_t mgr = sub ? rq(sub + 0x40) : 0;
@@ -544,6 +558,7 @@ namespace
                     ++placed;
                 }
             }
+            capture_sprite171_rm2_tags(sd);
             g_iid_lo.store(iid_lo, std::memory_order_relaxed);
             g_iid_hi.store(iid_hi, std::memory_order_relaxed);
             if (goblin::config::debugLogging)
@@ -645,6 +660,163 @@ namespace
         return ret;
     }
 
+    // ── V3 native-marker SPIKE (stage 0) ────────────────────────────────────
+    // One-shot, debug_logging-gated. Piggybacks on the FIRST native RemoveObject2
+    // executed on a live display context while the world map is open (a sprite
+    // playing a composite frame = a live, engine-driven display list on the right
+    // thread): we execute OUR synthesized PlaceObject3 (first injected icon,
+    // unused depth) on the SAME ctx via the tag's own vtable Execute (slot 6).
+    // Proves the v3 mechanism end to end: place-into-live-list, native render,
+    // parent-transform inheritance, teardown tolerance (the parent destroys our
+    // node at close - watch for crashes). One-shot per process: re-test needs a
+    // game restart. See scratch/v3_native_markers_plan.md.
+    std::atomic<int> g_spike_done{0};
+    constexpr uint16_t SPIKE_DEPTH = 24; // composite icon frames use depths 1-2
+    constexpr uint16_t SPIKE_SLOTS = 8;
+
+    void seh_spike_place(void *ctx, uint32_t frame)
+    {
+        __try
+        {
+            uint64_t cx = (uint64_t)ctx;
+            uint64_t lbase = rq(cx + 0x28);
+            uint64_t lcnt0 = rq(cx + 0x30);
+            if (!looks_heap(lbase) || lcnt0 == 0 || lcnt0 >= 4096)
+                return; // not a sane display list; stay armed for the next RM2
+            if (g_spike_done.exchange(1, std::memory_order_relaxed) != 0)
+                return;
+            uint64_t node = 0;
+            uint64_t lcnt1 = lcnt0;
+            for (uint16_t slot = 0; slot < SPIKE_SLOTS; ++slot)
+            {
+                const goblin::generated::MapIconTag e = goblin::generated::MAP_ICON_TAGS[slot];
+                const uint16_t char_id = static_cast<uint16_t>(inject_base() + slot);
+                const uint16_t depth = static_cast<uint16_t>(SPIKE_DEPTH + slot);
+                uint64_t po = build_clean_place_tag(char_id, depth, e.matrix, e.matrixLen);
+                if (!po)
+                {
+                    spdlog::warn("[spike] slot {} place-tag build failed", slot);
+                    continue;
+                }
+                uint64_t vt = rq(po);
+                uint64_t fn = vt ? rq(vt + 0x30) : 0;
+                if (!fn)
+                {
+                    spdlog::warn("[spike] slot {} no Execute in tag vtable 0x{:X}", slot, vt);
+                    continue;
+                }
+                using ExecFn = void *(void *, void *, uint32_t);
+                ((ExecFn *)fn)((void *)po, ctx, frame);
+                lcnt1 = rq(cx + 0x30);
+                uint64_t slot_node = 0;
+                uint64_t nlbase = rq(cx + 0x28);
+                if (looks_heap(nlbase) && lcnt1 > 0 && lcnt1 < 4096)
+                    for (uint64_t i = 0; i < lcnt1; ++i)
+                    {
+                        uint64_t n = rq(nlbase + i * 8);
+                        if (looks_heap(n) && rd32(n + 0x14) == depth)
+                        {
+                            slot_node = n;
+                            break;
+                        }
+                    }
+                if (slot == 0) node = slot_node; // retain one representative raw dump below
+                spdlog::info("[spike] slot={} srcIconId={} charId={} depth={} ctx=0x{:X} "
+                             "list {}->{} node=0x{:X}",
+                             slot, e.srcIconId, char_id, depth, cx,
+                             slot == 0 ? lcnt0 : lcnt1 - 1, lcnt1, slot_node);
+            }
+
+            // V3 stage 1: raw dumps for offline pointer analysis. Execute-side
+            // statics showed ctx carries no parent/root link (only the list at
+            // +0x28/+0x30, a mode flag +0x60 and a pending list head +0x18), so
+            // the way up runs through the created NODE -> sprite instance ->
+            // its links. Dump both objects; the analysis happens offline.
+            if (node)
+            {
+                unsigned char buf[0x200];
+                memset(buf, 0, sizeof(buf));
+                safe_copy(buf, (void *)cx, sizeof(buf));
+                for (int row = 0; row < 0x200 / 32; ++row)
+                {
+                    char hx[3 * 32 + 1] = {0};
+                    for (int k = 0; k < 32; ++k)
+                        snprintf(hx + k * 3, 4, "%02X ", buf[row * 32 + k]);
+                    spdlog::info("[spike] ctx+0x{:03X}: {}", row * 32, hx);
+                }
+                memset(buf, 0, sizeof(buf));
+                safe_copy(buf, (void *)node, 0x100);
+                for (int row = 0; row < 0x100 / 32; ++row)
+                {
+                    char hx[3 * 32 + 1] = {0};
+                    for (int k = 0; k < 32; ++k)
+                        snprintf(hx + k * 3, 4, "%02X ", buf[row * 32 + k]);
+                    spdlog::info("[spike] node+0x{:02X}: {}", row * 32, hx);
+                }
+            }
+
+            // Ancestry scan (kept from the previous build; L0 had no candidates -
+            // rerun for confirmation alongside the raw dumps).
+            uint64_t lvl = cx;
+            for (int depth_up = 0; depth_up < 2 && lvl; ++depth_up)
+            {
+                uint64_t best_p = 0, best_c = 0;
+                char cands[512] = {0};
+                size_t cl = 0;
+                for (uint64_t off = 0; off <= 0xE8; off += 8)
+                {
+                    uint64_t p = rq(lvl + off);
+                    if (!looks_heap(p) || p == lvl) continue;
+                    uint64_t pb = rq(p + 0x28);
+                    uint64_t pc = rq(p + 0x30);
+                    if (!looks_heap(pb) || pc == 0 || pc >= 20000) continue;
+                    int w = snprintf(cands + cl, sizeof(cands) - cl,
+                                     "+0x%02llX->0x%llX list=%llu; ",
+                                     (unsigned long long)off, (unsigned long long)p,
+                                     (unsigned long long)pc);
+                    if (w > 0) cl += (size_t)w;
+                    if (pc > best_c) { best_c = pc; best_p = p; }
+                    if (cl > sizeof(cands) - 64) break;
+                }
+                spdlog::info("[spike] ancestry L{} of 0x{:X}: {}", depth_up, lvl,
+                             cl ? cands : "no candidates");
+                lvl = best_p; // climb toward the biggest list
+            }
+
+            // Raw dumps for offline layout analysis (the direct-pointer scan above
+            // found nothing in ctx[0..0xE8]): the full ctx object and our fresh
+            // display node - pointers inside them are the ancestry candidates.
+            {
+                unsigned char cb[0x200] = {0};
+                safe_copy(cb, (void *)cx, sizeof(cb));
+                char hx[3 * 0x80 + 1];
+                for (int part = 0; part < 4; ++part)
+                {
+                    hx[0] = 0;
+                    for (int k = 0; k < 0x80; ++k)
+                        snprintf(hx + k * 3, 4, "%02X ", cb[part * 0x80 + k]);
+                    spdlog::info("[spike] ctxdump +0x{:03X}: {}", part * 0x80, hx);
+                }
+                if (node)
+                {
+                    unsigned char db[0x100] = {0};
+                    safe_copy(db, (void *)node, sizeof(db));
+                    for (int part = 0; part < 2; ++part)
+                    {
+                        hx[0] = 0;
+                        for (int k = 0; k < 0x80; ++k)
+                            snprintf(hx + k * 3, 4, "%02X ", db[part * 0x80 + k]);
+                        spdlog::info("[spike] nodedump +0x{:03X}: {}", part * 0x80, hx);
+                    }
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            spdlog::warn("[spike] access violation during place (spike aborted, game unharmed)");
+        }
+    }
+
     // DIAGNOSTIC detour on RemoveObject2::Execute. For OUR injected RM2 tags, inspect the display list
     // (ctx+0x28 base, ctx+0x30 count; node depth@+0x14, sticky flag@+0x71) for an entry at our depth,
     // BEFORE the original runs - tells us whether the anon's layer is present and sticky.
@@ -674,7 +846,19 @@ namespace
             spdlog::debug("[rmtag] my RM2 depth={} ctx=0x{:X} listBase=0x{:X} cnt={} -> entry@0x{:X} flag71=0x{:02X}",
                          dep, cx, lbase, lcnt, foundNode, f71);
         }
-        return o_rm2exec(thisTag, ctx, frame);
+        const uint32_t exact_count = g_sprite171_rm2_count.load(std::memory_order_acquire);
+        const bool exact_sprite171 = exact_count != 0 &&
+            std::binary_search(g_sprite171_rm2_tags,
+                               g_sprite171_rm2_tags + exact_count, t);
+        void *ret = o_rm2exec(thisTag, ctx, frame);
+        // Execute queued native placements only while this callback's timeline
+        // context is live. Retaining ctx for a later map frame caused the first
+        // integrated V3 build to crash before its first attach.
+        if (goblin::config::debugLogging && exact_sprite171 && ctx &&
+            g_qmark_injected.load(std::memory_order_relaxed) &&
+            goblin::maphover::map_dialog() != nullptr)
+            goblin::stall_probe::v3_native_factory_pulse(ctx, frame);
+        return ret;
     }
 
 #ifdef MFG_DUMP_FRAMES
@@ -946,6 +1130,36 @@ namespace
         spdlog::warn("[icons] no composite RM2+RM2+PO3 frame found; using fallback vtable RVAs.");
     }
 
+    void capture_sprite171_rm2_tags(uint64_t sd)
+    {
+        g_sprite171_rm2_count.store(0, std::memory_order_release);
+        const uint64_t fdata = rq(sd + OFF_FRAMEARR_DATA);
+        const uint32_t fcnt = rd32(sd + OFF_FRAMEARR_COUNT);
+        const uint64_t rmvt = g_rm2_vt.load(std::memory_order_relaxed);
+        if (!looks_heap(fdata) || fcnt == 0 || fcnt > 8192 || !rmvt) return;
+
+        uint32_t count = 0;
+        for (uint32_t f = 0; f < fcnt && count < SPRITE171_RM2_CAP; ++f)
+        {
+            const uint64_t elem = fdata + static_cast<uint64_t>(f) * FRAME_STRIDE;
+            const uint64_t tags = rq(elem);
+            const uint32_t tag_count = rd32(elem + 8);
+            if (!looks_heap(tags) || tag_count == 0 || tag_count > 64) continue;
+            for (uint32_t i = 0; i < tag_count && count < SPRITE171_RM2_CAP; ++i)
+            {
+                const uint64_t tag = rq(tags + static_cast<uint64_t>(i) * 8);
+                if (looks_heap(tag) && rq(tag) == rmvt)
+                    g_sprite171_rm2_tags[count++] = tag;
+            }
+        }
+        std::sort(g_sprite171_rm2_tags, g_sprite171_rm2_tags + count);
+        count = static_cast<uint32_t>(std::unique(g_sprite171_rm2_tags,
+                                                  g_sprite171_rm2_tags + count) -
+                                      g_sprite171_rm2_tags);
+        g_sprite171_rm2_count.store(count, std::memory_order_release);
+        spdlog::info("[v3native] captured {} exact sprite-171 RM2 tags", count);
+    }
+
     // Place our registered logo bitmap onto the decorative-plaque sprite (246) by re-pointing its
     // char-10 PlaceObject3 to our logo charId. PO3 tag-object body is inline at this+8: flags0@+8,
     // flags1@+9, depth@+0xa, charId@+0xc, matrix@+0xe (confirmed via PO3::Execute 0x1411bdb40). We clone
@@ -1068,6 +1282,108 @@ uint32_t goblin::gfx_probe::injected_iconid(int srcIconId)
     return g_icon_iid[srcIconId];
 }
 
+int goblin::gfx_probe::source_iconid(uint32_t runtimeIconId)
+{
+    for (int i = 0; i < ICON_MAP_SIZE; ++i)
+        if (g_icon_iid[i] != 0 && g_icon_iid[i] == runtimeIconId)
+            return i;
+    // Before remapping (or during a guarded partial load), accept a generated
+    // source id directly, but reject unrelated vanilla frames.
+    for (int i = 0; i < goblin::generated::MAP_ICON_TAG_COUNT; ++i)
+        if (goblin::generated::MAP_ICON_TAGS[i].srcIconId == static_cast<int>(runtimeIconId))
+            return static_cast<int>(runtimeIconId);
+    return -1;
+}
+
+uint32_t goblin::gfx_probe::native_character_id(int sourceIconId)
+{
+    for (int i = 0; i < goblin::generated::MAP_ICON_TAG_COUNT; ++i)
+        if (goblin::generated::MAP_ICON_TAGS[i].srcIconId == sourceIconId)
+            return inject_base() + static_cast<uint32_t>(i);
+    return 0;
+}
+
+uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint16_t depth,
+                                                          void *live_ctx, uint32_t frame)
+{
+    const uint64_t ctx = reinterpret_cast<uint64_t>(live_ctx);
+    if (!ctx || !goblin::maphover::map_dialog()) return 0;
+
+    int tag_index = -1;
+    for (int i = 0; i < goblin::generated::MAP_ICON_TAG_COUNT; ++i)
+        if (goblin::generated::MAP_ICON_TAGS[i].srcIconId == sourceIconId)
+        {
+            tag_index = i;
+            break;
+        }
+    if (tag_index < 0) return 0;
+
+    uintptr_t child = 0;
+    __try
+    {
+        // A FRESH tag per request - never a shared cached one. The engine's
+        // deferred materialization re-decodes the placement FROM THE TAG, so a
+        // per-icon cached tag re-patched to a new depth each call makes every
+        // in-flight record decode the LAST depth (the stage-4 batch failure:
+        // 8 records, one tag, one surviving match). Movie-heap allocation,
+        // reclaimed with the movie at teardown.
+        const auto &e = goblin::generated::MAP_ICON_TAGS[tag_index];
+        const uint64_t tag =
+            build_clean_place_tag(static_cast<uint16_t>(inject_base() + tag_index),
+                                  depth, e.matrix, e.matrixLen);
+        const uint64_t vt = tag ? rq(tag) : 0;
+        const uint64_t execute = vt ? rq(vt + 0x30) : 0;
+        if (!execute) return 0;
+        using ExecFn = void *(void *, void *, uint32_t);
+        reinterpret_cast<ExecFn *>(execute)(reinterpret_cast<void *>(tag),
+                                             reinterpret_cast<void *>(ctx),
+                                             frame);
+        const uint64_t list = rq(ctx + 0x28);
+        const uint64_t count = rq(ctx + 0x30);
+        if (looks_heap(list) && count > 0 && count < 4096)
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                const uint64_t node = rq(list + i * 8);
+                if (looks_heap(node) && rd32(node + 0x14) == depth)
+                {
+                    child = static_cast<uintptr_t>(node);
+                    break;
+                }
+            }
+    }
+
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        child = 0;
+    }
+    return child;
+}
+
+bool goblin::gfx_probe::remove_native_icon_record(uint16_t depth, void *ctx, uint32_t frame)
+{
+    const uint64_t c = reinterpret_cast<uint64_t>(ctx);
+    if (!c) return false;
+    bool ok = false;
+    __try
+    {
+        const uint64_t tag = build_remove_tag(depth);
+        const uint64_t vt = tag ? rq(tag) : 0;
+        const uint64_t execute = vt ? rq(vt + 0x30) : 0;
+        if (execute)
+        {
+            using ExecFn = void *(void *, void *, uint32_t);
+            reinterpret_cast<ExecFn *>(execute)(reinterpret_cast<void *>(tag),
+                                                reinterpret_cast<void *>(c), frame);
+            ok = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok;
+}
+
 // The anon "?" is one of the injected icons (its source iconId is goblin::generated::ANON_ICON_ID).
 // Kept for the apply_loot_settings pre-load placeholder path.
 uint32_t goblin::gfx_probe::anon_dynamic_iconid()
@@ -1079,6 +1395,15 @@ void goblin::gfx_probe::injected_iid_range(uint32_t &lo, uint32_t &hi)
 {
     lo = g_iid_lo.load(std::memory_order_relaxed);
     hi = g_iid_hi.load(std::memory_order_relaxed);
+}
+
+void goblin::gfx_probe::v3_on_map_close()
+{
+    // The spike child was moved into the map-owned display tree and has now been
+    // destroyed by its normal teardown. A new dialog needs a new display instance;
+    // icon definitions/resources themselves remain loaded and are not reset here.
+    if (goblin::config::debugLogging)
+        g_spike_done.store(0, std::memory_order_release);
 }
 
 
@@ -1097,6 +1422,58 @@ void goblin::gfx_probe::tick()
     if (recorded != last_logged)
     {
         last_logged = recorded;
+    }
+
+    // V3 stage 1: TOP-DOWN layer discovery from the live WorldMapDialog. maphover
+    // publishes the MapArea (r8 of the per-frame hook); dialogBase = MapArea -
+    // 0x27D8 (map_layer RE). The projection broadcast fn 0x1409C38D0 scales ~10
+    // layer widgets at fixed dialog offsets; one is the icon layer. For each we
+    // scan the widget for a sub-object holding a display list (+0x28 base / +0x30
+    // count) and log the node count - the layer with hundreds/thousands of nodes
+    // is the marker layer (our stage-2 insertion target). One-shot per map session.
+    if (probe)
+    {
+        uint64_t area = (uint64_t)goblin::maphover::map_dialog();
+        bool map_open = area != 0;
+        if (map_open && g_layer_dumped.load(std::memory_order_relaxed) == 0 &&
+            g_layer_dumped.exchange(1, std::memory_order_relaxed) == 0)
+        {
+            __try
+            {
+                // Wide scan of the dialog object: every qword in [0, 0x3A00) whose
+                // target is a heap object with a sane display list (+0x28 base /
+                // +0x30 count). The layer widgets + the movie root live among these;
+                // the entry with the most nodes is the marker layer (stage-2 target).
+                uint64_t dialog = area - 0x27D8;
+                spdlog::info("[v3layer] MapArea=0x{:X} dialog=0x{:X} - wide pointer scan:", area, dialog);
+                uint64_t best_p = 0, best_cnt = 0, best_off = 0;
+                int hits = 0;
+                for (uint64_t off = 0; off < 0x3A00; off += 8)
+                {
+                    uint64_t p = rq(dialog + off);
+                    if (!looks_heap(p)) continue;
+                    uint64_t lb = rq(p + 0x28), lc = rq(p + 0x30);
+                    if (!looks_heap(lb) || lc == 0 || lc >= 20000) continue;
+                    // sanity: first node must be a heap object too (real display list)
+                    uint64_t n0 = rq(lb);
+                    if (!looks_heap(n0)) continue;
+                    if (hits++ < 24)
+                        spdlog::info("[v3layer]   dialog+0x{:X} -> 0x{:X} list=0x{:X} count={}",
+                                     off, p, lb, lc);
+                    if (lc > best_cnt) { best_cnt = lc; best_p = p; best_off = off; }
+                }
+                spdlog::info("[v3layer] BUSIEST: dialog+0x{:X} -> 0x{:X} count={} ({} list-holders total)",
+                             best_off, best_p, best_cnt, hits);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                spdlog::warn("[v3layer] AV during dialog scan (skipped, game unharmed)");
+            }
+        }
+        else if (!map_open)
+        {
+            g_layer_dumped.store(0, std::memory_order_relaxed); // re-arm for the next open
+        }
     }
 
 

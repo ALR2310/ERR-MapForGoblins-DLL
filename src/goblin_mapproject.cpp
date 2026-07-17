@@ -14,6 +14,7 @@ namespace
     constexpr size_t OFF_PAN = 0x378;       // 2 floats: panX, panZ
     constexpr size_t OFF_ZOOM = 0x380;
     constexpr size_t OFF_VISRECT = 0x340;   // 4 floats: minX, minZ, maxX, maxZ
+    constexpr size_t OFF_FULLRECT = 0x350;  // complete canvas; normally {0,0,10496,10496}
 
     // World->map-space affine (overworld/underground/DLC), from the game's own converter
     // (FUN_140876140, area-60 converter: bGX=28,bGZ=64,off=128,scale=1): mapX = worldX-7040,
@@ -52,12 +53,29 @@ bool goblin::mapproject::read_view(MapView &out)
     out.zoom = rf(b, OFF_ZOOM);
     const float vminX = rf(b, OFF_VISRECT + 0), vminZ = rf(b, OFF_VISRECT + 4);
     const float vmaxX = rf(b, OFF_VISRECT + 8), vmaxZ = rf(b, OFF_VISRECT + 12);
+    const float fminX = rf(b, OFF_FULLRECT + 0), fminZ = rf(b, OFF_FULLRECT + 4);
+    const float fmaxX = rf(b, OFF_FULLRECT + 8), fmaxZ = rf(b, OFF_FULLRECT + 12);
     out.snapMidX = (vminX + vmaxX) * 0.5f;
     out.snapMidZ = (vminZ + vmaxZ) * 0.5f;
+    out.fullMidX = (fminX + fmaxX) * 0.5f;
+    out.fullMidZ = (fminZ + fmaxZ) * 0.5f;
     if (!(out.zoom > 0.01f)) return false;
     if (!((vmaxX - vminX) > 1.0f) || !((vmaxZ - vminZ) > 1.0f)) return false;
+    if (!((fmaxX - fminX) > 1.0f) || !((fmaxZ - fminZ) > 1.0f)) return false;
     out.valid = true;
     return true;
+}
+
+bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
+                                float px, float pz, float &map_x, float &map_z)
+{
+    if (area == 60 || area == 61)
+    {
+        map_x = (static_cast<float>(gx) * 256.0f + px) - CONST_X;
+        map_z = CONST_Z - (static_cast<float>(gz) * 256.0f + pz);
+        return true;
+    }
+    return goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z);
 }
 
 bool goblin::mapproject::project(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
@@ -67,18 +85,7 @@ bool goblin::mapproject::project(uint8_t area, uint16_t gx, uint16_t gz, float p
     if (!v.valid) return false;
 
     float mapX, mapZ;
-    if (area == 60 || area == 61)
-    {
-        // Overworld + DLC-overworld: plain affine on the reconstructed world coord.
-        mapX = (static_cast<float>(gx) * 256.0f + px) - CONST_X;
-        mapZ = CONST_Z - (static_cast<float>(gz) * 256.0f + pz);
-    }
-    else
-    {
-        // Underground / legacy dungeons / DLC-legacy: fold to map-space via the game's
-        // own converter (adapts to the loaded regulation). Skip if not captured yet.
-        if (!goblin::worldmap_probe::project(area, gx, gz, px, pz, mapX, mapZ)) return false;
-    }
+    if (!to_map(area, gx, gz, px, pz, mapX, mapZ)) return false;
     mapX += c.dmap_x;
     mapZ += c.dmap_z;
 

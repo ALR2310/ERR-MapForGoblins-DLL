@@ -9,6 +9,8 @@
 #include "goblin_item_icons.hpp"
 #include "goblin_location_alt.hpp"
 #include "goblin_gfx_probe.hpp"
+#include "goblin_maphover.hpp"   // map_layer() for the native reticle-hover proxy
+#include "goblin_mapproject.hpp" // read_view/to_map for the native reticle-hover proxy
 #include "goblin_overlay.hpp"
 #include "goblin_progress.hpp"   // region_place_id (tag each CategoryRow for focus)
 #include "goblin_diag.hpp"
@@ -85,6 +87,12 @@ struct CategoryRow
     int32_t baked_text1;     // textId1 as baked (restored when focus removes a fabricated label)
     bool baked_notext;       // isEnableNoText as baked (restored after focus force-show)
     bool focus_text;         // true while focus fabricated a label on a textless row
+    uint8_t native_area;
+    uint8_t native_layer;
+    uint16_t native_gx;
+    uint16_t native_gz;
+    float native_px;
+    float native_pz;
 };
 
 // textEnableFlagId1..8 of a row, as a pointer array (the paramdef has them as
@@ -98,6 +106,25 @@ static inline void enable_flag_ptrs(from::paramdef::WORLD_MAP_POINT_PARAM_ST *p,
     out[6] = &p->textEnableFlagId7; out[7] = &p->textEnableFlagId8;
 }
 static std::vector<CategoryRow> g_category_rows;
+
+// V3 rollout is deliberately category-by-category.  A migrated category keeps
+// its WorldMapPointParam data for visibility/tooltip metadata, but the game must
+// not build the heavyweight WorldMapItem for it; goblin_stall_probe creates the
+// lightweight bitmap child instead.  Keep this debug-gated until parity is
+// proven for every behaviour the stock widget supplied.
+static bool native_category_migrated(Category cat)
+{
+    if (!goblin::config::debugLogging) return false;
+    using C = Category;
+    // Stage 4: every item-like category (plain icon + pickup-flag hide) runs
+    // native. World*/boss/NPC/grace classes keep the stock widget - they use
+    // engine-side features the native path does not replicate yet (cleared
+    // checkmarks, kindling spirits, spiritspring hawks, summoning pools).
+    return (cat >= C::EquipArmaments && cat <= C::ReforgedFortunes) ||
+           (cat >= C::MagicIncantations && cat <= C::MagicSorceries) ||
+           (cat >= C::QuestDeathroot && cat <= C::QuestSeedbedCurses) ||
+           (cat >= C::ReforgedEmberPieces && cat <= C::ReforgedRunePieces);
+}
 // Progress-tab focus: g_focus_category = -1 (none) or a Category value; paired
 // with g_focus_region (a region PlaceName id, or -1 for the "Other" bucket).
 // When active, the live map shows ONLY that category's uncollected markers IN
@@ -813,6 +840,7 @@ void goblin::inject_map_entries()
     auto *new_locators = reinterpret_cast<ParamRowInfo *>(new_param_file + row_locators_start);
     auto *new_wrapper_locs = reinterpret_cast<WrapperRowLocator *>(new_param_file + wrapper_row_loc_start);
     size_t file_end_marker = type_str_start + type_str_len;
+    size_t native_suppressed[3]{};
 
     for (size_t i = 0; i < all_rows.size(); i++)
     {
@@ -846,10 +874,24 @@ void goblin::inject_map_entries()
             cr.baked_text1 = wp->textId1;
             cr.baked_notext = wp->isEnableNoText;
             cr.focus_text = false;
+            cr.native_area = wp->areaNo;
+            cr.native_layer = wp->dispMask00 ? 0 : (wp->dispMask01 ? 1 :
+                              (wp->dispMask02 ? 2 : 0xFF));
+            cr.native_gx = wp->gridXNo;
+            cr.native_gz = wp->gridZNo;
+            cr.native_px = wp->posX;
+            cr.native_pz = wp->posZ;
             unsigned *en[8];
             enable_flag_ptrs(wp, en);
             for (int k = 0; k < 8; ++k) cr.baked_enable[k] = *en[k];
             g_category_rows.push_back(cr);
+            if (native_category_migrated(cr.cat))
+            {
+                if (cr.native_layer < 3) ++native_suppressed[cr.native_layer];
+                wp->dispMask00 = 0;
+                wp->dispMask01 = 0;
+                wp->dispMask02 = 0;
+            }
             if (!is_category_enabled(all_rows[i].category))
                 // Gate EVERY text line behind a never-set flag -> icon hidden
                 // (the engine hides the icon only once all text lines - item,
@@ -989,6 +1031,11 @@ void goblin::inject_map_entries()
 
     spdlog::info("Registered {} piece + {} kindling entries ({} + {} hidden at load)",
                  registered_pieces, registered_kindling, hidden_pieces, hidden_kindling);
+    if (goblin::config::debugLogging)
+        spdlog::info("[v3native] item-category migration suppressed stock rows: "
+                     "OW={} UG={} DLC={} total={}",
+                     native_suppressed[0], native_suppressed[1], native_suppressed[2],
+                     native_suppressed[0] + native_suppressed[1] + native_suppressed[2]);
 
 
     // Capture state for runtime toggle. Save original size before overwriting.
@@ -1320,6 +1367,139 @@ void goblin::apply_category_visibility()
             *en[k] = show ? cr.baked_enable[k]
                           : static_cast<unsigned>(goblin::flag::AlwaysOff);
     }
+}
+
+// Native bitmap markers do not render the stock green completion checkmark.
+// A set clearedEventFlagId therefore does not hide the image when
+// hideKilledBosses is off; apply_kill_display moves the same defeat condition
+// into textDisableFlagId1 when the user explicitly wants killed markers hidden.
+static bool native_row_hidden(const CategoryRow &cr)
+{
+    if (!cr.p || goblin::collected::is_row_collected(cr.row_id) ||
+        goblin::kindling::is_row_collected(cr.row_id) || is_manually_hidden(cr.p))
+        return true;
+    const unsigned fl[8] = {cr.p->textDisableFlagId1, cr.p->textDisableFlagId2,
+                            cr.p->textDisableFlagId3, cr.p->textDisableFlagId4,
+                            cr.p->textDisableFlagId5, cr.p->textDisableFlagId6,
+                            cr.p->textDisableFlagId7, cr.p->textDisableFlagId8};
+    for (unsigned f : fl)
+        if (f != 0 && goblin::flag_is_set(f)) return true;
+    return false;
+}
+
+std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
+{
+    std::vector<NativeMarkerPoint> out;
+    if (layer < 0 || layer > 2 || icons_hidden()) return out;
+    out.reserve(g_category_rows.size());
+    const int focus = g_focus_category;
+    for (const auto &cr : g_category_rows)
+    {
+        // Rows of EVERY map layer are returned: the map hosts all layers'
+        // markers in one shared parent, so a layer switch is pure show/hide
+        // (the layer match is part of `visible`, not a row filter).
+        if (!cr.p || cr.original_row_id == 0 ||
+            !native_category_migrated(cr.cat)) continue;
+        const bool eligible =
+            (focus >= 0) ? (static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region)
+                         : is_category_enabled(cr.cat);
+        bool event_gate = false;
+        if (cr.p->eventFlagId != 0)
+            event_gate = !goblin::flag_is_set(cr.p->eventFlagId);
+        const bool visible = eligible && !event_gate && !native_row_hidden(cr) &&
+                             !row_group2_gate_off(cr.p) &&
+                             cr.native_layer == layer;
+        const int source_icon = goblin::gfx_probe::source_iconid(cr.p->iconId);
+        if (source_icon < 0) continue;
+        out.push_back({cr.original_row_id, source_icon, cr.native_area, cr.native_layer,
+                       cr.native_gx, cr.native_gz, cr.native_px, cr.native_pz, visible,
+                       cr.p});
+    }
+    return out;
+}
+
+namespace
+{
+    // Shared reticle math for the native-tooltip proxy. Reticle distance in the
+    // fixed 1920x1080 GFx canvas is client-independent:
+    // screen - client/2 = (map - viewCentre) * zoom * (client/canvas), so the
+    // canvas-space distance (map - viewCentre) * zoom needs no client size.
+    bool reticle_view(float &cU, float &cV, float &zoom)
+    {
+        goblin::mapproject::MapView v{};
+        if (!goblin::mapproject::read_view(v)) return false;
+        cU = (v.panX + v.snapMidX) / v.zoom;
+        cV = (v.panZ + v.snapMidZ) / v.zoom;
+        zoom = v.zoom;
+        return true;
+    }
+}
+
+void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_map_z)
+{
+    const int layer = goblin::maphover::map_layer();
+    if (layer < 0 || layer > 2) return nullptr;
+    float cU = 0.0f, cV = 0.0f, zoom = 0.0f;
+    if (!reticle_view(cU, cV, zoom)) return nullptr;
+    // Called once per map frame; at stage-4 scale (~9k migrated rows) the full
+    // visibility snapshot (per-row event-flag reads) is too heavy per frame -
+    // refresh a cached copy at the same 200ms cadence the native manager uses.
+    // Positions are static; 200ms-stale visibility on a hover test is invisible.
+    static std::vector<NativeMarkerPoint> cache;
+    static int cache_layer = -1;
+    static std::chrono::steady_clock::time_point cache_at{};
+    const auto now = std::chrono::steady_clock::now();
+    if (layer != cache_layer ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - cache_at).count() > 200)
+    {
+        cache = native_marker_snapshot(layer);
+        cache_layer = layer;
+        cache_at = now;
+    }
+    constexpr float PICK_CANVAS_PX = 40.0f; // ~engine pin focus radius
+    float best = PICK_CANVAS_PX * PICK_CANVAS_PX;
+    void *best_row = nullptr;
+    float best_mx = 0.0f, best_mz = 0.0f;
+    for (const auto &p : cache)
+    {
+        if (!p.visible || !p.rowptr) continue;
+        float mx = 0.0f, mz = 0.0f;
+        if (!goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz))
+            continue;
+        const float dx = (mx - cU) * zoom;
+        const float dy = (mz - cV) * zoom;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < best)
+        {
+            best = d2;
+            best_row = p.rowptr;
+            best_mx = mx;
+            best_mz = mz;
+        }
+    }
+    if (best_row)
+    {
+        if (out_dist2) *out_dist2 = best;
+        if (out_map_x) *out_map_x = best_mx;
+        if (out_map_z) *out_map_z = best_mz;
+    }
+    return best_row;
+}
+
+bool goblin::row_reticle_dist2(const void *rowptr, float &out_dist2)
+{
+    if (!rowptr) return false;
+    float cU = 0.0f, cV = 0.0f, zoom = 0.0f;
+    if (!reticle_view(cU, cV, zoom)) return false;
+    const auto *wp = static_cast<const from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(rowptr);
+    float mx = 0.0f, mz = 0.0f;
+    if (!goblin::mapproject::to_map(wp->areaNo, wp->gridXNo, wp->gridZNo,
+                                    wp->posX, wp->posZ, mx, mz))
+        return false;
+    const float dx = (mx - cU) * zoom;
+    const float dy = (mz - cV) * zoom;
+    out_dist2 = dx * dx + dy * dy;
+    return true;
 }
 
 // ---- Manual per-marker hide: public API ------------------------------------

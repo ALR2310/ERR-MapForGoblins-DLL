@@ -25,4 +25,11 @@ namespace goblin::overlay
     // active pad. Reads the overlay's polled pad state (updated each render frame), so it
     // needs the overlay thread running (enable_overlay). Used by the manual marker-hide loop.
     bool gamepad_mask_down(uint16_t mask);
+
+    // Live WorldMapPointParam row of the V3 native marker projecting nearest the
+    // map reticle (screen centre), or nullptr. Markers migrated off the engine
+    // pin pipeline have no pin, so the game's hover routine can never report
+    // them - this is the equivalent focus test. Thread-safe (no ImGui state);
+    // also used by the manual-hide hotkey thread.
+    void *native_hover_row();
 }

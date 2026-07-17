@@ -27,6 +27,7 @@ namespace goblin::mapproject
         float panX, panZ;
         float zoom;
         float snapMidX, snapMidZ;
+        float fullMidX, fullMidZ; // fixed midpoint of the complete map canvas
         bool valid;
     };
 
@@ -48,6 +49,12 @@ namespace goblin::mapproject
     // Read the live view transform from the map dialog. false if the map is closed or
     // the dialog is not resolvable this frame.
     bool read_view(MapView &out);
+
+    // Convert a raw WorldMapPointParam position to the map canvas coordinate
+    // used by native Scaleform display objects. Unlike project(), this does not
+    // depend on the current pan/zoom or the client size.
+    bool to_map(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
+                float &map_x, float &map_z);
 
     // Project a marker to a screen pixel. area 60/61 use the plain overworld affine on
     // (grid*256+pos); every other area is folded to map-space by the game's converter

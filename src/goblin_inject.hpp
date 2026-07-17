@@ -55,6 +55,38 @@ namespace goblin
     // no live hide/cleared flag set). Empty when no focus is active.
     std::vector<HighlightPoint> focus_highlight_points();
 
+    // Lightweight native-marker input. During the category-by-category debug
+    // rollout, only rows whose stock WorldMapItem has been suppressed are
+    // returned. The native manager consumes this snapshot on the map thread.
+    struct NativeMarkerPoint
+    {
+        uint64_t original_row_id;
+        int source_icon_id;
+        uint8_t area;
+        uint8_t layer;
+        uint16_t gx;
+        uint16_t gz;
+        float px;
+        float pz;
+        bool visible;
+        void *rowptr; // live WorldMapPointParam row (hover tooltip / manual hide)
+    };
+    std::vector<NativeMarkerPoint> native_marker_snapshot(int layer);
+
+    // Live row of the VISIBLE native marker nearest the map reticle (screen
+    // centre), within a pin-sized radius - or nullptr. The native-tooltip proxy:
+    // called once per frame from the map hover hook (our raw display objects are
+    // invisible to the engine hit test). out_dist2 (optional) receives the
+    // canvas-space squared distance for nearest-wins arbitration vs engine pins;
+    // out_map_x/out_map_z receive the marker's map-space position (the units of
+    // CS::WorldMapPointPinData+0x10, which anchors the engine name panel).
+    void *native_reticle_row(float *out_dist2 = nullptr,
+                             float *out_map_x = nullptr, float *out_map_z = nullptr);
+
+    // Same canvas-space squared reticle distance for ANY live WorldMapPointParam
+    // row (engine pin rows included) - the shared metric of that arbitration.
+    bool row_reticle_dist2(const void *rowptr, float &out_dist2);
+
     // Original (pre-remap) row ids of injected markers whose icon is currently HIDDEN
     // for any reason (collected / kindling / manually hidden / a live disable or cleared
     // flag is set). The region-progress tab counts these as done. Reads the LIVE rows so

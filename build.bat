@@ -222,7 +222,7 @@ REM Self-heal a RELOCATED build tree: if the cache's recorded binary dir no long
 REM matches BUILD_DIR (e.g. after moving build* under builds\), CMake would abort
 REM with a "cache directory is different" error. Detect the mismatch and reconfigure.
 set "FS_BUILD=%BUILD_DIR:\=/%"
-findstr /C:"CMAKE_CACHEFILE_DIR:INTERNAL=%FS_BUILD%" "%BUILD_DIR%\CMakeCache.txt" >nul 2>&1
+findstr /I /C:"CMAKE_CACHEFILE_DIR:INTERNAL=%FS_BUILD%" "%BUILD_DIR%\CMakeCache.txt" >nul 2>&1
 if errorlevel 1 (
     echo Build cache is stale or relocated - reconfiguring...
     call :configure

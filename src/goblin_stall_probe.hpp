@@ -17,4 +17,23 @@ namespace goblin::stall_probe
     // Sample the CALLING thread for duration_ms. tag names the capture in the log.
     // Also opens the counter window above; both are logged when the window closes.
     void capture(const char *tag, unsigned duration_ms);
+
+    // Debug V3 visual experiment: compensate the transplanted child's local scale
+    // once per map frame so it keeps the same on-screen size while the map zooms.
+    void on_map_frame();
+
+    // Called synchronously from a live RemoveObject2::Execute callback. Consumes
+    // a bounded part of the native-marker queue while the supplied timeline ctx
+    // is guaranteed alive; never caches ctx beyond this call.
+    void v3_native_factory_pulse(void *ctx, unsigned frame);
+
+    // Debug V3 correlation: bracket the game's native buildMarkers call. Any
+    // Scaleform attachMovie operations observed inside the bracket are grouped
+    // by their actual display-list parent and logged at the end of the build.
+    void v3_pin_build_begin(void *owner, void *ctx);
+    void v3_pin_build_end();
+
+    // Forget map-owned pointers and re-arm the one-shot attach for the next map.
+    // Called before the WorldMapDialog's normal teardown destroys its display tree.
+    void on_map_close();
 }

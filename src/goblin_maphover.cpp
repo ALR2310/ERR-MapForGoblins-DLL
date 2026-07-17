@@ -11,7 +11,9 @@
 // that row ptr; the inject layer matches it to one of our CategoryRow::p.
 #include "goblin_maphover.hpp"
 
+#include "goblin_inject.hpp"     // native_reticle_row() - the native-tooltip proxy
 #include "goblin_map_timing.hpp"
+#include "goblin_stall_probe.hpp"
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -44,17 +46,69 @@ namespace
 
     std::atomic<void *> g_dialog_data{nullptr};  // buildMarkers param_2 (dialogData)
 
+    // Native-tooltip proxy: the last REAL pin the engine focused this map
+    // session. When the engine focuses nothing but one of OUR native markers
+    // sits under the reticle, we re-point this pin's row at ours for exactly
+    // one o_placename call, so the game's own name panel renders the label
+    // (works with the overlay disabled). Cleared whenever pins are rebuilt.
+    std::atomic<void *> g_proxy_pin{nullptr};
+
+    // Preferred proxy: our OWN pin, built once by the engine's own pin ctor
+    // (FUN_14087ba70 in v2.6.2.0) into a static buffer. RE-verified
+    // (scratch/re_pin_ctor_results.md): the ctor reads ONLY POD fields of the
+    // source wrapper (+0x08 id, +0x10 row ptr; it installs the wrapper vftable
+    // itself), plus a float[2] map-space position - so a fabricated source is
+    // safe, no live engine object is ever mutated, and the label works before
+    // any real pin was focused. Constructed lazily on the map UI thread; the
+    // buffer is never handed to engine ownership (the panel only reads it for
+    // the duration of one call).
+    using PinCtorFn = void *(void *, void *, void *); // (pin, posPtr, srcWrapper)
+    PinCtorFn *g_pin_ctor = nullptr;
+    alignas(16) uint8_t g_own_pin[0x310]{};
+    bool g_own_pin_ready = false; // map UI thread only
+    struct FakeSrcWrapper
+    {
+        void *vft;    // ignored by the ctor (it writes its own constant)
+        uint64_t id;  // row id -> pin+0x240 (panel does not consume it)
+        void *row;    // WORLD_MAP_POINT_PARAM_ST* -> pin+0x248 (must outlive the pin)
+    };
+
+    bool seh_construct_own_pin(void *row, float mx, float mz)
+    {
+        FakeSrcWrapper src{nullptr, 0, row};
+        float pos[2] = {mx, mz};
+        __try
+        {
+            g_pin_ctor(g_own_pin, pos, &src);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     void *build_detour(void *owner, void *ctx, void *a, void *b)
     {
         g_map_owner.store(owner, std::memory_order_relaxed);
+        g_proxy_pin.store(nullptr, std::memory_order_relaxed);
         // ctx = dialogData. The displayed map id lives at *(int*)(dialogData+8) and its top
         // byte is the area (60=overworld, 12=underground, 61=DLC) - it updates live on layer
         // switch (FUN_1401b9390). We keep the pointer and read it live in map_layer().
         g_dialog_data.store(ctx, std::memory_order_relaxed);
-        return o_build(owner, ctx, a, b);
+        goblin::stall_probe::v3_pin_build_begin(owner, ctx);
+        void *result = o_build(owner, ctx, a, b);
+        goblin::stall_probe::v3_pin_build_end();
+        return result;
     }
 
     constexpr size_t PIN_ROW_OFF = 0x248;  // item -> underlying WorldMapPointParam row
+    // CS::WorldMapPointPinData layout (Ghidra pass, scratch/pin_layout_re*.log):
+    // +0x0C computed-visible byte (panel gates on it), +0x10 f32[2] map-space
+    // position - the panel projects the label anchor from it (screen =
+    // mapPos*scale - pan), so a borrowed pin must get OUR position too.
+    constexpr size_t PIN_VIS_OFF = 0x0C;
+    constexpr size_t PIN_POS_OFF = 0x10;
     // The hook's r8 (map_area) is CS::WorldMapArea. It carries the live view transform:
     // pan @+0x378/+0x37C, zoom/scale @+0x380, fullRect side @+0x358 (10496). We publish
     // this object directly (no dialog hunt) for the overlay projection. Verified live.
@@ -77,11 +131,15 @@ namespace
         {
             uintptr_t vt = *reinterpret_cast<uintptr_t *>(item);
             if (vt == g_pin_vt)
+            {
                 row = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(item) + PIN_ROW_OFF);
+                g_proxy_pin.store(item, std::memory_order_relaxed);
+            }
         }
-        g_hovered_row.store(row, std::memory_order_relaxed);
 
         // Publish the WorldMapArea (r8) if its vtable matches; it drives the projection.
+        // Published BEFORE the proxy branch: native_reticle_row() projects through
+        // map_dialog()/map_layer() and needs this frame's state.
         void *area = nullptr;
         uintptr_t avt = 0;
         if (g_maparea_vt && map_area && read_vt(map_area, avt) && avt == g_maparea_vt)
@@ -98,6 +156,65 @@ namespace
         }
         g_dialog.store(area, std::memory_order_relaxed);
         g_last_hook_ms.store(GetTickCount64(), std::memory_order_relaxed);
+
+        // Native-tooltip proxy: mirror the engine's nearest-pin-wins rule with
+        // our pinless markers in the pool. The engine picked the nearest of ITS
+        // pins (or none); if our best candidate is closer to the reticle, borrow
+        // a real pin - the live item when there is one, else the cached proxy -
+        // re-point its row at ours for exactly this call, restore straight
+        // after. The engine's own focus state is untouched.
+        float ours_d2 = 0.0f, ours_mx = 0.0f, ours_mz = 0.0f;
+        void *ours = goblin::native_reticle_row(&ours_d2, &ours_mx, &ours_mz);
+        if (ours)
+        {
+            bool use_ours = false;
+            if (row)
+            {
+                float item_d2 = 0.0f;
+                use_ours = goblin::row_reticle_dist2(row, item_d2) && ours_d2 < item_d2;
+            }
+            else if (!item)
+            {
+                use_ours = true;
+            }
+            void *pin = nullptr;
+            if (use_ours)
+            {
+                // Preferred: our own engine-constructed pin. Fallback when the
+                // ctor AOB missed: borrow the live item (or the cached pin).
+                if (g_pin_ctor)
+                {
+                    if (!g_own_pin_ready && seh_construct_own_pin(ours, ours_mx, ours_mz))
+                        g_own_pin_ready = true;
+                    if (g_own_pin_ready)
+                        pin = g_own_pin;
+                }
+                if (!pin)
+                    pin = item ? item : g_proxy_pin.load(std::memory_order_relaxed);
+            }
+            if (pin)
+            {
+                g_hovered_row.store(ours, std::memory_order_relaxed);
+                auto *base = reinterpret_cast<uint8_t *>(pin);
+                auto *slot = reinterpret_cast<void **>(base + PIN_ROW_OFF);
+                auto *pos = reinterpret_cast<float *>(base + PIN_POS_OFF);
+                auto *vis = base + PIN_VIS_OFF;
+                void *orig_row = *slot;
+                const float orig_pos0 = pos[0], orig_pos1 = pos[1];
+                const uint8_t orig_vis = *vis;
+                *slot = ours;
+                pos[0] = ours_mx;
+                pos[1] = ours_mz;
+                *vis = 1;
+                void *ret = o_placename(panel, pin, map_area);
+                *slot = orig_row;
+                pos[0] = orig_pos0;
+                pos[1] = orig_pos1;
+                *vis = orig_vis;
+                return ret;
+            }
+        }
+        g_hovered_row.store(row, std::memory_order_relaxed);
         return o_placename(panel, item, map_area);
     }
 }  // namespace
@@ -126,6 +243,24 @@ void goblin::maphover::setup()
     catch (const std::exception &e)
     {
         spdlog::error("[maphover] maparea-vtable AOB miss (layer/projection disabled): {}", e.what());
+    }
+    try
+    {
+        // Pin ctor (FUN_14087ba70): resolved via the unique wrapper-vftable lea
+        // site inside it (0x14087bb82 in v2.6.2.0); function entry = site - 0x112.
+        // A miss only disables the own-pin proxy (borrowed-pin fallback stays).
+        auto *site = modutils::scan<uint8_t>(
+            {.aob = "48 89 BE 30 02 00 00 48 8D 05 ?? ?? ?? ?? 48 89 86 38 02 00 00 "
+                    "8B 45 08 89 86 40 02 00 00"});
+        g_pin_ctor = reinterpret_cast<PinCtorFn *>(site - 0x112);
+        spdlog::info("[maphover] pin factory resolved @ 0x{:X}",
+                     reinterpret_cast<uintptr_t>(g_pin_ctor));
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::warn("[maphover] pin-factory AOB miss (own-pin proxy disabled, "
+                     "borrowed-pin fallback active): {}",
+                     e.what());
     }
     try
     {

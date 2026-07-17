@@ -131,6 +131,28 @@ SIGNATURES = [
         "note": "CS::WorldMapPointPinData vtable (was RVA 0x2AD6688). Gates the hovered pin "
                 "-> marker hover-detect (manual hide / hover overlay). Miss disables hover.",
     },
+    {
+        "name": "record_materialize_driver",
+        "pattern": "4C 8B DC 55 56 41 55 49 8D 6B D8 48 81 EC 10 01 00 00 "
+                   "48 8D 41 48 4C 8B EA",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Timeline-record materialization walker (FUN_1411bf1b0 v2.6.2.0). "
+                "The V3 factory runs it on its queued records; a miss limits native "
+                "marker creation to the finite build-burst trickle.",
+    },
+    {
+        "name": "pin_factory_site",
+        "pattern": "48 89 BE 30 02 00 00 48 8D 05 ?? ?? ?? ?? 48 89 86 38 02 00 00 "
+                   "8B 45 08 89 86 40 02 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_maphover.cpp"],
+        "note": "Unique lea site inside the pin builder (FUN_14087ba70 v2.6.2.0, entry = "
+                "site-0x112). Powers the own-pin native-tooltip proxy for V3 markers; a "
+                "miss falls back to borrowing a live pin (label needs a prior real hover).",
+    },
     # ---- GFX icon injection (no-gfx icon rendering) - load-bearing ----
     {
         "name": "gfx_ctor",
@@ -302,6 +324,52 @@ SIGNATURES = [
         "refs": ["goblin_stall_probe.cpp"],
         "note": "Per-frame child-step loop (v1.16 entry 0x1411d3980) - walks every "
                 "marker widget per frame; the while-map-open fps cost. Counter only.",
+    },
+    {
+        "name": "stallprobe_v3_native_insert_core",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 "
+                   "48 C7 44 24 28 FF FF FF FF 49 8B D9 48 89 5C 24 20 49 8B F0 48 8B EA 48 8B F9",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Scaleform DisplayObjContainer insert core (v1.16 entry 0x14113e970). "
+                "Pass-through spy records the +0xd8 child-vector count, sorted index, "
+                "and child during debug-logging sessions.",
+    },
+    {
+        "name": "stallprobe_v3_custom_placeobject",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 "
+                   "41 54 41 56 41 57 48 83 EC 20 45 8B 70 4C 4C 8B FA 4C 8B 61 08 "
+                   "41 8B D6 49 8B D9 49 8B E8 48 8B F9 E8",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Scaleform PlaceObject add path (v1.16 entry 0x14113e7e0). The spy "
+                "filters to the spike's MAP_ICON_CHARID_BASE/depth-24 pair and captures "
+                "the ready custom DisplayObject.",
+    },
+    {
+        "name": "stallprobe_v3_attach_movie_bridge",
+        "pattern": "4C 8B DC 4D 89 4B 20 4D 89 43 18 55 56 41 57 49 8D 6B D8 "
+                   "48 81 EC 10 01 00 00 48 8B 41 08 49 8B F1 48 8B 4A 28 4C 8B 78 18 "
+                   "8B 81 90 00 00 00 83 E8 1F 83 F8 05",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Scaleform attachMovie DAPI bridge (v1.16 entry 0x1410e00c0). "
+                "Debug-only spy correlates export/init parameters with the actual "
+                "display-list parent observed by the nested high-level attach hook.",
+    },
+    {
+        "name": "stallprobe_v3_high_level_attach",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 40 "
+                   "48 8B DA 45 8B F0 48 8B 51 18 48 8B E9 48 8B 4B 38 8B 82 E0 00 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "High-level Scaleform display-object move/attach API (v1.16 entry "
+                "0x1410c8440). One-shot V3 visual experiment uses its trampoline so "
+                "old-parent removal, refcounts and child state remain engine-owned.",
     },
     {
         "name": "stallprobe_xform_get",

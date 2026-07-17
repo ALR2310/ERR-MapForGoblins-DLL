@@ -162,6 +162,10 @@ static void manual_hide_hotkey_loop()
         if (down && !prev)
         {
             void *row = goblin::maphover::hovered_row();
+            if (!row)
+                // V3 native markers have no engine pin; use the overlay's
+                // reticle-distance hover so hide-under-cursor keeps working.
+                row = goblin::overlay::native_hover_row();
             if (row)
             {
                 goblin::ManualHideResult res = goblin::toggle_hovered_marker(row);

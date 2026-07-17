@@ -86,4 +86,9 @@ CATEGORIES = [
 # Icons with no marker file of their own (runtime-only, e.g. the spoiler "?").
 EXTRA_ICONS = [
     ('anon', 'anon.png'),
+    # Defeated-badge for native markers (twin child over killed boss/NPC/hawk
+    # markers, hide_killed_bosses=false mode). SAME art the non-ERR gfx builds
+    # embed - referenced in place (path is relative to assets/map_icons/custom);
+    # the badge's on-map scale/offset are applied at runtime by the DLL.
+    ('cleared', '../../badges/cleared_badge.png'),
 ]

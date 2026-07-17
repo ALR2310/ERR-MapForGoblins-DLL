@@ -405,6 +405,8 @@ def generate_item_icons_cpp(output_path):
     # Spoiler-free "?" map-icon iconId. Just another registry-assigned icon id; the
     # DLL injects its frame and remaps markers to it at runtime like every other icon.
     anon_icon_id = __import__("icon_registry").iconid("anon")
+    # Green "cleared" check badge (native-marker twin child for defeated rows).
+    cleared_icon_id = __import__("icon_registry").iconid("cleared")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
@@ -412,6 +414,7 @@ def generate_item_icons_cpp(output_path):
         f.write('#include "goblin_item_icons.hpp"\n\n')
         f.write("namespace goblin::generated\n{\n\n")
         f.write(f"const uint16_t ANON_ICON_ID = {anon_icon_id}u;\n\n")
+        f.write(f"const uint16_t CLEARED_ICON_ID = {cleared_icon_id}u;\n\n")
         f.write(f"const size_t ITEM_ICON_COUNT = {len(table)};\n\n")
         f.write("const ItemIcon ITEM_ICONS[] = {\n")
         for key in sorted(table.keys()):

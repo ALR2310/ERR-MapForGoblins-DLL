@@ -287,6 +287,16 @@ namespace
     // build-burst pool (~2 per remaining native widget, ~3900/session), so at
     // batch=16 the pool covers ~60k markers - far above any profile's needs.
     constexpr size_t V3_FACTORY_BATCH = 16;
+
+    // ERR-look placement for the "cleared" badge twin. The badge frame is
+    // authored like every icon (full footprint, centred), so at transfer its
+    // basis/pivot are rescaled to ~26px over the ~92px icon and re-centred
+    // up-left of the anchor - the effective centre (-335,-336) twips matches
+    // the gfx placement in build_vanilla_gfx.py. Baked into the captured
+    // basis/pivot once, so zoom counter-scale and show/hide stay uniform.
+    constexpr float V3_BADGE_SCALE = 39.0f / 92.0f; // user-tuned: 1.5x the gfx look
+    constexpr float V3_BADGE_OFF_X = -335.0f;
+    constexpr float V3_BADGE_OFF_Y = -336.0f;
     struct V3FactorySlot
     {
         uint32_t depth = UINT32_MAX; // requested timeline depth (unique match key)
@@ -1416,6 +1426,13 @@ namespace
             }
             else
             {
+                if (s.point.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT)
+                {
+                    for (float &m : s.basis)
+                        m *= V3_BADGE_SCALE;
+                    s.base_tx = s.base_tx * V3_BADGE_SCALE + V3_BADGE_OFF_X;
+                    s.base_ty = s.base_ty * V3_BADGE_SCALE + V3_BADGE_OFF_Y;
+                }
                 const uint32_t exc = v3_guarded_attach(g_v3_native.wrapper, s.child);
                 uint64_t child_parent = 0;
                 v3_read64(s.child + 0x38, child_parent);

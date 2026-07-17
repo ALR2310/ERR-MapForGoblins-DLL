@@ -71,6 +71,12 @@ namespace goblin
         bool visible;
         void *rowptr; // live WorldMapPointParam row (hover tooltip / manual hide)
     };
+    // Key-space bit for the twin "cleared" checkmark points: defeat-capable
+    // rows emit a second NativeMarkerPoint whose original_row_id carries this
+    // bit and whose icon is the green check badge; its visibility is
+    // base-visible AND defeat-flag-set. Real row ids never reach bit 63.
+    constexpr uint64_t NATIVE_CLEARED_KEY_BIT = 1ull << 63;
+
     std::vector<NativeMarkerPoint> native_marker_snapshot(int layer);
 
     // Live row of the VISIBLE native marker nearest the map reticle (screen

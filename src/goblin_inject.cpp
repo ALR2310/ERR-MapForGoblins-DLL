@@ -114,16 +114,13 @@ static std::vector<CategoryRow> g_category_rows;
 // proven for every behaviour the stock widget supplied.
 static bool native_category_migrated(Category cat)
 {
-    if (!goblin::config::debugLogging) return false;
-    using C = Category;
-    // Stage 4: every item-like category (plain icon + pickup-flag hide) runs
-    // native. World*/boss/NPC/grace classes keep the stock widget - they use
-    // engine-side features the native path does not replicate yet (cleared
-    // checkmarks, kindling spirits, spiritspring hawks, summoning pools).
-    return (cat >= C::EquipArmaments && cat <= C::ReforgedFortunes) ||
-           (cat >= C::MagicIncantations && cat <= C::MagicSorceries) ||
-           (cat >= C::QuestDeathroot && cat <= C::QuestSeedbedCurses) ||
-           (cat >= C::ReforgedEmberPieces && cat <= C::ReforgedRunePieces);
+    // Stage 4 final: EVERY injected category runs native, including the World
+    // classes - defeat state renders via the CLEARED_ICON_ID twin child (the
+    // native path's replacement for the stock completion overlay). Our grace
+    // markers are ordinary icons too: the clickable/travel graces are the
+    // GAME'S OWN pins, which we never touch.
+    (void)cat;
+    return goblin::config::debugLogging;
 }
 // Progress-tab focus: g_focus_category = -1 (none) or a Category value; paired
 // with g_focus_region (a region PlaceName id, or -1 for the "Other" bucket).
@@ -1414,6 +1411,20 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
         out.push_back({cr.original_row_id, source_icon, cr.native_area, cr.native_layer,
                        cr.native_gx, cr.native_gz, cr.native_px, cr.native_pz, visible,
                        cr.p});
+        // Twin checkmark point for defeat-capable rows (bosses/NPC/hawks/...):
+        // the native path has no stock completion overlay, so a second
+        // lightweight child with the green check icon rides the same coords
+        // and shows only while the base icon is shown AND the defeat flag is
+        // set. (hide_killed_bosses=ON instead hides the base row through
+        // textDisableFlagId - the twin follows it down via `visible`.)
+        const unsigned cleared_flag = cr.p->clearedEventFlagId;
+        if (cleared_flag != 0)
+            out.push_back({cr.original_row_id | NATIVE_CLEARED_KEY_BIT,
+                           static_cast<int>(goblin::generated::CLEARED_ICON_ID),
+                           cr.native_area, cr.native_layer,
+                           cr.native_gx, cr.native_gz, cr.native_px, cr.native_pz,
+                           visible && goblin::flag_is_set(cleared_flag),
+                           cr.p});
     }
     return out;
 }

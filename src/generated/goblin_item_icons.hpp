@@ -28,4 +28,9 @@ namespace goblin::generated
     // 440 on a vanilla-base gfx, shifted by the icon-frame offset on bases that
     // add their own frames (Convergence). Generated per profile.
     extern const uint16_t ANON_ICON_ID;
+
+    // Green "cleared" check badge source iconId: the native-marker twin child
+    // shown over defeated boss/NPC/hawk markers (no engine Cleared subclip on
+    // the native path). Generated per profile like ANON_ICON_ID.
+    extern const uint16_t CLEARED_ICON_ID;
 }

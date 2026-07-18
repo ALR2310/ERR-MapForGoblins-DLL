@@ -15,6 +15,8 @@ namespace goblin::config
     bool debugLogging = false;        // key debug_logging: verbose diagnostics; also gates the dev-only
                                       // worldmap SpriteDef/dict dumps + RM2::Execute trace in goblin_gfx_probe.
     bool fastMapOpen = true;          // key fast_map_open: skip redundant relayout on re-open + amortize the first open
+    bool nativeSelfDetach = true;     // key native_self_detach: bulk-detach our native markers at WMD dtor (lever C)
+    bool nativeViewportWindow = true; // key native_viewport_window: attach only near-view native markers (lever B)
     // (icon/resource injection is unconditional - it IS how icons render without a gfx; no ini toggle.)
 
     bool showArmaments = true, showArmour = true, showAshesOfWar = true,
@@ -124,6 +126,10 @@ namespace
                 IniEntry{"fast_map_open", IniType::Bool, &cfg::fastMapOpen, "true",
                          "BETA: makes the world map open faster when many icons are shown.\nTurn off if the map glitches or crashes.",
                          false, "fast_map_reopen"},
+                B("native_self_detach", nativeSelfDetach, "true",
+                  "BETA: reduces the brief freeze when closing the world map.\nTurn off if the map glitches or crashes on close."),
+                B("native_viewport_window", nativeViewportWindow, "true",
+                  "BETA: only renders map icons near the visible area to reduce map\nstutter. Icons may pop in briefly when panning. Turn off to render all at once."),
             }},
 
             {"Equipment", nullptr, false, {

@@ -326,6 +326,81 @@ namespace
     using V3MatDriverFn = void(void *, void *); // (execCtx, sprite)
     V3MatDriverFn *g_v3_mat_driver = nullptr;
 
+    // Lever C self-detach primitives (the engine's own remove-from-container path,
+    // as used by the high-level reparent FUN_1410c8440):
+    //   find-index  FUN_14113f8d0(childVecHeader=owner+0xd8, child) -> index or -1
+    //   remove-at   FUN_1410c87c0(wrapper, index) -> erase child at index from
+    //               *(wrapper+0x18) (=owner); unlinks its render node, clears
+    //               child+0x38 (parent), marks the container dirty and drops the
+    //               container's reference (freeing the child if it was the last).
+    using V3RemoveAtFn = void(void *, uint32_t);
+    V3RemoveAtFn *g_v3_remove_at = nullptr;
+    std::atomic<uint32_t> g_v3_last_detached{0};
+    std::atomic<uint64_t> g_v3_last_detach_us{0};
+
+    // Leaf 1: scan the parent's logical child vector (owner+0xd8: base@[0],
+    // count@+0xe0, entry stride 0x10 with the child ptr at +0) and record the
+    // indices whose child ptr is in the pre-sorted `sorted[0..n)` set (our
+    // markers). Pure raw memory + POD only, so SEH is legal here (no C++ unwind).
+    // Returns the count of ascending indices written to out_idx (capped).
+    uint32_t v3_detach_scan(uintptr_t parent, const uintptr_t *sorted, uint32_t n,
+                            uint32_t *out_idx, uint32_t out_cap)
+    {
+        uint32_t found = 0;
+        __try
+        {
+            uintptr_t base = *reinterpret_cast<uintptr_t *>(parent + 0xd8);
+            uint32_t count = *reinterpret_cast<uint32_t *>(parent + 0xe0);
+            if (!base || !count || count > 300000)
+                return 0;
+            for (uint32_t i = 0; i < count && found < out_cap; ++i)
+            {
+                uintptr_t child =
+                    *reinterpret_cast<uintptr_t *>(base + static_cast<uint64_t>(i) * 0x10);
+                if (!child)
+                    continue;
+                uint32_t lo = 0, hi = n; // binary search in sorted[]
+                while (lo < hi)
+                {
+                    uint32_t mid = lo + ((hi - lo) >> 1);
+                    if (sorted[mid] < child)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                if (lo < n && sorted[lo] == child)
+                    out_idx[found++] = i;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // Return whatever was collected from the consistent pre-fault snapshot;
+            // those ascending indices are still valid for a descending removal.
+        }
+        return found;
+    }
+
+    // Leaf 2: remove the collected indices via the engine's remove-at primitive,
+    // DESCENDING (out_idx is ascending) so each surviving index stays valid and the
+    // per-remove tail memmove shrinks. Removing drops the container's reference,
+    // freeing the child. SEH-guarded. Returns the count removed.
+    uint32_t v3_detach_remove(uintptr_t wrapper, const uint32_t *idx, uint32_t n)
+    {
+        uint32_t removed = 0;
+        __try
+        {
+            for (uint32_t k = n; k-- > 0;)
+            {
+                g_v3_remove_at(reinterpret_cast<void *>(wrapper), idx[k]);
+                ++removed;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return removed;
+    }
+
     uint32_t v3_guarded_materialize(void *ctx, uintptr_t sprite)
     {
         __try
@@ -350,6 +425,12 @@ namespace
         float base_ty = 0.0f;
         float base_m[4] = {}; // authored 2x2 basis {m0,m1,m4,m5} captured at staging
         bool visible = false;
+        bool attached = true; // lever B: currently linked into the marker parent (has a
+                              // render node). Always true unless nativeViewportWindow.
+        bool ref_held = false; // lever B: we kept an extra reference at build so this
+                               // child survives being detached. Only children built with
+                               // nativeViewportWindow ON have it -> only they may be
+                               // detached/re-attached (guards a mid-session flag flip).
     };
     struct V3NativeManager
     {
@@ -1450,9 +1531,20 @@ namespace
             }
             if (s.held && v3_heap_ptr(s.child))
             {
-                uint32_t rb = 0, ra = 0;
-                v3_drop_held_ref(s.child, rb, ra);
-                s.held = false;
+                if (goblin::config::nativeViewportWindow && ok)
+                {
+                    // Lever B: KEEP our reference so the child survives while it is
+                    // DETACHED (out of view). Without it, detaching (which drops the
+                    // parent's reference) would free the child. The manager (obj.child)
+                    // now owns this reference; it is released only by movie teardown.
+                    s.held = false;
+                }
+                else
+                {
+                    uint32_t rb = 0, ra = 0;
+                    v3_drop_held_ref(s.child, rb, ra);
+                    s.held = false;
+                }
             }
             if (ok)
             {
@@ -1466,6 +1558,9 @@ namespace
                 obj.base_ty = s.base_ty;
                 memcpy(obj.base_m, s.basis, sizeof(obj.base_m));
                 obj.visible = s.point.visible;
+                // We kept the build reference above iff B was on -> this child may be
+                // safely detached/re-attached by the viewport reconcile.
+                obj.ref_held = goblin::config::nativeViewportWindow;
                 g_v3_native.last_progress_ms = GetTickCount64();
                 g_v3_native.by_row[s.point.original_row_id] =
                     g_v3_native.objects.size();
@@ -1496,6 +1591,98 @@ namespace
             g_v3_factory_active = 0;
         }
         g_v3_native.in_factory = false;
+    }
+
+    // Lever B (nativeViewportWindow): keep out-of-view markers DETACHED so they carry
+    // no TreeCacheNode; attach only those within the visible map rect (+ hysteresis).
+    // Runs once per map frame on the map UI thread; bounded ops/frame so a big pan
+    // reconciles across a few frames instead of one spike. Detaching happens while the
+    // movie is alive and rendering, so the freed render nodes recycle on normal frames
+    // (async) - unlike the close-time lever C, whose nodes never get a reconcile pass.
+    size_t g_v3_vp_cursor = 0; // (unused; reserved for round-robin if needed)
+    void v3_viewport_reconcile()
+    {
+        if (!goblin::config::nativeViewportWindow || !g_v3_remove_at)
+            return;
+        if (!g_v3_native.seeded || g_v3_native.objects.empty() ||
+            g_v3_map_closed.load(std::memory_order_relaxed))
+            return;
+        const uintptr_t wrapper = g_v3_native.wrapper;
+        const uintptr_t parent = g_v3_native.parent;
+        if (!v3_heap_ptr(wrapper) || !v3_heap_ptr(parent))
+            return;
+
+        goblin::mapproject::MapView view{};
+        if (!goblin::mapproject::read_view(view) || !(view.zoom > 0.01f))
+            return;
+
+        // Visible map-space rect: screen_x in [0,w] <=> |map_x - cU| <= (1920/2)/zoom
+        // (the client-size factor cancels, see mapproject::project). MARGIN (virtual px)
+        // is hysteresis so pan jitter near an edge does not thrash attach/detach.
+        const float cU = (view.panX + view.snapMidX) / view.zoom;
+        const float cV = (view.panZ + view.snapMidZ) / view.zoom;
+        constexpr float MARGIN = 400.0f;
+        const float halfX = (960.0f + MARGIN) / view.zoom;
+        const float halfZ = (540.0f + MARGIN) / view.zoom;
+
+        constexpr size_t DETACH_BUDGET = 1024;
+        constexpr size_t ATTACH_BUDGET = 1024;
+
+        auto in_window = [&](const V3NativeObject &o) {
+            return o.visible && std::fabs(o.map_x - cU) <= halfX &&
+                   std::fabs(o.map_z - cV) <= halfZ;
+        };
+
+        // Phase 1: collect out-of-view (or hidden) attached children, batch-detach them
+        // via the same engine remove-at leaves lever C uses (one parent scan, descending
+        // removal). Their retained reference (kept at build) keeps them alive detached.
+        static std::vector<uintptr_t> det_ptrs;
+        static std::vector<size_t> det_objs;
+        det_ptrs.clear();
+        det_objs.clear();
+        for (size_t i = 0; i < g_v3_native.objects.size() &&
+                           det_objs.size() < DETACH_BUDGET; ++i)
+        {
+            V3NativeObject &o = g_v3_native.objects[i];
+            if (o.ref_held && o.attached && v3_heap_ptr(o.child) && !in_window(o))
+            {
+                det_ptrs.push_back(o.child);
+                det_objs.push_back(i);
+            }
+        }
+        if (!det_ptrs.empty())
+        {
+            std::sort(det_ptrs.begin(), det_ptrs.end());
+            static std::vector<uint32_t> idxbuf;
+            idxbuf.assign(det_ptrs.size(), 0);
+            const uint32_t found = v3_detach_scan(parent, det_ptrs.data(),
+                                                  static_cast<uint32_t>(det_ptrs.size()),
+                                                  idxbuf.data(),
+                                                  static_cast<uint32_t>(idxbuf.size()));
+            v3_detach_remove(wrapper, idxbuf.data(), found);
+            for (size_t j : det_objs)
+                g_v3_native.objects[j].attached = false;
+        }
+
+        // Phase 2: attach in-view children that are currently detached (append = on top).
+        size_t attached_now = 0;
+        for (size_t i = 0; i < g_v3_native.objects.size() &&
+                           attached_now < ATTACH_BUDGET; ++i)
+        {
+            V3NativeObject &o = g_v3_native.objects[i];
+            if (!o.ref_held || o.attached || !v3_heap_ptr(o.child) || !in_window(o))
+                continue;
+            const uint32_t exc = v3_guarded_attach(wrapper, o.child);
+            uint64_t child_parent = 0;
+            v3_read64(o.child + 0x38, child_parent);
+            if (exc == 0 && child_parent == parent)
+            {
+                v3_position_child(o.child, o.map_x, o.map_z, o.base_tx, o.base_ty,
+                                  o.base_m, g_v3_native.cur_fx, g_v3_native.cur_fy);
+                o.attached = true;
+                ++attached_now;
+            }
+        }
     }
 
     void v3_try_matrix_batch()
@@ -2804,6 +2991,9 @@ void goblin::stall_probe::on_map_frame()
     // Drive the category-by-category lightweight native-marker rollout.
     v3_native_tick();
 
+    // Lever B: reconcile which markers are attached to the visible map window.
+    v3_viewport_reconcile();
+
     if (!g_v3_scale_ready.load(std::memory_order_acquire))
         return;
 
@@ -2887,6 +3077,58 @@ void goblin::stall_probe::on_map_close()
     g_v3_candidate_lock.clear(std::memory_order_release);
     g_v3_custom_child.store(0, std::memory_order_release);
     g_v3_visual_state.store(0, std::memory_order_release);
+}
+
+uint32_t goblin::stall_probe::v3_detach_all_children()
+{
+    if (!goblin::config::nativeSelfDetach || !g_v3_remove_at)
+        return 0;
+    const uintptr_t wrapper = g_v3_native.wrapper;
+    const uintptr_t parent = g_v3_native.parent;
+    if (!v3_heap_ptr(wrapper) || !v3_heap_ptr(parent) || g_v3_native.objects.empty())
+        return 0;
+
+    // Snapshot our live child pointers, sorted+unique for the leaf's binary search.
+    // Runs on the map UI thread from the WMD dtor detour, single-shot per close.
+    static std::vector<uintptr_t> ours;
+    ours.clear();
+    ours.reserve(g_v3_native.objects.size());
+    for (const auto &o : g_v3_native.objects)
+        if (v3_heap_ptr(o.child))
+            ours.push_back(o.child);
+    if (ours.empty())
+        return 0;
+    std::sort(ours.begin(), ours.end());
+    ours.erase(std::unique(ours.begin(), ours.end()), ours.end());
+
+    static std::vector<uint32_t> idxbuf;
+    idxbuf.assign(ours.size(), 0);
+
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    const uint32_t found = v3_detach_scan(parent, ours.data(),
+                                          static_cast<uint32_t>(ours.size()),
+                                          idxbuf.data(),
+                                          static_cast<uint32_t>(idxbuf.size()));
+    const uint32_t removed = v3_detach_remove(wrapper, idxbuf.data(), found);
+    QueryPerformanceCounter(&t1);
+    const uint64_t us = freq.QuadPart
+        ? static_cast<uint64_t>((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart)
+        : 0;
+    g_v3_last_detached.store(removed, std::memory_order_relaxed);
+    g_v3_last_detach_us.store(us, std::memory_order_relaxed);
+    spdlog::info("[v3native] self-detach: matched={} removed={} tracked={} in {} us",
+                 found, removed, g_v3_native.objects.size(), us);
+
+    // Those children are unlinked and their container reference dropped (freed).
+    // Drop every cached pointer now so nothing downstream (re-arm, quick-reopen
+    // refresh) can touch a freed child. on_map_close() ran just before us and set
+    // g_v3_map_closed, so the next real build burst re-seeds from scratch.
+    g_v3_native.objects.clear();
+    g_v3_native.by_row.clear();
+    g_v3_native.queued.clear();
+    return removed;
 }
 
 void goblin::stall_probe::setup()
@@ -2988,6 +3230,24 @@ void goblin::stall_probe::setup()
     {
         spdlog::warn("[stallprobe] v3 record driver AOB miss (native marker "
                      "creation limited): {}",
+                     e.what());
+    }
+
+    // Lever C self-detach: the engine's remove-from-container primitive
+    // FUN_1410c87c0 (the removal half of the reparent path FUN_1410c8440). A miss
+    // just disables self-detach (close falls back to the engine's full teardown).
+    try
+    {
+        g_v3_remove_at = reinterpret_cast<V3RemoveAtFn *>(modutils::scan<void>(
+            {.aob = "40 57 48 83 EC 20 48 8B 41 18 48 8B F9 3B 90 E0 00 00 00 72 08 "
+                    "33 C0 48 83 C4 20 5F C3"}));
+        spdlog::info("[stallprobe] v3 self-detach primitive resolved: removeAt=0x{:X}",
+                     reinterpret_cast<uintptr_t>(g_v3_remove_at));
+    }
+    catch (const std::exception &e)
+    {
+        g_v3_remove_at = nullptr;
+        spdlog::warn("[stallprobe] v3 self-detach primitive AOB miss (lever C off): {}",
                      e.what());
     }
 

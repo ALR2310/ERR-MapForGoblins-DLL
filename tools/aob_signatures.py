@@ -143,6 +143,17 @@ SIGNATURES = [
                 "marker creation to the finite build-burst trickle.",
     },
     {
+        "name": "detach_remove_at",
+        "pattern": "40 57 48 83 EC 20 48 8B 41 18 48 8B F9 3B 90 E0 00 00 00 72 08 "
+                   "33 C0 48 83 C4 20 5F C3",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Remove-child-at-index (FUN_1410c87c0 v1.16), the removal half of the "
+                "reparent path FUN_1410c8440. Lever C bulk self-detach calls it at WMD "
+                "dtor; a miss just disables self-detach (engine full teardown instead).",
+    },
+    {
         "name": "pin_factory_site",
         "pattern": "48 89 BE 30 02 00 00 48 8D 05 ?? ?? ?? ?? 48 89 86 38 02 00 00 "
                    "8B 45 08 89 86 40 02 00 00",

@@ -26,6 +26,10 @@ namespace goblin
         extern bool requireMapFragments;
         extern bool debugLogging;
         extern bool fastMapOpen; // ini key: fast_map_open (skip relayout on reopen + amortize first open)
+        extern bool nativeSelfDetach; // ini key: native_self_detach (bulk-detach our native markers at WMD dtor
+                                      // before the engine's blocking close-teardown; lever C for the close freeze)
+        extern bool nativeViewportWindow; // ini key: native_viewport_window (lever B: keep out-of-view native
+                                          // markers DETACHED so they carry no render node; attach only near-view)
         // NOTE: icon/resource injection is unconditional now (no ini toggle) - it's how icons render without
         // a gfx. The dev-only SpriteDef/dict dumps + RM2 trace in goblin_gfx_probe are gated by debugLogging.
 

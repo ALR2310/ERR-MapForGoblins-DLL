@@ -69,6 +69,14 @@ namespace
         // next WorldMapDialog instance.
         goblin::stall_probe::on_map_close();
 
+        // Lever C: while the display tree is still alive (before the dtor below),
+        // bulk-detach every native marker child we attached, using the engine's own
+        // remove-from-container primitive. This unlinks our TreeCacheNodes and drops
+        // the container's reference NOW (map UI thread) instead of leaving all ~9k of
+        // them for the dtor's blocking close-teardown job (the ~75ms freeze). No-op
+        // unless config::nativeSelfDetach.
+        goblin::stall_probe::v3_detach_all_children();
+
         // Map closing. Profile the deferred post-close heap-release stall (~1s after
         // close) when debug_logging is on; the dtor runs on the map UI thread we
         // need to sample.

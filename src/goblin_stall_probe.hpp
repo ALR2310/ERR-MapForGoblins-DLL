@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 // Debug-only stall sampler. When debug_logging is on, capture() records the
 // calling game thread and samples its instruction pointer + stack from a helper
 // thread for a short window, then logs exe+RVA histograms. Used to attribute
@@ -36,4 +37,11 @@ namespace goblin::stall_probe
     // Forget map-owned pointers and re-arm the one-shot attach for the next map.
     // Called before the WorldMapDialog's normal teardown destroys its display tree.
     void on_map_close();
+
+    // Lever C: bulk-detach every native marker child we attached, using the engine's
+    // own remove-from-container primitive, BEFORE the WorldMapDialog dtor runs its
+    // blocking close-teardown. Must be called on the map UI thread while the display
+    // tree is still alive (i.e. from the WMD dtor detour before the original dtor).
+    // Returns the number of children detached. No-op unless config::nativeSelfDetach.
+    uint32_t v3_detach_all_children();
 }

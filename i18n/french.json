@@ -59,12 +59,21 @@
     "IconPreviewShow": "Afficher l'aperçu",
     "IconPreviewSize": "Taille de l'aperçu (px)",
     "IconPreviewSource": "source : %d x %d px",
+    "ValueOn": "Oui",
+    "ValueOff": "Non",
     "TabHidden": "Masqués",
     "HiddenDisabled": "Le masquage manuel est désactivé. Activez-le ci-dessus.",
     "MegaLandsBetween": "Entre-terre",
     "MegaDungeons": "Les Profondeurs",
     "MegaShadow": "Terres de l'Ombre",
-    "ProgressFocusResetHint": "Pour réinitialiser, appuyez sur '%s' dans le menu"
+    "ProgressFocusResetHint": "Pour réinitialiser, appuyez sur '%s' dans le menu",
+    "MenuBack": "Retour",
+    "MenuTools": "Outils",
+    "MenuTotal": "Total",
+    "MenuSaveNow": "Enregistrer les reglages",
+    "MenuUnavailable": "Page indisponible",
+    "MenuPressKey": "Appuyez sur une touche...",
+    "MenuKeepCurrent": "Conserver"
   },
   "toasts": {
     "MapIconsOn": "Icônes de carte : ACTIVÉES",

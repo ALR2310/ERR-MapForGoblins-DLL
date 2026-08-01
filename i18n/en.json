@@ -59,12 +59,21 @@
     "IconPreviewShow": "Show preview",
     "IconPreviewSize": "Preview size (px)",
     "IconPreviewSource": "source: %d x %d px",
+    "ValueOn": "On",
+    "ValueOff": "Off",
     "TabHidden": "Hidden",
     "HiddenDisabled": "Manual marker hiding is off. Turn it on above.",
     "MegaLandsBetween": "The Lands Between",
     "MegaDungeons": "The Underground",
     "MegaShadow": "Land of Shadow",
-    "ProgressFocusResetHint": "To reset, press '%s' in the menu"
+    "ProgressFocusResetHint": "To reset, press '%s' in the menu",
+    "MenuBack": "Back",
+    "MenuTools": "Tools",
+    "MenuTotal": "Total",
+    "MenuSaveNow": "Save settings now",
+    "MenuUnavailable": "This page is unavailable",
+    "MenuPressKey": "Press a key...",
+    "MenuKeepCurrent": "Keep current"
   },
   "toasts": {
     "MapIconsOn": "Map icons: ON",

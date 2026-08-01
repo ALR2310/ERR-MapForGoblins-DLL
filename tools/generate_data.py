@@ -407,6 +407,8 @@ def generate_item_icons_cpp(output_path):
     anon_icon_id = __import__("icon_registry").iconid("anon")
     # Green "cleared" check badge (native-marker twin child for defeated rows).
     cleared_icon_id = __import__("icon_registry").iconid("cleared")
+    # Focus ring: an extra marker row over the isolated category (no icon swapping).
+    highlight_icon_id = __import__("icon_registry").iconid("highlight")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
@@ -415,6 +417,7 @@ def generate_item_icons_cpp(output_path):
         f.write("namespace goblin::generated\n{\n\n")
         f.write(f"const uint16_t ANON_ICON_ID = {anon_icon_id}u;\n\n")
         f.write(f"const uint16_t CLEARED_ICON_ID = {cleared_icon_id}u;\n\n")
+        f.write(f"const uint16_t HIGHLIGHT_ICON_ID = {highlight_icon_id}u;\n\n")
         f.write(f"const size_t ITEM_ICON_COUNT = {len(table)};\n\n")
         f.write("const ItemIcon ITEM_ICONS[] = {\n")
         for key in sorted(table.keys()):

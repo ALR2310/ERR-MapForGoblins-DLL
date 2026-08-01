@@ -5,6 +5,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include <thread>
+#include <atomic>
 #include <windows.h>
 
 #include "from/params.hpp"
@@ -122,6 +123,261 @@ static void safe_init_step(InitFn fn, const char *name)
 {
     if (!seh_invoke_void(fn))
         spdlog::error("SEH exception in init step '{}' - feature may be degraded", name);
+}
+
+// ── crash breadcrumbs ────────────────────────────────────────────────────────────────
+// Under Proton there is no Windows minidump, so a crash report from a Linux player carries no
+// fault address at all - the DLC map crash we are chasing arrived as "the log just stops". This
+// records the fault ourselves: a vectored handler appends code, module+RVA and a short backtrace to
+// its own file.
+// HEAP-FREE on purpose - a stack buffer and WriteFile, no CRT, no spdlog. One of the codes we want
+// to catch is heap corruption (0xC0000374), where any allocation could deadlock or fault again.
+// It only RECORDS and returns CONTINUE_SEARCH: the process still crashes exactly as it would have,
+// and nothing about behaviour changes.
+static HANDLE g_crash_file = INVALID_HANDLE_VALUE;
+static uintptr_t g_self_base = 0, g_self_size = 0;
+
+// 64-bit hex, written by hand. wsprintfA does NOT support %llX (its format set is a small subset of
+// printf's), so the first version of this logger recorded every address as the literal text "0xlX".
+// Doing it manually keeps the handler heap-free, which is the whole point of this path.
+static int crash_hex64(char *buf, unsigned long long v)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char tmp[16];
+    int n = 0;
+    do
+    {
+        tmp[n++] = digits[v & 0xF];
+        v >>= 4;
+    } while (v && n < 16);
+    int len = 0;
+    buf[len++] = '0';
+    buf[len++] = 'x';
+    while (n)
+        buf[len++] = tmp[--n];
+    return len;
+}
+
+// addr -> "module+0xRVA", or bare hex when no module owns it. No heap use.
+static int crash_fmt_addr(char *buf, uintptr_t addr)
+{
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(addr), &mod) &&
+        mod)
+    {
+        char full[MAX_PATH];
+        DWORD n = GetModuleFileNameA(mod, full, MAX_PATH);
+        const char *base = full;
+        for (DWORD i = 0; i < n; ++i)
+            if (full[i] == '\\' || full[i] == '/')
+                base = full + i + 1;
+        int len = wsprintfA(buf, "%s+", base);
+        len += crash_hex64(buf + len, addr - reinterpret_cast<uintptr_t>(mod));
+        return len;
+    }
+    return crash_hex64(buf, addr);
+}
+
+// ── write watch (HUD investigation) ──────────────────────────────────────────────────────────────
+// Static searching could not name the code that clears the menu-state bytes: the offsets are generic and
+// there are a thousand candidates. So catch the writer in the act - a hardware data breakpoint on the one
+// byte we know the game clears, and log the instruction that trips it. Debug only, armed on request from
+// goblin_stall_probe, one address at a time.
+namespace goblin::watch
+{
+    std::atomic<uintptr_t> g_addr{0};
+    std::atomic<int> g_hits{0};
+
+    // A request is QUEUED by the game thread and carried out by another thread. Setting debug registers
+    // means SuspendThread + Get/SetThreadContext, and doing that to your OWN thread suspends you with
+    // nobody left to resume it - which is exactly how the first version hung the game the instant our
+    // screen closed, before any write could even happen. So arm() must never run on the target thread.
+    std::atomic<uintptr_t> g_pending_addr{0};
+    std::atomic<unsigned long> g_pending_tid{0};
+
+    void request(uintptr_t address, unsigned long thread_id)
+    {
+        g_pending_tid.store(thread_id, std::memory_order_relaxed);
+        g_pending_addr.store(address, std::memory_order_release);
+    }
+
+    bool arm(uintptr_t address, DWORD thread_id)
+    {
+        if (thread_id == GetCurrentThreadId())
+        {
+            spdlog::warn("[watch] refusing to arm on the calling thread - queue it instead");
+            return false;
+        }
+        HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
+                               thread_id);
+        if (!th)
+            return false;
+        bool ok = false;
+        if (SuspendThread(th) != (DWORD)-1)
+        {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(th, &ctx))
+            {
+                ctx.Dr0 = address;
+                // DR7: L0 (bit 0) enables Dr0; bits 16-17 = 01 (write), bits 18-19 = 00 (1 byte)
+                ctx.Dr7 = (ctx.Dr7 & ~0xFULL) | 0x1ULL;
+                ctx.Dr7 = (ctx.Dr7 & ~(0xFULL << 16)) | (0x1ULL << 16);
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                ok = SetThreadContext(th, &ctx) != 0;
+            }
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+        if (ok)
+        {
+            g_addr.store(address, std::memory_order_release);
+            g_hits.store(0, std::memory_order_release);
+            spdlog::info("[watch] armed a write watch on 0x{:X} (thread {})", address, thread_id);
+        }
+        else
+            spdlog::warn("[watch] could not arm the write watch on 0x{:X}", address);
+        return ok;
+    }
+}
+
+namespace goblin::watch
+{
+    // Called from OUR background thread; performs any queued arming.
+    void pump()
+    {
+        const uintptr_t addr = g_pending_addr.load(std::memory_order_acquire);
+        if (!addr)
+            return;
+        const unsigned long tid = g_pending_tid.load(std::memory_order_relaxed);
+        g_pending_addr.store(0, std::memory_order_release);
+        arm(addr, tid);
+    }
+}
+
+static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
+{
+    // The watch fires as a single-step with the DR6 hit bit set. Log who wrote, then carry on.
+    if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
+        goblin::watch::g_addr.load(std::memory_order_acquire) &&
+        (ep->ContextRecord->Dr6 & 0xF) != 0)
+    {
+        // ONE SHOT. The first version stayed armed and the byte turns out to be written from a hot path,
+        // so every write raised an exception and the thread drowned in them - the game hung. Disarm inside
+        // the handler (this context belongs to the trapping thread, so clearing DR here takes effect on
+        // continue), log once, and let everything run at full speed again.
+        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const uintptr_t rip = ep->ContextRecord->Rip;
+        const uintptr_t watched = goblin::watch::g_addr.exchange(0, std::memory_order_acq_rel);
+        ep->ContextRecord->Dr0 = 0;
+        ep->ContextRecord->Dr7 = 0;
+        ep->ContextRecord->Dr6 = 0;
+        ep->ContextRecord->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+        if (watched)
+        {
+            spdlog::info("[watch] 0x{:X} written by exe+0x{:X} (rip 0x{:X}) - watch disarmed",
+                         watched, rip > exe ? rip - exe : rip, rip);
+            // The writing instruction alone is not enough: the menu-state bytes are written by ONE
+            // generic writer, so what we actually need is who asked for it. Walk the stack
+            // conservatively and print every value that looks like a return address into the exe.
+            // No unwind info is consulted, so some of these are stale slots rather than real frames -
+            // that is fine, it is a lead list to check in the disassembler, not a call stack.
+            __try
+            {
+                const uintptr_t *sp = reinterpret_cast<const uintptr_t *>(ep->ContextRecord->Rsp);
+                const uintptr_t lo = exe;
+                const uintptr_t hi = exe + 0x6000000; // past the last .text of eldenring.exe
+                int printed = 0;
+                for (int i = 0; i < 128 && printed < 10; ++i)
+                {
+                    const uintptr_t v = sp[i];
+                    if (v <= lo || v >= hi)
+                        continue;
+                    // A return address is preceded by a call, so require the previous bytes to look
+                    // like one: E8 rel32 (5 bytes) or FF /2 indirect (2-7 bytes). Cheap filter, kills
+                    // most of the noise.
+                    const uint8_t *p = reinterpret_cast<const uint8_t *>(v);
+                    const bool after_call = (p[-5] == 0xE8) || (p[-2] == 0xFF) || (p[-3] == 0xFF) ||
+                                            (p[-6] == 0xFF) || (p[-7] == 0xFF);
+                    if (!after_call)
+                        continue;
+                    spdlog::info("[watch]   caller candidate exe+0x{:X} (stack +0x{:X})", v - exe,
+                                 i * 8);
+                    ++printed;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        goblin::watch::g_hits.fetch_add(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    switch (code) // genuinely fatal codes only
+    {
+    case 0xC0000005: // access violation
+    case 0xC0000374: // heap corruption
+    case 0xC0000409: // fast fail / stack buffer
+    case 0xC000001D: // illegal instruction
+    case 0xC0000096: // privileged instruction
+    case 0xC00000FD: // stack overflow
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uintptr_t fault = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    // An access violation faulting INSIDE this DLL is almost always one of our own guarded read
+    // probes (v3_read64 and friends), which its own __except handles - recording those would bury
+    // the real thing. Heap corruption is recorded wherever it lands, because our probes never
+    // raise it. Latch after a handful so a fault loop cannot fill the disk.
+    if (code == 0xC0000005 && fault >= g_self_base && fault < g_self_base + g_self_size)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG s_logged = 0;
+    if (InterlockedIncrement(&s_logged) > 12)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_crash_file == INVALID_HANDLE_VALUE)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    char line[1024];
+    int len = 0;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    len += wsprintfA(line + len, "\n[%04d-%02d-%02d %02d:%02d:%02d] [CRASH] code=0x%08X fault=",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                     static_cast<unsigned>(code));
+    len += crash_fmt_addr(line + len, fault);
+    line[len++] = '\n';
+    DWORD wr = 0;
+    WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+
+    void *frames[20];
+    const USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
+    for (USHORT i = 0; i < n; ++i)
+    {
+        len = wsprintfA(line, "  #%02d ", i);
+        len += crash_fmt_addr(line + len, reinterpret_cast<uintptr_t>(frames[i]));
+        line[len++] = '\n';
+        WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+    }
+    FlushFileBuffers(g_crash_file);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path log_file)
+{
+    g_self_base = reinterpret_cast<uintptr_t>(dll_instance);
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(dll_instance);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uint8_t *>(dll_instance) +
+                                                  dos->e_lfanew);
+    g_self_size = nt->OptionalHeader.SizeOfImage;
+
+    g_crash_file = CreateFileW(log_file.wstring().c_str(), FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    AddVectoredExceptionHandler(1, crash_veh);
 }
 
 static void setup_logger(std::filesystem::path log_file)
@@ -363,6 +619,7 @@ bool WINAPI DllMain(HINSTANCE dll_instance, unsigned int fdw_reason, void *lpv_r
         g_mod_folder = folder;
 
         setup_logger(folder / "logs" / "MapForGoblins.log");
+        install_crash_logger(dll_instance, folder / "logs" / "MapForGoblins_crash.log");
 
         spdlog::info("Map For Goblins DLL v{} [{}] ({})", PROJECT_VERSION, BUILD_NAME, GIT_HASH);
         goblin::load_config(folder / "MapForGoblins.ini");

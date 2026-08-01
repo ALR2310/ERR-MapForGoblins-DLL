@@ -38,6 +38,12 @@
 #include "goblin_overlay_icons.hpp"
 #include "goblin_map_icons.hpp" // shared DefineBitsLossless2 icon tags (decoded here for the atlas)
 #include "miniz.h"              // zlib inflate to decode the tags
+// sc2: in-swapchain D3D12 backend. Selected by overlay_render_mode = swapchain_2; it draws our
+// ImGui into the game's OWN swapchain instead of a separate window, which is what removes the
+// focus steal under Linux/Proton.
+#include "sc2/hooks.hpp"
+#include "sc2/log.hpp" // cte::g_hinst
+#include "sc2/overlay_present.hpp"
 #include "goblin_inject.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_maphover.hpp"   // hovered_row() for the passive hover-info panel
@@ -135,7 +141,30 @@ ID3D11Texture2D *g_logo_tex = nullptr;    // mod logo
 ID3D11ShaderResourceView *g_logo_srv = nullptr;
 ID3D11Texture2D *g_highlight_tex = nullptr;   // focus-highlight ring (drawn over markers)
 ID3D11ShaderResourceView *g_highlight_srv = nullptr;
+// True when running under Wine/Proton (ntdll exports wine_get_version). Set once in init_d3d.
+// Used to re-assert the "game keeps foreground" invariant that WS_EX_NOACTIVATE gives us on
+// Windows but which X11/Wayland window managers ignore.
+bool g_is_wine = false;
 bool g_atlas_ready = false;
+
+// ── where the overlay's own images come from ──────────────────────────────────────────
+// One indirection for every image we draw, because the two render paths get their pixels from
+// different places. The window modes (surface/layered/swapchain) point these at the standalone
+// D3D11 shader resource views with an IDENTITY uv transform - exactly what the code did before.
+// The in-swapchain path (swapchain_2) has no D3D11 atlas of its own: its frame packet only carries
+// the ImGui FONT texture token, so the icon atlas and the logo are merged into the FONT atlas as
+// custom rects and these fields carry the uv transform INTO those rects. Routing every draw through
+// them is what lets icons reach the D3D12 renderer without that renderer knowing about our textures.
+ImTextureID g_icon_texid = nullptr;           // category / hover / progress icons
+float g_icon_uofs = 0.0f, g_icon_vofs = 0.0f; // uv offset (rect origin / font atlas dims)
+float g_icon_uscl = 1.0f, g_icon_vscl = 1.0f; // uv scale  (icon atlas dims / font atlas dims)
+ImTextureID g_logo_texid = nullptr;
+ImVec2 g_logo_uv0{0.0f, 0.0f}, g_logo_uv1{1.0f, 1.0f};
+ImTextureID g_highlight_texid = nullptr;
+ImVec2 g_highlight_uv0{0.0f, 0.0f}, g_highlight_uv1{1.0f, 1.0f};
+
+// The window modes: draw straight from the SRVs, identity transform.
+void point_images_at_srvs();
 
 // Dev "Icon Preview" (Debug tab): pick a PNG off disk, show it floating + centered with a transparent
 // background at a chosen on-map size, so icon art can be eyeballed against the live map without a rebuild.
@@ -226,13 +255,18 @@ void draw_row_icon(const char *key)
     constexpr float ICON_SZ = 28.0f;
     using namespace goblin::overlay_icons;
     const IconCell *ic = g_atlas_ready ? find_icon_cell(key) : nullptr;
-    if (ic && g_atlas_srv)
+    if (ic && g_icon_texid)
     {
-        const ImVec2 uv0((ic->col * CELL) / static_cast<float>(ATLAS_W),
-                         (ic->row * CELL) / static_cast<float>(ATLAS_H));
-        const ImVec2 uv1(((ic->col + 1) * CELL) / static_cast<float>(ATLAS_W),
-                         ((ic->row + 1) * CELL) / static_cast<float>(ATLAS_H));
-        ImGui::Image(reinterpret_cast<ImTextureID>(g_atlas_srv), ImVec2(ICON_SZ, ICON_SZ), uv0, uv1);
+        // The cell's uv inside the icon-atlas space, then mapped through the (offset, scale)
+        // transform: identity for the window modes, into the merged font-atlas rect for
+        // swapchain_2.
+        const float ru0 = (ic->col * CELL) / static_cast<float>(ATLAS_W);
+        const float rv0 = (ic->row * CELL) / static_cast<float>(ATLAS_H);
+        const float ru1 = ((ic->col + 1) * CELL) / static_cast<float>(ATLAS_W);
+        const float rv1 = ((ic->row + 1) * CELL) / static_cast<float>(ATLAS_H);
+        const ImVec2 uv0(g_icon_uofs + ru0 * g_icon_uscl, g_icon_vofs + rv0 * g_icon_vscl);
+        const ImVec2 uv1(g_icon_uofs + ru1 * g_icon_uscl, g_icon_vofs + rv1 * g_icon_vscl);
+        ImGui::Image(g_icon_texid, ImVec2(ICON_SZ, ICON_SZ), uv0, uv1);
     }
     else
     {
@@ -732,12 +766,12 @@ void draw_about_tab()
     const tr::Language lang = tr::current_language();
 
     // Large logo on the left, title/version/description to its right.
-    if (g_atlas_ready && goblin::overlay_icons::LOGO_W > 0 && g_logo_srv)
+    if (g_atlas_ready && goblin::overlay_icons::LOGO_W > 0 && g_logo_texid)
     {
         const float lh = 120.0f;
         const float lw = lh * goblin::overlay_icons::LOGO_W /
                          static_cast<float>(goblin::overlay_icons::LOGO_H);
-        ImGui::Image(reinterpret_cast<ImTextureID>(g_logo_srv), ImVec2(lw, lh));
+        ImGui::Image(g_logo_texid, ImVec2(lw, lh), g_logo_uv0, g_logo_uv1);
         ImGui::SameLine();
     }
     ImGui::BeginGroup();
@@ -1558,6 +1592,24 @@ void try_upload_atlas()
     upload_rgba(goblin::overlay_icons::HIGHLIGHT_RGBA, goblin::overlay_icons::HIGHLIGHT_W,
                 goblin::overlay_icons::HIGHLIGHT_H, &g_highlight_tex, &g_highlight_srv);
     g_atlas_ready = true; // mark done even on partial failure (don't retry every frame)
+    point_images_at_srvs(); // window modes draw straight from these; swapchain_2 overrides later
+}
+
+// The window modes (surface / layered / swapchain): every image comes from its own D3D11 view, uv
+// untouched. Called once the atlas exists, and again if it is rebuilt.
+void point_images_at_srvs()
+{
+    g_icon_texid = reinterpret_cast<ImTextureID>(g_atlas_srv);
+    g_icon_uofs = 0.0f;
+    g_icon_vofs = 0.0f;
+    g_icon_uscl = 1.0f;
+    g_icon_vscl = 1.0f;
+    g_logo_texid = reinterpret_cast<ImTextureID>(g_logo_srv);
+    g_logo_uv0 = ImVec2(0.0f, 0.0f);
+    g_logo_uv1 = ImVec2(1.0f, 1.0f);
+    g_highlight_texid = reinterpret_cast<ImTextureID>(g_highlight_srv);
+    g_highlight_uv0 = ImVec2(0.0f, 0.0f);
+    g_highlight_uv1 = ImVec2(1.0f, 1.0f);
 }
 
 const goblin::overlay_icons::IconCell *find_icon_cell(const char *key)
@@ -2181,7 +2233,7 @@ static void draw_map_highlights()
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
     const float r = HIGHLIGHT_PX * 0.5f;
-    const ImTextureID tex = reinterpret_cast<ImTextureID>(g_highlight_srv);
+    const ImTextureID tex = g_highlight_texid;
     for (const auto &p : pts)
     {
         // Only draw markers on the currently displayed layer (dispMask vs current layer).
@@ -2410,8 +2462,334 @@ void update_menu_toggle()
 }
 
 // ── The overlay thread: window + D3D11 + DComp + ImGui + render loop ──
+// ── sc2 (backend v2) frontend: in-swapchain D3D12 overlay ──
+// When overlay_render_mode = swapchain_2 we do NOT create our own window / D3D11
+// / DComp. We install the ported in-swapchain backend (src/sc2/), which draws our
+// published ImGui packet into the game's OWN backbuffer just before its Present,
+// so there is NO separate top-level window -> no focus-steal (the Linux/Proton
+// fix) and no second swapchain. Under ERR + a mod loader we always load after the
+// game is already presenting, so discovery goes through late adoption.
+//
+// Custom images (category icons, logo, dev preview) are NOT drawn in this mode:
+// the packet protocol carries only the font atlas, and our D3D11 icon atlas is
+// never created here, so those calls degrade to blank space via their existing
+// g_atlas_ready/g_*_srv guards. Text/shapes (the whole functional menu + hover
+// tooltip) render normally. A future phase can extend the packet with our icon
+// atlas as a second texture.
+
+// Build the ImGui context + fonts WITHOUT a platform/renderer backend (the sc2
+// D3D12 renderer consumes the packet). Mirrors init_d3d's context/font setup so
+// text + Cyrillic + optional CJK match the windowed modes; kept separate so the
+// shipped layered/surface/swapchain paths stay untouched.
+static void sc2_build_context_fonts()
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    {
+        const goblin::i18n::Language ui_lang = goblin::i18n::current_language();
+        const bool need_cjk = ui_lang == goblin::i18n::Language::SimplifiedChinese ||
+                              ui_lang == goblin::i18n::Language::TraditionalChinese ||
+                              ui_lang == goblin::i18n::Language::Korean;
+        static ImVector<ImWchar> base_ranges;
+        {
+            ImFontGlyphRangesBuilder b;
+            b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+            b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+            b.BuildRanges(&base_ranges);
+        }
+        const char *base_fonts[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+                                    "C:\\Windows\\Fonts\\arial.ttf",
+                                    "C:\\Windows\\Fonts\\tahoma.ttf"};
+        ImFont *base = nullptr;
+        for (const char *fp : base_fonts)
+            if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES &&
+                (base = io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, base_ranges.Data)) != nullptr)
+                break;
+        if (!base)
+        {
+            io.Fonts->AddFontDefault();
+            spdlog::warn("[SC2] no base system font found; text may show as '?'");
+        }
+        if (need_cjk && base)
+        {
+            static ImVector<ImWchar> cjk_ranges;
+            {
+                ImFontGlyphRangesBuilder b;
+                b.AddText(goblin::i18n::font_glyph_seed_utf8());
+                b.BuildRanges(&cjk_ranges);
+            }
+            ImFontConfig cfg;
+            cfg.MergeMode = true;
+            const char *cjk_sc[] = {"C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\msjh.ttc",
+                                    "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\simsun.ttc"};
+            const char *cjk_tc[] = {"C:\\Windows\\Fonts\\msjh.ttc", "C:\\Windows\\Fonts\\msyh.ttc",
+                                    "C:\\Windows\\Fonts\\simsun.ttc", "C:\\Windows\\Fonts\\simhei.ttf"};
+            const char *cjk_ko[] = {"C:\\Windows\\Fonts\\malgun.ttf", "C:\\Windows\\Fonts\\malgun.ttc",
+                                    "C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\msjh.ttc"};
+            const char *const *cjk_fonts = (ui_lang == goblin::i18n::Language::TraditionalChinese) ? cjk_tc
+                                          : (ui_lang == goblin::i18n::Language::Korean)            ? cjk_ko
+                                                                                                   : cjk_sc;
+            bool merged = false;
+            for (int i = 0; i < 4; ++i)
+            {
+                const char *fp = cjk_fonts[i];
+                if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES &&
+                    io.Fonts->AddFontFromFileTTF(fp, 18.0f, &cfg, cjk_ranges.Data))
+                { merged = true; break; }
+            }
+            if (!merged)
+                spdlog::warn("[SC2] no CJK font found; CJK UI may show as '?'");
+        }
+    }
+    apply_er_style();
+
+    // Merge our category-icon atlas + the logo into the FONT atlas as custom rects.
+    // The sc2 packet only maps the font-texture token, so this is how icons reach
+    // the in-swapchain D3D12 renderer WITHOUT extending the renderer/packet: the
+    // draw helpers emit ImGui::Image with the font token + a uv transform into
+    // these rects. Rects must be reserved BEFORE the atlas builds; we then force a
+    // build and blit our straight-alpha RGBA into the reserved regions.
+    {
+        using namespace goblin::overlay_icons;
+        const int icon_rect = io.Fonts->AddCustomRectRegular(ATLAS_W, ATLAS_H);
+        const int logo_rect = (LOGO_W > 0 && LOGO_H > 0)
+                                  ? io.Fonts->AddCustomRectRegular(LOGO_W, LOGO_H)
+                                  : -1;
+        const int hl_rect = (HIGHLIGHT_W > 0 && HIGHLIGHT_H > 0)
+                                ? io.Fonts->AddCustomRectRegular(HIGHLIGHT_W, HIGHLIGHT_H)
+                                : -1;
+        unsigned char *pix = nullptr; int fw = 0, fh = 0, bpp = 0;
+        io.Fonts->GetTexDataAsRGBA32(&pix, &fw, &fh, &bpp);
+        if (pix && fw > 0 && fh > 0 && bpp == 4)
+        {
+            std::vector<unsigned char> icons = build_atlas_rgba();
+            if (const ImFontAtlasCustomRect *rc = io.Fonts->GetCustomRectByIndex(icon_rect))
+            {
+                if (!icons.empty())
+                    for (int y = 0; y < rc->Height; ++y)
+                        std::memcpy(pix + (static_cast<size_t>(rc->Y + y) * fw + rc->X) * 4,
+                                    icons.data() + static_cast<size_t>(y) * ATLAS_W * 4,
+                                    static_cast<size_t>(ATLAS_W) * 4);
+                g_icon_uofs = rc->X / static_cast<float>(fw);
+                g_icon_vofs = rc->Y / static_cast<float>(fh);
+                g_icon_uscl = ATLAS_W / static_cast<float>(fw);
+                g_icon_vscl = ATLAS_H / static_cast<float>(fh);
+            }
+            if (logo_rect >= 0)
+                if (const ImFontAtlasCustomRect *rl = io.Fonts->GetCustomRectByIndex(logo_rect))
+                {
+                    for (int y = 0; y < rl->Height; ++y)
+                        std::memcpy(pix + (static_cast<size_t>(rl->Y + y) * fw + rl->X) * 4,
+                                    LOGO_RGBA + static_cast<size_t>(y) * LOGO_W * 4,
+                                    static_cast<size_t>(LOGO_W) * 4);
+                    g_logo_uv0 = ImVec2(rl->X / static_cast<float>(fw),
+                                        rl->Y / static_cast<float>(fh));
+                    g_logo_uv1 = ImVec2((rl->X + LOGO_W) / static_cast<float>(fw),
+                                        (rl->Y + LOGO_H) / static_cast<float>(fh));
+                }
+            if (hl_rect >= 0)
+                if (const ImFontAtlasCustomRect *rh = io.Fonts->GetCustomRectByIndex(hl_rect))
+                {
+                    for (int y = 0; y < rh->Height; ++y)
+                        std::memcpy(pix + (static_cast<size_t>(rh->Y + y) * fw + rh->X) * 4,
+                                    HIGHLIGHT_RGBA + static_cast<size_t>(y) * HIGHLIGHT_W * 4,
+                                    static_cast<size_t>(HIGHLIGHT_W) * 4);
+                    g_highlight_uv0 = ImVec2(rh->X / static_cast<float>(fw),
+                                             rh->Y / static_cast<float>(fh));
+                    g_highlight_uv1 = ImVec2((rh->X + HIGHLIGHT_W) / static_cast<float>(fw),
+                                             (rh->Y + HIGHLIGHT_H) / static_cast<float>(fh));
+                }
+            g_atlas_ready = true; // icon/logo/highlight guards may now pass in sc2
+        }
+    }
+}
+
+// Feed the mouse to ImGui by polling (focus-free, no window): cursor position
+// mapped into the game's client area (== the swapchain canvas) + buttons via
+// async key state. The game's own reading of these is already neutralized by our
+// GetRawInputData hook while the menu is open, so there is no double-acting.
+static void sc2_feed_mouse(HWND game)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    POINT p{};
+    if (GetCursorPos(&p) && game && ScreenToClient(game, &p))
+        io.AddMousePosEvent(static_cast<float>(p.x), static_cast<float>(p.y));
+    io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+    io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+    io.AddMouseButtonEvent(2, (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
+}
+
+static void sc2_frontend_loop()
+{
+    // g_hinst MUST be OUR DLL's module, not the EXE: present::install_hooks() pins
+    // the module containing its own code and refuses interception unless it equals
+    // g_hinst. GetModuleHandleW(nullptr) returns the game EXE -> mismatch -> "could
+    // not pin hook module". Resolve our real module from an address inside this DLL.
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&sc2_frontend_loop), &self);
+        cte::g_hinst = reinterpret_cast<HINSTANCE>(self);
+    }
+    spdlog::info("[OVERLAY] render mode = swapchain_2 (in-swapchain D3D12 backend)");
+    goblin::diag::set_overlay(goblin::diag::OverlayState::Active, "swapchain_2");
+
+    if (!cte::hooks::init())
+        spdlog::warn("[SC2] MinHook init reported failure (may already be initialized)");
+    if (!cte::overlay::present::install_hooks())
+        spdlog::error("[SC2] present::install_hooks() failed; in-swapchain backend unavailable");
+    else
+        spdlog::info("[SC2] DXGI discovery hooks installed");
+
+    // Frontend context + fonts, then publish the atlas once (the sc2 D3D12 renderer
+    // uploads it from the published RGBA and assigns the font texture token).
+    sc2_build_context_fonts();
+    cte::overlay::present::publish_font_atlas(ImGui::GetIO().Fonts);
+    // publish_font_atlas set io.Fonts->TexID to the font token. Icons + logo live
+    // in that same (merged) atlas, so point their draw helpers at the font token -
+    // their Image commands then carry the only texture the packet maps, and the uv
+    // transform (set in sc2_build_context_fonts) samples the merged rects.
+    g_icon_texid = ImGui::GetIO().Fonts->TexID;
+    g_logo_texid = ImGui::GetIO().Fonts->TexID;
+    g_highlight_texid = ImGui::GetIO().Fonts->TexID;
+
+    bool armed = false;
+    ULONGLONG last_log = 0;
+    ULONGLONG last_tick = GetTickCount64();
+    while (g_running.load())
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        { TranslateMessage(&msg); DispatchMessageW(&msg); }
+
+        HWND game = find_game_window();
+        if (!armed && game && !cte::overlay::present::observed_swapchain_creation())
+        {
+            spdlog::info("[SC2] late load: game window predates our DXGI hooks; arming live-swapchain adoption");
+            cte::overlay::present::log_creation_hook_forensics();
+            cte::overlay::present::arm_adoption(game);
+            armed = true;
+        }
+
+        poll_gamepad();
+        update_menu_toggle();
+
+        const auto canvas = cte::overlay::present::canvas();
+        const bool canvas_ok = canvas.ready && canvas.width > 0 && canvas.height > 0;
+
+        const bool open = g_menu_open.load();
+        void *hover_row = goblin::maphover::hovered_row();
+        if (!hover_row && !open && goblin::config::enableHoverInfo)
+            // Use the 200ms-CACHED reticle hover, NOT native_hover_row_impl():
+            // the latter rebuilds the full ~9k-row snapshot (with per-row event-
+            // flag reads from game memory) on EVERY call. On the map the reticle
+            // is almost always near a marker, so at this loop rate that heavy scan
+            // ran continuously and contended with the game's render thread -> map
+            // FPS collapse + hitches. native_reticle_row() refreshes at 200ms.
+            hover_row = goblin::native_reticle_row();
+        const bool hovering = !open && goblin::config::enableHoverInfo && hover_row != nullptr;
+        const bool projecting = goblin::focus_category() >= 0 &&
+                                goblin::maphover::map_dialog() != nullptr;
+        const bool want = open || hovering || projecting;
+
+        const ULONGLONG now = GetTickCount64();
+        if (now - last_log > 3000)
+        {
+            last_log = now;
+            spdlog::info("[SC2] observed_creation={} canvas.ready={} {}x{} healthy={}",
+                         cte::overlay::present::observed_swapchain_creation(),
+                         canvas.ready, canvas.width, canvas.height,
+                         cte::overlay::present::renderer_healthy());
+        }
+
+        if (!want || !canvas_ok)
+        {
+            cte::overlay::present::set_visible(false);
+            last_tick = now;
+            Sleep(16);
+            continue;
+        }
+
+        ImGuiIO &io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(static_cast<float>(canvas.width), static_cast<float>(canvas.height));
+        // sc2 has no DComp swapchain, so g_back_w/g_back_h are never set - yet
+        // draw_map_highlights (and other world->screen projection) use them as the
+        // canvas size. Feed the real backbuffer dims so the focus-highlight rings
+        // land on the correct map positions (else they projected against a 1920x1080
+        // fallback and scattered to wrong spots).
+        g_back_w = canvas.width;
+        g_back_h = canvas.height;
+        const float dt = (now - last_tick) / 1000.0f;
+        last_tick = now;
+        io.DeltaTime = dt > 0.0f ? dt : (1.0f / 60.0f);
+        io.AddFocusEvent(true);
+
+        sc2_feed_mouse(game);
+        feed_nav_keyboard();
+        feed_gamepad();
+        if (open) { poll_rebind_keyboard(); process_rebind(); }
+
+        ImGui::NewFrame();
+        {
+            const float fs = goblin::config::fontScale;
+            io.FontGlobalScale = fs < 0.8f ? 0.8f : (fs > 3.0f ? 3.0f : fs);
+        }
+        if (open)
+        {
+            io.MouseDrawCursor = true;
+            if (projecting) draw_map_highlights();
+            draw_settings_window();
+        }
+        else
+        {
+            io.MouseDrawCursor = false;
+            if (projecting) { draw_map_highlights(); draw_focus_banner_onscreen(); }
+            if (hovering) draw_hover_tooltip(hover_row);
+        }
+        ImGui::Render();
+        const ImDrawData *draw_data = ImGui::GetDrawData();
+        const bool has_geometry =
+            draw_data && draw_data->CmdListsCount > 0 && draw_data->TotalVtxCount > 0;
+        // The backend treats "published while visible but with no draw commands" as proof that the
+        // frontend is broken, and answers by marking the renderer unhealthy - which is right for a menu
+        // (a menu that cannot draw must not hold input) but wrong for us: with the menu closed we are
+        // visible only to paint focus rings and the hover tooltip, and a frame where the rings are
+        // off-screen or the tooltip is empty is perfectly normal. Publishing those made `healthy` flap
+        // about once every three seconds in the player's log. Stay hidden for such a frame instead.
+        if (!open && !has_geometry)
+        {
+            cte::overlay::present::set_visible(false);
+            Sleep(16);
+            continue;
+        }
+        cte::overlay::present::publish_draw_data(draw_data);
+        cte::overlay::present::set_visible(true);
+
+        Sleep(16); // ~60 Hz producer; shipped modes are vsync-throttled to a
+                   // similar rate by their present, so match it (the game renders
+                   // our published packet at its own rate regardless).
+    }
+    cte::overlay::present::set_visible(false);
+    cte::overlay::present::shutdown();
+    if (ImGui::GetCurrentContext())
+        ImGui::DestroyContext();
+}
+
 void overlay_thread()
 {
+    // swapchain_2: no window, no D3D11, no DComp - our ImGui goes into the game's own swapchain.
+    // Taken before any of the window setup below, so the shipped surface/layered/swapchain modes
+    // run exactly the code they always did.
+    if (goblin::config::overlayRenderMode == "swapchain_2")
+    {
+        sc2_frontend_loop();
+        return;
+    }
     pXInputGetState = nullptr;
     {
         const char *xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};

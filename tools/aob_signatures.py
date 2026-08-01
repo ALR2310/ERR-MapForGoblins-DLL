@@ -65,6 +65,17 @@ SIGNATURES = [
         "critical": True,
         "refs": ["from/params.cpp:15"],
     },
+    # ---- CSFeManImp singleton (HUD mode restore after our over-gameplay screen) ----
+    # The store at the tail of the manager's init. Only needed to put CSFeManImp+0x78 (the HUD
+    # visibility mode) back to the value it had before we pushed a screen; a miss just means the HUD
+    # stays hidden until the player opens any native menu, so this is not load-bearing.
+    {
+        "name": "feman_slot",
+        "pattern": "48 89 05 ?? ?? ?? ?? 48 8B 8B 80 00 00 00 48 85 C9 74 05 E8",
+        "slot": (3, 7),
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp:8506"],
+    },
     # ---- Message repository (all marker text) ----
     {
         "name": "msg_repository_slot",
@@ -451,6 +462,360 @@ SIGNATURES = [
         "note": "Map dialog per-frame 'name the focused pin' fn; RDX = hovered "
                 "WorldMapPointPinData. Drives marker hover-detect (manual hide / hover "
                 "overlay). Non-critical: a miss just disables hover, not core icons.",
+    },
+    # ---- Scaleform DrawingContext primitives (solid-fill route-c spike) ----
+    # Dev-only, gated on debug_logging. All non-critical: a miss disables only the
+    # spike (no shipping path depends on them). ctx = MovieClip child vtbl+0x2a0.
+    {
+        "name": "dc_begin",
+        "pattern": "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 0F B6 FA 48 8B 49 38 48 85 C9 0F 84",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::begin (v2.6.x 0x119CB50): open/clear the drawing "
+                "(returns 0 on a fresh ctx). Solid-fill route-c spike primitive.",
+    },
+    {
+        "name": "dc_beginfill_solid",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 33 ED 8B DA "
+                   "F6 81 D0 00 00 00 10 48",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::beginFill SOLID color (v2.6.x 0x119CC20): "
+                "void(ctx, u32 argb) - 0xAARRGGBB, NO GPU texture (unlike beginBitmapFill). "
+                "The key primitive proving a native panel can be drawn from our own objects.",
+    },
+    {
+        "name": "dc_moveto",
+        "pattern": "40 53 48 81 EC 80 00 00 00 33 C0 0F 29 74 24 70 0F 57 C0 48 89 44 24 3C "
+                   "F3 0F 7F 44 24 24",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::moveTo (v2.6.x 0x119D690): void(ctx, int xTwips, yTwips). "
+                "Solid-fill route-c spike primitive.",
+    },
+    {
+        "name": "dc_lineto",
+        "pattern": "40 53 48 83 EC 40 F6 81 D0 00 00 00 08 48 8B D9 0F 29 74 24 30 0F 28 F2 "
+                   "0F 29 7C 24 20 0F 28 F9",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::lineTo (v2.6.x 0x119D7A0): void(ctx, int xTwips, yTwips). "
+                "Solid-fill route-c spike primitive.",
+    },
+    {
+        "name": "dc_endfill",
+        "pattern": "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 33 C0 C7 83 CC 00 00 00 00 00 "
+                   "80 00 48 8B CB 48 89 43",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::endFill (v2.6.x 0x119D650): void(ctx). Contains a "
+                "build-specific rel32 (masked) - non-critical by design. Route-c spike primitive.",
+    },
+    {
+        "name": "settings_build_job",
+        "pattern": "48 8B C4 55 57 41 56 48 8D 68 A1 48 81 EC C0 00 00 00 48 C7 45 D7 FE FF FF FF "
+                   "48 89 58 18 48 89 70 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 37 41 0F B6 F8 "
+                   "48 8B F2",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Build the settings-menu open job (v2.6.x 0x8087e0): movie 02_040_OptionSetting "
+                "+ factory lambda. Pushed via pushJob to open settings by our F11. Dev proto.",
+    },
+    {
+        "name": "settings_refmove_job",
+        "pattern": "48 89 54 24 10 53 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 8B DA "
+                   "C7 44 24 20 00 00 00 00 48 8B 09 48 89 0A 48 85 C9 74",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Ref-move a job handle (v2.6.x 0x7a7b60), from the confirm-dialog machinery. "
+                "Used in the F11 settings-open push sequence. Dev proto.",
+    },
+    {
+        "name": "settings_push_job",
+        "pattern": "4C 89 4C 24 20 48 89 54 24 10 55 56 57 41 56 41 57 48 81 EC A0 00 00 00 "
+                   "48 C7 44 24 40 FE FF FF FF 48 89 9C 24 D0 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "pushJob (v2.6.x 0x7edfa0): push a menu job onto the active menu = open it. "
+                "Reused from the confirm-dialog work for the F11 settings open. Dev proto.",
+    },
+    {
+        "name": "map_subdialog_job_step",
+        "pattern": "4C 89 44 24 18 55 53 56 57 41 54 41 56 41 57 48 8D 6C 24 D9 "
+                   "48 81 EC A0 00 00 00 48 C7 45 A7 FE FF FF FF 4D 8B F0 4C 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Map sub-dialog job step (v2.6.x 0x7ad1c0): creates the sub-dialog's movie "
+                "(Path B, desc @job+0x58) + factory + registers render (FUN_140733ef0(job+0x50)). "
+                "The map's own 'menu movie over the map' mechanism. Dev diagnostic hook.",
+    },
+    {
+        "name": "settings_movie_job_builder",
+        "pattern": "40 55 56 57 41 56 41 57 48 8D 6C 24 C0 48 81 EC 40 01 00 00 "
+                   "48 C7 44 24 50 FE FF FF FF 48 89 9C 24 88 01 00 00 48 8B 05 ?? ?? ?? ?? "
+                   "48 33 C4 48 89 45 30 4D 8B F0 48 8B F2 48 8B F9",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Generic settings movie-job builder (v2.6.x 0x808630): (out, owner, DESC, flag). "
+                "All movie sub-opens (Graphic/Brightness) funnel through it; F11's 0x8087e0 is its "
+                "sibling. Task #9 capture hook to find the sub-page push target/site. Dev proto.",
+    },
+    {
+        "name": "opt_build_category",
+        "pattern": "4C 8B DC 49 89 4B 08 57 48 81 EC B0 00 00 00 48 C7 44 24 28 FE FF FF FF "
+                   "49 89 5B 18 48 8B F9 C7 44 24 20 00 00 00 00 49 8D 43 C0 49 89 43 10 "
+                   "BA B0 AD 01 00 49 8D 4B C0 E8 ?? ?? ?? ?? 48 8B D8 8B 15 ?? ?? ?? ?? "
+                   "83 C2 14 89 54 24 30 0F 57 C0",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Build a settings MenuOptionCategory (v2.6.x 0x807d60): label from FMG 110000 "
+                "+ icon block. Used to append our own settings tab. Non-critical (dev proto).",
+    },
+    {
+        "name": "opt_append_tab",
+        "pattern": "40 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 48 8B FA "
+                   "48 8B D9 48 8B 81 58 05 00 00 48 FF C0 48 83 F8 0A",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Append a MenuOptionCategory to the settings tab vector (v2.6.x 0x967b50); "
+                "copy-constructs into the slot, cap 10 (count @listBase+0x558). Dev proto.",
+    },
+    {
+        "name": "opt_show_page",
+        "pattern": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 99 B8 00 00 00 "
+                   "48 8B F1 48 63 C2 48 8B 44 C1 68 48 85 C0 75",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "OptionSetting show-page-for-category (v2.6.x 0x93b760): 10-slot page cache "
+                "@pageCtl+0x68 indexed by category id UNCHECKED - hooked so our out-of-range "
+                "tab id opens our own page instead of reading OOB. Dev proto.",
+    },
+    {
+        "name": "opt_populate_page5",
+        "pattern": "40 55 56 57 48 8D AC 24 50 FE FF FF 48 81 EC B0 02 00 00 "
+                   "48 C7 44 24 70 FE FF FF FF 48 89 9C 24 E0 02 00 00 48 8B 05 ?? ?? ?? ?? "
+                   "48 33 C4 48 89 85 A0 01 00 00 48 8B FA 48 8B D9 48 8D 4D F0",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Populate of the generic list page #5 (v2.6.x 0x957ef0), the page our tab "
+                "borrows; swapped to our config-bool checkbox rows when armed. Dev proto.",
+    },
+    {
+        "name": "opt_dtor_category",
+        "pattern": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 50 "
+                   "48 8B F9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 41 08 48 89 44 24 48 "
+                   "48 8D 59 10 48 89 5C 24 48 48 83 7B 20 08 72 0E",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Destruct a temp MenuOptionCategory (v2.6.x 0x8691a0) after append copied it "
+                "into the vector (the slot holds its own deep copy). Dev proto.",
+    },
+    {
+        "name": "option_top_dialog_dtor",
+        "pattern": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 50 "
+                   "48 89 74 24 58 48 8B F1 48 8D 05 ?? ?? ?? ?? 48 89 01 80 B9 98 18 00 00 00 "
+                   "74 73 E8 ?? ?? ?? ?? 90 48 8B F8 48 8D 8E 68 17 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "CS::OptionSettingTopDialog dtor (v2.6.x 0x966980). Detour clears the F11 "
+                "anti-restack tracker when our menu closes. Dev proto.",
+    },
+    {
+        "name": "option_top_dialog_ctor",
+        "pattern": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 C8 F5 FF FF "
+                   "48 81 EC 38 0B 00 00 48 C7 45 A0 FE FF FF FF",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "CS::OptionSettingTopDialog ctor (v2.6.x 0x966120). Detour observes/"
+                "populates the native settings tab list (MenuViewItemList<MenuOptionCategory>, "
+                "cap 10, count @dialog+0x1760). Dev-only tab-injection proto; a miss disables it.",
+    },
+    {
+        "name": "memo_dialog_show_site",
+        "pattern": "40 53 48 83 EC 50 48 8B 49 08 44 0F B6 81 30 0A 00 00 4C 8D 89 08 2F 00 00 "
+                   "48 8D 81 44 0A 00 00 48 89 44 24 40 4C 8D 91 B0 2D 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Map memo-flow show site (v2.6.x 0x9d0a80): spawns WorldMapMemoSelectDialog "
+                "with every creator arg derived from one host object *(ctx+8). Detour captures "
+                "the host + scene for our own dialog opens. Dev proto (Task #5 Route B).",
+    },
+    {
+        "name": "memo_dialog_ctor",
+        "pattern": "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 30 FB FF FF "
+                   "48 81 EC D0 05 00 00 48 C7 45 E8 FE FF FF FF 48 89 9C 24 18 06 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "CS::WorldMapMemoSelectDialog ctor (v2.6.x 0x9d21c0). Detour observes/"
+                "repopulates the item list (inline @dlg+0x1248 stride 0x1A8, count @+0x3370, "
+                "HARD cap 20). Dev proto (Task #5 Route B).",
+    },
+    {
+        "name": "memo_dialog_couple_callsite",
+        "pattern": "54 24 30 E8 ?? ?? ?? ?? 45 33 C9 44 8B C3 49 8B D6 48 8D 8E 78 0A 00 00 "
+                   "E8 ?? ?? ?? ??",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Unique call site of the memo view-couple FUN_1409d1ff0 inside the memo ctor "
+                "(the couple itself is a template with ~31 byte-identical instantiations, "
+                "unresolvable by prologue; target extracted from the tail E8 disp). Re-wires "
+                "the Scaleform ItemList to the item data. Dev proto (Task #5 Route B).",
+    },
+    {
+        "name": "memo_dialog_creator",
+        "pattern": "48 8B C4 57 48 83 EC 70 48 C7 40 D8 FE FF FF FF 48 89 58 08 48 89 68 10 "
+                   "48 89 70 18 49 8B D9 41 0F B6 F8 48 8B F2 48 8B E9 4C 8B 05 ?? ?? ?? ??",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "WorldMapMemoSelectDialog creator stub (v2.6.x 0x9d45b0): allocates 0x3528 "
+                "and runs the ctor. Called by us to open our own list over the map. Dev proto "
+                "(Task #5 Route B).",
+    },
+    {
+        "name": "memo_dialog_item_ctor",
+        "pattern": "48 89 4C 24 08 57 48 83 EC 40 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 60 "
+                   "49 8B D9 48 8B F9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ??",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "WorldMapMemoSelectDialog::_Item ctor (v2.6.x 0x9d3890): "
+                "(item, dialog, textObj, cbBlock). Used to build our own rows. Dev proto "
+                "(Task #5 Route B).",
+    },
+    {
+        "name": "memo_dialog_list_append",
+        "pattern": "40 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 48 8B FA "
+                   "48 8B D9 48 8B 81 28 21 00 00 48 FF C0 48 83 F8 14 76 18",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Memo item-list append (v2.6.x 0x9d7300): copy-constructs into the inline "
+                "slot, HARD-asserts above 20 (count @listBase+0x2128). Dev proto (Task #5 "
+                "Route B).",
+    },
+    {
+        "name": "game_heap_alloc",
+        "pattern": "49 8B 00 4D 8B C8 4C 8B C2 48 8B D1 49 8B C9 48 FF 60 50 90 F3 41 0F 58 C7 "
+                   "FF C7 48 83 C3 08 F3 48 85 C9 74 41",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Game heap allocator thunk FUN_141eb9ed0(rcx=size, rdx=align, r8=allocObj) -> "
+                "allocObj->vtable[0x50](allocObj, size, align). Used to allocate an "
+                "OptionSettingTopDialog (0x18a0) for the Route A settings-over-map experiment. Dev proto.",
+    },
+    {
+        "name": "alloc_singleton_global",
+        "pattern": "4C 8B 05 ?? ?? ?? ?? 4C 89 40 18 8D 53 08 B9 A0 18 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "mov r8,[rip+DAT_143d87350] in the settings build-job factory: loads the heap "
+                "allocator singleton ptr passed to the FUN_141eb9ed0 thunk. relative_offsets {{3,7}} "
+                "resolves the global's address. Dev proto (Route A settings-over-map).",
+    },
+    {
+        "name": "menu_man_update_task",
+        "pattern": "48 8B C4 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 68 A1 "
+                   "48 81 EC 98 00 00 00 48 C7 45 A7 FE FF FF FF 0F 29 70 A8 "
+                   "0F 29 78 98 44 0F 29 40 88 44 0F 29 4C 24 50 44 0F 29 54 24 40 "
+                   "48 8B FA 48 8B D9 0F 57 FF F3 0F 10 05 ?? ?? ?? ?? 0F 2E C7 "
+                   "7A 16 75 14 B9 29 0A 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "CSMenuMan::updateTask (v2.6.x 0x766980), per-frame menu UI-thread entry. "
+                "Detour reads the active menu (*(this+0x80)) for the dev menu-movie "
+                "graphics probe; also the UI-thread beachhead for future native announce/"
+                "dialogs. Non-critical: a miss just disables the probe.",
+    },
+    {
+        "name": "dc_shapereset",
+        "pattern": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 28 48 8B D9 45 33 C0 "
+                   "BA 80 00 00 00 48 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "GFx DrawingContext::shapeReset (v2.6.x 0x119D0C0): clear the shape "
+                "accumulator (the proven open on a fresh ctx). Route-c spike primitive.",
+    },
+    {
+        "name": "gfx_readtaginfo",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 30 "
+                   "44 8B 41 50 4C 8B",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "GFx SWF ReadTagInfo (v2.6.x 0x11BAB80): rcx=reader; fills taginfo "
+                "{tagCode@0,streamStartPos@+4,tagLen@+8,bodyStartPos@+0xc} from the record "
+                "header, pushes the tag END bound onto the reader nesting stack, advances to "
+                "the body. Path-A settings-clip inject core (dev, debug_logging). A miss just "
+                "disables the re-host inject.",
+    },
+    {
+        "name": "gfx_tagalign",
+        "pattern": "40 53 48 83 EC 20 FF 49 48 48 8B D9 8B 41 48 8B 54 81 40 E8",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "GFx SWF tag-align/pop (v2.6.x 0x11BAC70): rcx=reader; pops the tag END bound "
+                "pushed by ReadTagInfo (dec reader+0x48). Path-A settings-clip inject core "
+                "(dev, debug_logging). Non-critical: a miss just disables the re-host inject.",
+    },
+    {
+        "name": "gfx_chardef_registrar",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 33 DB 49 8B F8 83 B9 E4",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "GFx char-def registrar (v2.6.x 0x11169D90): rcx=char registry owner, rdx=&charId "
+                "u32, r8=CharacterDef; inserts into the owner's char hashmap (+0x180). Dev-only "
+                "diagnostic hook (debug_logging) for Path-A: logs which registry object native + "
+                "injected char defs land in. Non-critical: a miss just disables the diagnostic.",
+    },
+    {
+        "name": "gfx_placeobject2_exec",
+        "pattern": "48 89 5C 24 08 57 48 83 EC 20 8B DA 48 8B F9 E8 ?? ?? ?? ?? "
+                   "F6 C3 01 74 0D BA 10 00 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "PlaceObject2::Execute (v2.6.x 0x140EE3D10): (thisTag, ctx, frame). Dev-only Path-A "
+                "hook (debug_logging) - records the map _root's live DisplayObjContext in a TLS so the "
+                "settings-root placement can Execute against it. Contains a build-specific rel32 (E8 "
+                "wildcarded). Non-critical: a miss disables the Task-4 experiment only.",
+    },
+    {
+        "name": "gfx_name_resolver",
+        "pattern": "4C 89 44 24 18 4C 89 4C 24 20 55 53 56 57 41 56 41 57 48 8D 6C 24 D1 "
+                   "48 81 EC C8 00 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "GFx display-tree name resolver FUN_14074a2f0(scene, out, path): the dialog ctor binds "
+                "clips by name through this. Dev-only Path-A hook (debug_logging) - captures the map "
+                "scene ptr + logs the ctor's name lookups + drives the verify-probe. Non-critical.",
     },
 ]
 

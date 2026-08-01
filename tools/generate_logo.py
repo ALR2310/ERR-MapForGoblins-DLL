@@ -74,14 +74,31 @@ class BitW:
         return bytes(self.out)
 
 
-def swf_matrix(sx, sy, tx, ty, nS=N_SCALE_BITS, nT=N_TRANS_BITS):
+def _fb_bits(*values):
+    """Bit count for a SIGNED SWF fixed-point field holding all `values` (SB[n], two's complement)."""
+    return max(2, max(v.bit_length() for v in values) + 1)
+
+
+def swf_matrix(sx, sy, tx, ty, nS=None, nT=None):
+    """Build a SWF MATRIX. Scale and translate fields are SIGNED (SB[n]), so the field must be WIDE
+    ENOUGH for the value including its sign bit - masking into a fixed width silently flips the sign.
+    With the old fixed nS=17, a scale of 1.0 encodes 0x10000, whose bit 16 IS the sign bit, and the
+    engine read it back as -1.0: a mirrored icon. Same for nT=12, which holds only +-2048 twips
+    (+-102.4 px) before wrapping. Sizes are now derived from the values and asserted.
+    Audited 2026-07-28."""
+    fsx, fsy = round(sx * 65536), round(sy * 65536)
+    itx, ity = int(tx), int(ty)
+    nS = nS or _fb_bits(fsx, fsy)
+    nT = nT or _fb_bits(itx, ity)
+    if nS > 31 or nT > 31:
+        raise ValueError(f"SWF MATRIX field too wide: nS={nS} nT={nT} (scale {sx},{sy} trans {tx},{ty})")
     bw = BitW()
     bw.write(1, 1); bw.write(nS, 5)
-    bw.write(round(sx * 65536) & ((1 << nS) - 1), nS)
-    bw.write(round(sy * 65536) & ((1 << nS) - 1), nS)
+    bw.write(fsx & ((1 << nS) - 1), nS)
+    bw.write(fsy & ((1 << nS) - 1), nS)
     bw.write(0, 1); bw.write(nT, 5)
-    bw.write(tx & ((1 << nT) - 1), nT)
-    bw.write(ty & ((1 << nT) - 1), nT)
+    bw.write(itx & ((1 << nT) - 1), nT)
+    bw.write(ity & ((1 << nT) - 1), nT)
     return bw.bytes()
 
 

@@ -84,6 +84,16 @@ namespace goblin::i18n
         IconPreviewShow,
         IconPreviewSize,
         IconPreviewSource,
+        ValueOn,
+        ValueOff,
+        MenuBack,
+        // In-game (native) menu: rows the ini schema does not name for us.
+        MenuTools,
+        MenuTotal,
+        MenuSaveNow,
+        MenuUnavailable,
+        MenuPressKey,
+        MenuKeepCurrent,
     };
 
     enum class ToastId

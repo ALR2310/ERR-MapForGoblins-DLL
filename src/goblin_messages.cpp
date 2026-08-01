@@ -4,6 +4,7 @@
 #include "goblin_item_fallback.hpp"
 #include "goblin_location_alt.hpp"
 #include "goblin_config.hpp"
+#include "goblin_gfx_probe.hpp"
 #include "goblin_i18n.hpp"
 #include "goblin_inject.hpp"
 #include "from/paramdef/WORLD_MAP_POINT_PARAM_ST.hpp"
@@ -53,6 +54,16 @@ int32_t goblin::remap_textid(int32_t encoded)
 // swap - other slots get surgical in-place additions we don't try to undo.
 static uint8_t **g_placename_slot_ptr = nullptr;
 static uint8_t *g_vanilla_placename_fmg = nullptr;
+
+// Every MsgRepository slot we overwrote, with what it held before. See check_patched_slots().
+struct PatchedSlot
+{
+    uint8_t **slot = nullptr;
+    uint8_t *original = nullptr;
+    uint8_t *ours = nullptr;
+    bool reported = false;
+};
+static std::vector<PatchedSlot> g_patched_slots;
 static uint8_t *g_expanded_placename_fmg = nullptr;
 // PlaceName DLC layer FMGs (slots 329, 429). The game resolves a marker's
 // PlaceName textId through these layers first, then the base slot; ids that live
@@ -149,6 +160,9 @@ struct NewEntry
     int32_t id;
     const wchar_t *text;
 };
+
+// Defined below (after setup_messages); used by the GR_MenuText patch too.
+static const wchar_t *fmg_lookup_in(uint8_t *fmg, int32_t id);
 
 static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
                                 const std::vector<NewEntry> &new_entries_in,
@@ -321,7 +335,16 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
 
 
     // Allocate the expanded FMG buffer from the process heap.
-    fmg_allocation = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, new_file_size);
+    // The GAME's malloc, not ours. PROVEN 2026-07-28: at world unload the engine CLEARS the
+    // MsgRepository slots we patch (logged `slot changed under us ... now=0x0`), so it releases whatever
+    // the slot held - our buffer - with its own allocator. HeapAlloc(GetProcessHeap()) happened to be
+    // compatible because the game's statically linked UCRT frees through the process heap too, but that
+    // is luck, not a contract. Falls back to the old path if the game allocator is unresolved.
+    fmg_allocation = goblin::gfx_probe::game_alloc(new_file_size);
+    if (fmg_allocation)
+        memset(fmg_allocation, 0, new_file_size);
+    else
+        fmg_allocation = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, new_file_size);
     if (!fmg_allocation)
     {
         spdlog::error("[FMG] alloc failed ({} bytes)", new_file_size);
@@ -394,9 +417,44 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
 
     memcpy(nfmg + new_str_data_start, new_str_data.data(), new_str_data.size());
 
+    // Remember what the engine had here. Overwriting a MsgRepository slot means the engine may one day
+    // free OUR buffer with the allocator its own msgbnd loader used - the open question from the
+    // 2026-07-28 audit. Keeping the original lets us hand it back, and the watch below answers whether
+    // the engine ever swaps the slot on its own (a language change or a msgbnd reload would).
+    g_patched_slots.push_back({slot_ptr, fmg_ptr, nfmg});
     *slot_ptr = nfmg;
 
     return true;
+}
+
+// VERIFY (2026-07-28 audit): does the engine ever replace a slot we patched? Called from the periodic
+// refresh; logs the first time any slot stops pointing at our buffer.
+void goblin::check_patched_slots()
+{
+    if (!goblin::config::debugLogging)
+        return;
+    for (auto &ps : g_patched_slots)
+    {
+        if (ps.reported || !ps.slot)
+            continue;
+        uint8_t *now = nullptr;
+        __try
+        {
+            now = *ps.slot;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+        if (now != ps.ours)
+        {
+            ps.reported = true;
+            spdlog::warn("[verify] a patched MsgRepository slot changed under us: ours=0x{:X} now=0x{:X} "
+                         "(original was 0x{:X}) - the engine DOES replace these, so the restore-on-detach "
+                         "path is required",
+                         (uint64_t)ps.ours, (uint64_t)now, (uint64_t)ps.original);
+        }
+    }
 }
 
 static const wchar_t *fmg_lookup_in(uint8_t *fmg, int32_t id);  // defined below
@@ -1047,6 +1105,152 @@ void goblin::setup_messages()
     }
     else
         spdlog::warn("[TOAST] TutorialBody (slot 208) unavailable - codex banners unavailable");
+
+    // Inject the native settings-menu tab label into GR_MenuText (menu.msgbnd,
+    // bank "GRMT"; MsgRepository slots are indexed by global BND file id -> 200).
+    // The native menu builds its tab category label via the game's MenuTextCtor(fmgId) against this
+    // bank. Fresh id above the live max never collides with an overhaul's own menu text. Sanity-check
+    // the slot by resolving id 110000 (the "System" tab label) before touching it.
+    //
+    // Keyed on native_menu, NOT on debug_logging: this WRITES a rebuilt FMG into the game's
+    // MsgRepository and publishes the ids the menu resolves through, so a log key must not decide it -
+    // and with the log key off the menu silently fell back to unlocalized labels.
+    if (goblin::config::nativeMenu)
+    {
+        constexpr int kMenuTextSlot = 200;
+        if (count2 > kMenuTextSlot && sub[kMenuTextSlot] &&
+            fmg_lookup_in(sub[kMenuTextSlot], 110000))
+        {
+            // Entry texts must outlive patch_fmg_in_memory's copy pass; static
+            // backing keeps the converted row labels alive for the call.
+            static std::vector<std::wstring> mt_texts;
+            mt_texts.clear();
+            mt_texts.push_back(L"MapForGoblins"); // tab label (brand, locale-invariant)
+            size_t row_count = 0;
+            const auto *rows = goblin::native_menu_rows(&row_count);
+            const auto mt_lang = goblin::i18n::current_language();
+            for (size_t i = 0; i < row_count; ++i)
+            {
+                // Row label = the localized ini entry label (same text the overlay
+                // shows), utf8 -> utf16 for the FMG.
+                const char *u8 = goblin::i18n::entry_label(rows[i].ini_key, mt_lang);
+                std::wstring w;
+                if (u8 && *u8)
+                {
+                    int wl = MultiByteToWideChar(CP_UTF8, 0, u8, -1, nullptr, 0);
+                    if (wl > 1)
+                    {
+                        w.resize(static_cast<size_t>(wl) - 1);
+                        MultiByteToWideChar(CP_UTF8, 0, u8, -1, w.data(), wl);
+                    }
+                }
+                if (w.empty())
+                {
+                    // No/failed translation: fall back to the raw ini key.
+                    w.assign(rows[i].ini_key, rows[i].ini_key + strlen(rows[i].ini_key));
+                }
+                mt_texts.push_back(std::move(w));
+            }
+            // Two more entries after the row labels: the localized "On"/"Off" value
+            // texts the native keybinding form shows in its value column.
+            const size_t mt_value_first = mt_texts.size();
+            for (goblin::i18n::TextId vid :
+                 {goblin::i18n::TextId::ValueOn, goblin::i18n::TextId::ValueOff})
+            {
+                const char *u8 = goblin::i18n::tr(vid, mt_lang);
+                std::wstring w;
+                if (u8 && *u8)
+                {
+                    int wl = MultiByteToWideChar(CP_UTF8, 0, u8, -1, nullptr, 0);
+                    if (wl > 1)
+                    {
+                        w.resize(static_cast<size_t>(wl) - 1);
+                        MultiByteToWideChar(CP_UTF8, 0, u8, -1, w.data(), wl);
+                    }
+                }
+                if (w.empty())
+                    w = (vid == goblin::i18n::TextId::ValueOn) ? L"On" : L"Off";
+                mt_texts.push_back(std::move(w));
+            }
+            // Allocate above the max of ALL GR_MenuText layers (base 200, dlc01 368,
+            // dlc02 468): the runtime lookup prefers DLC layers, so a fresh id that
+            // collides with a DLC-layer id would resolve to the DLC text, not ours.
+            // DLC slots can hold STALE pointers under some loaders (the "?PlaceName?"
+            // incident class) - SEH-guard each layer read like the copy walks do.
+            // IGNORE absurd group ids while scanning: a live ERR run showed a layer
+            // carrying last_id = INT32_MAX (sentinel/garbage group), which made
+            // max+1 OVERFLOW to a negative base and killed every injected label.
+            constexpr int32_t kSaneIdCap = 1000000000;
+            auto sane_max = [](uint8_t *fmg) -> int32_t
+            {
+                uint32_t grp_cnt = *reinterpret_cast<uint32_t *>(fmg + 0x0C);
+                if (grp_cnt == 0 || grp_cnt > 0x100000)
+                    return 0;
+                auto *groups = reinterpret_cast<FmgGroup *>(fmg + 0x28);
+                int32_t mx = 0;
+                for (uint32_t g = 0; g < grp_cnt; g++)
+                    if (groups[g].last_id > mx && groups[g].last_id < kSaneIdCap)
+                        mx = groups[g].last_id;
+                return mx;
+            };
+            int32_t mt_max = sane_max(sub[kMenuTextSlot]);
+            for (int dlc_slot : {368, 468})
+            {
+                if (dlc_slot >= count2 || !sub[dlc_slot])
+                    continue;
+                std::function<int()> job = [&, dlc_slot]() -> int
+                { return sane_max(sub[dlc_slot]); };
+                int layer_max = seh_call(&seh_run_job_thunk, &job);
+                if (layer_max > mt_max)
+                    mt_max = layer_max;
+            }
+            int32_t mt_base = mt_max + 1;
+            // The ignored ids may legitimately exist above the cap - verify the whole
+            // candidate block is FREE in every layer (SEH-guarded), slide up if not.
+            {
+                const int32_t need = static_cast<int32_t>(mt_texts.size());
+                auto block_occupied = [&](int32_t first) -> bool
+                {
+                    for (int32_t k = 0; k < need; ++k)
+                    {
+                        for (int slot : {kMenuTextSlot, 368, 468})
+                        {
+                            if (slot >= count2 || !sub[slot])
+                                continue;
+                            std::function<int()> job = [&, slot, first, k]() -> int
+                            { return fmg_lookup_in(sub[slot], first + k) ? 1 : 0; };
+                            if (seh_call(&seh_run_job_thunk, &job) == 1)
+                                return true;
+                        }
+                    }
+                    return false;
+                };
+                int guard = 0;
+                while (block_occupied(mt_base) && guard++ < 64)
+                    mt_base += need;
+            }
+            std::vector<NewEntry> mt_entries;
+            for (size_t i = 0; i < mt_texts.size(); ++i)
+                mt_entries.push_back({mt_base + static_cast<int32_t>(i), mt_texts[i].c_str()});
+            if (patch_fmg_in_memory(sub[kMenuTextSlot], &sub[kMenuTextSlot], mt_entries))
+            {
+                goblin::g_menutext_tab_id = mt_base;
+                goblin::g_menutext_row_ids.assign(row_count, 0);
+                for (size_t i = 0; i < row_count; ++i)
+                    goblin::g_menutext_row_ids[i] = mt_base + 1 + static_cast<int32_t>(i);
+                goblin::g_menutext_on_id = mt_base + static_cast<int32_t>(mt_value_first);
+                goblin::g_menutext_off_id = goblin::g_menutext_on_id + 1;
+                spdlog::info("[optmenu] GR_MenuText.fmg expanded: tab label id {} + {} row labels "
+                             "+ on/off {}/{} (above live max {})", mt_base, row_count,
+                             goblin::g_menutext_on_id, goblin::g_menutext_off_id, mt_base - 1);
+            }
+            else
+                spdlog::warn("[optmenu] GR_MenuText merge failed - native tab keeps the duplicate label");
+        }
+        else
+            spdlog::warn("[optmenu] GR_MenuText slot {} unavailable / id 110000 missing - "
+                         "native tab keeps the duplicate label", kMenuTextSlot);
+    }
 
     // Point every injected marker textId at its FRESH remapped id (the strings
     // now live at fresh ids in PlaceName, allocated above the runtime max). Raw

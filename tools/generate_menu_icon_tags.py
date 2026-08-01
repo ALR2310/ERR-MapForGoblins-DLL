@@ -1,0 +1,501 @@
+"""Category icons for the IN-GAME MENU rows (movie 02_160_KeyConfiguration).
+
+The menu row clip has no image child at all, and an image registered into another movie is not
+reachable from this one - so the icons have to become part of THIS movie. They are handed to the
+game's own parser as an EXTENDED copy of the movie bytes when the movie LOADS
+(goblin_own_movie.cpp), which is the one route that does not disturb a live movie: the icon ends
+up an ordinary timeline child that the engine creates and destroys itself, and the DLL only
+resolves it by name and picks its frame. Creating display objects in a live movie was tried and
+crashed three times over; see the note in goblin_stall_probe.cpp.
+
+What this generator emits (src/generated_shared/goblin_menu_icon_tags.hpp):
+  ICON_BLOB[] = N x DefineBitsLossless2 (one per category icon, fresh charIds)
+                + ONE DefineSprite with N frames, frame i placing bitmap i
+  ROW_TAG[]   = a REPLACEMENT DefineSprite tag for cid 189 whose frame 1 additionally places
+                that icon sprite as a named child "MfgIcon"
+  ICON_FRAME_OF_KEY[] = ini key -> frame number inside the icon sprite (1-based)
+
+The DLL then splices:  orig[0..tag189start) + ICON_BLOB + ROW_TAG + orig[tag189end..)
+so our defs are parsed immediately before the row clip that uses them (both are defines, so
+this lands before the movie's first frame either way), and the row keeps its original charId.
+
+Run by the shared stage of the build; standalone: py tools/generate_menu_icon_tags.py
+"""
+import importlib.util as u
+from PIL import Image
+import struct
+import sys
+import os
+
+sys.path.insert(0, 'tools')
+sys.path.insert(0, 'scratch')
+
+import config
+
+GFX = str(config.GAME_DIR / 'menu' / '02_160_keyconfiguration.gfx')
+OUT = 'src/generated_shared/goblin_menu_icon_tags.hpp'
+ROW_CID = 189          # the row clip we extend
+ICON_PX = 32           # icons are drawn into a 40px-tall row
+ICON_X = 2.0           # px, left of Text_0 (which starts at x=26.8)
+ICON_Y = 11.0         # rows are 63.7 apart; 4 sat too high and 18 too low, measured in game
+
+PLACE2, PLACE3, SHOWFRAME, END, DEFSPRITE, REMOVE2, LOSSLESS2 = 26, 70, 1, 0, 39, 28, 36
+
+
+def build_tag(tt, body):
+    n = len(body)
+    if n >= 0x3f:
+        return struct.pack('<HI', (tt << 6) | 0x3f, n) + bytes(body)
+    return struct.pack('<H', (tt << 6) | n) + bytes(body)
+
+
+def matrix_bytes(scale, tx_px, ty_px):
+    """Minimal SWF MATRIX: HasScale=1 (16.16), no rotate, translate in twips.
+
+    Audited 2026-07-28 and correct as written: the scale field is 20 bits, which in signed 16.16 spans
+    about +-8.0, so scale 1.0 (0x10000, 18 bits with its sign) fits without tripping the sign bit, and
+    the translate width is already derived from the values. generate_logo.swf_matrix had the opposite
+    problem with a fixed 17-bit scale field and was changed to size its fields the same way."""
+    bits = []
+
+    def put(v, n):
+        for i in range(n - 1, -1, -1):
+            bits.append((v >> i) & 1)
+
+    def put_signed(v, n):
+        put(v & ((1 << n) - 1), n)
+
+    s = int(round(scale * 65536))
+    put(1, 1)          # HasScale
+    put(20, 5)         # NScaleBits
+    put_signed(s, 20)
+    put_signed(s, 20)
+    put(0, 1)          # HasRotate
+    tx = int(round(tx_px * 20))
+    ty = int(round(ty_px * 20))
+    nbits = max(tx.bit_length(), ty.bit_length()) + 1
+    nbits = max(nbits, 1)
+    put(nbits, 5)
+    put_signed(tx, nbits)
+    put_signed(ty, nbits)
+    while len(bits) % 8:
+        bits.append(0)
+    out = bytearray()
+    for i in range(0, len(bits), 8):
+        b = 0
+        for bit in bits[i:i + 8]:
+            b = (b << 1) | bit
+        out.append(b)
+    return bytes(out)
+
+
+def place2(cid, depth, matrix=b'', name=None, clip_depth=None):
+    flags = 0x02 | (0x04 if matrix else 0)   # HasCharacter | HasMatrix
+    if name:
+        flags |= 0x20                        # HasName
+    if clip_depth is not None:
+        flags |= 0x40                        # HasClipDepth -> this object MASKS depths <= it
+    body = bytearray()
+    body.append(flags)
+    body += struct.pack('<H', depth)
+    body += struct.pack('<H', cid)
+    body += matrix
+    if name:
+        body += name.encode('utf-8') + b'\x00'
+    if clip_depth is not None:
+        body += struct.pack('<H', clip_depth)
+    return build_tag(PLACE2, body)
+
+
+def define_shape_rect(cid, w_px, h_px):
+    """A minimal DefineShape: one solid fill, a w x h rectangle. Written out by hand because the
+    masking path wants a genuine shape - a placed image character renders as artwork but is not
+    something the engine can clip with."""
+    w, h = int(round(w_px * 20)), int(round(h_px * 20))
+    bits = []
+
+    def put(v, n):
+        for i in range(n - 1, -1, -1):
+            bits.append((v >> i) & 1)
+
+    def put_signed(v, n):
+        put(v & ((1 << n) - 1), n)
+
+    def need(*vals):
+        return max(max(abs(v).bit_length() for v in vals) + 1, 2)
+
+    # SHAPEWITHSTYLE: one solid white fill, no lines
+    styles = bytearray()
+    styles.append(1)            # FillStyleCount
+    styles.append(0x00)         # solid
+    styles += bytes((255, 255, 255))  # RGB (tag 2 = DefineShape, no alpha)
+    styles.append(0)            # LineStyleCount
+    styles.append(0x10)         # NumFillBits = 1, NumLineBits = 0
+
+    put(0, 1)                   # StyleChangeRecord
+    put(0, 1)                   # StateNewStyles
+    put(0, 1)                   # StateLineStyle
+    put(1, 1)                   # StateFillStyle1
+    put(0, 1)                   # StateFillStyle0
+    put(1, 1)                   # StateMoveTo
+    nb = need(0, 0)
+    put(nb, 5)
+    put_signed(0, nb)
+    put_signed(0, nb)
+    put(1, 1)                   # FillStyle1 = index 1 (NumFillBits = 1)
+    for dx, dy in ((w, 0), (0, h), (-w, 0), (0, -h)):
+        put(1, 1)               # EdgeRecord
+        put(1, 1)               # StraightEdge
+        n = need(dx, dy)
+        put(n - 2, 4)
+        put(1, 1)               # GeneralLineFlag
+        put_signed(dx, n)
+        put_signed(dy, n)
+    put(0, 6)                   # EndShapeRecord
+    while len(bits) % 8:
+        bits.append(0)
+    recs = bytearray()
+    for i in range(0, len(bits), 8):
+        b = 0
+        for bit in bits[i:i + 8]:
+            b = (b << 1) | bit
+        recs.append(b)
+
+    # ShapeBounds RECT (5-bit count + 4 signed fields)
+    rb = []
+
+    def rput(v, n):
+        for i in range(n - 1, -1, -1):
+            rb.append((v >> i) & 1)
+    nbits = max(w.bit_length(), h.bit_length()) + 1
+    rput(nbits, 5)
+    for v in (0, w, 0, h):
+        rput(v & ((1 << nbits) - 1), nbits)
+    while len(rb) % 8:
+        rb.append(0)
+    rect = bytearray()
+    for i in range(0, len(rb), 8):
+        b = 0
+        for bit in rb[i:i + 8]:
+            b = (b << 1) | bit
+        rect.append(b)
+    return build_tag(2, struct.pack('<H', cid) + bytes(rect) + bytes(styles) + bytes(recs))
+
+
+def remove2(depth):
+    return build_tag(REMOVE2, struct.pack('<H', depth))
+
+
+class _BitWriter:
+    """Bit writer for rebuilding a CXFORMWITHALPHA in place (same bit length in, same out)."""
+
+    def __init__(self):
+        self.bits = []
+
+    def u(self, v, n):
+        for i in range(n - 1, -1, -1):
+            self.bits.append((v >> i) & 1)
+
+    def s(self, v, n):
+        self.u(v & ((1 << n) - 1), n)
+
+    def bytes_out(self):
+        b = list(self.bits)
+        while len(b) % 8:
+            b.append(0)
+        out = bytearray()
+        for i in range(0, len(b), 8):
+            byte = 0
+            for bit in b[i:i + 8]:
+                byte = (byte << 1) | bit
+            out.append(byte)
+        return bytes(out)
+
+
+class _BitReader:
+    def __init__(self, buf, pos):
+        self.buf, self.p, self.b = buf, pos, 0
+
+    def bit(self):
+        v = (self.buf[self.p] >> (7 - self.b)) & 1
+        self.b += 1
+        if self.b == 8:
+            self.b = 0
+            self.p += 1
+        return v
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.bit()
+        return v
+
+    def s(self, n):
+        if n == 0:
+            return 0
+        v = self.u(n)
+        return v - (1 << n) if (v >> (n - 1)) else v
+
+    def align(self):
+        if self.b:
+            self.b = 0
+            self.p += 1
+
+
+def patch_depth7_cxform(body, mul, add):
+    """The row's depth-7 placements carry a FLAT-TINT colour transform (mul RGB = 0, add =
+    120/130/110), which would turn our icon into a grey-green silhouette. Rewrite those
+    transforms with the given mul/add. The rebuilt block uses the SAME nbits, so it occupies
+    exactly as many bytes as before and nothing after it shifts."""
+    import struct as _st
+    out = bytearray(body)
+    p = 4
+    n = len(out)
+    patched = 0
+    while p + 2 <= n:
+        rh = out[p] | (out[p + 1] << 8)
+        t, ln, hdr = rh >> 6, rh & 0x3f, 2
+        if ln == 0x3f:
+            ln = _st.unpack('<I', out[p + 2:p + 6])[0]
+            hdr = 6
+        if t == 0:
+            break
+        if t in (PLACE2, PLACE3):
+            q = p + hdr
+            f0 = out[q]
+            q += 1
+            if t == PLACE3:
+                q += 1
+            depth = _st.unpack('<H', out[q:q + 2])[0]
+            q += 2
+            if f0 & 0x02:
+                q += 2
+            if depth == 7:
+                if f0 & 0x04:                     # skip MATRIX
+                    br = _BitReader(out, q)
+                    if br.bit():
+                        nb = br.u(5); br.s(nb); br.s(nb)
+                    if br.bit():
+                        nb = br.u(5); br.s(nb); br.s(nb)
+                    nb = br.u(5); br.s(nb); br.s(nb); br.align()
+                    q = br.p
+                if f0 & 0x08:                     # CXFORMWITHALPHA
+                    br = _BitReader(out, q)
+                    ha, hm, nb = br.bit(), br.bit(), br.u(4)
+                    if hm:
+                        [br.s(nb) for _ in range(4 if ha else 3)]
+                    if ha:
+                        [br.s(nb) for _ in range(4 if ha else 3)]
+                    br.align()
+                    span = br.p - q
+                    w = _BitWriter()
+                    w.u(1, 1); w.u(1, 1); w.u(nb, 4)
+                    for v in mul:
+                        w.s(v, nb)
+                    for v in add:
+                        w.s(v, nb)
+                    blk = w.bytes_out()
+                    if len(blk) != span:
+                        raise SystemExit(f'cxform rebuild changed size ({len(blk)} vs {span})')
+                    out[q:q + span] = blk
+                    patched += 1
+        p += hdr + ln
+    return bytes(out), patched
+
+
+def main():
+    import config  # noqa: F401  (tools/config.py - keeps path handling consistent)
+    gm = u.spec_from_file_location('gmi', 'tools/generate_map_icons.py')
+    icons_mod = u.module_from_spec(gm)
+    gm.loader.exec_module(icons_mod)          # normalize() + lossless_body()
+    import generate_overlay_icons as art      # icon_image(iconId) -> RGBA PNG art
+
+    rm = u.spec_from_file_location('r', 'scratch/re_gfx_remap.py')
+    M = u.module_from_spec(rm)
+    rm.loader.exec_module(M)
+
+    mv = M.Movie(GFX)
+    if ROW_CID not in mv.defs:
+        raise SystemExit(f'row clip cid {ROW_CID} not found in {GFX}')
+    used = set(mv.defs.keys())
+    base = max(used) + 1
+    print(f'movie defs: {len(used)}, max cid {max(used)}, our ids start at {base}')
+
+    # --- which icons do we need? one per ini key that has an atlas cell ---
+    import icon_registry  # noqa: F401  (same registry the map icons come from)
+    keys_icons = []       # (ini_key, iconId)
+    hdr = open('src/generated_shared/goblin_overlay_icons.cpp', encoding='utf-8').read()
+    import re as _re
+    cells = dict()
+    for m in _re.finditer(r'\{"([^"]+)",\s*(\d+),\s*(\d+)\}', hdr):
+        cells[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+    src = _re.search(r'CELL_SRC_ICON\[\] = \{([^}]*)\}', hdr).group(1)
+    cell_src = [int(x) for x in src.split(',') if x.strip()]
+    atlas_w = int(_re.search(r'ATLAS_W = (\d+)', hdr).group(1))
+    cell_px = int(_re.search(r'CELL = (\d+)', hdr).group(1))
+    per_row = atlas_w // cell_px
+    for key, (col, row) in sorted(cells.items()):
+        idx = row * per_row + col
+        if 0 <= idx < len(cell_src):
+            keys_icons.append((key, cell_src[idx]))
+    print(f'keys with an icon: {len(keys_icons)}')
+
+    # --- bitmaps ---
+    blob = bytearray()
+    frame_of_key = []
+    bitmap_cids = []
+    for i, (key, icon_id) in enumerate(keys_icons):
+        img = art.icon_image(icon_id)
+        if img is None:
+            print(f'  WARN no art for iconId {icon_id} (key {key}) - skipped')
+            continue
+        img = icons_mod.normalize(img, ICON_PX)
+        body = bytearray(icons_mod.lossless_body(img))
+        cid = base + i
+        body[0:2] = struct.pack('<H', cid)      # patch the charId placeholder
+        blob += build_tag(LOSSLESS2, bytes(body))
+        bitmap_cids.append((cid, img.size))
+        frame_of_key.append((key, len(bitmap_cids)))  # strip cell; cell 0 stays empty
+
+    # --- two candidate sprites, ONE frame each -----------------------------------------
+    # Neither uses frames: nothing in a tag stream stops a timeline, so a multi-frame sprite
+    # animates in every instance we do not reach (the right column, and the player's own
+    # key-binding screen).
+    #
+    # A: all icons side by side inside a child clip "Strip", behind a real DefineShape mask.
+    #    Picking an icon is a horizontal shift; cell 0 is empty, so an untouched instance shows
+    #    nothing. The mask is a genuine shape this time - an image character renders as artwork
+    #    but faulted the engine when asked to clip (0xC0000005 in Scaleform).
+    # B: one named child per icon, all baked at scale 0 (invisible), and the chosen one switched
+    #    to 100%. No new byte construction at all, which is the point: it cannot bring a new
+    #    parser fault.
+    mask_cid = base + len(bitmap_cids)
+    strip_cid = mask_cid + 1
+    sprite_a_cid = strip_cid + 1
+    sprite_b_cid = sprite_a_cid + 1
+
+    blob_a = bytearray(blob)
+    blob_a += define_shape_rect(mask_cid, ICON_PX, ICON_PX)
+    strip = bytearray()
+    for i, (cid, size) in enumerate(bitmap_cids):
+        scale = ICON_PX / float(max(size))
+        strip += place2(cid, i + 1, matrix_bytes(scale, (i + 1) * ICON_PX, 0.0))
+    strip += build_tag(SHOWFRAME, b'')
+    strip += build_tag(END, b'')
+    blob_a += build_tag(DEFSPRITE, struct.pack('<HH', strip_cid, 1) + bytes(strip))
+    inner = bytearray()
+    inner += place2(mask_cid, 1, matrix_bytes(1.0, 0.0, 0.0), clip_depth=2)
+    inner += place2(strip_cid, 2, matrix_bytes(1.0, 0.0, 0.0), 'Strip')
+    inner += build_tag(SHOWFRAME, b'')
+    inner += build_tag(END, b'')
+    blob_a += build_tag(DEFSPRITE, struct.pack('<HH', sprite_a_cid, 1) + bytes(inner))
+
+    # Variant B, built ONLY from what has been measured to work. Exactly one thing ever
+    # resolved by name: a single named child, one level down, in the row clip itself (the old
+    # container at depth 6). Children inside it were unreachable (0 of 64), and 64 siblings were
+    # unreachable too, on low and high depths alike. So there is one named child again - the
+    # strip of all icons - and the mask that limits it to one cell is its SIBLING, not its
+    # parent. Picking an icon stays a horizontal shift of that one child.
+    mask_b_cid = base + len(bitmap_cids)
+    strip_b_cid = mask_b_cid + 1
+    blob_b = bytearray(blob)
+    blob_b += define_shape_rect(mask_b_cid, ICON_PX, ICON_PX)
+    # The strip carries the row offset ITSELF (ICON_X/ICON_Y folded into every icon), because the
+    # placement of the strip must go in WITHOUT a matrix - see below.
+    strip_b = bytearray()
+    for i, (cid, size) in enumerate(bitmap_cids):
+        scale = ICON_PX / float(max(size))
+        strip_b += place2(cid, i + 1, matrix_bytes(scale, ICON_X + (i + 1) * ICON_PX, ICON_Y))
+    strip_b += build_tag(SHOWFRAME, b'')
+    strip_b += build_tag(END, b'')
+    blob_b += build_tag(DEFSPRITE, struct.pack('<HH', strip_b_cid, 1) + bytes(strip_b))
+    # Mask on 16 clips depth 17; the strip sits on 17. The row clip itself uses 1..15.
+    #
+    # NO MATRIX on the strip's placement, and that is the whole point. DisplayList::MoveDisplayObject
+    # (GFx SDK, Src/GFx/GFx_DisplayList.cpp:363) re-applies the tag's matrix every time the timeline
+    # places an object again, and a script-set transform only survives if the object rejects anim
+    # moves - which the movie-wide continueAnimation flag undoes for it (GFx_DisplayObject.cpp:1175).
+    # With a matrix in the tag, every row re-place snapped our strip back to cell 0 (the empty one),
+    # which in game read as "the icons disappeared after toggling a row" and came back only when the
+    # list was scrolled. `if (pos.HasMatrix())` is the escape: a placement with no matrix is never
+    # reset, so the shift we set stays set. An untouched instance (the right column, the player's own
+    # key-binding screen) sits at identity, and since the icons now start at ICON_X + ICON_PX, the
+    # mask window shows the empty cell there exactly as before.
+    icon_places = (place2(mask_b_cid, 16, matrix_bytes(1.0, ICON_X, ICON_Y), clip_depth=17)
+                   + place2(strip_b_cid, 17, b'', 'MfgIcon'))
+
+    tt, b0, b1 = mv.defs[ROW_CID]
+    if tt != DEFSPRITE:
+        raise SystemExit(f'cid {ROW_CID} is tag {tt}, expected DefineSprite')
+    body = bytes(mv.d[b0:b1])
+    # Both variants insert their placements at the START of frame 1 (right after cid +
+    # frameCount), where they persist across the row's style frames.
+    row_tag_a = build_tag(DEFSPRITE,
+                          body[:4]
+                          + place2(sprite_a_cid, 6, matrix_bytes(1.0, ICON_X, ICON_Y), 'MfgIcon')
+                          + body[4:])
+    row_tag_b = build_tag(DEFSPRITE, body[:4] + bytes(icon_places) + body[4:])
+    # --- SELF-CHECK: assemble exactly what the DLL will splice, for BOTH variants ---
+    # Any icon build must survive a parse-back before it is emitted, and every original charId
+    # reference inside the row clip must survive untouched (an early attempt repurposed a clip
+    # other code resolves paths inside, and the game crashed).
+    for label, blb, rtag, sprite in (('A', blob_a, row_tag_a, sprite_a_cid),
+                                     ('B', blob_b, row_tag_b, strip_b_cid)):
+        ext = bytearray(mv.d[:b0 - 6]) + bytearray(blb) + bytearray(rtag) + bytearray(mv.d[b1:])
+        struct.pack_into('<I', ext, 4, len(ext))
+        check_path = 'scratch/ext_02_160_%s.gfx' % label
+        with open(check_path, 'wb') as f:
+            f.write(ext)
+        mv2 = M.Movie(check_path)
+        if ROW_CID not in mv2.defs or sprite not in mv2.defs:
+            raise SystemExit('SELF-CHECK %s: row clip or icon sprite missing' % label)
+        t2, y0, y1 = mv2.defs[ROW_CID]
+        orig_refs = sorted(o for pos, o in mv.id_positions.items() if b0 <= pos < b1)
+        new_refs = sorted(o for pos, o in mv2.id_positions.items() if y0 <= pos < y1)
+        missing = [c for c in orig_refs if c not in new_refs]
+        if missing:
+            raise SystemExit('SELF-CHECK %s: row clip lost char refs %s' % (label, missing))
+        print('self-check %s OK: %d defs, sprite %d, %d B blob + %d B row tag'
+              % (label, len(mv2.defs), sprite, len(blb), len(rtag)))
+
+    with open(OUT, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('#pragma once\n')
+        f.write('// GENERATED by tools/generate_menu_icon_tags.py - do not edit.\n')
+        f.write('// Category icons for the in-game menu rows: bitmaps + an icon sprite, plus a\n')
+        f.write('// replacement DefineSprite tag for the row clip that places the sprite as "MfgIcon".\n')
+        f.write('#include <cstdint>\n#include <cstddef>\n\n')
+        f.write('namespace goblin::menu_icon_tags\n{\n')
+        f.write(f'    constexpr uint16_t ROW_CID = {ROW_CID};\n')
+        f.write('    // The runtime splice refuses to patch a movie these bytes were not built\n')
+        f.write('    // against: the row tag body must be exactly this long, and every character\n')
+        f.write('    // id we add must still be unused in the movie that actually loaded.\n')
+        f.write(f'    constexpr size_t ORIG_ROW_BODY_LEN = {len(body)};\n')
+        f.write(f'    constexpr uint16_t FIRST_CID = {base};\n')
+        f.write(f'    constexpr uint16_t LAST_CID = {sprite_b_cid};\n')
+        f.write(f'    constexpr int ICON_COUNT = {len(bitmap_cids)};\n')
+        for name, data in (('ICON_BLOB_A', blob_a), ('ROW_TAG_A', row_tag_a),
+                           ('ICON_BLOB_B', blob_b), ('ROW_TAG_B', row_tag_b)):
+            f.write(f'    constexpr size_t {name}_LEN = {len(data)};\n')
+            f.write(f'    inline const unsigned char {name}[] = {{\n')
+            for i in range(0, len(data), 20):
+                f.write('        ' + ','.join(str(b) for b in data[i:i + 20]) + ',\n')
+            f.write('    };\n')
+        f.write(f'    constexpr int ICON_CELL_PX = {ICON_PX};\n')
+        f.write('    // Variant B places the strip with NO matrix in the tag (so the timeline can\n')
+        f.write('    // never reset it), and the row offset lives inside the strip - so the shift\n')
+        f.write('    // to show a cell is (-cell * ICON_CELL_PX, 0) from the origin, not\n')
+        f.write(f'    // (ICON_X - cell * ICON_CELL_PX, ICON_Y).\n')
+        f.write('    // Which strip cell an ini key uses: shift the strip by -cell*ICON_CELL_PX\n')
+        f.write('    // to show it. Cell 0 is empty, so cell 0 means "no icon".\n')
+        f.write('    struct KeyFrame { const char *key; int frame; };\n')
+        f.write('    inline const KeyFrame ICON_FRAME_OF_KEY[] = {\n')
+        for key, frame in frame_of_key:
+            f.write(f'        {{"{key}", {frame}}},\n')
+        f.write('    };\n')
+        f.write('}\n')
+    print('wrote %s: variant A %d B, variant B %d B, %d icons'
+          % (OUT, len(blob_a), len(blob_b), len(bitmap_cids)))
+
+
+if __name__ == '__main__':
+    main()

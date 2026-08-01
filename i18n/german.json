@@ -59,12 +59,21 @@
     "IconPreviewShow": "Vorschau zeigen",
     "IconPreviewSize": "Vorschaugröße (px)",
     "IconPreviewSource": "Quelle: %d x %d px",
+    "ValueOn": "Ein",
+    "ValueOff": "Aus",
     "TabHidden": "Ausgeblendet",
     "HiddenDisabled": "Manuelles Ausblenden ist deaktiviert. Aktiviere es oben.",
     "MegaLandsBetween": "Zwischenland",
     "MegaDungeons": "Die Unterwelt",
     "MegaShadow": "Schattenland",
-    "ProgressFocusResetHint": "Zum Zurücksetzen '%s' im Menü drücken"
+    "ProgressFocusResetHint": "Zum Zurücksetzen '%s' im Menü drücken",
+    "MenuBack": "Zurück",
+    "MenuTools": "Werkzeuge",
+    "MenuTotal": "Gesamt",
+    "MenuSaveNow": "Einstellungen speichern",
+    "MenuUnavailable": "Diese Seite ist nicht verfuegbar",
+    "MenuPressKey": "Taste druecken...",
+    "MenuKeepCurrent": "Unveraendert lassen"
   },
   "toasts": {
     "MapIconsOn": "Kartensymbole: AN",

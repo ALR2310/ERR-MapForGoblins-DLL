@@ -137,6 +137,13 @@ add_library( MapForGoblins SHARED
   src/goblin_markers.cpp
   src/goblin_progress.hpp
   src/goblin_progress.cpp
+  src/goblin_native_menu.hpp
+  src/goblin_native_menu.cpp
+    src/goblin_own_movie.cpp
+  src/goblin_menu_addons.hpp
+  src/goblin_menu_addons.cpp
+  src/goblin_sfimage.hpp
+  src/goblin_sfimage.cpp
   src/goblin_messages.hpp
   src/goblin_messages.cpp
   src/goblin_overlay.hpp
@@ -182,8 +189,29 @@ target_sources(MapForGoblins PRIVATE
   ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp)
+
+# sc2: in-swapchain D3D12 overlay backend. Our ImGui is rendered into the game's OWN backbuffer
+# through a per-instance Present shadow, instead of into a separate top-most window - so there is no
+# focus steal (the Linux/Proton alt-tab problem) and no second swapchain. Selected at runtime by
+# overlay_render_mode = swapchain_2; every other mode leaves this code dormant.
+# Origin: the backend v2 core written for CustomTalismanEffects / QuestPath (imCioco), used here
+# with the author's permission; its design notes are BACKEND_V2_ARCHITECTURE.md and
+# OVERLAY_V2_PORTING_GUIDE.md in that project.
+target_sources(MapForGoblins PRIVATE
+  src/sc2/overlay_frame.cpp
+  src/sc2/overlay_dxgi_shadow.cpp
+  src/sc2/overlay_d3d12.cpp
+  src/sc2/overlay_present.cpp
+  src/sc2/hooks.cpp
+  src/sc2/overlay_coexist.cpp
+  src/sc2/log.cpp)
+# Makes the backend's PRIVATE window-class names unique per mod. The SHARED arbitration mutex names
+# must stay identical across mods that embed this backend - see sc2/overlay_coexist.hpp.
+target_compile_definitions(MapForGoblins PRIVATE QP_BACKEND_MOD_ID=MapForGoblins)
+
 target_include_directories(MapForGoblins PRIVATE
   ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+  ${CMAKE_SOURCE_DIR}/src/sc2
   ${CMAKE_SOURCE_DIR}/src
   ${CMAKE_SOURCE_DIR}/src/generated_shared)
 
@@ -191,6 +219,17 @@ target_include_directories(MapForGoblins PRIVATE
 # XInput itself in feed_gamepad() and masks the menu-toggle combo out of the nav
 # feed; letting the backend also poll would double-feed nav and fight our masking.
 target_compile_definitions(MapForGoblins PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+
+# Build variants (src/goblin_build_variants.hpp). Each defaults in the header; passing one here is how
+# the documented "switch it back with a rebuild" actually works, e.g.
+#   cmake -DMFG_STALL_PROFILER=1 ...
+foreach(mfg_variant MFG_LEGACY_PIN_MARKERS MFG_SLOW_MAP_OPEN MFG_NO_SELF_DETACH
+                    MFG_ATTACH_ALL_MARKERS MFG_STALL_PROFILER)
+  if(DEFINED ${mfg_variant})
+    target_compile_definitions(MapForGoblins PRIVATE ${mfg_variant}=${${mfg_variant}})
+    message(STATUS "MapForGoblins build variant: ${mfg_variant}=${${mfg_variant}}")
+  endif()
+endforeach()
 
 # Reproducible build: /Brepro makes the compiler emit deterministic object files
 # and the linker zero the PE TimeDateStamp, so the same source always produces a
@@ -200,6 +239,12 @@ target_compile_definitions(MapForGoblins PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPA
 # => stable verdict (and a clean variant stays clean).
 target_compile_options(MapForGoblins PRIVATE /Brepro /utf-8)
 target_link_options(MapForGoblins PRIVATE /Brepro)
+# /MAP for CRASH SYMBOLIZATION. The shipped DLL carries no PDB and no debug directory (that is
+# deliberate - see the Defender false-positive notes), so a crash breadcrumb gives us
+# "MapForGoblins.dll+0xRVA" and nothing else. The link map turns those RVAs back into function
+# names. It is a separate .map file next to the DLL: it does not change codegen, does not add a
+# debug directory to the binary, and /Brepro keeps the build byte-identical.
+target_link_options(MapForGoblins PRIVATE /MAP)
 
 # Non-ERR bakes (vanilla, convergence): omit + disable ERR-only config
 # entries at runtime. MFG_VANILLA here means "no ERR-only features".
@@ -276,4 +321,8 @@ target_link_libraries( MapForGoblins
   d3d12
   dxgi
   dcomp
-  comdlg32)
+  comdlg32
+  # sc2 backend: compiles its own root signature / shaders (d3dcompiler) and uses COM apartment
+  # helpers for the DXGI work (ole32).
+  d3dcompiler
+  ole32)

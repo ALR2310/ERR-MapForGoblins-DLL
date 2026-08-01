@@ -1,6 +1,7 @@
 #include "goblin_map_timing.hpp"
 
 #include "goblin_config.hpp"
+#include "goblin_build_variants.hpp"
 #include "goblin_gfx_probe.hpp"
 #include "goblin_stall_probe.hpp"
 #include "modutils.hpp"
@@ -56,7 +57,7 @@ namespace
                 goblin::stall_probe::capture("map-open build", 1500);
 
             // Skip the per-marker relayout on the map path, every pass (Patch D).
-            if (goblin::config::fastMapOpen)
+            if (goblin::variants::kFastMapOpen)
                 return nullptr;
         }
         return o_refresh(a, b, c, d);
@@ -74,7 +75,7 @@ namespace
         // remove-from-container primitive. This unlinks our TreeCacheNodes and drops
         // the container's reference NOW (map UI thread) instead of leaving all ~9k of
         // them for the dtor's blocking close-teardown job (the ~75ms freeze). No-op
-        // unless config::nativeSelfDetach.
+        // unless the self-detach variant is off (goblin_build_variants.hpp).
         goblin::stall_probe::v3_detach_all_children();
 
         // Map closing. Profile the deferred post-close heap-release stall (~1s after
@@ -99,7 +100,7 @@ void goblin::map_timing::on_map_frame()
 
 void goblin::map_timing::setup()
 {
-    if (!goblin::config::fastMapOpen) return;
+    if (!goblin::variants::kFastMapOpen) return;
 
     // Resolve the per-marker call site by byte pattern (resilient to game updates):
     // the skip keys on the return address of the refresh call in the map's

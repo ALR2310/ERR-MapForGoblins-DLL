@@ -5,6 +5,8 @@
 // and (later) the passive hover-info overlay. The hovered pin's underlying
 // WorldMapPointParam row pointer is published; goblin::inject matches it to one of our
 // injected rows. Native + exact (no compute-nearest approximation).
+#include <cstdint>
+
 namespace goblin::maphover
 {
     // Arm the hook (call once at DLL init, before enable_hooks()).
@@ -21,9 +23,22 @@ namespace goblin::maphover
     // Thread-safe; nullptr when stale (map closed). (Named map_dialog for API stability.)
     void *map_dialog();
 
+    // The game's hover POPUP panel (the one that names the focused pin), or nullptr when the
+    // map is not open. Everything FUN_14087A8E0 does to it is reachable through small
+    // primitives, so this handle is enough to place it and fill its lines ourselves.
+    void *popup_panel();
+    // How many text-line slots the panel's current variant has (-1 = not measured yet).
+    int32_t popup_line_slots();
+
     // The currently displayed map layer, decoded live from the WorldMapDialog field at
     // MapArea+0x904 (value = world*10 + sublayer). Matches WorldMapPointParam dispMask
     // bits: 0 = overworld (M00), 1 = underground (M01), 2 = DLC (M02, both sublayers).
     // -1 when the map is closed / not yet known.
     int map_layer();
+
+    // GetTickCount64() of the last time the map dialog's per-frame Update ran (this hook fires
+    // every frame the world map is open, independent of any marker build). 0 if it has never
+    // fired. A value that has advanced PAST a recorded close time is proof the map genuinely
+    // reopened - the dialog resumed - which a cached pointer cannot tell you. Thread-safe.
+    uint64_t last_activity_ms();
 }

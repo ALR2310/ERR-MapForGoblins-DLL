@@ -200,8 +200,26 @@ static void read_singleton_entries(uintptr_t slot,
     if (!slot || !safe_read((void *)slot, &gf_ptr, 8) || !gf_ptr)
         return;
 
+    // The manager keeps a SORTED DENSE vector of (tile_id, blob) pairs: base = gf_ptr + 8, stride 0x10,
+    // and the live element count is a qword at gf_ptr + 0x189D0. The engine walks exactly that many.
+    // Scanning to a fixed 0x20000 instead read stale slots past the end (the vector removes elements in
+    // place, so those slots keep previously-removed records -> phantom "collected" geometry) and also
+    // read past the object entirely, which only looked harmless because safe_read swallows the faults.
+    // Audited 2026-07-28; if the count looks insane we fall back to the old bounded scan.
+    uint64_t live_count = 0;
+    if (!safe_read((char *)gf_ptr + 0x189D0, &live_count, 8) || live_count == 0 || live_count > 0x2000)
+        live_count = 0;
+    const int scan_limit = live_count ? (int)(0x08 + live_count * 16) : 0x20000;
+    if (goblin::config::debugLogging)
+    {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1, std::memory_order_relaxed) < 2)
+            spdlog::info("[verify] GEOF table: live count from +0x189D0 = {} -> scanning to 0x{:X} "
+                         "(the old code always scanned to 0x20000)", live_count, scan_limit);
+    }
+
     int tiles_found = 0, tiles_skipped = 0, consecutive_empty = 0;
-    for (int off = 0x08; off < 0x20000; off += 16)
+    for (int off = 0x08; off < scan_limit; off += 16)
     {
         uint64_t id_val = 0, ptr_val = 0;
         if (!safe_read((char *)gf_ptr + off, &id_val, 8))
@@ -266,6 +284,28 @@ static void read_singleton_entries(uintptr_t slot,
             uint8_t entry[8] = {};
             if (!safe_read((void *)(entries_start + ei * 8), entry, 8))
                 break;
+
+            // The record is `key | value`, where the key is ((model_id << 0x11) | geom_idx) << 0xf and
+            // BIT 0 IS THE STORED BOOLEAN. The engine's setter does not drop a record when the value
+            // goes false, it clears bit 0 in place, and the tile-load applier only treats an instance as
+            // collected when bit 0 is set. Reading mere presence as "collected" therefore hid markers for
+            // geometry the player had NOT collected (anything collected once and later reset).
+            // Audited 2026-07-28. Bits 1..14 are always 0, which is why the entry[1] filter below has
+            // been working as a de-facto key check.
+            if ((entry[0] & 1) == 0)
+            {
+                // VERIFY (2026-07-28 audit): every one of these is a record the OLD code counted as
+                // collected while the engine considers it NOT collected.
+                static std::atomic<int> rejected{0};
+                const int n = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (goblin::config::debugLogging && (n <= 5 || n % 100 == 0))
+                    spdlog::info("[verify] GEOF record with value bit CLEAR ignored (#{}): "
+                                 "model={} geom={}", n,
+                                 (uint32_t)(entry[4] | (entry[5] << 8) | (entry[6] << 16) |
+                                            (entry[7] << 24)),
+                                 (uint16_t)(entry[2] | (entry[3] << 8)));
+                continue;
+            }
 
             uint8_t entry_flags = entry[1];
             uint16_t geom_idx = entry[2] | (entry[3] << 8);
@@ -905,7 +945,11 @@ int goblin::collected::refresh()
     //    (the exact blind spot: flag flipped but match missed → nothing hidden).
     if (goblin::config::debugLogging)
     {
+        // Bounded on purpose. This grew for the life of the process - one std::string key per WGM
+        // instance per scan - so a long debug session leaked steadily while only producing a log line.
+        // ~1500 tracked instances is the real ceiling; past 4096 we stop remembering rather than grow.
         static std::map<std::string, int> dbg_prev_alive;
+        constexpr size_t kDbgAliveCap = 4096;
         for (auto &[tile_id, snap] : wgm)
         {
             const int a = (tile_id >> 24) & 0xFF, gx = (tile_id >> 16) & 0xFF, gz = (tile_id >> 8) & 0xFF;
@@ -940,7 +984,9 @@ int goblin::collected::refresh()
                                          a, gx, gz, prefix, slot, in.model_id, in.gidx,
                                          (unsigned)in.f263, (unsigned)in.f26B, it->second, cur, rows);
                         }
-                        dbg_prev_alive[key] = cur;
+                        if (dbg_prev_alive.size() < kDbgAliveCap ||
+                            dbg_prev_alive.find(key) != dbg_prev_alive.end())
+                            dbg_prev_alive[key] = cur;
                     }
         }
     }

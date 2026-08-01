@@ -59,12 +59,21 @@
     "IconPreviewShow": "미리보기 표시",
     "IconPreviewSize": "미리보기 크기(px)",
     "IconPreviewSource": "원본: %d x %d px",
+    "ValueOn": "켜기",
+    "ValueOff": "끄기",
     "TabHidden": "숨김",
     "HiddenDisabled": "수동 숨기기가 꺼져 있습니다. 위에서 켜세요.",
     "MegaLandsBetween": "사이의 땅",
     "MegaDungeons": "지하 세계",
     "MegaShadow": "그림자의 땅",
-    "ProgressFocusResetHint": "초기화하려면 메뉴에서 '%s'를 누르세요"
+    "ProgressFocusResetHint": "초기화하려면 메뉴에서 '%s'를 누르세요",
+    "MenuBack": "뒤로",
+    "MenuTools": "도구",
+    "MenuTotal": "합계",
+    "MenuSaveNow": "설정 저장",
+    "MenuUnavailable": "사용할 수 없는 페이지입니다",
+    "MenuPressKey": "키를 누르세요...",
+    "MenuKeepCurrent": "현재 값 유지"
   },
   "toasts": {
     "MapIconsOn": "지도 아이콘: 켬",

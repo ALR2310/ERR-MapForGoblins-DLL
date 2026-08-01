@@ -25,6 +25,7 @@ TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS_DIR))
 import config  # noqa: E402
 from aob_signatures import SIGNATURES, check_drift  # noqa: E402
+from rva_anchors import ANCHORS  # noqa: E402
 
 
 def to_regex(aob):
@@ -134,6 +135,30 @@ def main():
         import json
         Path(args.json).write_text(json.dumps(results, indent=2), encoding="utf-8")
         print(f"Wrote resolved RVAs -> {args.json}\n")
+
+    # ---- RVA anchors: the native-menu code calls small UI helpers by direct RVA, which a
+    # game update would silently redirect to unrelated code. Verify the bytes still match.
+    anchor_fail = []
+    if ANCHORS:
+        print(f"  {'status':10} {'anchor':28} {'RVA':>10}")
+        print(f"  {'-'*10} {'-'*28} {'-'*10}")
+        for a in ANCHORS:
+            want = a["bytes"].split()
+            off = a["rva"] - text_rva
+            got = code[off:off + len(want)] if 0 <= off < len(code) else b""
+            ok = len(got) == len(want) and all(
+                w == "??" or int(w, 16) == g for w, g in zip(want, got))
+            print(f"  {('[OK]' if ok else '[BROKEN]'):10} {a['name']:28} {'0x%X' % a['rva']:>10}")
+            if not ok:
+                anchor_fail.append(a)
+        print()
+    if anchor_fail:
+        print("BUILD-BLOCKING: the bytes at these RVAs changed - the game was probably updated.")
+        for a in anchor_fail:
+            print(f"  {a['name']} (0x{a['rva']:X}) - used by: {a['used']}")
+        print("Re-find each function (Ghidra: scratch/ghidra_proj/eldenring), update the RVA in")
+        print("src/ and refresh tools/rva_anchors.py (py tools/rva_anchors.py --emit 0xRVA name).")
+        return 1
 
     if critical_fail:
         print("BUILD-BLOCKING: a CRITICAL eldenring.exe signature is missing or ambiguous.")

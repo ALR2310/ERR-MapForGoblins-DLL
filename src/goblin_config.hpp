@@ -25,11 +25,10 @@ namespace goblin
     {
         extern bool requireMapFragments;
         extern bool debugLogging;
-        extern bool fastMapOpen; // ini key: fast_map_open (skip relayout on reopen + amortize first open)
-        extern bool nativeSelfDetach; // ini key: native_self_detach (bulk-detach our native markers at WMD dtor
-                                      // before the engine's blocking close-teardown; lever C for the close freeze)
-        extern bool nativeViewportWindow; // ini key: native_viewport_window (lever B: keep out-of-view native
-                                          // markers DETACHED so they carry no render node; attach only near-view)
+        extern bool nativeMenuDevRows;    // ini key: native_menu_dev_rows (our diagnostic menu rows)
+        extern bool nativeMenu;           // ini key: native_menu (the in-game native menu + its hotkeys)
+        // The map-open levers (fast open, self-detach at close, near-view attach window) are no longer
+        // ini keys: they are compile-time variants in goblin_build_variants.hpp.
         // NOTE: icon/resource injection is unconditional now (no ini toggle) - it's how icons render without
         // a gfx. The dev-only SpriteDef/dict dumps + RM2 trace in goblin_gfx_probe are gated by debugLogging.
 
@@ -149,7 +148,11 @@ namespace goblin
         // toggle key. Set false if a DX-hook conflict (Steam overlay/RTSS/etc.)
         // or a GPU driver issue makes the game unstable.
         extern std::string uiLanguage; // auto, english, schinese, tchinese, korean
-        extern float fontScale;        // overlay text size multiplier (live io.FontGlobalScale)
+    // key native_menu_icons: how the in-game menu draws category icons - 0 off,
+    // 1 masked strip, 2 one child per icon (both need the movie rebuilt at load),
+    // 3 drawn straight from our own pixels into a clip the row already has.
+    extern uint8_t nativeMenuIcons;
+    extern float fontScale;        // overlay text size multiplier (live io.FontGlobalScale)
         extern bool enableOverlay;
         extern std::string overlayRenderMode; // layered | surface | swapchain (ini overlay_render_mode)
         extern float overlayOpacity;   // overlay menu panel opacity 0.3..1.0 (window bg alpha)

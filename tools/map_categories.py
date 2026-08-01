@@ -91,4 +91,7 @@ EXTRA_ICONS = [
     # embed - referenced in place (path is relative to assets/map_icons/custom);
     # the badge's on-map scale/offset are applied at runtime by the DLL.
     ('cleared', '../../badges/cleared_badge.png'),
+    # Focus ring drawn as an EXTRA marker ON TOP of the isolated category's markers -
+    # the marker's own icon is never replaced. Same art the overlay projected.
+    ('highlight', 'highlight.png'),
 ]

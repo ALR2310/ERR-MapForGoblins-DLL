@@ -33,4 +33,8 @@ namespace goblin::generated
     // shown over defeated boss/NPC/hawk markers (no engine Cleared subclip on
     // the native path). Generated per profile like ANON_ICON_ID.
     extern const uint16_t CLEARED_ICON_ID;
+
+    // Focus-ring source iconId: the EXTRA marker row drawn over the isolated category on the
+    // progress screen. The markers' own icons are never swapped. Generated per profile.
+    extern const uint16_t HIGHLIGHT_ICON_ID;
 }

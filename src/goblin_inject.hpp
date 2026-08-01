@@ -77,6 +77,15 @@ namespace goblin
     // base-visible AND defeat-flag-set. Real row ids never reach bit 63.
     constexpr uint64_t NATIVE_CLEARED_KEY_BIT = 1ull << 63;
 
+    // Focus-ring points: a small FIXED pool of extra native children, keyed by this bit plus
+    // the pool index. They exist from the seed build (the icon factory only pulses during a
+    // build burst, so anything not created then can never appear) and are then MOVED onto the
+    // focused markers live - which is why the pool is a pool and not one ring per row: one ring
+    // per row would mean ~9500 extra children, and every attached child costs driver-side
+    // teardown on map close.
+    constexpr uint64_t NATIVE_HIGHLIGHT_KEY_BIT = 1ull << 62;
+    constexpr size_t NATIVE_RING_POOL = 128;
+
     std::vector<NativeMarkerPoint> native_marker_snapshot(int layer);
 
     // Live row of the VISIBLE native marker nearest the map reticle (screen
@@ -213,6 +222,30 @@ namespace goblin
     enum ToastSlot { TOAST_ON = 0, TOAST_OFF, TOAST_DUMP_OK, TOAST_DUMP_FAIL, TOAST_COUNT };
     extern int g_toast_fmg_id[TOAST_COUNT];
     extern int g_toast_param_row_id[TOAST_COUNT];
+
+    // Native settings-menu texts: GR_MenuText.fmg ids allocated dynamically
+    // above the live max by setup_messages (same principle as the toast ids).
+    // The native menu (goblin_stall_probe) builds its tab category label and its
+    // page row labels via the game's MenuTextCtor against these ids. 0/empty
+    // until allocated / if the merge failed.
+    extern int g_menutext_tab_id;
+    extern std::vector<int> g_menutext_row_ids; // parallel to native_menu_rows()
+    // Value texts for rows rendered on the native keybinding form (its rows show a
+    // name plus a VALUE column): localized "On"/"Off". 0 if the merge failed.
+    extern int g_menutext_on_id;
+    extern int g_menutext_off_id;
+
+    // Rows of our native settings page: each a native checkbox bound directly to
+    // a config bool. ini_key doubles as the i18n entry_labels lookup key (the
+    // localized label text injected into GR_MenuText). Defined in
+    // goblin_stall_probe.cpp (the native-menu owner).
+    struct NativeMenuRowDef
+    {
+        const char *ini_key;
+        bool *value;
+        bool def; // schema default (drives the row's "modified" indicator)
+    };
+    const NativeMenuRowDef *native_menu_rows(size_t *count);
 
     // Inject the codex-toast TutorialParam rows for the F10/F9 banners. Rows
     // get menuType=0 (upper-left codex caption widget) with textId pointing

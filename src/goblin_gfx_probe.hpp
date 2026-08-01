@@ -12,6 +12,16 @@ namespace goblin::gfx_probe
 {
     void setup();
 
+    // True once the in-game menu's movie has been extended with our category icons
+    // (bitmaps + an icon sprite spliced in while that movie was loading). When false the
+    // menu rows simply draw no icon.
+    bool menu_icons_ready();
+
+    /// The GAME's own CRT malloc (resolved by AOB), for buffers the ENGINE may later free: it uses the
+    /// same heap the game's own free() does, so nothing rests on our allocator matching by luck.
+    /// Returns null if the allocator could not be resolved.
+    void *game_alloc(size_t bytes);
+
     // Injected iconId (1-based frame appended at worldmap load) for a category's source gfx iconId,
     // or 0 if that source icon wasn't injected / before load. goblin_inject's remap_injected_icons
     // points every marker at injected_iconid(its baked iconId) so our embedded bitmaps render without
@@ -42,6 +52,11 @@ namespace goblin::gfx_probe
     // a fresh instance. No-op for normal icon/resource injection state.
     void v3_on_map_close();
 
+    // Have our icon frames been appended to the worldmap icon sprite for the current map load?
+    // Nothing native can materialize before that, so it is the first gate to check when markers
+    // do not appear.
+    bool icons_injected();
+
     // Queue one lightweight bitmap placement in the CURRENT live icon timeline
     // callback. The return value is the timeline record, not a DisplayObject;
     // Scaleform materialises the real child later through Sprite::AddDisplayObject.
@@ -54,4 +69,7 @@ namespace goblin::gfx_probe
     // has been transplanted out, so the engine's own materialization pass can
     // never re-process the record and spawn a duplicate inside the host sprite.
     bool remove_native_icon_record(uint16_t depth, void *ctx, uint32_t frame);
+    // NOTE: the Lever A single-mesh DrawingContext probe was removed 2026-07-18 after it
+    // hit a GPU-texture wall (our injected icons cannot supply a created texture to
+    // beginBitmapFill). Findings + revival options: docs/research_native_singlemesh_wall.md.
 }

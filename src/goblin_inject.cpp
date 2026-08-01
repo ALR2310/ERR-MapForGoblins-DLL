@@ -1,4 +1,6 @@
 #include "goblin_inject.hpp"
+
+#include "goblin_build_variants.hpp"
 #include "goblin_collected.hpp"
 #include "goblin_kindling.hpp"
 #include "goblin_logic.hpp"
@@ -120,7 +122,8 @@ static bool native_category_migrated(Category cat)
     // markers are ordinary icons too: the clickable/travel graces are the
     // GAME'S OWN pins, which we never touch.
     (void)cat;
-    return goblin::config::debugLogging;
+    // Compile-time now, not an ini key: one marker mechanism per binary (see goblin_build_variants.hpp).
+    return goblin::variants::kNativeMarkers;
 }
 // Progress-tab focus: g_focus_category = -1 (none) or a Category value; paired
 // with g_focus_region (a region PlaceName id, or -1 for the "Other" bucket).
@@ -1085,6 +1088,12 @@ static constexpr int TUTORIAL_TEMPLATE_ROW_ID = 4167000;
 int goblin::g_toast_fmg_id[goblin::TOAST_COUNT]       = {0, 0, 0, 0};
 int goblin::g_toast_param_row_id[goblin::TOAST_COUNT] = {0, 0, 0, 0};
 
+// Native settings-menu text ids in GR_MenuText.fmg (see goblin_inject.hpp).
+int goblin::g_menutext_tab_id = 0;
+std::vector<int> goblin::g_menutext_row_ids;
+int goblin::g_menutext_on_id = 0;
+int goblin::g_menutext_off_id = 0;
+
 static ParamResCap *find_param_res_cap_by_name(const wchar_t *target)
 {
     auto param_list = *from::params::param_list_address;
@@ -1442,6 +1451,49 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
                            visible && goblin::flag_is_set(cleared_flag),
                            cr.p});
     }
+    // Focus rings. The pool is emitted ALWAYS (even with no focus) so the children get built
+    // during the seed burst; without a focus they simply report invisible. When a focus is on,
+    // ring i rides the coordinates of the i-th marker in the set and the merge moves it there.
+    // A pool rather than one ring per row: per-row would mean ~9500 extra children, and every
+    // attached child costs driver-side teardown on map close.
+    const uint32_t ring_frame =
+        goblin::gfx_probe::injected_iconid(static_cast<int>(goblin::generated::HIGHLIGHT_ICON_ID));
+    if (ring_frame && !g_category_rows.empty() && g_category_rows[0].p)
+    {
+        const std::vector<HighlightPoint> pts = focus_highlight_points();
+        const auto &cr0 = g_category_rows[0];
+        for (size_t k = 0; k < NATIVE_RING_POOL; ++k)
+        {
+            NativeMarkerPoint rp{};
+            rp.original_row_id = NATIVE_HIGHLIGHT_KEY_BIT | static_cast<uint64_t>(k);
+            rp.source_icon_id = static_cast<int>(goblin::generated::HIGHLIGHT_ICON_ID);
+            rp.rowptr = nullptr; // not a real marker: no hover, no manual hide
+            if (k < pts.size())
+            {
+                const auto &hp = pts[k];
+                rp.area = hp.area;
+                rp.layer = hp.layer;
+                rp.gx = hp.gx;
+                rp.gz = hp.gz;
+                rp.px = hp.px;
+                rp.pz = hp.pz;
+                rp.visible = hp.layer == layer;
+            }
+            else
+            {
+                // Unused rings still need coordinates that PROJECT, or they could not be built
+                // at seed time at all. Borrow a real marker's and stay invisible.
+                rp.area = cr0.native_area;
+                rp.layer = cr0.native_layer;
+                rp.gx = cr0.native_gx;
+                rp.gz = cr0.native_gz;
+                rp.px = cr0.native_px;
+                rp.pz = cr0.native_pz;
+                rp.visible = false;
+            }
+            out.push_back(rp);
+        }
+    }
     return out;
 }
 
@@ -1472,9 +1524,20 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
     // visibility snapshot (per-row event-flag reads) is too heavy per frame -
     // refresh a cached copy at the same 200ms cadence the native manager uses.
     // Positions are static; 200ms-stale visibility on a hover test is invisible.
+    // THIS CACHE IS SHARED BY TWO THREADS and must be locked. It is read from the map dialog's
+    // per-frame update (our hover detour calls this) and from the overlay thread (the hover info
+    // panel calls it too). Unlocked, the 200ms refresh below move-assigns the vector - freeing the
+    // old buffer - while the other thread is iterating it or refreshing it as well: the same block
+    // gets freed twice and the heap trips. That is a real crash, caught in the act:
+    //   placename_detour -> native_reticle_row -> vector::operator=(&&) -> free_base -> ntdll
+    //   reported 0xC0000374 (heap corruption), and map tiles rendered transparent alongside it.
+    // A function-local static is thread-safe to INITIALIZE, never to use.
+    // The lock covers the refresh AND the loop, because the loop reads the buffer the refresh frees.
+    static std::mutex cache_mutex;
     static std::vector<NativeMarkerPoint> cache;
     static int cache_layer = -1;
     static std::chrono::steady_clock::time_point cache_at{};
+    std::lock_guard<std::mutex> cache_lock(cache_mutex);
     const auto now = std::chrono::steady_clock::now();
     if (layer != cache_layer ||
         std::chrono::duration_cast<std::chrono::milliseconds>(now - cache_at).count() > 200)

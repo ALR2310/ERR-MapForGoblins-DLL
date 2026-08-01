@@ -52,8 +52,14 @@ namespace goblin::progress
     void rebuild_if_stale(double now_seconds);
 
     // Cached regions, sorted by name (the "Other" bucket sorts last). Empty
-    // until rebuild()/rebuild_if_stale() has run at least once.
-    const std::vector<RegionProgress> &snapshot();
+    // until rebuild()/rebuild_if_stale() has run at least once. Returned BY VALUE:
+    // rebuild() replaces the cache from another thread, so handing out a reference
+    // would let a reader iterate a freed buffer.
+    std::vector<RegionProgress> snapshot();
+
+    // One region's localized name, copied under the cache lock. For per-frame
+    // callers (the map hover tip) that want a single name, not the whole table.
+    bool region_name(int32_t place_name_id, std::string &out);
 
     // The region grouping key (a PlaceName id, or -1 for the "Other" bucket) for
     // a marker's baked tile. Same logic the tab groups by; used by inject to tag

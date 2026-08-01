@@ -74,6 +74,10 @@ struct ParamRef
 std::vector<KindlingSlot> g_slots;
 std::map<uint64_t, ParamRef> g_param_ptrs;
 std::set<uint64_t> g_collected_rows;
+// Move-assigned by the refresh (worker/overlay side) while is_row_collected() walks it from the map
+// apply path. A std::set move-assign frees every node, so an unlocked reader can follow a dangling
+// child pointer. Same class of bug as the reticle cache; guard every access.
+std::mutex g_collected_rows_mutex;
 std::unordered_map<uint64_t, uint64_t> g_original_to_dynamic;
 bool g_initialized = false;
 
@@ -527,7 +531,10 @@ void goblin::kindling::initialize()
 {
     g_slots.clear();
     g_param_ptrs.clear();
-    g_collected_rows.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
+        g_collected_rows.clear();
+    }
     g_original_to_dynamic.clear();
     {
         std::lock_guard<std::mutex> lock(g_state_mutex);
@@ -630,8 +637,11 @@ int goblin::kindling::refresh()
         // PERMANENT_FLAG, after which the ON branch above takes over.
     }
 
-    if (new_collected == g_collected_rows)
-        return 0;
+    {
+        std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
+        if (new_collected == g_collected_rows)
+            return 0;
+    }
 
     // Apply: restore everyone first, then hide collected.
     std::vector<uint64_t> stale;
@@ -660,15 +670,21 @@ int goblin::kindling::refresh()
         spdlog::warn("[KINDLING] Dropped {} stale entries", stale.size());
     }
 
-    int delta = (int)new_collected.size() - (int)g_collected_rows.size();
-    g_collected_rows = std::move(new_collected);
-    spdlog::info("[KINDLING] Refresh: {} hidden (delta {:+d}), applied {}",
-                 g_collected_rows.size(), delta, applied);
+    int delta = 0;
+    size_t hidden = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
+        delta = (int)new_collected.size() - (int)g_collected_rows.size();
+        g_collected_rows = std::move(new_collected);
+        hidden = g_collected_rows.size();
+    }
+    spdlog::info("[KINDLING] Refresh: {} hidden (delta {:+d}), applied {}", hidden, delta, applied);
     return delta;
 }
 
 bool goblin::kindling::is_row_collected(uint64_t row_id)
 {
+    std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
     if (g_collected_rows.count(row_id)) return true;
     auto it = g_original_to_dynamic.find(row_id);
     if (it != g_original_to_dynamic.end() && g_collected_rows.count(it->second))
@@ -678,5 +694,6 @@ bool goblin::kindling::is_row_collected(uint64_t row_id)
 
 int goblin::kindling::collected_count()
 {
+    std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
     return (int)g_collected_rows.size();
 }

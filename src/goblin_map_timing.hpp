@@ -2,11 +2,11 @@
 
 namespace goblin::map_timing
 {
-    // World-map open optimization (config::fastMapOpen). Hooks the per-marker
+    // World-map open optimization (variants::kFastMapOpen). Hooks the per-marker
     // relayout at the map's dispatcher call site (AOB-resolved) and skips it there
     // unconditionally (field-proven "Patch D"; markers render correctly without it).
     // The defer-and-replay variant crashed and is permanently removed - see the
-    // history note in goblin_map_timing.cpp. No-op when fastMapOpen is off.
+    // history note in goblin_map_timing.cpp. No-op when the fast-open variant is off.
     void setup();
 
     // Called once per frame on the game UI thread while the world map is open

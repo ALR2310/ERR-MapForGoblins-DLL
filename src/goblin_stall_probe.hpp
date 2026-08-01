@@ -42,6 +42,6 @@ namespace goblin::stall_probe
     // own remove-from-container primitive, BEFORE the WorldMapDialog dtor runs its
     // blocking close-teardown. Must be called on the map UI thread while the display
     // tree is still alive (i.e. from the WMD dtor detour before the original dtor).
-    // Returns the number of children detached. No-op unless config::nativeSelfDetach.
+    // Returns the number of children detached. No-op unless variants::kSelfDetach.
     uint32_t v3_detach_all_children();
 }

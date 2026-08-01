@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -294,6 +295,11 @@ bool row_switch_gate_off(const goblin::generated::MapEntry &e)
 }
 
 std::vector<goblin::progress::RegionProgress> g_regions;
+// g_regions is move-assigned by rebuild() (overlay thread, and the native menu when it opens a region
+// page) while the map's hover tip reads it on the engine's map thread. That is a container freed under a
+// live reader: exactly the shape that took down native_reticle_row's cache. Everything that touches
+// g_regions holds this.
+std::mutex g_regions_mutex;
 double g_last_build_time = -1.0e9;
 bool g_built = false;
 
@@ -376,7 +382,10 @@ void goblin::progress::rebuild()
                   return a.name < b.name;
               });
 
-    g_regions = std::move(regions);
+    {
+        std::lock_guard<std::mutex> lock(g_regions_mutex);
+        g_regions = std::move(regions);
+    }
     g_built = true;
 }
 
@@ -389,9 +398,24 @@ void goblin::progress::rebuild_if_stale(double now_seconds)
     }
 }
 
-const std::vector<goblin::progress::RegionProgress> &goblin::progress::snapshot()
+// By value, not by reference: a reference lets the caller iterate while rebuild() frees the buffer under
+// it. The copy is ~22 rows and only the tab / menu pages / one hover line ask for it.
+std::vector<goblin::progress::RegionProgress> goblin::progress::snapshot()
 {
+    std::lock_guard<std::mutex> lock(g_regions_mutex);
     return g_regions;
+}
+
+bool goblin::progress::region_name(int32_t place_name_id, std::string &out)
+{
+    std::lock_guard<std::mutex> lock(g_regions_mutex);
+    for (const auto &rp : g_regions)
+        if (rp.place_name_id == place_name_id)
+        {
+            out = rp.name;
+            return true;
+        }
+    return false;
 }
 
 int32_t goblin::progress::region_place_id(const from::paramdef::WORLD_MAP_POINT_PARAM_ST &data)

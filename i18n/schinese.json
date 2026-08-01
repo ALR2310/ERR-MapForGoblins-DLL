@@ -59,12 +59,21 @@
     "IconPreviewShow": "显示预览",
     "IconPreviewSize": "预览大小(px)",
     "IconPreviewSource": "源: %d x %d px",
+    "ValueOn": "开",
+    "ValueOff": "关",
     "TabHidden": "已隐藏",
     "HiddenDisabled": "手动隐藏已关闭。请在上方开启。",
     "MegaLandsBetween": "交界地",
     "MegaDungeons": "地下世界",
     "MegaShadow": "幽影之地",
-    "ProgressFocusResetHint": "重置请在菜单中点击“%s”"
+    "ProgressFocusResetHint": "重置请在菜单中点击“%s”",
+    "MenuBack": "返回",
+    "MenuTools": "工具",
+    "MenuTotal": "总计",
+    "MenuSaveNow": "立即保存设置",
+    "MenuUnavailable": "此页面不可用",
+    "MenuPressKey": "请按一个键...",
+    "MenuKeepCurrent": "保持当前"
   },
   "toasts": {
     "MapIconsOn": "地图图标：开启",

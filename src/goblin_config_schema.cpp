@@ -12,11 +12,12 @@
 namespace goblin::config
 {
     bool requireMapFragments = true;
-    bool debugLogging = false;        // key debug_logging: verbose diagnostics; also gates the dev-only
-                                      // worldmap SpriteDef/dict dumps + RM2::Execute trace in goblin_gfx_probe.
-    bool fastMapOpen = true;          // key fast_map_open: skip redundant relayout on re-open + amortize the first open
-    bool nativeSelfDetach = true;     // key native_self_detach: bulk-detach our native markers at WMD dtor (lever C)
-    bool nativeViewportWindow = true; // key native_viewport_window: attach only near-view native markers (lever B)
+    bool debugLogging = false;        // key debug_logging: verbose diagnostics. LOGGING ONLY - it must never
+                                      // arm behaviour. Anything functional gets its own key below.
+    bool nativeMenuDevRows = false;   // key native_menu_dev_rows: append our diagnostic rows to the
+                                      // native menu (un-localized, for us, not for players).
+    bool nativeMenu = false;          // key native_menu: the in-game native menu (F8 opens it, F6 opens
+                                      // the graphics-screen host). Under development.
     // (icon/resource injection is unconditional - it IS how icons render without a gfx; no ini toggle.)
 
     bool showArmaments = true, showArmour = true, showAshesOfWar = true,
@@ -75,6 +76,7 @@ namespace goblin::config
 
     std::string uiLanguage = "auto";
     std::string overlayRenderMode = "surface";
+    uint8_t nativeMenuIcons = 2;  // which icon construction the native menu movie gets
     float fontScale = 1.0f;  // overlay text size multiplier (live io.FontGlobalScale)
     bool enableOverlay = true;
     float overlayOpacity = 1.0f;                 // overlay menu panel opacity (window bg alpha)
@@ -123,13 +125,12 @@ namespace
             {"Goblin", nullptr, false, {
                 B("require_map_fragments", requireMapFragments, "true",
                   "Require map fragment discovery before showing icons in that area"),
-                IniEntry{"fast_map_open", IniType::Bool, &cfg::fastMapOpen, "true",
-                         "BETA: makes the world map open faster when many icons are shown.\nTurn off if the map glitches or crashes.",
-                         false, "fast_map_reopen"},
-                B("native_self_detach", nativeSelfDetach, "true",
-                  "BETA: reduces the brief freeze when closing the world map.\nTurn off if the map glitches or crashes on close."),
-                B("native_viewport_window", nativeViewportWindow, "true",
-                  "BETA: only renders map icons near the visible area to reduce map\nstutter. Icons may pop in briefly when panning. Turn off to render all at once."),
+                // fast_map_open / native_self_detach / native_viewport_window used to live here as
+                // BETA toggles. They are compile-time variants now - see goblin_build_variants.hpp.
+                B("native_menu_dev_rows", nativeMenuDevRows, "false",
+                  "Adds our own diagnostic rows to the in-game menu. Development only."),
+                B("native_menu", nativeMenu, "false",
+                  "EXPERIMENTAL: in-game native menu drawn by the game itself.\nF8 opens it, F6 opens the graphics-screen variant."),
             }},
 
             {"Equipment", nullptr, false, {
@@ -273,7 +274,7 @@ namespace
                 // screen width (0.5 = centered); Y = the window TOP as a fraction of screen
                 // height (0 = flush top). Fractions keep the position sensible after a
                 // resolution/aspect change; W/H are in pixels (clamped to fit the screen).
-                IniEntry{"overlay_render_mode", IniType::Text, &cfg::overlayRenderMode, "surface", "How the overlay is drawn: surface (default, GPU-composited, low overhead, compatible with screen-recording and monitoring utilities), layered (CPU-composited, maximum compatibility but higher CPU/FPS cost), or swapchain (lightest, but some external utilities may not read it correctly). Change needs a game restart.", false, nullptr},
+                IniEntry{"overlay_render_mode", IniType::Text, &cfg::overlayRenderMode, "surface", "How the overlay is drawn: surface (default, GPU-composited, low overhead, compatible with screen-recording and monitoring utilities), layered (CPU-composited, maximum compatibility but higher CPU/FPS cost), swapchain (lightest, but some external utilities may not read it correctly), or swapchain_2 (EXPERIMENTAL: drawn inside the game's own frame with no separate window - best compatibility with Linux/Proton, frame generators and other overlays). Change needs a game restart.", false, nullptr},
                 IniEntry{"overlay_window_x", IniType::Float, &cfg::overlayWinX, "0.5", "Overlay menu horizontal CENTER, fraction of screen width (0.5 = centered). Auto-saved.", false, nullptr},
                 IniEntry{"overlay_window_y", IniType::Float, &cfg::overlayWinY, "0.03", "Overlay menu TOP edge, fraction of screen height (0.0 = top). Auto-saved.", false, nullptr},
                 IniEntry{"overlay_window_w", IniType::Float, &cfg::overlayWinW, "560", "Overlay menu window width in pixels (auto-saved, clamped to screen).", false, nullptr},
@@ -301,6 +302,13 @@ namespace
                 B("debug_logging", debugLogging, "false",
                   "Enable verbose debug logging (memory addresses, param details, FMG internals)"),
                 B("enable_marker_dump", enableMarkerDump, "false", "Master switch for the marker dump hotkey"),
+                IniEntry{"native_menu_icons", IniType::U8, &cfg::nativeMenuIcons, "2",
+                         "How the in-game (native) menu draws its category icons: 0 = none, "
+                         "1 = one strip behind a mask, 2 = one child per icon, 3 = drawn "
+                         "directly from our own pixels (edits no movie at all, so it survives "
+                         "game updates and overhaul mods). 1 and 2 rebuild the screen's movie "
+                         "when it loads, so changing between them needs a game restart.",
+                         false, nullptr},
                 IniEntry{"marker_dump_key", IniType::VkKey, &cfg::markerDumpKey, "F9",
                          "Key to dump decoded markers to logs/MapForGoblins_markers.log. Default: F9.", false, nullptr},
             }},
@@ -309,6 +317,21 @@ namespace
 
 #undef B
 #undef BE
+}
+
+const std::vector<const char *> &goblin::ini_retired_keys()
+{
+    // Retired 2026-07-27/28. The three map-open levers became compile-time build variants
+    // (goblin_build_variants.hpp) because nobody tuned them and a mod should work on install;
+    // native_markers was folded into the same variant switch so only one marker mechanism ships.
+    static const std::vector<const char *> keys = {
+        "fast_map_open",
+        "fast_map_reopen",  // the even older name of the same lever
+        "native_self_detach",
+        "native_viewport_window",
+        "native_markers",
+    };
+    return keys;
 }
 
 const std::vector<goblin::IniSection> &goblin::ini_schema()

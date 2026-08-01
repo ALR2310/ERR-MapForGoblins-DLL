@@ -59,12 +59,21 @@
     "IconPreviewShow": "Mostrar vista previa",
     "IconPreviewSize": "Tamaño (px)",
     "IconPreviewSource": "fuente: %d x %d px",
+    "ValueOn": "Sí",
+    "ValueOff": "No",
     "TabHidden": "Ocultos",
     "HiddenDisabled": "El ocultado manual está desactivado. Actívalo arriba.",
     "MegaLandsBetween": "Las Tierras Intermedias",
     "MegaDungeons": "El Subsuelo",
     "MegaShadow": "Tierras de la Sombra",
-    "ProgressFocusResetHint": "Para restablecer, pulsa '%s' en el menú"
+    "ProgressFocusResetHint": "Para restablecer, pulsa '%s' en el menú",
+    "MenuBack": "Atrás",
+    "MenuTools": "Herramientas",
+    "MenuTotal": "Total",
+    "MenuSaveNow": "Guardar ajustes",
+    "MenuUnavailable": "Pagina no disponible",
+    "MenuPressKey": "Pulsa una tecla...",
+    "MenuKeepCurrent": "Mantener actual"
   },
   "toasts": {
     "MapIconsOn": "Iconos del mapa: ACTIVADOS",

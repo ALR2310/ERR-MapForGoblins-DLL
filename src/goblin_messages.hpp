@@ -37,4 +37,8 @@ namespace goblin
     /// unchanged. MUST be called for every textId written into a live
     /// WorldMapPointParam row AFTER setup_messages() has run. Identity until then.
     int32_t remap_textid(int32_t encoded);
+
+    /// Diagnostic (debug_logging only): warns once per slot if the engine ever replaces a
+    /// MsgRepository slot we patched. Cheap; call it from any periodic tick.
+    void check_patched_slots();
 }

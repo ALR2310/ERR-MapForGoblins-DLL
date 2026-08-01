@@ -59,12 +59,21 @@
     "IconPreviewShow": "Показать просмотр",
     "IconPreviewSize": "Размер просмотра (px)",
     "IconPreviewSource": "источник: %d x %d px",
+    "ValueOn": "Вкл",
+    "ValueOff": "Выкл",
     "TabHidden": "Скрытые",
     "HiddenDisabled": "Ручное скрытие меток отключено. Включите его выше.",
     "MegaLandsBetween": "Междуземье",
     "MegaDungeons": "Подземелья",
     "MegaShadow": "Земли теней",
-    "ProgressFocusResetHint": "Для сброса нажмите '%s' в меню"
+    "ProgressFocusResetHint": "Для сброса нажмите '%s' в меню",
+    "MenuBack": "Назад",
+    "MenuTools": "Инструменты",
+    "MenuTotal": "Всего",
+    "MenuSaveNow": "Сохранить настройки",
+    "MenuUnavailable": "Страница недоступна",
+    "MenuPressKey": "Нажмите клавишу...",
+    "MenuKeepCurrent": "Оставить как есть"
   },
   "toasts": {
     "MapIconsOn": "Иконки карты: ВКЛ",

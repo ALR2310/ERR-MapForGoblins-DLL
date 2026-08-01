@@ -52,6 +52,12 @@ namespace goblin
     // The schema, built once.
     const std::vector<IniSection> &ini_schema();
 
+    // Keys this version deliberately RETIRED. An unclaimed key in a player's ini is normally kept,
+    // commented, so a value is never silently lost - but for keys we removed on purpose that would
+    // leave a comment block growing version after version. These are dropped from the file instead.
+    // Add a key here in the same change that removes it from the schema.
+    const std::vector<const char *> &ini_retired_keys();
+
     // Compile-time profile. The vanilla DLL is built with -DMFG_VANILLA.
     constexpr bool profile_is_vanilla()
     {

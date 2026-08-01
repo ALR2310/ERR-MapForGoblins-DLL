@@ -178,14 +178,33 @@ void goblin::ensure_ini(const std::filesystem::path &ini_path)
     if (had)
     {
         std::vector<std::string> dead;
+        std::vector<std::string> retired;
         for (auto const &sec_pair : existing)
         {
             const std::string &sname = sec_pair.first;
             for (auto const &kv : sec_pair.second)
             {
-                if (!consumed.count({to_lower(sname), to_lower(kv.first)}))
+                if (consumed.count({to_lower(sname), to_lower(kv.first)}))
+                    continue;
+                // A key WE retired is dropped outright: keeping it commented would leave the file
+                // accumulating a graveyard across versions. Anything else unclaimed is preserved as a
+                // comment, because it may be a value from a newer build or a key we are about to rename.
+                const std::string lkey = to_lower(kv.first);
+                bool is_retired = false;
+                for (const char *r : goblin::ini_retired_keys())
+                    if (lkey == to_lower(r)) { is_retired = true; break; }
+                if (is_retired)
+                    retired.push_back(kv.first);
+                else
                     dead.push_back("[" + sname + "] " + kv.first + " = " + kv.second);
             }
+        }
+        if (!retired.empty())
+        {
+            std::string names;
+            for (size_t i = 0; i < retired.size(); ++i)
+                names += (i ? ", " : "") + retired[i];
+            spdlog::info("Config: dropped {} retired setting(s) from the ini: {}", retired.size(), names);
         }
         if (!dead.empty())
         {

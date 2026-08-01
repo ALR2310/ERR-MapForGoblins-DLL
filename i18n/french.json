@@ -70,7 +70,9 @@
     "MenuTotal": "Total",
     "MenuUnavailable": "Page indisponible",
     "MenuPressKey": "Appuyez sur une touche...",
-    "MenuKeepCurrent": "Conserver"
+    "MenuKeepCurrent": "Conserver",
+    "MenuPressPad": "Appuyez sur un bouton de manette...",
+    "MenuUnbind": "Supprimer le raccourci"
   },
   "toasts": {
     "MapIconsOn": "Icônes de carte : ACTIVÉES",

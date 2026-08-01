@@ -70,7 +70,9 @@
     "MenuTotal": "Total",
     "MenuUnavailable": "This page is unavailable",
     "MenuPressKey": "Press a key...",
-    "MenuKeepCurrent": "Keep current"
+    "MenuKeepCurrent": "Keep current",
+    "MenuPressPad": "Press a gamepad button...",
+    "MenuUnbind": "Unbind"
   },
   "toasts": {
     "MapIconsOn": "Map icons: ON",
@@ -282,6 +284,6 @@
     "enable_manual_hide": "Hover a marker on the world map and press the hide key to hide it. Hidden markers persist and can be restored on the Hidden tab.",
     "hide_marker_key": "Key that hides the map marker currently under the cursor.",
     "hover_info": "While the map is open, show a small panel on the LEFT telling you how far above or\nbelow you the marker under the cursor sits. Its name is not repeated there - the\ngame's own popup already shows it.",
-    "hide_marker_gamepad": "Gamepad button that hides the map marker under the cursor (same as the hide-marker key)."
+    "hide_marker_gamepad": "Gamepad button that hides the map marker under the cursor (same as the hide-marker key). RB is also the map's own tab-switch button, so it is easy to press by accident - set this to \"none\" to unbind it."
   }
 }

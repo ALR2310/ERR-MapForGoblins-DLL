@@ -770,7 +770,9 @@ void hotkey_loop()
                 spdlog::info("Marker dump OK: {} markers", count);
             else
                 spdlog::error("Marker dump failed (code {})", count);
-            goblin::show_codex_toast(goblin::g_toast_param_row_id[
+            // QUEUED, not fired: this is the dump hotkey's own polling thread, and the popup
+            // routine behind the toast is UI-thread state (see queue_codex_toast).
+            goblin::queue_codex_toast(goblin::g_toast_param_row_id[
                 count >= 0 ? goblin::TOAST_DUMP_OK : goblin::TOAST_DUMP_FAIL]);
         }
         prev_down = down;

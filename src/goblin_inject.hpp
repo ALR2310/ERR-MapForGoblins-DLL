@@ -92,7 +92,10 @@ namespace goblin
     constexpr uint64_t NATIVE_HIGHLIGHT_KEY_BIT = 1ull << 62;
     constexpr size_t NATIVE_RING_POOL = 128;
 
-    std::vector<NativeMarkerPoint> native_marker_snapshot(int layer);
+    // include_hidden: still return every row when the master switch is off, each one forced
+    // invisible. The marker manager needs that (a row it never created cannot be switched back
+    // on without reopening the map); the hover pick and the rings want the default empty answer.
+    std::vector<NativeMarkerPoint> native_marker_snapshot(int layer, bool include_hidden = false);
 
     // Live row of the VISIBLE native marker nearest the map reticle, within a
     // pin-sized radius - or nullptr. The reticle is NOT assumed to be the screen
@@ -273,8 +276,19 @@ namespace goblin
 
     // Fire an upper-left codex-style toast for one of the injected TutorialParam
     // rows (pass a goblin::g_toast_param_row_id[...] value). Static text, no FMG
-    // rewrite - same path as the F10 banner. Safe from any thread once init has run.
+    // rewrite - same path as the F10 banner.
+    // ONLY CALL THIS FROM THE UI THREAD. It runs the game's own tutorial-popup routine, which
+    // builds on-screen menu state; the "safe from any thread" this comment used to claim was
+    // wrong. Measured 2026-07-31 in a player log: with menu_enabled=false the toggle key is the
+    // icon master switch, the user flipped it seven times in eighteen seconds, every flip fired
+    // this from the 10 ms polling thread, and 0.8 s after the last one the game died in Scaleform
+    // (exe+0x1177413, a null container). Off-thread callers must use queue_codex_toast.
     void show_codex_toast(int tutorial_id);
+
+    // Thread-safe request for the toast above: stores the id and returns. pump_codex_toast()
+    // fires it from the UI thread (the CSMenuMan::updateTask detour drives it).
+    void queue_codex_toast(int tutorial_id);
+    void pump_codex_toast();
 
     // Background thread polling the toggle hotkey.
     void toggle_hotkey_loop();

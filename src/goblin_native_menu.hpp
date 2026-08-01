@@ -135,8 +135,14 @@ namespace goblin::nmenu
     // while this is true and hands the result back. Keeping the polling in the host keeps
     // the model free of Windows input, and lets the same page serve a gamepad combo later.
     bool rebind_pending();
+    // Which kind of binding the open page is editing - the host polls the keyboard or XInput
+    // accordingly. ("lets the same page serve a gamepad combo later" above: that is now.)
+    bool rebind_is_pad();
     // Apply the captured virtual-key code (0 = the player cancelled) and leave the page.
     void rebind_apply(uint32_t vk);
+    // Apply a captured gamepad combo and leave the page. 0 is NOT a cancel here - it is the
+    // unbind the Unbind row asks for; cancelling is the page's Back row.
+    void rebind_apply_pad(uint16_t mask);
 
     // The press that FINISHES a rebind is still a press of that key, so whatever the key now does
     // would fire immediately - bind the overlay key and the overlay opens on the spot. rebind_apply

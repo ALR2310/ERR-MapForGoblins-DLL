@@ -181,7 +181,15 @@ static int crash_fmt_addr(char *buf, uintptr_t addr)
     return crash_hex64(buf, addr);
 }
 
-// ── write watch (HUD investigation) ──────────────────────────────────────────────────────────────
+// ── write watch (HUD investigation) - DEV BUILDS ONLY ────────────────────────────────────────────
+// Compiled out of shipping builds since 2026-08-01. What it does - OpenThread, SuspendThread,
+// GetThreadContext(CONTEXT_DEBUG_REGISTERS), write Dr0/Dr7, SetThreadContext, then a vectored
+// handler reading Dr6 - is a textbook anti-debug/rootkit shape sitting in .text, and VirusTotal's
+// behaviour tab tags the DLL `detect-debug-environment` (report 13). It answered its question (who
+// clears the menu-state bytes) long ago and has ONE caller. Imports do not change either way -
+// MinHook already pulls Suspend/Get/SetThreadContext - so this is about the code pattern, not the
+// import table. Rebuild with -DMFG_STALL_PROFILER=1 to get it back for an investigation.
+#if MFG_STALL_PROFILER
 // Static searching could not name the code that clears the menu-state bytes: the offsets are generic and
 // there are a thousand candidates. So catch the writer in the act - a hardware data breakpoint on the one
 // byte we know the game clears, and log the instruction that trips it. Debug only, armed on request from
@@ -257,6 +265,10 @@ namespace goblin::watch
         arm(addr, tid);
     }
 }
+#else
+// Shipping: the callers are compiled out too (goblin_gfx_probe's tick and one site in
+// goblin_stall_probe), so nothing here needs a stub.
+#endif // MFG_STALL_PROFILER
 
 // One record: a header line with the label, the code and the faulting address, then the stack.
 static void crash_write_record(const char *label, DWORD code, uintptr_t fault)
@@ -288,6 +300,10 @@ static void crash_write_record(const char *label, DWORD code, uintptr_t fault)
 static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
 {
     // The watch fires as a single-step with the DR6 hit bit set. Log who wrote, then carry on.
+    // Only this BRANCH is dev-gated - the crash logging below it is what players send us and must
+    // stay in every build. Reading Dr6 here is half of the debug-register pattern the shipping
+    // binary no longer carries.
+#if MFG_STALL_PROFILER
     if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
         goblin::watch::g_addr.load(std::memory_order_acquire) &&
         (ep->ContextRecord->Dr6 & 0xF) != 0)
@@ -342,6 +358,7 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
         }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+#endif // MFG_STALL_PROFILER
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     switch (code) // genuinely fatal codes only
     {

@@ -31616,7 +31616,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 15000,
         .textDisableFlagId3 = 400321,
         .selectMinZoomStep = 1,
-    }, Category::QuestProgression, -1, -1, nullptr, 113210u, 2, 4.193f, 440.614f},
+    }, Category::QuestProgression, -1, -1, nullptr, 113210u, 1, 4.193f, 440.614f},
     // Row ID 800012
     {800012ull, {
         .iconId = 43,
@@ -32078,7 +32078,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700121900,
         .textDisableFlagId2 = 400130,
         .selectMinZoomStep = 1,
-    }, Category::QuestProgression, -1, -1, nullptr, 111300u, 2, -102.314f, -117.415f},
+    }, Category::QuestProgression, -1, -1, nullptr, 111300u, 1, -102.314f, -117.415f},
     // Row ID 800041
     {800041ull, {
         .iconId = 43,
@@ -32208,7 +32208,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700130900,
         .textDisableFlagId2 = 400181,
         .selectMinZoomStep = 1,
-    }, Category::QuestProgression, -1, -1, nullptr, 111815u, 2, -13.411f, 53.512f},
+    }, Category::QuestProgression, -1, -1, nullptr, 111815u, 1, -13.411f, 53.512f},
     // Row ID 800050
     {800050ull, {
         .iconId = 43,
@@ -32522,7 +32522,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700140300,
         .textDisableFlagId2 = 400710,
         .selectMinZoomStep = 1,
-    }, Category::QuestProgression, -1, -1, nullptr, 117100u, 2, -0.590f, -80.270f},
+    }, Category::QuestProgression, -1, -1, nullptr, 117100u, 1, -0.590f, -80.270f},
     // Row ID 800072
     {800072ull, {
         .iconId = 43,
@@ -32538,7 +32538,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700140300,
         .textDisableFlagId2 = 400710,
         .selectMinZoomStep = 1,
-    }, Category::QuestProgression, -1, -1, nullptr, 117100u, 2, -0.590f, -80.060f},
+    }, Category::QuestProgression, -1, -1, nullptr, 117100u, 1, -0.590f, -80.060f},
     // Row ID 900000
     {900000ull, {
         .iconId = 13,
@@ -41427,7 +41427,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 12050,
         .textDisableFlagId3 = 400037,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmaments, -1, -1, nullptr, 110300u, 2, 1614.660f, 1237.590f},
+    }, Category::EquipArmaments, -1, -1, nullptr, 110300u, 1, 1614.660f, 1237.590f},
     // Row ID 2400047
     {2400047ull, {
         .iconId = 2,
@@ -43114,7 +43114,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700121600,
         .textDisableFlagId2 = 400158,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmaments, -1, -1, nullptr, 111500u, 2, -32.193f, 31.880f},
+    }, Category::EquipArmaments, -1, -1, nullptr, 111500u, 1, -32.193f, 31.880f},
     // Row ID 2400156
     {2400156ull, {
         .iconId = 2,
@@ -43536,7 +43536,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700133300,
         .textDisableFlagId2 = 400361,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmaments, -1, -1, nullptr, 113601u, 2, -34.005f, 96.449f},
+    }, Category::EquipArmaments, -1, -1, nullptr, 113601u, 1, -34.005f, 96.449f},
     // Row ID 2400185
     {2400185ull, {
         .iconId = 2,
@@ -47140,7 +47140,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 31110,
         .textDisableFlagId3 = 400431,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114311u, 2, 19.820f, 169.455f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114311u, 1, 19.820f, 169.455f},
     // Row ID 2500108
     {2500108ull, {
         .iconId = 3,
@@ -47157,7 +47157,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 31110,
         .textDisableFlagId3 = 400431,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114312u, 2, 19.820f, 169.455f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114312u, 1, 19.820f, 169.455f},
     // Row ID 2500109
     {2500109ull, {
         .iconId = 3,
@@ -47174,7 +47174,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 31110,
         .textDisableFlagId3 = 400431,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114313u, 2, 19.820f, 169.455f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114313u, 1, 19.820f, 169.455f},
     // Row ID 2500110
     {2500110ull, {
         .iconId = 3,
@@ -47191,7 +47191,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 31110,
         .textDisableFlagId3 = 400431,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114310u, 2, 19.820f, 169.455f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114310u, 1, 19.820f, 169.455f},
     // Row ID 2500111
     {2500111ull, {
         .iconId = 3,
@@ -47714,7 +47714,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700121600,
         .textDisableFlagId2 = 400158,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111501u, 2, -32.193f, 31.880f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111501u, 1, -32.193f, 31.880f},
     // Row ID 2500145
     {2500145ull, {
         .iconId = 3,
@@ -47730,7 +47730,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700121600,
         .textDisableFlagId2 = 400158,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111502u, 2, -32.193f, 31.880f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111502u, 1, -32.193f, 31.880f},
     // Row ID 2500146
     {2500146ull, {
         .iconId = 3,
@@ -47746,7 +47746,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700121600,
         .textDisableFlagId2 = 400158,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111503u, 2, -32.193f, 31.880f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111503u, 1, -32.193f, 31.880f},
     // Row ID 2500147
     {2500147ull, {
         .iconId = 3,
@@ -47762,7 +47762,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131600,
         .textDisableFlagId2 = 400107,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111001u, 2, -3.653f, 41.808f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111001u, 1, -3.653f, 41.808f},
     // Row ID 2500148
     {2500148ull, {
         .iconId = 3,
@@ -47890,7 +47890,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700122800,
         .textDisableFlagId2 = 400412,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114101u, 2, 131.259f, -60.252f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114101u, 1, 131.259f, -60.252f},
     // Row ID 2500157
     {2500157ull, {
         .iconId = 3,
@@ -47906,7 +47906,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700122800,
         .textDisableFlagId2 = 400412,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114102u, 2, 131.259f, -60.252f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114102u, 1, 131.259f, -60.252f},
     // Row ID 2500158
     {2500158ull, {
         .iconId = 3,
@@ -47922,7 +47922,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700122800,
         .textDisableFlagId2 = 400412,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114103u, 2, 131.259f, -60.252f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114103u, 1, 131.259f, -60.252f},
     // Row ID 2500159
     {2500159ull, {
         .iconId = 3,
@@ -47938,7 +47938,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700122800,
         .textDisableFlagId2 = 400412,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114100u, 2, 131.259f, -60.252f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114100u, 1, 131.259f, -60.252f},
     // Row ID 2500160
     {2500160ull, {
         .iconId = 3,
@@ -48244,7 +48244,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700111100,
         .textDisableFlagId2 = 400441,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114411u, 2, 5.022f, -69.466f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114411u, 1, 5.022f, -69.466f},
     // Row ID 2500181
     {2500181ull, {
         .iconId = 3,
@@ -48260,7 +48260,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700111100,
         .textDisableFlagId2 = 400441,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114412u, 2, 5.022f, -69.466f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114412u, 1, 5.022f, -69.466f},
     // Row ID 2500182
     {2500182ull, {
         .iconId = 3,
@@ -48276,7 +48276,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700111100,
         .textDisableFlagId2 = 400441,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 114410u, 2, 5.022f, -69.466f},
+    }, Category::EquipArmour, -1, -1, nullptr, 114410u, 1, 5.022f, -69.466f},
     // Row ID 2500183
     {2500183ull, {
         .iconId = 3,
@@ -49106,7 +49106,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131801,
         .textDisableFlagId2 = 400164,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111611u, 2, 90.099f, 101.079f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111611u, 1, 90.099f, 101.079f},
     // Row ID 2500241
     {2500241ull, {
         .iconId = 3,
@@ -49122,7 +49122,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131801,
         .textDisableFlagId2 = 400164,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111612u, 2, 90.099f, 101.079f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111612u, 1, 90.099f, 101.079f},
     // Row ID 2500242
     {2500242ull, {
         .iconId = 3,
@@ -49138,7 +49138,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131801,
         .textDisableFlagId2 = 400164,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111613u, 2, 90.099f, 101.079f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111613u, 1, 90.099f, 101.079f},
     // Row ID 2500243
     {2500243ull, {
         .iconId = 3,
@@ -49154,7 +49154,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131801,
         .textDisableFlagId2 = 400164,
         .selectMinZoomStep = 1,
-    }, Category::EquipArmour, -1, -1, nullptr, 111610u, 2, 90.099f, 101.079f},
+    }, Category::EquipArmour, -1, -1, nullptr, 111610u, 1, 90.099f, 101.079f},
     // Row ID 2500244
     {2500244ull, {
         .iconId = 3,
@@ -50326,7 +50326,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 16000,
         .textDisableFlagId3 = 400091,
         .selectMinZoomStep = 1,
-    }, Category::EquipTalismans, -1, -1, nullptr, 110910u, 2, 6.236f, -136.893f},
+    }, Category::EquipTalismans, -1, -1, nullptr, 110910u, 1, 6.236f, -136.893f},
     // Row ID 2600033
     {2600033ull, {
         .iconId = 62,
@@ -58085,7 +58085,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 12010,
         .textDisableFlagId3 = 400918,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119085u, 2, -14.966f, -34.848f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119085u, 1, -14.966f, -34.848f},
     // Row ID 3700001
     {3700001ull, {
         .iconId = 37,
@@ -58102,7 +58102,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 12070,
         .textDisableFlagId3 = 400917,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119080u, 2, 1263.398f, 1524.262f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119080u, 1, 1263.398f, 1524.262f},
     // Row ID 3700002
     {3700002ull, {
         .iconId = 37,
@@ -58119,7 +58119,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId3 = 12050,
         .textDisableFlagId3 = 400919,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119090u, 2, 1571.074f, 1144.122f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119090u, 1, 1571.074f, 1144.122f},
     // Row ID 3700003
     {3700003ull, {
         .iconId = 37,
@@ -58135,7 +58135,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131600,
         .textDisableFlagId2 = 400106,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 111000u, 2, -3.653f, 41.808f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 111000u, 1, -3.653f, 41.808f},
     // Row ID 3700004
     {3700004ull, {
         .iconId = 37,
@@ -58151,7 +58151,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180107,
         .textDisableFlagId2 = 400907,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119030u, 2, 96.277f, 46.730f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119030u, 1, 96.277f, 46.730f},
     // Row ID 3700005
     {3700005ull, {
         .iconId = 37,
@@ -58167,7 +58167,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180108,
         .textDisableFlagId2 = 400908,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119035u, 2, 17.519f, -10.720f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119035u, 1, 17.519f, -10.720f},
     // Row ID 3700006
     {3700006ull, {
         .iconId = 37,
@@ -58183,7 +58183,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700133000,
         .textDisableFlagId2 = 400209,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 112000u, 2, -44.238f, -0.010f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 112000u, 1, -44.238f, -0.010f},
     // Row ID 3700007
     {3700007ull, {
         .iconId = 37,
@@ -58199,7 +58199,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180111,
         .textDisableFlagId2 = 400911,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119050u, 2, -66.603f, 46.277f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119050u, 1, -66.603f, 46.277f},
     // Row ID 3700008
     {3700008ull, {
         .iconId = 37,
@@ -58215,7 +58215,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180105,
         .textDisableFlagId2 = 400905,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119020u, 2, 35.646f, -125.473f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119020u, 1, 35.646f, -125.473f},
     // Row ID 3700009
     {3700009ull, {
         .iconId = 37,
@@ -58231,7 +58231,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700133300,
         .textDisableFlagId2 = 400360,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 113600u, 2, -34.005f, 96.449f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 113600u, 1, -34.005f, 96.449f},
     // Row ID 3700010
     {3700010ull, {
         .iconId = 37,
@@ -58247,7 +58247,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180110,
         .textDisableFlagId2 = 400910,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119045u, 2, 103.022f, 124.636f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119045u, 1, 103.022f, 124.636f},
     // Row ID 3700011
     {3700011ull, {
         .iconId = 37,
@@ -58263,7 +58263,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180106,
         .textDisableFlagId2 = 400906,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119025u, 2, 6.938f, 100.063f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119025u, 1, 6.938f, 100.063f},
     // Row ID 3700012
     {3700012ull, {
         .iconId = 37,
@@ -58279,7 +58279,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180103,
         .textDisableFlagId2 = 400903,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119010u, 2, 109.188f, -99.508f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119010u, 1, 109.188f, -99.508f},
     // Row ID 3700013
     {3700013ull, {
         .iconId = 37,
@@ -58295,7 +58295,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180000,
         .textDisableFlagId2 = 400049,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 110410u, 2, -56.955f, 91.424f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 110410u, 1, -56.955f, 91.424f},
     // Row ID 3700014
     {3700014ull, {
         .iconId = 37,
@@ -58311,7 +58311,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180109,
         .textDisableFlagId2 = 400909,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119040u, 2, -21.175f, 1.330f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119040u, 1, -21.175f, 1.330f},
     // Row ID 3700015
     {3700015ull, {
         .iconId = 37,
@@ -58327,7 +58327,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180104,
         .textDisableFlagId2 = 400904,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119015u, 2, 74.512f, -110.605f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119015u, 1, 74.512f, -110.605f},
     // Row ID 3700016
     {3700016ull, {
         .iconId = 37,
@@ -58343,7 +58343,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180112,
         .textDisableFlagId2 = 400912,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119055u, 2, -28.623f, 19.259f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119055u, 1, -28.623f, 19.259f},
     // Row ID 3700017
     {3700017ull, {
         .iconId = 37,
@@ -58359,7 +58359,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180115,
         .textDisableFlagId2 = 400915,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119070u, 2, -88.673f, -78.510f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119070u, 1, -88.673f, -78.510f},
     // Row ID 3700018
     {3700018ull, {
         .iconId = 37,
@@ -58375,7 +58375,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180113,
         .textDisableFlagId2 = 400913,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119060u, 2, -77.253f, -15.400f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119060u, 1, -77.253f, -15.400f},
     // Row ID 3700019
     {3700019ull, {
         .iconId = 37,
@@ -58391,7 +58391,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700180116,
         .textDisableFlagId2 = 400916,
         .selectMinZoomStep = 1,
-    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119075u, 2, -38.944f, -61.411f},
+    }, Category::LootMerchantBellBearings, -1, -1, nullptr, 119075u, 1, -38.944f, -61.411f},
     // Row ID 3800000
     {3800000ull, {
         .iconId = 53,
@@ -60613,7 +60613,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700131401,
         .textDisableFlagId2 = 400452,
         .selectMinZoomStep = 1,
-    }, Category::LootGoldenRunes, -1, -1, nullptr, 104512u, 2, 43.275f, 4.794f},
+    }, Category::LootGoldenRunes, -1, -1, nullptr, 104512u, 1, 43.275f, 4.794f},
     // Row ID 3900140
     {3900140ull, {
         .iconId = 19,
@@ -95182,7 +95182,7 @@ const MapEntry MAP_ENTRIES[] = {
         .textId2 = 700133000,
         .textDisableFlagId2 = 400209,
         .selectMinZoomStep = 1,
-    }, Category::LootCraftingMaterials, -1, -1, nullptr, 112001u, 2, -44.238f, -0.010f},
+    }, Category::LootCraftingMaterials, -1, -1, nullptr, 112001u, 1, -44.238f, -0.010f},
     // Row ID 5700322
     {5700322ull, {
         .iconId = 11,

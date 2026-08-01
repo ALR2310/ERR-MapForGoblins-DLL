@@ -1657,10 +1657,18 @@ static void refresh_deoverlap(int layer)
     }
 }
 
-std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
+std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer, bool include_hidden)
 {
     std::vector<NativeMarkerPoint> out;
-    if (layer < 0 || layer > 2 || icons_hidden()) return out;
+    if (layer < 0 || layer > 2) return out;
+    // Master switch off: the hover pick and the focus rings want NOTHING back - an empty snapshot
+    // is what keeps tooltips and rings off icons the player just switched away. The marker manager
+    // asks with include_hidden instead, because a row that never got CREATED cannot be switched
+    // back on without reopening the map, and that is exactly the bug this argument exists for.
+    // Those rows come back PARKED: `hidden` forces every point invisible here, so nothing shows
+    // until the switch goes on again and the next merge re-reads the real visibility.
+    const bool hidden = icons_hidden();
+    if (hidden && !include_hidden) return out;
     out.reserve(g_category_rows.size());
     const int focus = g_focus_category;
     // Pull crowded markers apart FIRST, from the set that is visible on this layer right now, so the
@@ -1675,7 +1683,7 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
         // (the layer match is part of `visible`, not a row filter).
         if (!cr.p || cr.original_row_id == 0 ||
             !native_category_migrated(cr.cat)) continue;
-        const bool visible = g_vis[idx] != 0;  // answered once, by the refresh above
+        const bool visible = !hidden && g_vis[idx] != 0;  // answered once, by the refresh above
         const int source_icon = goblin::gfx_probe::source_iconid(cr.p->iconId);
         if (source_icon < 0) continue;
         out.push_back({cr.original_row_id, source_icon, cr.native_area, cr.native_layer,
@@ -1727,7 +1735,7 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
                 rp.gz = hp.gz;
                 rp.px = hp.px;
                 rp.pz = hp.pz;
-                rp.visible = hp.layer == layer;
+                rp.visible = !hidden && hp.layer == layer;
             }
             else
             {
@@ -2363,11 +2371,30 @@ static void seh_fire_toast(int tutorial_id)
     __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
-// Fire the upper-left codex toast for the icons ON/OFF toggle.
+// The toast the toggle asks for, handed to the UI thread. 0 = nothing pending. One slot is
+// enough: the toggle is a two-state announcement, so a flip that overtakes an unfired one has
+// simply superseded it - showing the stale state would be worse than dropping it.
+static std::atomic<int> g_pending_toast{0};
+
+void goblin::queue_codex_toast(int tutorial_id)
+{
+    g_pending_toast.store(tutorial_id, std::memory_order_release);
+}
+
+void goblin::pump_codex_toast()
+{
+    const int id = g_pending_toast.exchange(0, std::memory_order_acq_rel);
+    if (id)
+        seh_fire_toast(id);
+}
+
+// Ask for the upper-left codex toast for the icons ON/OFF toggle. QUEUED, not fired: this runs on
+// menu_auto_toggle_loop's polling thread, and the popup routine it ends in is UI-thread state.
 static void show_toggle_banner(bool icons_on)
 {
-    spdlog::info("[TOAST] fire (icons {})", icons_on ? "ON" : "OFF");
-    seh_fire_toast(goblin::g_toast_param_row_id[icons_on ? goblin::TOAST_ON : goblin::TOAST_OFF]);
+    spdlog::info("[TOAST] queue (icons {})", icons_on ? "ON" : "OFF");
+    goblin::queue_codex_toast(
+        goblin::g_toast_param_row_id[icons_on ? goblin::TOAST_ON : goblin::TOAST_OFF]);
 }
 
 // Fire an upper-left codex toast for one of the injected TutorialParam rows

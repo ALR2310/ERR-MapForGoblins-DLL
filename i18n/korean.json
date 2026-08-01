@@ -70,7 +70,9 @@
     "MenuTotal": "합계",
     "MenuUnavailable": "사용할 수 없는 페이지입니다",
     "MenuPressKey": "키를 누르세요...",
-    "MenuKeepCurrent": "현재 값 유지"
+    "MenuKeepCurrent": "현재 값 유지",
+    "MenuPressPad": "Press a gamepad button...",
+    "MenuUnbind": "Unbind"
   },
   "toasts": {
     "MapIconsOn": "지도 아이콘: 켬",

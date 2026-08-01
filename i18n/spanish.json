@@ -70,7 +70,9 @@
     "MenuTotal": "Total",
     "MenuUnavailable": "Pagina no disponible",
     "MenuPressKey": "Pulsa una tecla...",
-    "MenuKeepCurrent": "Mantener actual"
+    "MenuKeepCurrent": "Mantener actual",
+    "MenuPressPad": "Pulsa un botón del mando...",
+    "MenuUnbind": "Quitar asignación"
   },
   "toasts": {
     "MapIconsOn": "Iconos del mapa: ACTIVADOS",

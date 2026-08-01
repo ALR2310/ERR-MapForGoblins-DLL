@@ -1191,8 +1191,18 @@ def main():
         # Each sub-entry may have its own getItemFlagId (one-time unique drops)
         is_enemy = tr.get('source') == 'enemy'
         lots_to_check = []
+        # WHICH PARAM these items actually came out of. Not the same question as "is this an enemy
+        # drop": NpcParam has two death-lot fields, itemLotId_map and itemLotId_enemy, and the
+        # paramdef says to set only one - vanilla's named NPCs (merchants, Blaidd, Sellen, Lusat,
+        # Igon...) use the MAP one. Deciding the runtime lotType from tr['source'] instead labelled
+        # every such drop "enemy", so the DLL looked those ids up in ItemLotParam_enemy, where they
+        # do not exist, and the live-loot refresh missed on 50 markers per profile while logging an
+        # ERROR line each time. The two params share one id space, so this must be recorded, never
+        # guessed and never cross-fallen-back to.
+        lot_param = None
 
         if (is_enemy or tr.get('source') == 'emevd') and lot_id in item_lots_enemy:
+            lot_param = 'enemy'
             # Scan base + sequential sub-lots, STOPPING at the first gap.
             # Without the break, the scan walks across the gap and picks up
             # sub-lots that belong to a *different* NpcParam's chain - e.g.
@@ -1205,6 +1215,7 @@ def main():
                     break  # gap in sequence - chain belongs to another NPC
                 lots_to_check.append((lot_id + offset, sub_lot))
         elif lot_id in item_lots:
+            lot_param = 'map'
             # Treasure: scan base + sequential sub-lots (chests can have multiple items)
             # Stop at sub-lots that are themselves another treasure's base lot
             lots_to_check.append((lot_id, item_lots[lot_id]))
@@ -1219,6 +1230,7 @@ def main():
         else:
             lot = item_lots_enemy.get(lot_id)
             if lot:
+                lot_param = 'enemy'
                 lots_to_check.append((lot_id, lot))
 
         if not lots_to_check:
@@ -1260,6 +1272,10 @@ def main():
                     'source': tr.get('source', 'treasure'),
                     'guaranteed': lot_is_guaranteed(sub_lot),
                 }
+                if lot_param:
+                    # Same param as the base lot - a sub-lot is by definition the next row in the
+                    # very chain the base was scanned from.
+                    sub_record['lotParam'] = lot_param
                 if tr.get('enemyModel'):
                     sub_record['enemyModel'] = tr['enemyModel']
                 if tr.get('npcParamId'):
@@ -1293,6 +1309,8 @@ def main():
             'source': tr.get('source', 'treasure'),
             'guaranteed': lot_is_guaranteed(base_lot),
         }
+        if lot_param:
+            record['lotParam'] = lot_param  # which ItemLotParam these items were read from
         if tr.get('enemyModel'):
             record['enemyModel'] = tr['enemyModel']
         if tr.get('npcParamId'):

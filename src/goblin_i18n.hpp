@@ -90,6 +90,8 @@ namespace goblin::i18n
         MenuTotal,
         MenuUnavailable,
         MenuPressKey,
+        MenuPressPad,     // same screen, entered from a gamepad-combo entry
+        MenuUnbind,       // clears a binding outright (a pad button has no "Escape")
         MenuKeepCurrent,
     };
 

@@ -148,8 +148,29 @@ static int32_t fmg_max_id(uint8_t *fmg)
     if (grp_cnt == 0 || grp_cnt > 0x100000) return -1;
     auto *groups = reinterpret_cast<FmgGroup *>(fmg + 0x28);
     int32_t mx = -1;
+    // Ignore implausible group ids. Measured on ERR 2026-08-01: one PlaceName group carries
+    // last_id = INT32_MAX, which made this return 2147483647, so the caller's "allocate fresh ids
+    // above the max" started at INT32_MAX+1, tripped its own headroom guard on the FIRST entry and
+    // allocated NOTHING - the log read "allocated 0 fresh ids ... for 20841 queued strings" on
+    // every ERR startup, and the ids fell back to the original encoded ones with no collision
+    // protection at all. Real FMG ids are in the millions; a billion is already far outside
+    // anything the game or an overhaul ships, so a value at or above it is padding or a sentinel,
+    // never content.
+    constexpr int32_t kImplausibleId = 1'000'000'000;
+    uint32_t skipped = 0;
     for (uint32_t g = 0; g < grp_cnt; g++)
-        if (groups[g].last_id > mx) mx = groups[g].last_id;
+    {
+        const int32_t last = groups[g].last_id;
+        if (last >= kImplausibleId)
+        {
+            ++skipped;
+            continue;
+        }
+        if (last > mx) mx = last;
+    }
+    if (skipped)
+        spdlog::info("[FMG] max-id scan skipped {} group(s) with a sentinel last_id (>= {}); "
+                     "real max = {}", skipped, kImplausibleId, mx);
     return mx;
 }
 

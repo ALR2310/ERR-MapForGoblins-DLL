@@ -47,9 +47,9 @@
 #include "goblin_inject.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_build_variants.hpp" // which overlay backend is in this build
-// goblin_maphover.hpp / goblin_mapproject.hpp / goblin_collected.hpp were included here for the
-// hover panel, the highlight-ring projection and the height readout. All three went away with the
-// on-map overlay drawing (2026-07-28) and no symbol from them is referenced in this file any more.
+// goblin_mapproject.hpp / goblin_collected.hpp were included here for the highlight-ring
+// projection and the height readout; both went away with the on-map overlay drawing (2026-07-28).
+#include "goblin_maphover.hpp" // back 2026-08-01: map_dialog() gates the pad combo's grace window
 #include "goblin_messages.hpp"   // lookup_text() for marker names in the menu
 #include "goblin_progress.hpp"
 #include "modutils.hpp" // hook GetRawInputData (menu input-leak block)
@@ -2309,11 +2309,122 @@ HCURSOR WINAPI hk_SetCursor(HCURSOR c)
 // the game keeps polling the slot - returning ERROR_DEVICE_NOT_CONNECTED makes games drop
 // the pad and stop polling it, killing the gamepad even after the menu closes. Our own
 // poll_gamepad reads the real pad via the o_ trampoline.
+// Is our open-combo held right now, and should its buttons be kept from the game?
+// LATCHED: once the full combo is seen, its bits stay hidden until EVERY one of them is
+// released. Without the latch the game would see a release edge the moment we start hiding,
+// and a release edge is an action too.
+std::atomic<bool> g_combo_latched{false};
+// While the MAP is open the combo's buttons are held back from the game for a moment before it
+// may see them, so a chord that is on its way can still win. Long enough to cover a human's
+// two-button press, short enough that a deliberate single press does not feel broken.
+constexpr uint64_t kComboGraceMs = 120;
+// A tap SHORTER than the grace was hidden for its whole life and would otherwise be lost - the
+// player would press Y on the map and nothing at all would happen. So it is not swallowed, it is
+// DELAYED: on release we hand the game the press it never saw, held on for this long so it reads
+// as a real press followed by a release across several polls.
+constexpr uint64_t kComboReplayMs = 80;
+uint64_t g_combo_pending_since = 0; // 0 = no partial chord in flight
+WORD g_combo_pending_bits = 0;      // what we are holding back, so a short tap can be replayed
+bool g_combo_gave_up = false;       // grace expired: pass the buttons through until all are up
+uint64_t g_combo_replay_until = 0;  // 0 = not replaying a swallowed tap
+WORD g_combo_replay_bits = 0;
+
+// Returns the combo bits to KEEP FROM the game; `force_on` comes back with bits to hand it
+// instead (the delayed replay of a tap too short to have been passed through live).
+static uint16_t combo_bits_to_hide(WORD held, WORD &force_on)
+{
+    const uint16_t mask = goblin::config::toggleGamepadMask;
+    // Only in the native menu mode: there the combo opens OUR in-game screen, and the same two
+    // buttons are live game actions on the map (the reporter's Y + R3 both do something there).
+    // In the ImGui backend the branch above hides the whole pad anyway.
+    if (!mask || !goblin::config::menuEnabled || goblin::config::overlay_menu_enabled())
+        return 0;
+
+    const WORD in_combo = static_cast<WORD>(held & mask);
+    const uint64_t tick = GetTickCount64();
+    if (in_combo == 0)
+    {
+        // Nothing held. If a partial chord was still inside its grace when it ended, the game never
+        // saw that press at all - owe it back now rather than lose it. (Not owed if the grace had
+        // already expired: the buttons were passed through live from that moment.)
+        if (g_combo_pending_since != 0 && !g_combo_gave_up &&
+            !g_combo_latched.load(std::memory_order_relaxed))
+        {
+            g_combo_replay_bits = g_combo_pending_bits;
+            g_combo_replay_until = tick + kComboReplayMs;
+        }
+        g_combo_latched.store(false, std::memory_order_relaxed);
+        g_combo_pending_since = 0;
+        g_combo_pending_bits = 0;
+        g_combo_gave_up = false;
+        if (g_combo_replay_until != 0)
+        {
+            if (tick < g_combo_replay_until)
+            {
+                force_on = g_combo_replay_bits;  // the delayed press, on its way to the game
+                return 0;
+            }
+            g_combo_replay_until = 0;            // and its release edge
+            g_combo_replay_bits = 0;
+        }
+        return 0;
+    }
+    g_combo_replay_until = 0;  // a new press supersedes any replay still in flight
+    g_combo_replay_bits = 0;
+    if (in_combo == mask)
+    {
+        g_combo_latched.store(true, std::memory_order_relaxed);
+        g_combo_pending_since = 0;
+        g_combo_pending_bits = 0;
+        g_combo_gave_up = false;
+        return mask;
+    }
+    if (g_combo_latched.load(std::memory_order_relaxed))
+        return mask; // chord seen; stay hidden until every button is released
+
+    // PARTIAL chord. Off the map, let it through at once - the whole point of hiding is that the
+    // map binds both of our buttons to its own actions, and elsewhere the player would only feel
+    // an unexplained delay. On the map, hold them back briefly: the reporter could open the menu
+    // with R3+Y but not Y+R3, because Y alone had already done its map thing before R3 landed.
+    if (!goblin::maphover::map_dialog())
+    {
+        // Also covers the map CLOSING with a partial chord still held: from here the buttons reach
+        // the game live, so nothing is owed and the release must not replay a press it already saw.
+        g_combo_pending_since = 0;
+        g_combo_pending_bits = 0;
+        return 0;
+    }
+    if (g_combo_gave_up)
+        return 0;
+    if (g_combo_pending_since == 0)
+        g_combo_pending_since = tick;
+    g_combo_pending_bits = in_combo;  // remember it, in case this turns out to be a short tap
+    if (tick - g_combo_pending_since < kComboGraceMs)
+        return mask;      // still might become our chord - the game waits
+    g_combo_gave_up = true;  // it was a real single press; hand it over (late, by that grace)
+    return 0;
+}
+
 DWORD WINAPI hk_XInputGetState(DWORD idx, XINPUT_STATE *state)
 {
     DWORD r = o_XInputGetState(idx, state);
-    if (g_menu_open.load() && r == ERROR_SUCCESS && state)
+    if (r != ERROR_SUCCESS || !state)
+        return r;
+    if (g_menu_open.load())
+    {
         state->Gamepad = XINPUT_GAMEPAD{}; // zero buttons + centre sticks; keep connected
+        return r;
+    }
+    // KNOWN AND UNAVOIDABLE HERE: a combo is not atomic. Between the first button going down and
+    // the second landing, the game has already seen the first one - so a chord whose members are
+    // both live game actions can still fire one of them on the way in. Hiding starts the frame the
+    // chord completes. Removing that window needs the buttons to be BUFFERED for ~100 ms before the
+    // game sees them at all, which costs every normal press that much latency; not done without a
+    // decision. Binding the combo to a button the map does not use avoids it entirely.
+    WORD force_on = 0;
+    if (const uint16_t hide = combo_bits_to_hide(state->Gamepad.wButtons, force_on))
+        state->Gamepad.wButtons &= static_cast<WORD>(~hide);
+    state->Gamepad.wButtons |= force_on;
     return r;
 }
 
@@ -2897,6 +3008,16 @@ bool goblin::overlay::gamepad_mask_down(uint16_t mask)
     return g_pad_ok && mask != 0 && (g_pad.wButtons & mask) == mask;
 }
 
+uint16_t goblin::overlay::gamepad_buttons()
+{
+    // Whatever is held right now, for callers that do not know the mask in advance - the menu's
+    // rebind page has to LEARN a combo. It must come from this cache and not from a fresh
+    // XInputGetState: we hook that function, so a direct call returns our own injected buttons
+    // and, while our menu is open, reports the pad as disconnected outright. poll_gamepad reads
+    // the real device through the trampoline; this just publishes what it saw.
+    return g_pad_ok ? static_cast<uint16_t>(g_pad.wButtons) : uint16_t{0};
+}
+
 void goblin::overlay::setup()
 {
     if (!goblin::config::menuEnabled)
@@ -2933,6 +3054,28 @@ void goblin::overlay::setup()
             {
                 spdlog::info("[OVERLAY] no XInput: gamepad hotkeys are keyboard-only this run");
                 return;
+            }
+            // The comment above this branch used to promise "no input hooks" in this mode, and that
+            // was the whole problem: with nothing between the pad and the game, our open-combo's
+            // buttons reach the game as ordinary presses. On the map, where both members of the
+            // default Y+R3 are live actions, that makes the combo unusable. So this mode hooks
+            // XInputGetState too - not to blank the pad the way the ImGui backend does (our screen
+            // IS a game screen and needs the game's own input to navigate), but purely to hide the
+            // combo's own bits while the chord is held. poll_gamepad keeps reading the REAL device
+            // through the trampoline, so our own detection is unaffected by the hiding.
+            try
+            {
+                modutils::hook(reinterpret_cast<void *>(pXInputGetState),
+                               reinterpret_cast<void *>(&hk_XInputGetState),
+                               reinterpret_cast<void **>(&o_XInputGetState));
+                modutils::enable_hooks();
+                spdlog::info("[OVERLAY] pad filter ready: the open-combo's buttons are held back "
+                             "from the game while the chord is down");
+            }
+            catch (const std::exception &e)
+            {
+                spdlog::warn("[OVERLAY] pad filter unavailable ({}); the combo will also trigger "
+                             "its buttons' game actions", e.what());
             }
             while (true)
             {

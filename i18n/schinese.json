@@ -70,7 +70,9 @@
     "MenuTotal": "总计",
     "MenuUnavailable": "此页面不可用",
     "MenuPressKey": "请按一个键...",
-    "MenuKeepCurrent": "保持当前"
+    "MenuKeepCurrent": "保持当前",
+    "MenuPressPad": "Press a gamepad button...",
+    "MenuUnbind": "Unbind"
   },
   "toasts": {
     "MapIconsOn": "地图图标：开启",

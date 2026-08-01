@@ -1,7 +1,9 @@
 #include "goblin_stall_probe.hpp"
 #include "goblin_config.hpp"
 
+#if MFG_STALL_PROFILER
 namespace goblin::watch { void request(uintptr_t address, unsigned long thread_id); }
+#endif
 #include "goblin_build_variants.hpp"
 #include "goblin_config_schema.hpp"
 #include "goblin_native_menu.hpp"
@@ -295,7 +297,33 @@ namespace
     // captured and transferred inside ONE pulse. RM2 pulses are a finite
     // build-burst pool (~2 per remaining native widget, ~3900/session), so at
     // batch=16 the pool covers ~60k markers - far above any profile's needs.
-    constexpr size_t V3_FACTORY_BATCH = 16;
+    //
+    // That ~3900 figure is a BASE-MAP measurement and does not hold on the DLC map. Measured
+    // 2026-08-01 from a player log in m61: the whole burst there yields ~213 pulses, so batch=16
+    // caps the build at 3408 - and the player's every map open reported exactly
+    // "CATEGORIES READY: layer=2 created=3407" against 7136 requested, i.e. the cap, not a bug in
+    // the markers themselves. The pool is what is scarce on that map, so take more per pulse.
+    // The pipeline stays strictly one-record-in-flight (see v3_native_factory_consume), so this
+    // only lengthens the loop, it does not widen it - the shared per-icon tag stays legal.
+    constexpr size_t V3_FACTORY_BATCH = 48;
+
+    // TWO floors, deliberately DIFFERENT - unifying them was a regression, measured 2026-08-01.
+    //
+    // kPickerMinItems gates who may become the target in v3_note_movie_attach. It must stay HIGH:
+    // the arms it guards fire whenever a list reaches it, and every re-anchor forces a reseed that
+    // re-queues ~9.5k markers and rebuilds them. Dropped to 48 for one build, and an ERR session
+    // logged SIX retargets in 33 seconds, every one at exactly count=48, each one a full rebuild -
+    // which is the frame-rate collapse the tester saw a couple of minutes into the world. The
+    // original comment beside those arms promised "tiny side clips can never steal the target";
+    // 48 broke that promise.
+    //
+    // kSeedMinItems gates when we may START BUILDING on the target we already have. It must stay
+    // LOW, because RM2 factory pulses only exist during the build burst: on the DLC map the list
+    // tops out near 105, so a 100 floor was satisfied - if at all - only after the pulses were
+    // spent, and CATEGORIES READY reported created=0.
+    // High picker + low seed is not a contradiction: pick late and confidently, then build at once.
+    constexpr uint64_t kPickerMinItems = 100;
+    constexpr uint64_t kSeedMinItemsValue = 48;
 
     // ERR-look placement for the "cleared" badge twin. The badge frame is
     // authored like every icon (full footprint, centred), so at transfer its
@@ -586,6 +614,28 @@ namespace
         uint64_t parent_vtable = 0;
     };
     V3NativeManager g_v3_native;
+
+    // WHY the queue stalled. The watchdog below could only say "no factory pulses", which does not
+    // separate "the engine never executed one of our sprite-171 RM2 tags" from "pulses arrived and
+    // every one of them bounced off an early return in consume". Both look identical in the log and
+    // they need opposite fixes, and the DLC map hits this every open (created=0 here, ~half at the
+    // reporter). These count the pulse path so the warning can name the gate.
+    std::atomic<uint32_t> g_v3_pulse_seen{0};      // passed the gfx-side gate, entered the pulse
+    std::atomic<uint32_t> g_v3_pulse_unseeded{0};  // seed_from_live_callback() refused
+    std::atomic<uint32_t> g_v3_consume_nodriver{0};
+    std::atomic<uint32_t> g_v3_consume_nobudget{0};
+    std::atomic<uint32_t> g_v3_consume_nosprite{0};
+    std::atomic<uint32_t> g_v3_consume_busy{0};    // !seeded or re-entered while in_factory
+
+    void v3_pulse_counters_reset()
+    {
+        g_v3_pulse_seen.store(0, std::memory_order_relaxed);
+        g_v3_pulse_unseeded.store(0, std::memory_order_relaxed);
+        g_v3_consume_nodriver.store(0, std::memory_order_relaxed);
+        g_v3_consume_nobudget.store(0, std::memory_order_relaxed);
+        g_v3_consume_nosprite.store(0, std::memory_order_relaxed);
+        g_v3_consume_busy.store(0, std::memory_order_relaxed);
+    }
     // g_v3_custom_child, g_v3_visual_state, V3VisualSnapshot and its publish flag lived here.
 
     // A V3ScaleState (the transplanted child's reference zoom, authored basis and pivot) and its
@@ -760,15 +810,23 @@ namespace
                 if (g_v3_map_closed.load(std::memory_order_relaxed))
                     g_v3_map_closed.store(false, std::memory_order_relaxed);
             }
-            else if (prev_parent == 0 || count > prev_count ||
-                     (count >= 100 &&
+            else if (prev_parent == 0 ||
+                     (count > prev_count && !g_v3_native.seeded) ||
+                     (count >= kPickerMinItems &&
                       g_v3_map_closed.load(std::memory_order_relaxed)) ||
-                     (count >= 100 && prev_layer >= 0 && live_layer >= 0 &&
+                     (count >= kPickerMinItems && prev_layer >= 0 && live_layer >= 0 &&
                       live_layer != prev_layer))
             {
-                // Re-anchor ONLY on: first target / monotonically-largest list /
-                // rebuild after a REAL teardown / an actual known layer switch.
-                // Tiny side clips (count<100) can never steal the target.
+                // Re-anchor ONLY on: first target / monotonically-largest list while we have not
+                // committed yet / rebuild after a REAL teardown / an actual known layer switch.
+                //
+                // The "largest list" arm is now gated on NOT being seeded. Measured 2026-08-01 on
+                // the DLC map: we seeded on a parent of 81, built 3072+ markers in 18 ms, and then
+                // a list of 82 - one item larger - took the target, which forces a reseed, and a
+                // reseed calls v3_native_reset() and throws every built child away. The burst's
+                // pulses were spent by then, so the rebuild produced created=0 and the icons that
+                // had just appeared vanished. Discovery is what that arm is for; once we are
+                // building, only a real teardown or a layer switch may move the anchor.
                 if (prev_parent)
                     spdlog::info("[v3movie] RETARGET parent 0x{:X} -> 0x{:X} "
                                  "count={} layer={} mapClosed={}",
@@ -1536,6 +1594,7 @@ namespace
         v3_check_owner("v3_native_reset");
         v3_factory_clear_request(false);
         g_v3_native = V3NativeManager{};
+        v3_pulse_counters_reset(); // per generation, like the manager itself
     }
 
     bool v3_native_seed_from_live_callback()
@@ -1556,19 +1615,79 @@ namespace
         if (g_v3_map_closed.load(std::memory_order_relaxed))
             return false;
         uint64_t wrapper_parent = 0, live_count = 0;
-        // At 100 WorldMapItems this is unambiguously the active native marker
-        // parent, while hundreds of exact sprite-171 callbacks still remain in
-        // the stock build burst to act as safe factory pulses.
+        // Enough WorldMapItems that this is unambiguously the active native marker parent, while
+        // most of the stock build burst's sprite-171 callbacks still lie ahead to act as factory
+        // pulses. The old value was 100, chosen on the BASE map where the parent blows past it in
+        // the first moments of the burst. On the DLC map (layer 2) the same list only ever reaches
+        // ~105, so 100 was satisfied - if at all - at the very END of the burst: measured 2026-08-01
+        // in m61, this seed refused at liveCount 81 and 82 while pulses were live, and the parent
+        // only reached 105 later, by which time the map-frame tick reseeded with no pulses left and
+        // CATEGORIES READY reported created=0. Hence a threshold that fires EARLY in a ~105 burst.
+        // It is still far above the "tiny side clip" case the target picker guards against, and the
+        // identity checks below (export name upstream, wrapper+0x18 == parent) do the real work.
+        constexpr uint64_t kSeedMinItems = kSeedMinItemsValue;
         if (layer < 0 || layer > 2 ||
             !v3_heap_ptr(wrapper) || !v3_heap_ptr(parent) ||
             !v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != parent ||
-            !v3_read64(parent + 0xe0, live_count) || live_count < 100)
+            !v3_read64(parent + 0xe0, live_count) || live_count < kSeedMinItems)
+        {
+            // A refusal here is INVISIBLE downstream: nothing seeds, so build_started_ms and
+            // last_progress_ms stay 0 and the queue watchdog never fires either - the DLC map
+            // then reports no icons and no warning at all. Say it once per generation, with the
+            // numbers, so "we anchored to a parent we will never seed on" is readable.
+            static uintptr_t s_last_parent = 0;
+            if (parent != s_last_parent)
+            {
+                s_last_parent = parent;
+                spdlog::warn("[v3native] seed refused: layer={} wrapper=0x{:X} parent=0x{:X} "
+                             "wrapperParent=0x{:X} liveCount={} (needs >={})",
+                             layer, wrapper, parent, wrapper_parent, live_count,
+                             kSeedMinItems);
+            }
             return false;
+        }
         if (target_layer < 0)
             // The burst ran before map_layer() resolved; stamp the live layer
             // (informational only - the shared parent hosts every layer).
             g_v3_target_layer.store(layer, std::memory_order_relaxed);
 
+        // Take the OLD generation's children off the OLD parent before the reset drops every
+        // reference to them. v3_native_reset deliberately never touches them, on the reasoning
+        // that a reset only happens once the previous movie is torn down - which was true while
+        // "layer switches no longer reset at all". It is not true here: the layer-switch arm of
+        // the target picker re-anchors to a different parent, so opening the map inside the DLC
+        // and switching to the Lands Between resets while the old parent is still very much
+        // alive, and its children stay drawn - inert pictures with no popup, because the popups
+        // belong to the game's own pins and never to ours. Measured on ERR 2026-08-01: the
+        // 13:52:34 switch retargeted, reseeded, and left the DLC icons on the overworld map.
+        // Guarded on the old parent still carrying the vtable we saw it alive with, so the
+        // torn-down case still takes the old path of leaving freed memory alone.
+        if (g_v3_native.seeded && !g_v3_native.objects.empty() &&
+            g_v3_native.parent && g_v3_native.parent != parent)
+        {
+            // Liveness WITHOUT g_v3_native.parent_vtable: that field is only ever written inside
+            // the map-closed branch of the tick, so on a layer switch (mapClosed=false) it is
+            // still 0 and any test against it silently refuses - measured on ERR 2026-08-01, the
+            // detach never ran and printed nothing. Both parents are WorldMapItem list objects of
+            // the same class, so a live old one carries the SAME vtable as the new one; a freed
+            // one does not. That test needs no state we might have failed to seed.
+            uint64_t old_vt = 0, new_vt = 0;
+            const bool old_parent_live =
+                v3_read64(g_v3_native.parent, old_vt) && old_vt != 0 &&
+                v3_read64(parent, new_vt) && new_vt != 0 && old_vt == new_vt;
+            if (old_parent_live)
+            {
+                const uint32_t removed = goblin::stall_probe::v3_detach_all_children();
+                spdlog::info("[v3native] re-anchor: detached {} of {} children from the previous "
+                             "parent 0x{:X} before reseeding on 0x{:X}",
+                             removed, g_v3_native.objects.size(), g_v3_native.parent, parent);
+            }
+            else
+                // Say so too. A silent skip here is what cost a whole test run.
+                spdlog::info("[v3native] re-anchor: leaving {} children on parent 0x{:X} "
+                             "(vtable {:X} vs new {:X}) - it does not read as live",
+                             g_v3_native.objects.size(), g_v3_native.parent, old_vt, new_vt);
+        }
         v3_native_reset();
         g_v3_native.layer = layer;
         g_v3_native.wrapper = wrapper;
@@ -1611,7 +1730,7 @@ namespace
                          g_v3_native.player_map & 0xFF);
         }
         // └─ end removable block ────────────────────────────────────────────────────────┘
-        v3_native_merge_snapshot(goblin::native_marker_snapshot(layer), true);
+        v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), true);
         // Initial construction happens across exact sprite-171 ExecuteTag calls
         // in this same stock build burst, before the first map-frame callback.
         g_v3_native.frame_budget = g_v3_native.pending.size();
@@ -1676,11 +1795,20 @@ namespace
     void v3_native_merge_snapshot(const std::vector<goblin::NativeMarkerPoint> &snapshot,
                                   bool initial)
     {
+        // Master switch off: park every child we own. The snapshot itself already comes back with
+        // every point invisible (that is what native_marker_snapshot's include_hidden does), so the
+        // merge below would park them anyway; this also covers objects that are not in the snapshot
+        // at all. What must NOT happen here is returning early. The rule this function states
+        // further down is that the merge keeps every migrated row, hidden ones included, because
+        // factory pulses exist only during the build burst and a row that is not created NOW can
+        // never be shown by a later toggle. Skipping the merge while hidden seeded an empty
+        // manager: turning the switch back on then queued the rows with no pulses left to build
+        // them, the watchdog dropped the queue after 5 s, and the icons stayed gone. Reported from
+        // the Deck as "master off, open map, master on -> invisible until you close the map, WAIT,
+        // and reopen" - the wait being what forces a real teardown and therefore a fresh burst; a
+        // quick reopen reuses the movie and emits none, which is why it did not help.
         if (goblin::icons_hidden())
-        {
             for (auto &obj : g_v3_native.objects) v3_native_set_visible(obj, false);
-            return;
-        }
 
         // Does this tab hold any marker of the player's own map? Answered BEFORE anything
         // is sized or sorted, because both read it. The layer of the tab, not of the
@@ -1755,6 +1883,9 @@ namespace
                 if (goblin::mapproject::to_map(point.area, point.gx, point.gz, point.px, point.pz,
                                                mx, mz))
                     v3_native_move(obj, mx, mz);
+                // The master switch is already folded into `point.visible` by the snapshot, so a
+                // switched-off map merges as "every point invisible" and nothing can be shown
+                // against the switch here.
                 v3_native_set_visible(obj, point.visible);
                 continue;
             }
@@ -1766,6 +1897,11 @@ namespace
                 g_v3_native.queued.insert(point.original_row_id).second)
                 g_v3_native.pending.push_back(point);
         }
+        // (A "sweep the rows this snapshot did not mention" pass stood here for one build. It could
+        //  never fire: native_marker_snapshot returns EVERY row whatever the layer - measured
+        //  migrated=9552 requested=9552 on both layer 0 and layer 2 - and encodes the layer in
+        //  point.visible alone, which the loop above already applies. The tab leak it was meant to
+        //  fix comes from the re-anchor path abandoning the previous generation's children.)
         if (g_v3_native.pending.size() != queued_before)
         {
             g_v3_native.completion_reported = false;
@@ -2017,7 +2153,7 @@ namespace
             g_v3_native.build_started_ms = GetTickCount64();
             g_v3_native.next_refresh_ms = g_v3_native.build_started_ms + 200;
             g_v3_native.last_progress_ms = g_v3_native.build_started_ms;
-            v3_native_merge_snapshot(goblin::native_marker_snapshot(layer), true);
+            v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), true);
         }
 
         // Visibility/category/collection is re-read live. Existing objects are
@@ -2036,20 +2172,30 @@ namespace
             // timeline ctx on sprite 171, and an open map. A player report (Linux, DLC map) hit
             // this with 1331 markers dropped, and the message alone could not tell which gate was
             // shut - so print the three of them plus how many children were rejected.
-            spdlog::warn("[v3native] {} queued markers never built (no factory pulses); dropping "
-                         "the queue to keep live refresh alive. gates: qmark_injected={} "
-                         "map_open={} rejected_so_far={} attached={}",
+            spdlog::warn("[v3native] {} queued markers never built; dropping the queue to keep "
+                         "live refresh alive. gates: qmark_injected={} map_open={} "
+                         "rejected_so_far={} attached={}; pulses seen={} unseeded={} "
+                         // budget_regranted is NOT a block: it counts the pulses that arrived with
+                         // an empty batch and were handed a fresh one. Reading it as a gate cost a
+                         // whole diagnostic pass once.
+                         "blocked(driver/sprite/busy)={}/{}/{} budget_regranted={}",
                          g_v3_native.pending.size() - g_v3_native.pending_index,
                          goblin::gfx_probe::icons_injected(),
                          goblin::maphover::map_dialog() != nullptr, g_v3_native.failed,
-                         g_v3_native.objects.size());
+                         g_v3_native.objects.size(),
+                         g_v3_pulse_seen.load(std::memory_order_relaxed),
+                         g_v3_pulse_unseeded.load(std::memory_order_relaxed),
+                         g_v3_consume_nodriver.load(std::memory_order_relaxed),
+                         g_v3_consume_nosprite.load(std::memory_order_relaxed),
+                         g_v3_consume_busy.load(std::memory_order_relaxed),
+                         g_v3_consume_nobudget.load(std::memory_order_relaxed));
             g_v3_native.pending_index = g_v3_native.pending.size();
         }
         if (g_v3_native.pending_index >= g_v3_native.pending.size() &&
             now_ms >= g_v3_native.next_refresh_ms)
         {
             g_v3_native.next_refresh_ms = now_ms + 200;
-            v3_native_merge_snapshot(goblin::native_marker_snapshot(layer), false);
+            v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
         }
 
         // Counter-zoom pass: our children ride the marker layer's parent
@@ -2680,6 +2826,17 @@ namespace
         float shift_tx = 0.0f; // the tx we want the row section to sit at (twips)
     };
 
+    // How fresh a screen's heartbeat must be before we may call INTO the engine on its dialog.
+    // kBeatStaleMs (further down) is a PRUNING threshold - how long we wait before declaring a
+    // screen gone - and it is far too loose for this: measured on the Deck, a dialog's memory is
+    // already scrambled about two frames after its last tick (the debug scroll telemetry read
+    // count=3161501440 at +32 ms). Engine calls want a few frames, not half a second.
+    constexpr uint64_t kEngineCallFreshMs = 100;
+    inline bool safe_to_call_engine(const Screen &s, uint64_t now)
+    {
+        return s.beat != 0 && now - s.beat < kEngineCallFreshMs;
+    }
+
     // UI thread only: every writer (row build, decide, dialog update, the menu tick that polls
     // F8) runs on the menu thread.
     std::vector<Screen> g_screens;
@@ -3119,6 +3276,17 @@ namespace
 
     void hud_snapshot_take(uintptr_t base_menu)
     {
+#if !MFG_STALL_PROFILER
+        // MUST leave shipping builds together with hud_snapshot_compare, which is where its
+        // matching RELEASE and slot restore live. Retiring only the compare half on 2026-08-01 left
+        // this one taking a reference on the base menu's sequence-slot job and never giving it back,
+        // and never restoring the slot either - an addref with no release, on an object the engine
+        // owns. It is gated on debug_logging, which is why it bit the Steam Deck (true there) and
+        // not the PC (false), and the crash it produced is the engine calling a virtual on a dead
+        // object through a menu window's +0x118. Take and compare are one mechanism; gate them as one.
+        (void)base_menu;
+        return;
+#else
         if (!goblin::config::debugLogging || !v3_heap_ptr(base_menu))
             return;
         __try
@@ -3138,9 +3306,11 @@ namespace
             // elsewhere - which means the useful question is who performs the hide, not what the byte
             // says. A hardware write watch on id 7's byte answers exactly that, and the handler now also
             // prints stack values that look like return addresses so the CALLER is named too.
+#if MFG_STALL_PROFILER
             const uintptr_t man_now = g_menuman.load(std::memory_order_relaxed);
             if (v3_heap_ptr(man_now))
                 goblin::watch::request(man_now + 0x90 + 7, GetCurrentThreadId());
+#endif
             g_hud_orig_job = *reinterpret_cast<void **>(base_menu + 0x10);
             if (v3_heap_ptr(reinterpret_cast<uintptr_t>(g_hud_orig_job)))
                 reinterpret_cast<void (*)(void *)>(base + 0x1EBA1C0)(
@@ -3160,10 +3330,25 @@ namespace
         {
             g_hud_snap_state.store(0, std::memory_order_release);
         }
+#endif // !MFG_STALL_PROFILER
     }
 
     void hud_snapshot_compare()
     {
+#if !MFG_STALL_PROFILER
+        // RETIRED FROM SHIPPING BUILDS 2026-08-01. This is the HUD-after-close investigation
+        // harness, and its question was answered long ago - the fix is the CSFeManImp+0x78 restore
+        // on job_finished, which lives elsewhere and is untouched by this. What it still did was
+        // walk the base menu, the job stack, the autohide block and the whole CSMenuMan map - THE
+        // MOMENT OUR SCREEN CLOSED, i.e. exactly while the engine is tearing those structures down.
+        // On the Steam Deck (debug_logging = true) that walk faulted inside the game's own menu
+        // enumeration: menu_update_detour -> tick_native_menu -> prune_screens ->
+        // hud_snapshot_compare -> AV at exe+0x7A8A8B, on the reporter's "close the menu over
+        // gameplay, then open the map" path. A diagnostic must not be able to do that.
+        // Rebuild with -DMFG_STALL_PROFILER=1 to get it back for an investigation.
+        g_hud_snap_state.store(0, std::memory_order_release);
+        return;
+#else
         if (g_hud_snap_state.load(std::memory_order_acquire) != 1)
             return;
         g_hud_snap_state.store(2, std::memory_order_release);
@@ -3265,18 +3450,22 @@ namespace
                     reinterpret_cast<void *>(base_menu + 0x10), &held);
                 spdlog::info("[hud] restored the HUD menu's sequence-slot job 0x{:X} (was 0x{:X}) - "
                              "experiment", (uint64_t)g_hud_orig_job, (uint64_t)now_job);
-                // inline release (release_job_ref is defined further down in this file): decrement and,
-                // if we held the last reference, run the object's own destructor - the same shape.
-                auto p_unref_x = reinterpret_cast<int (*)(void *)>(base_x + 0x1EBA200);
-                if (p_unref_x(reinterpret_cast<uint8_t *>(g_hud_orig_job) + 8) == 1)
-                    (*reinterpret_cast<void (**)(void *)>(
-                        *reinterpret_cast<void **>(g_hud_orig_job)))(g_hud_orig_job);
+                // NO release here. The setter above already CONSUMED our reference - decompiled
+                // 2026-08-01: 0x7A9250 addrefs into the holder, then unrefs *src and nulls it, so
+                // `held` is spent by the time it returns. The inline unref that used to follow was
+                // therefore a second release of a reference we no longer owned, and in the case
+                // this experiment exists for - where our captured +1 was the object's last one - it
+                // destroyed the job the engine had just been handed, leaving its holder pointing at
+                // freed memory. Dormant (profiler builds only) but a guaranteed use-after-free in an
+                // engine structure, and a plausible source of the exe+0x7A8A8B fault this harness
+                // was itself blamed for.
                 g_hud_orig_job = nullptr;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+#endif // !MFG_STALL_PROFILER
     }
 
     Screen *top_screen() { return g_screens.empty() ? nullptr : &g_screens.back(); }
@@ -4319,6 +4508,23 @@ namespace
         return item;
     }
 
+    // Is this a pointer INTO THE GAME'S OWN IMAGE? Used to sanity-check a value that is about to
+    // become a CALL TARGET. A vtable and the function it points at both live in the exe, so a
+    // value outside that range is not one, whatever else it may be.
+    bool exe_image_ptr(uintptr_t p)
+    {
+        static uintptr_t s_base = 0, s_end = 0;
+        if (!s_end)
+        {
+            const uintptr_t b = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(b);
+            const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(b + dos->e_lfanew);
+            s_base = b;
+            s_end = b + nt->OptionalHeader.SizeOfImage;
+        }
+        return p >= s_base && p < s_end;
+    }
+
     // The selected model row index, resolved exactly like the form's own handler does:
     //   index = FUN_140739e20(dlg + 0xa38)               (GridControl cursor)
     //   item  = viewList_vt[+0x28](dlg + 0x1268, index)   (MenuViewItemList)
@@ -4336,7 +4542,37 @@ namespace
                 reinterpret_cast<void *>(dlg + 0xa38));
             void *viewList = reinterpret_cast<void *>(dlg + 0x1268);
             const uintptr_t vvt = *reinterpret_cast<uintptr_t *>(viewList);
-            void *item = (*reinterpret_cast<ItemAtFn **>(vvt + 0x28))(viewList, index);
+            // CHECKED BEFORE IT IS CALLED. A dialog that is being torn down under us hands back
+            // rubbish here - measured on the Deck 2026-08-02, where it read -1 and produced two
+            // AVs with fault=0xFFFFFFFFFFFFFFFF. The __except below caught those, but only by
+            // luck: -1 is unmapped, so the call faulted instead of landing somewhere. A garbage
+            // value that happened to be mapped and executable would have been EXECUTED, and no
+            // exception filter can help with that. So the vtable and the slot we take out of it
+            // must both point into the game's own image before either becomes a call target.
+            if (!exe_image_ptr(vvt))
+                return false;
+            const uintptr_t item_at = *reinterpret_cast<uintptr_t *>(vvt + 0x28);
+            if (!exe_image_ptr(item_at))
+                return false;
+            // AND the index must be inside the list AS IT IS RIGHT NOW. itemAt CLAMPS rather than
+            // refusing, so an index left over from before a rebuild comes back as a mapped but
+            // stale slot; nothing faults at the call, and the crash surfaces one frame deeper when
+            // that dead item's scene proxy is copied (measured: exe+0x74A7F5, six times in a
+            // second while the player toggled a row). Decompiled 2026-08-02: the list at dlg+0x1268
+            // holds a {begin,end,cap} vector at +0x10/+0x18/+0x20 with a 0x50 element stride, and
+            // the rebuild destructs every element in place and may relocate the buffer entirely.
+            // There is no generation counter and no rebuild-in-progress flag anywhere to ask
+            // instead - this bounds test IS the liveness test.
+            const uintptr_t list_begin = *reinterpret_cast<uintptr_t *>(dlg + 0x1278);
+            const uintptr_t list_end = *reinterpret_cast<uintptr_t *>(dlg + 0x1280);
+            if (!v3_heap_ptr(list_begin) || !v3_heap_ptr(list_end) || list_end < list_begin)
+                return false;
+            const uintptr_t span = list_end - list_begin;
+            if (span % 0x50 != 0)
+                return false;  // not the layout we believe it is - never guess past this point
+            if (index >= span / 0x50)
+                return false;  // a cursor from before the last rebuild
+            void *item = reinterpret_cast<ItemAtFn *>(item_at)(viewList, index);
             const goblin::nmenu::Row *row =
                 item ? model_row_of(reinterpret_cast<uintptr_t>(item), out_index) : nullptr;
             if (row)
@@ -4348,6 +4584,23 @@ namespace
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
+            // Silent until 2026-08-01, which is why 12 faults a session went unnoticed. MEASURED
+            // that day, so nobody re-opens this: exe+0x739E20 is a two-instruction leaf,
+            // `mov eax,[rcx+0xd4]; ret`, so this reads the FIXED address dlg+0xB0C - no pointer
+            // chase, nothing uninitialised to blame inside a grid. It faults about four times per
+            // freshly opened screen and then works for the rest of that screen's life, which is an
+            // initialisation race, not a freed dialog. The caller's screen_level() check does NOT
+            // catch it (measured: screenLevel=0 screens=1 while faulting) and could not, because
+            // g_form_dialog and g_screens[i].dlg are filled from the same source - that test is
+            // circular for this failure. The __except IS the handling: skip the frame, repaint next
+            // one. Debug level on purpose - it is benign and costs a few unpainted help lines.
+            static uintptr_t s_last = 0;
+            if (dlg != s_last)
+            {
+                s_last = dlg;
+                spdlog::debug("[nmenu] cursor read faulted: dlg=0x{:X} screenLevel={} screens={}",
+                              dlg, screen_level(dlg), g_screens.size());
+            }
             return false;
         }
         return ok;
@@ -4624,7 +4877,12 @@ namespace
     void paint_help_line()
     {
         const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
-        if (!dlg || !menu_open())
+        // Tighter than the old `menu_open()`, which only said SOME screen exists while
+        // g_form_dialog is a raw pointer cleared solely at teardown. It does NOT fix the
+        // cursor-read fault this was written for - that one is an init race, see the __except in
+        // selected_model_index - and it cannot, since both fields come from the same store. Kept
+        // because it is still the right question to ask before handing a dialog to the game.
+        if (!dlg || screen_level(dlg) < 0)
             return;
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         size_t ix = 0;
@@ -5416,6 +5674,15 @@ namespace
                      found ? list : std::string(" none"));
     }
 
+    // A menu open that arrived while the map's own job chain still held the sequence slot. Retried
+    // from tick_native_menu() until the slot frees; -1 = nothing waiting. Map UI thread only.
+    int32_t g_pending_open_page = -1;
+    uint64_t g_pending_open_since = 0;
+    // Long enough for the Deck's slowest measured occupancy (about 12 s from the map opening, and
+    // the chains that follow our own screen closing), short enough that a key press cannot appear
+    // to act half a minute later.
+    constexpr uint64_t kPendingOpenTimeoutMs = 15000;
+
     void open_screen(int32_t page, uintptr_t nest_parent)
     {
         if (!nest_parent && menu_open())
@@ -5488,14 +5755,61 @@ namespace
             log_window_candidates(g_menuman.load(std::memory_order_acquire));
             return;
         }
+        // TRIED AND REVERTED 2026-08-02: forcing the push route here for every open over the map,
+        // to keep our screen out of the map's own menu sequence (the sequence whose teardown the
+        // crash below happens in). It made the menu STOP OPENING over the map entirely - the Deck
+        // logged "SEH opening the screen" on all eleven opens of the run. The premise was wrong:
+        // pushing is NOT a working alternative over the map. Re-reading the crash run says so
+        // plainly - of its two pushes, one threw the same SEH and the other logged "pushed onto"
+        // and then "level 0 never came up - dropped" 3 s later. The ONLY route that has ever
+        // brought the screen up over the map is the slot store below. So the slot store stays,
+        // and the crash is dealt with where it actually happens: on the way out (see the slot
+        // hand-back in close_screen / the map dtor).
         // Is the slot free? Asked with the engine's OWN test - the same one its input gate uses,
         // so "the host holds a screen" and "the host is not reading input" can never disagree.
         // A pushed job is in no slot, so there is nothing to ask.
         if (!pushed && !seq_slot_empty(host))
         {
-            spdlog::info("[form] ignored: host 0x{:X} already holds a screen in its sequence slot",
-                         host);
-            return;
+            // A TAKEN SLOT IS NOT A REFUSAL, AND IT IS NOT A REASON TO PUSH EITHER. What sits in
+            // the map window's slot is the engine's own CS::FixOrderJobSequence (vt exe+0x2AA8D78,
+            // RTTI-confirmed) - a legitimate occupant, put there by the map's own open/close job
+            // chains. It clears by itself, and the ONLY thing that differs between the two
+            // machines is how long that takes: measured across every log we have, the PC's slot
+            // was empty on all 7 opens over the map, while the Deck's was busy on 37 of 54 - for
+            // SECONDS at a time (the same occupant answered five presses across 2.9 s), which is
+            // why no frame-rate story explains it and why every Deck-only symptom traces here.
+            //
+            // Pushing was the old answer to a busy slot and it is DEAD: exe+0x1EBA1C0 is
+            // DLReferenceCountObject::AddRef, three instructions, and the fault is its LOCK XADD
+            // at +5. The push functions (FUN_1407edfa0/FUN_1407f0b50) are CS::CSPopupMenu methods
+            // whose first host access dereferences *(host+0xB0) as a job pointer. Over gameplay
+            // the host IS a CSPopupMenu and it works; the map host is a CS::WorldMapDialog, a
+            // different class with a different layout, so the push is a this-pointer type
+            // confusion that cannot be fixed by any argument or offset. It scored 0 successes in
+            // 36 attempts across the logs. (It also invalidated the note that used to stand here
+            // claiming "the dialog's push vector +0xD0 reads count=0": execution never reaches
+            // +0xD0, and that reading was taken on the wrong class.)
+            //
+            // So: WAIT for the slot instead. The request is remembered and tick_native_menu()
+            // retries it once the engine's chain has finished, which is the same route the PC
+            // takes on the first try - both machines end up in the identical code path, one just
+            // waits a beat.
+            log_job_stack(host, "the slot host that is still busy");
+            if (g_pending_open_page >= 0)
+            {
+                // Pressed again while we were waiting. The key is a TOGGLE, so the second press
+                // means "never mind" - otherwise the screen would spring open by itself seconds
+                // after the player had given up on it.
+                spdlog::info("[form] the wait for the map's slot was cancelled by a second press");
+                g_pending_open_page = -1;
+                g_pending_open_since = 0;
+                return;
+            }
+            g_pending_open_since = GetTickCount64();
+            g_pending_open_page = page;
+            spdlog::info("[form] host 0x{:X} ({}) is still running its own job chain - waiting for "
+                         "the slot instead of forcing the screen in", host, what);
+            return;  // nothing pushed onto g_screens yet - that happens further down
         }
         spdlog::info("[form] opening page {} on {} (0x{:X})", page, what, host);
 
@@ -5575,7 +5889,15 @@ namespace
                 }
                 else
                 {
-                    p_addref(reinterpret_cast<uint8_t *>(slotC) + 8); // see the note above
+                    // The slot setter is SELF-BALANCED - decompiled 2026-08-01: 0x7A9250 addrefs the
+                    // object into the holder, then unrefs *src and nulls it. So it needs no help
+                    // from us, and the extra addref that used to stand here belonged to nobody: it
+                    // left the object at one reference above zero forever, so the engine's own
+                    // teardown unref never reached the destructor and one job leaked per open.
+                    // That is the same shape of imbalance that produced the Deck crash from
+                    // hud_snapshot_take - an unowned +1 on an engine-owned object - and it is worth
+                    // fixing even though this branch is rarely taken now (over the map the slot is
+                    // usually held by the map's own job sequence, so we push instead).
                     auto p_seq = reinterpret_cast<void (*)(void *, void *)>(base + 0x7A9250);
                     p_seq(reinterpret_cast<void *>(host + 0x10), r);
                 }
@@ -5659,12 +5981,53 @@ namespace
     // The page is entered BY a key press, so nothing is read until every key is up again;
     // otherwise the confirm key would instantly rebind the entry to itself.
     bool g_rebind_armed = false;
+    uint16_t g_pad_peak = 0; // the widest set of buttons held during THIS capture
+
+    // A combo is captured on RELEASE, not on press: the player pressing Y+R3 goes through a frame
+    // where only Y is down, and taking the first non-empty read would bind Y alone. So accumulate
+    // while anything is held and commit the peak once everything is up again.
+    // The state comes from overlay::gamepad_buttons, NOT from XInputGetState: we hook that
+    // function, so a direct call reads back the buttons we inject ourselves and, while our own
+    // menu is open, reports no pad at all - this page would have captured nothing.
+    bool poll_rebind_pad()
+    {
+        const uint16_t held = goblin::overlay::gamepad_buttons();
+        if (!g_rebind_armed)
+        {
+            if (!held)
+                g_rebind_armed = true; // the press that opened this page has been let go
+            return false;
+        }
+        if (held)
+        {
+            g_pad_peak |= held;
+            return false;
+        }
+        if (!g_pad_peak)
+            return false;
+        const uint16_t captured = g_pad_peak;
+        g_pad_peak = 0;
+        g_rebind_armed = false;
+        goblin::nmenu::rebind_apply_pad(captured);
+        return true;
+    }
 
     void poll_rebind()
     {
         if (!goblin::nmenu::rebind_pending())
         {
             g_rebind_armed = false;
+            g_pad_peak = 0;
+            return;
+        }
+        if (goblin::nmenu::rebind_is_pad())
+        {
+            if (poll_rebind_pad())
+            {
+                const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
+                if (dlg)
+                    build_form_rows();
+            }
             return;
         }
         bool any_down = false;
@@ -5689,10 +6052,19 @@ namespace
         // Escape means "leave it alone", which rebind_apply spells as 0.
         goblin::nmenu::rebind_apply(pressed == VK_ESCAPE ? 0u : static_cast<uint32_t>(pressed));
         const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
+        // The MODEL is rebuilt unconditionally - it is ours and touches nothing of the engine's.
+        // The engine-side refresh is not: refresh_form_view drives the game's own row rebuild on
+        // this dialog, and g_form_dialog is only dropped after the heartbeat has been stale for
+        // 600 ms, so without a freshness test this is the widest window we have for calling into a
+        // dialog the engine may already have freed. A live screen ticks every frame, so the gate
+        // is always open in practice; when it is not, the engine's next row build repaints anyway.
         if (dlg)
         {
             build_form_rows();
-            refresh_form_view(dlg);
+            const int lvl = screen_level(dlg);
+            if (lvl >= 0 && safe_to_call_engine(g_screens[static_cast<size_t>(lvl)],
+                                                GetTickCount64()))
+                refresh_form_view(dlg);
         }
     }
 
@@ -5938,19 +6310,67 @@ namespace
         // A screen that asked to be closed from inside its own confirm handler: doing it here
         // means the handler has long returned before the dialog is torn down.
         const uintptr_t want_close = g_close_request.exchange(0, std::memory_order_acq_rel);
-        if (want_close && screen_level(want_close) >= 0)
-            close_screen(want_close);
+        if (want_close)
+        {
+            // Only if that screen is STILL BEING TICKED. close_screen -> invoke_cancel reads the
+            // dialog's command table and CALLS A FUNCTION POINTER out of it, and an indirect call
+            // through freed memory is the one shape __try cannot save us from - if the stale bytes
+            // happen to land in mapped executable memory the game runs them instead of faulting.
+            // The request is stamped by a decide handler, when the dialog was alive, and consumed
+            // on the next tick, so the window is one frame - narrow, but the worst-shaped hazard
+            // we have. screen_level() alone cannot cover it: it is filled from the same source as
+            // the pointer it is meant to vet, which makes that test circular (see the note on
+            // g_form_dialog).
+            const int lvl = screen_level(want_close);
+            if (lvl >= 0 && safe_to_call_engine(g_screens[static_cast<size_t>(lvl)], GetTickCount64()))
+                close_screen(want_close);
+        }
         // Before pruning: a screen that has begun closing means the page under it should already
         // be visible, so the fade-out plays over it instead of over nothing.
         reveal_page_under_closing_top();
         prune_screens();
+        // An open that had to wait for the map's job chain to let go of the sequence slot. Retried
+        // here, on the map UI thread, exactly as if the player had pressed the key at this moment.
+        if (g_pending_open_page >= 0)
+        {
+            const int32_t page = g_pending_open_page;
+            const uintptr_t win = map_menu_window();
+            const bool expired = GetTickCount64() - g_pending_open_since > kPendingOpenTimeoutMs;
+            if (menu_open() || !win || expired)
+            {
+                // Gone, or waited too long, or the player got a menu another way in the meantime.
+                if (expired && win && !menu_open())
+                    spdlog::info("[form] gave up waiting for the map's sequence slot after {} ms",
+                                 GetTickCount64() - g_pending_open_since);
+                g_pending_open_page = -1;
+                g_pending_open_since = 0;
+            }
+            else if (seq_slot_empty(win))
+            {
+                const uint64_t waited = GetTickCount64() - g_pending_open_since;
+                g_pending_open_page = -1;
+                g_pending_open_since = 0;
+                spdlog::info("[form] the map's sequence slot came free after {} ms - opening now",
+                             waited);
+                open_screen(page, 0);
+            }
+        }
         if (!menu_open())
             return;
         const Screen &top = g_screens.back();
         if (!top.dlg)
             return; // still coming up
         menu_cfg_apply_if_changed();
-        paint_help_line();
+        // ONLY while the engine is still ticking this dialog. paint_help_line reaches into the
+        // dialog's own row list, and the engine frees that list's items - with their scene proxies
+        // - when the rows are rebuilt or the screen goes away. Measured on the Deck 2026-08-02: the
+        // dialog stopped ticking 610 ms before we noticed (g_form_dialog is only dropped once the
+        // heartbeat has been stale for kBeatStaleMs = 600), and we kept calling into it for that
+        // whole window: six access violations in one second, each one dragging an SEH unwind
+        // through the engine's own destructors. kBeatStaleMs is a PRUNING threshold and far too
+        // loose to authorise an engine call; three frames is not.
+        if (safe_to_call_engine(top, GetTickCount64()))
+            paint_help_line();
         poll_rebind();
         arm_action_log_on_escape();
         // ── the strips, EVERY frame ──────────────────────────────────────────────────
@@ -5998,6 +6418,11 @@ namespace
         // Whatever id answers YES there is the action ESC really produces - and the first run proved
         // it is none of the nine our screen listens for.
         arm_action_log_on_escape();
+        // The UI-thread beachhead this detour was always meant to be: anything that has to touch
+        // on-screen menu state but was asked for elsewhere runs HERE. First user is the icons
+        // ON/OFF toast, which menu_auto_toggle_loop used to fire from its own 10 ms polling thread
+        // straight into the game's popup routine - see queue_codex_toast for the measurement.
+        goblin::pump_codex_toast();
         // F11 (dev-only): open the native settings menu on this UI thread. GATED to
         // IN-GAME with the map open - the settings dialog reads gameplay-state
         // singletons that are NULL at the title screen (opening it from the main menu
@@ -6144,9 +6569,22 @@ namespace
                 const uint16_t mask = goblin::config::toggleGamepadMask;
                 const bool down = (vk && (GetAsyncKeyState(vk) & 0x8000) != 0) ||
                                   (mask && goblin::overlay::gamepad_mask_down(mask));
-                if (down && !s_key_down &&
-                    !goblin::nmenu::key_swallowed(static_cast<uint32_t>(vk)))
-                    open_screen(goblin::nmenu::kPageRoot, 0);
+                if (down && !s_key_down)
+                {
+                    // "The menu does not open over the map" came in from the Steam Deck with a
+                    // debug log that contained NO attempt at all - every push it recorded had
+                    // map=0x0 - so the open either never reached open_screen or died silently.
+                    // One line per PRESS separates those: if this prints and no "[form] opening
+                    // page" follows, the refusal is inside open_screen; if it never prints, the
+                    // press never got here (input path), and the map state says whether the map
+                    // was up when it happened.
+                    const bool swallowed = goblin::nmenu::key_swallowed(static_cast<uint32_t>(vk));
+                    spdlog::debug("[form] toggle pressed: swallowed={} menuOpen={} mapDialog=0x{:X}",
+                                  swallowed, menu_open(),
+                                  reinterpret_cast<uintptr_t>(goblin::maphover::map_dialog()));
+                    if (!swallowed)
+                        open_screen(goblin::nmenu::kPageRoot, 0);
+                }
                 s_key_down = down;
             }
             // F6 (the graphics screen as a second host) was REMOVED 2026-07-28: measured in game, its
@@ -6217,20 +6655,48 @@ namespace
     void v3_native_factory_consume(void *live_ctx, uint32_t frame)
     {
         if (!g_v3_native.seeded || g_v3_native.in_factory)
+        {
+            g_v3_consume_busy.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
         // Fully SYNCHRONOUS pipeline: queue a batch of records, run the
         // engine's own materialization driver on them, transfer the children,
         // neutralize the records - all inside this one pulse. No cross-pulse
         // state; leftovers can only mean a previous pulse aborted mid-way.
         if (g_v3_factory_active != 0)
             v3_factory_clear_request(true);
-        if (!g_v3_mat_driver || g_v3_native.frame_budget == 0 ||
-            g_v3_native.pending_index >= g_v3_native.pending.size())
+        // Counted separately: a spent queue is the NORMAL end of a build and must not be
+        // reported as a blocked gate, while a missing driver or a spent budget is exactly
+        // what the watchdog needs to name.
+        if (!g_v3_mat_driver)
+        {
+            g_v3_consume_nodriver.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
+        if (g_v3_native.pending_index >= g_v3_native.pending.size())
+            return;   // spent queue: the normal end of a build, not a blocked gate
+        if (g_v3_native.frame_budget == 0)
+        {
+            // The budget is a PER-FRAME cap and only the map-frame tick refills it (to 96). When
+            // that tick does not run - our own screen sitting on top of the map is enough to stop
+            // it - the budget stays 0 forever and every pulse bounces off it while the queue still
+            // has work. Measured on the Deck: "pulses seen=27428 ... blocked(driver/budget/sprite/
+            // busy)=0/24372/0/0" and CATEGORIES READY created=0, i.e. the icons vanished with a
+            // plentiful supply of pulses and nothing wrong anywhere else. Starving forever is worse
+            // than the stall the cap exists to prevent, so a pulse may grant itself ONE batch when
+            // the queue is not empty. That keeps the per-pulse work bounded exactly as before -
+            // the loop below still stops at V3_FACTORY_BATCH - it only stops the build from
+            // deadlocking when no frame boundary is coming.
+            g_v3_consume_nobudget.fetch_add(1, std::memory_order_relaxed);
+            g_v3_native.frame_budget = V3_FACTORY_BATCH;
+        }
         uint64_t sprite = 0;
         if (!v3_read64(reinterpret_cast<uintptr_t>(live_ctx) + 0x58, sprite) ||
             !v3_heap_ptr(sprite))
+        {
+            g_v3_consume_nosprite.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
         g_v3_native.in_factory = true;
 
         // Per-item synchronous pipeline: queue ONE record, run the engine's
@@ -7687,7 +8153,12 @@ void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
     {
         v3_note_thread("v3_native_factory_pulse (RM2 burst)");
         v3_check_owner("v3_native_factory_pulse");
-        if (!v3_native_seed_from_live_callback()) return;
+        g_v3_pulse_seen.fetch_add(1, std::memory_order_relaxed);
+        if (!v3_native_seed_from_live_callback())
+        {
+            g_v3_pulse_unseeded.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         v3_native_factory_consume(ctx, static_cast<uint32_t>(frame));
     }
     catch (const std::exception &e)

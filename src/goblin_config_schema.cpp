@@ -332,7 +332,7 @@ namespace
                 IniEntry{"hide_marker_key", IniType::VkKey, &cfg::hideMarkerKey, "Delete",
                          "Key that hides the map marker currently under the cursor. Default: Delete.", false, nullptr},
                 IniEntry{"hide_marker_gamepad", IniType::GamepadMask, &cfg::hideMarkerGamepad, "RB",
-                         "Gamepad button that hides the map marker under the cursor (same as\nhide_marker_key). Tokens joined with '+'. Default: RB.", false, nullptr},
+                         "Gamepad button that hides the map marker under the cursor (same as\nhide_marker_key). Tokens joined with '+'. Set it to 'none' to unbind - RB is\nalso the map's own tab-switch button, so on a pad it is easy to hit by\naccident. Default: RB.", false, nullptr},
                 B("hover_info", enableHoverInfo, "true",
                   "Show a small passive panel (top-left) while the world map is open and the\ncursor is over a marker: the marker's name and its height relative to you\n(\"N units above/below\"). Never captures input."),
             }},

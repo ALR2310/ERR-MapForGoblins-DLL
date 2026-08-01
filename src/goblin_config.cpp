@@ -54,7 +54,23 @@ namespace
         }
         case IniType::GamepadMask:
         {
-            uint16_t m = goblin::parse_gamepad_combo(v);
+            // "none"/"off"/empty must be able to UNBIND a pad button, not fall through to the
+            // default. Reported 2026-08-01: hide_marker_gamepad defaults to RB, which is also the
+            // map's own tab-switch button, so the player hid their markers by accident all session
+            // and could not turn it off - clearing the key left RB in place, because an unparsed
+            // value was indistinguishable from an empty one and both were ignored.
+            std::string t = v;
+            t.erase(0, t.find_first_not_of(" \t"));
+            const size_t last = t.find_last_not_of(" \t");
+            t.erase(last == std::string::npos ? 0 : last + 1);
+            std::string up = t;
+            std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+            if (t.empty() || up == "NONE" || up == "OFF" || up == "0")
+            {
+                *static_cast<uint16_t *>(e.target) = 0;
+                break;
+            }
+            uint16_t m = goblin::parse_gamepad_combo(t);
             if (m) *static_cast<uint16_t *>(e.target) = m;
             break;
         }
@@ -578,5 +594,7 @@ std::string goblin::format_gamepad_combo(uint16_t mask)
     std::string out;
     for (auto &p : order)
         if (mask & p.first) { if (!out.empty()) out += '+'; out += p.second; }
-    return out;
+    // Spell an unbound pad button rather than writing a blank, which reads as a value someone
+    // forgot to fill in. The parser accepts this back as "no button".
+    return out.empty() ? std::string("none") : out;
 }

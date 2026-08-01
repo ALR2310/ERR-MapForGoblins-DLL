@@ -26,6 +26,9 @@ namespace goblin::overlay
     // needs the pad poll running, which setup() starts in every mode. Used by the manual
     // marker-hide loop.
     bool gamepad_mask_down(uint16_t mask);
+    // The whole button set currently held on the real pad (0 when none/no pad). For callers that
+    // must discover a combo rather than test a known one - the menu's rebind page.
+    uint16_t gamepad_buttons();
 
     // Live WorldMapPointParam row of the V3 native marker projecting nearest the
     // map reticle (screen centre), or nullptr. Markers migrated off the engine

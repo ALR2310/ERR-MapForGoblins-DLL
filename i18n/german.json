@@ -70,7 +70,9 @@
     "MenuTotal": "Gesamt",
     "MenuUnavailable": "Diese Seite ist nicht verfuegbar",
     "MenuPressKey": "Taste druecken...",
-    "MenuKeepCurrent": "Unveraendert lassen"
+    "MenuKeepCurrent": "Unveraendert lassen",
+    "MenuPressPad": "Drücke eine Gamepad-Taste...",
+    "MenuUnbind": "Belegung entfernen"
   },
   "toasts": {
     "MapIconsOn": "Kartensymbole: AN",

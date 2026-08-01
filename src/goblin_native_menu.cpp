@@ -403,7 +403,11 @@ namespace
             return RowKind::Toggle;
         if (e.type == goblin::IniType::Language)
             return RowKind::Enum;
-        if (e.type == goblin::IniType::VkKey)
+        // Both binding kinds open the same "press it" page; build_rebind and the poller branch on
+        // the entry's type. Until 2026-08-01 a GamepadMask fell through to Info, so the menu showed
+        // the button and refused to change it - the reporter hit hide_marker_gamepad (default RB,
+        // which is also the map's tab-switch button) all session with no way out.
+        if (e.type == goblin::IniType::VkKey || e.type == goblin::IniType::GamepadMask)
             return RowKind::Rebind;
         if (range_for(e.key))
             return RowKind::Number;
@@ -909,6 +913,20 @@ namespace
     void build_root()
     {
         g_title = kProductName;
+        // The master switch, first row. It is runtime state (goblin::icons_hidden), not an ini
+        // entry, so it cannot be a Toggle row - those flip a bool* belonging to the schema. The
+        // overlay used to carry this and the native menu never picked it up when it took over as
+        // the config UI, which left the only way to turn every icon off at once being a hotkey
+        // the player may well have unbound.
+        {
+            Row master;
+            master.kind = RowKind::Action;
+            master.label = text(tr::TextId::MasterToggle);
+            master.value = text(goblin::icons_hidden() ? tr::TextId::ValueOff : tr::TextId::ValueOn);
+            master.help = text(tr::TextId::MasterToggleTooltip);
+            master.action = [] { goblin::set_icons_hidden(!goblin::icons_hidden()); };
+            push(master);
+        }
         // Two settings are important enough to sit at the top level rather than inside a
         // page: what the map is allowed to show at all, and how it tells the place you are
         // in from the places that merely sit under (or over) it.
@@ -1307,15 +1325,27 @@ namespace
         }
         std::wstring name = wide(tr::entry_label(e->key, mlang()));
         g_title = name.empty() ? wide(e->key) : name;
+        const bool pad = e->type == goblin::IniType::GamepadMask;
         Row prompt;
         prompt.kind = RowKind::Info;
-        prompt.label = text(tr::TextId::MenuPressKey);
+        prompt.label = text(pad ? tr::TextId::MenuPressPad : tr::TextId::MenuPressKey);
         prompt.value = hold(value_of(*e));
         push(prompt);
         Row keep;
         keep.kind = RowKind::Back;
         keep.label = text(tr::TextId::MenuKeepCurrent);
         push(keep);
+        // A keyboard binding can be cleared by pressing Escape, which the poller reads as "leave
+        // it alone" and which players also use as "get me out". A pad has no such key, so the only
+        // way to say "no button at all" is to offer it as a row.
+        if (pad)
+        {
+            Row clear;
+            clear.kind = RowKind::Action;
+            clear.label = text(tr::TextId::MenuUnbind);
+            clear.action = [] { goblin::nmenu::rebind_apply_pad(0); };
+            push(clear);
+        }
     }
 
     // The Tools page is gone (2026-07-29). Its only surviving row, "Save settings now", duplicated
@@ -1646,6 +1676,35 @@ void goblin::nmenu::rebind_apply(uint32_t vk)
     if (g_nested)
     {
         g_want_close = true; // the "press a key" screen closes itself once it has one
+        return;
+    }
+    navigate_back();
+}
+
+bool goblin::nmenu::rebind_is_pad()
+{
+    return g_edit_entry && g_edit_entry->type == goblin::IniType::GamepadMask;
+}
+
+void goblin::nmenu::rebind_apply_pad(uint16_t mask)
+{
+    // Unlike the keyboard path, mask 0 is a REAL value here - it is how "no button" is spelled,
+    // and the Unbind row is the only way to say it. Cancelling is the Back row instead.
+    if (g_edit_entry && g_edit_entry->target)
+    {
+        *static_cast<uint16_t *>(g_edit_entry->target) = mask;
+        g_dirty = true;
+        // Same reasoning as the key path: a binding is verified by using it, and using it may
+        // well mean closing the game, so it goes to disk now.
+        goblin::save_config(goblin::g_ini_path);
+        goblin::reapply_live_settings();
+        spdlog::info("[nmenu] {} rebound to pad 0x{:04X} ({}) (saved)", g_edit_entry->key, mask,
+                     mask ? goblin::format_gamepad_combo(mask) : std::string("none"));
+    }
+    g_rebind_waiting = false;
+    if (g_nested)
+    {
+        g_want_close = true;
         return;
     }
     navigate_back();

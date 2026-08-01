@@ -247,12 +247,24 @@ foreach(mfg_variant MFG_LEGACY_PIN_MARKERS MFG_SLOW_MAP_OPEN MFG_NO_SELF_DETACH
   endif()
 endforeach()
 
-# Reproducible build: /Brepro makes the compiler emit deterministic object files
-# and the linker zero the PE TimeDateStamp, so the same source always produces a
-# byte-identical DLL. Without it MSVC stamps wall-clock build time into the PE
-# header, which changes the bytes every build and lets a borderline AV ML model
+# Reproducible build: /Brepro makes the compiler emit deterministic object files, so the same
+# source always produces a byte-identical DLL. Without it MSVC stamps wall-clock build time into
+# the PE header, which changes the bytes every build and lets a borderline AV ML model
 # (Wacatac.B!ml) flip its verdict between otherwise-identical builds. Stable bytes
 # => stable verdict (and a clean variant stays clean).
+#
+# CORRECTION 2026-08-01: the linker's /Brepro does NOT zero the PE TimeDateStamp, as this comment
+# claimed for months - it writes a CONTENT HASH there. That reads back as a nonsense date (VT saw
+# 2064-12-05 on the 2.1.0 sample; a local 2.1.1 build read 1979-11-17) and VirusTotal scores it as
+# timestomping: MBC "Hidden Files and Directories -> Timestamp F0005.004" plus MITRE T1070
+# Indicator Removal. Our own anti-FP measure was generating an FP signal.
+# The obvious fix does NOT work on this toolchain: /TIMESTAMP:0x<unix_hex> was TRIED 2026-08-01 and
+# the linker answered "LNK4044: unrecognized option ... ignored" (MSVC linker 14.36, VS2022 17.6).
+# Ignored silently means the stamp fell back to WALL-CLOCK build time, which costs determinism -
+# strictly worse than a nonsense date. So the linker /Brepro stays until the toolchain is new
+# enough to take /TIMESTAMP; do not re-try it without checking the link log for LNK4044.
+# ACCEPTANCE TEST if this line is ever touched: two consecutive full builds must produce a
+# byte-identical DLL.
 target_compile_options(MapForGoblins PRIVATE /Brepro /utf-8)
 target_link_options(MapForGoblins PRIVATE /Brepro)
 # /MAP for CRASH SYMBOLIZATION. The shipped DLL carries no PDB and no debug directory (that is

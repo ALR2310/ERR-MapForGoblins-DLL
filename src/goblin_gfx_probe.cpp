@@ -6,7 +6,10 @@
 #include "goblin_config.hpp"
 #include "goblin_messages.hpp"
 
+#include "goblin_build_variants.hpp" // MFG_STALL_PROFILER gates the hardware write watch
+#if MFG_STALL_PROFILER
 namespace goblin::watch { void pump(); }
+#endif
 #include "goblin_build_variants.hpp"
 #include "generated_shared/goblin_map_icons.hpp" // one DefineBitsLossless2 tag per custom map icon
 #include "generated_shared/goblin_logo.hpp"       // runtime-injectable MapForGoblins logo (bitmap + matrix)
@@ -656,6 +659,12 @@ namespace
             // PlaceObject tags embed the bitmap charId, whose collision-safe
             // base is recomputed for every loaded movie.
             memset(g_native_place_tags, 0, sizeof(g_native_place_tags));
+            // A new worldmap movie is loading, so whatever movieDef we latched belongs to the
+            // PREVIOUS one and must not be dereferenced again (tick() walks its resource dict).
+            // Cleared here as well as at map close, because a movie can be re-loaded without a
+            // close ever running.
+            g_moviedef.store(0, std::memory_order_relaxed);
+            g_dict_dumped.store(false, std::memory_order_relaxed);
             g_worldmap_ctx.store(ctx, std::memory_order_relaxed); // scope sprite-246 logo to THIS movie
             uint64_t sub = rq(ctx + 0x18);
             uint64_t mgr = sub ? rq(sub + 0x40) : 0;
@@ -2061,8 +2070,15 @@ bool goblin::gfx_probe::icons_injected()
 
 void goblin::gfx_probe::v3_on_map_close()
 {
-    // Nothing to reset here any more: icon definitions and resources stay loaded across map opens,
-    // and the one-shot flag this used to clear belonged to a spike that no longer exists.
+    // Icon definitions and resources stay loaded across map opens, so nothing of the injection is
+    // undone here. What DOES have to go is our cached movieDef pointer: it is latched once (see
+    // lookup_detour) and then dereferenced by tick() from the background watcher every 100ms-2s,
+    // forever - while the worldmap movie itself is re-loaded (seh_inject_sprite171 recomputes the
+    // charId base "for every loaded movie"). A movieDef that has been freed since we latched it
+    // makes the collision self-heal read a dead resource dict and bump the injected charId base off
+    // garbage. Dropping it here costs one re-latch on the next charId-171 lookup.
+    g_moviedef.store(0, std::memory_order_relaxed);
+    g_dict_dumped.store(false, std::memory_order_relaxed);
 }
 
 
@@ -2075,7 +2091,9 @@ void goblin::gfx_probe::tick()
     // The background loop already paces us (100ms-2s), so no frame throttle here; the work below is one-shot.
     const bool probe = goblin::config::debugLogging;
     goblin::check_patched_slots(); // audit watch; no-op without debug logging
+#if MFG_STALL_PROFILER
     goblin::watch::pump();        // arm any queued hardware write watch (never on its own thread)
+#endif
 
     // V3 stage 1: TOP-DOWN layer discovery from the live WorldMapDialog. maphover
     // publishes the MapArea (r8 of the per-frame hook); dialogBase = MapArea -

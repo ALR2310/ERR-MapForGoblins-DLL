@@ -839,7 +839,19 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
         if lot_linkage is not None:
             _lot = rec.get('itemLotId', 0) or 0
             if _lot > 0:
-                _lt = 2 if rec.get('source') == 'enemy' else 1  # enemy vs map(treasure/emevd)
+                # Which param, as MEASURED by the extractor when it read the items - not inferred
+                # from the marker being an enemy drop. A named NPC whose NpcParam uses the
+                # itemLotId_map field drops through ItemLotParam_map, and looking it up in
+                # ItemLotParam_enemy simply misses (the DLL then keeps the baked icon and logs an
+                # error). The `source` fallback keeps older databases, from before lotParam was
+                # recorded, behaving exactly as they did.
+                _param = rec.get('lotParam')
+                if _param == 'enemy':
+                    _lt = 2
+                elif _param == 'map':
+                    _lt = 1
+                else:
+                    _lt = 2 if rec.get('source') == 'enemy' else 1
                 lot_linkage[row_id] = [int(_lot), _lt]
 
         # Primary item ID for localized text, offset-encoded by item category:

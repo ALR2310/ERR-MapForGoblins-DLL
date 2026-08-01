@@ -68,9 +68,7 @@
     "MegaShadow": "幽影之地",
     "ProgressFocusResetHint": "重置请在菜单中点击“%s”",
     "MenuBack": "返回",
-    "MenuTools": "工具",
     "MenuTotal": "总计",
-    "MenuSaveNow": "立即保存设置",
     "MenuUnavailable": "此页面不可用",
     "MenuPressKey": "请按一个键...",
     "MenuKeepCurrent": "保持当前"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "标记导出失败，请再按一次"
   },
   "section_labels": {
+    "Categories": "分类",
+    "Menu settings": "模组设置",
     "Goblin": "基础",
     "Equipment": "装备",
     "Key Items": "重要道具",
@@ -92,18 +92,19 @@
     "World": "世界",
     "ERR Markers": "ERR 原生标记",
     "Compatibility": "兼容性",
-    "Overlay & Hotkeys": "菜单与热键",
+    "Menu & Hotkeys": "菜单与快捷键",
     "Debug": "调试"
   },
   "section_comments": {
     "Reforged": "仅 Elden Ring Reforged 内容。原版构建中不会出现。",
     "ERR Markers": "本节会把本 MOD 的显示规则应用到 ERR 自带的预设地图标记\n（营地、商人、Boss、地下城入口）上，而不是本 MOD 注入的图标。\n这样两套图标会遵循相同的可见性逻辑（地图碎片发现、清除后隐藏）。\n关闭某个开关即可让对应标记组保持 ERR 原样。本 MOD 自己的 Boss 标记\n由 [World] show_bosses 控制，和本节相互独立。",
     "Compatibility": "与改变物品摆放的其他 MOD 共用时的选项。",
-    "Overlay & Hotkeys": "游戏内设置菜单，以及打开菜单的键盘/手柄按键。enable_overlay 开启时，\ntoggle_key（键盘）/ toggle_gamepad_combo（手柄）会打开菜单；关闭时则会\n开关所有地图图标。按键名支持：F1-F24、A-Z、0-9、Space、Escape、Tab、\nEnter、Backspace、Home、End、PageUp、PageDown、Insert、Delete、方向键。",
+    "Menu & Hotkeys": "模组的菜单以及打开它的按键。启用 menu_enabled 时，toggle_key（键盘）和\ntoggle_gamepad_combo（手柄）会打开菜单；关闭时，它们改为开关全部地图图标。\n打开哪个菜单由 menu_render_mode 决定。按键名称：F1-F24、A-Z、0-9、Space、\nEscape、Tab、Enter、Backspace、Home、End、PageUp、PageDown、Insert、Delete、方向键。",
     "Debug": "诊断选项，会显示在菜单的“调试”标签页。"
   },
   "entry_labels": {
     "require_map_fragments": "需要地图碎片",
+    "location_emphasis": "当前区域强调",
     "fast_map_open": "加快地图打开",
     "show_armaments": "武器",
     "show_armour": "防具",
@@ -179,8 +180,8 @@
     "live_loot_icons": "实时战利品图标",
     "anonymous_loot": "匿名战利品",
     "rebind": "重绑",
-    "ui_language": "语言",
-    "enable_overlay": "启用菜单",
+    "overlay_ui_language": "覆盖层语言",
+    "menu_enabled": "启用菜单",
     "enable_toggle_hotkey": "启用切换热键",
     "toggle_key": "切换键",
     "toggle_gamepad_combo": "手柄组合键",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "手动隐藏标记",
     "hide_marker_key": "隐藏标记键",
     "hover_info": "标记悬停信息",
-    "overlay_render_mode": "覆盖层渲染模式",
+    "menu_render_mode": "菜单类型",
     "hide_marker_gamepad": "隐藏标记按键"
   },
   "entry_comments": {
     "require_map_fragments": "需要先发现对应区域的地图碎片，才显示该区域图标。",
+    "location_emphasis": "你所在地图的标记会画得更大；只是看起来在附近的标记（脚下的地下城，或其上方的地表）会画得更小。不会隐藏任何标记。",
     "fast_map_open": "测试功能：显示大量图标时加快世界地图打开速度。\n如果地图异常或崩溃，请关闭。",
     "show_armaments": "武器、盾牌、弓、杖等。",
     "show_armour": "防具部位（头盔、胸甲、臂甲、腿甲）。",
@@ -270,19 +272,19 @@
     "live_loot_labels": "把每个战利品标记改名为当前 lot 实际给予的物品，使名称匹配随机器。\n会使用更多内存（把物品名复制到地图名称表中）。",
     "live_loot_icons": "让每个战利品标记使用当前 lot 实际物品的图标和类别，\n使图标和 show_* 开关匹配随机器。",
     "anonymous_loot": "无剧透：所有战利品标记显示灰色“?”和通用名称，而不显示真实物品。\n会覆盖 live_loot_labels/icons；标记仍会在拾取后隐藏。",
-    "ui_language": "菜单语言。auto 会跟随 Steam 游戏语言；无法识别时回退到英文。",
-    "enable_overlay": "游戏内设置菜单（Dear ImGui），用下面的热键打开。\n如果 DX Hook 与 Steam 覆盖层/RTSS/GeForce Experience 冲突，或 GPU 驱动导致游戏不稳定，可设为 false。",
+    "overlay_ui_language": "覆盖层菜单的语言。auto 跟随 Steam 游戏语言；无法识别的语言回退为英文。\n游戏内菜单不使用此设置，始终跟随游戏语言。",
+    "menu_enabled": "由下面的切换键打开的模组菜单。关闭后，同一按键改为开关全部地图图标，不会打开菜单；\n若 DX 挂钩冲突（Steam 叠加层/RTSS/GeForce Experience）或显卡驱动导致覆盖层菜单\n使游戏不稳定，也应关闭此项。",
     "enable_toggle_hotkey": "当菜单被禁用时，允许 toggle_key / toggle_gamepad_combo 开关所有地图图标。\n菜单启用时，这些按键会打开菜单。",
-    "toggle_key": "键盘热键：enable_overlay 开启时打开设置菜单；菜单禁用时开关所有地图图标。\n默认：F10。",
-    "toggle_gamepad_combo": "手柄组合键，作用同 toggle_key（打开菜单；菜单禁用时开关所有图标）。\n按键用 + 连接：A,B,X,Y,LB,RB,L3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,\nSTART/MENU,UP/DOWN/LEFT/RIGHT。默认：Y+R3。",
+    "toggle_key": "键盘热键：menu_enabled 开启时打开设置菜单；菜单禁用时开关所有地图图标。\n默认：F10。",
+    "toggle_gamepad_combo": "手柄开关，与 toggle_key 作用相同：打开覆盖层，或在覆盖层关闭时开关所有地图图标。\n在菜单中只需按下想要的按键即可。手动编辑本文件时用 '+' 连接名称\n(A, B, X, Y, LB, RB, L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT)。",
     "debug_logging": "启用详细调试日志（内存地址、param 详情、FMG 内部信息）。",
     "enable_marker_dump": "标记导出热键的总开关。",
     "marker_dump_key": "把已解码标记导出到 logs/MapForGoblins_markers.log 的按键。默认：F9。",
-    "overlay_render_mode": "覆盖层的绘制方式：surface（默认）、layered（最大兼容性）或 swapchain（最轻量）。需重启游戏。",
+    "menu_render_mode": "切换键打开哪个菜单：native（由游戏自己绘制的游戏内菜单）或 imgui（独立的覆盖层窗口）。\n只能在此处修改：决定某个菜单是否存在的开关不能放在该菜单里。需要重启游戏。",
     "show_world_maps_ignore_fragments": "始终显示地图残片标记，即使开启了按残片解锁的限制（这样你能在获得残片前找到它）。",
     "enable_manual_hide": "在世界地图上将光标悬停在标记上并按下隐藏键即可隐藏。隐藏的标记会保留，可在'已隐藏'标签页恢复。",
     "hide_marker_key": "隐藏光标下方地图标记的按键。",
-    "hover_info": "打开地图时，在左上角显示一个小面板，展示所悬停标记的名称及其相对你的高度。",
+    "hover_info": "打开地图时，在左侧显示一个小面板，说明光标下的标记比你高多少或低多少。\n其名称不再重复显示——游戏自带的弹窗已经显示了。",
     "hide_marker_gamepad": "隐藏光标下方地图标记的手柄按键（与隐藏键相同）。"
   }
 }

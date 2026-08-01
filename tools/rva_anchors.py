@@ -109,13 +109,14 @@ ANCHORS = [
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 41 8B D8",
      "used": "draw_row_icon (shifts the icon strip)"},
 
-    # ---- load-time movie interception (goblin_own_movie.cpp) ----
-    {"name": "movie_open_file", "rva": 0xD6B4D0,
-     "bytes": "40 55 53 56 57 41 54 41 56 41 57 48 8D 6C 24 D9",
-     "used": "own_movie::install (CSScaleformFileOpener::OpenFile detour)"},
-    # Not called - it is the constructor whose body DEFINES the memory-file layout the
-    # interception relies on (+0x18 buffer, +0x20 size, +0x24 position). If these bytes stop
-    # matching, re-read the layout before trusting the interception.
+    # ---- movie transform (goblin_own_movie.cpp) ----
+    # The engine's movie OPENER is deliberately not used and has no anchor: whether it is called for a
+    # given movie is the mod loader's decision (ModEngine3 answers for the files it overrides before the
+    # engine gets there, so of Convergence's 22 overridden movies it fired for 0). The transform runs on
+    # the tag loop instead - AOB gfx_tag_loop - which every movie goes through whoever served the file.
+    # Not called - it is the constructor whose body DEFINES the memory-file layout the transform
+    # relies on (+0x18 buffer, +0x20 size, +0x24 position, +0x08 refcount). If these bytes stop
+    # matching, re-read the layout before trusting the transform.
     {"name": "memory_file_ctor", "rva": 0xCE7BB0,
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE",
      "used": "own_movie: source of the memory-file field offsets"},

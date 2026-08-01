@@ -6,6 +6,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "goblin_config_schema.hpp"
 #include "goblin_native_menu.hpp"
 #include "goblin_own_movie.hpp"
+#include "goblin_overlay.hpp" // gamepad_mask_down: the pad state is polled there
 #include "goblin_sfimage.hpp"
 #include "goblin_map_icons.hpp"
 #include "generated_shared/goblin_menu_icon_tags.hpp"
@@ -13,6 +14,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "goblin_maphover.hpp"
 #include "goblin_mapproject.hpp"
 #include "goblin_gfx_probe.hpp"
+#include "goblin_collected.hpp" // read_player_map_id() for the location emphasis
 #include "goblin_inject.hpp"
 #include "modutils.hpp"
 
@@ -520,6 +522,19 @@ namespace
         float base_tx = 0.0f;
         float base_ty = 0.0f;
         float base_m[4] = {}; // authored 2x2 basis {m0,m1,m4,m5} captured at staging
+        // The MAP this marker belongs to (WorldMapPointParam areaNo/gridXNo/gridZNo),
+        // kept per object so the location emphasis can be re-decided whenever the
+        // player moves, with no rebuild. Rings carry the coords of whatever marker
+        // they are currently sitting on, so they follow its emphasis for free.
+        uint8_t area = 0;
+        uint16_t gx = 0;
+        uint16_t gz = 0;
+        float emph = 1.0f;    // location-emphasis size factor (1.0 = untouched)
+        // Location-emphasis colour, as last WRITTEN (1.0 / 0.0 = untouched). Memoised so a
+        // re-decide only pays for a colour write when the answer actually moved - that
+        // write is a copy-on-write inside the engine, not a store.
+        float fade = 1.0f;
+        float cool = 0.0f;
         bool visible = false;
         bool attached = true; // lever B: currently linked into the marker parent (has a
                               // render node). Always true unless the viewport-window variant.
@@ -548,6 +563,11 @@ namespace
         bool in_factory = false;
         uint64_t last_progress_ms = 0; // last creation (or seed); queue watchdog
         uint16_t next_depth = 24;      // timeline depth allocator (never reused)
+        // Focus rings live ABOVE every marker. Depth is what decides who draws over whom, and
+        // with one allocator the rings took whatever number their turn in the queue gave them -
+        // which put them under the icons they are meant to point at. The band starts far past
+        // any marker count we can reach (about 9.5k children today) and still fits a u16.
+        uint16_t next_ring_depth = 50000;
         // Counter-zoom state: the marker layer's parent transform scales with the
         // map and nothing in the engine touches our raw children (they are not
         // widgets). The manager copies the live 2x2 the engine writes into a REAL
@@ -560,6 +580,17 @@ namespace
         float sample_zoom = 0.0f; // MapView.zoom at that sample (zoom-ratio fallback)
         float last_dump_zoom = 0.0f; // last zoom the diagnostic probe logged at
         bool sample_logged = false;
+        // Location emphasis: the map the player stands in, resampled while the map is
+        // open (fast travel and the map screen never coexist, but a reopen after a
+        // move must not carry the old answer). 0 = unknown -> every marker plain.
+        uint32_t player_map = 0;
+        uint64_t emph_sig = 0;   // player map + the two scales + on/off, as one compare
+        // Does the TAB being looked at contain the player's own location at all? Standing
+        // in Siofra (an underground map) and looking at the surface tab, nothing on screen
+        // is "here" - emphasising then would mute the entire tab and say nothing. Decided
+        // per merge from the snapshot, which is the only place that knows every marker's
+        // layer, and false until a snapshot says otherwise.
+        bool emph_active = false;
         std::vector<goblin::NativeMarkerPoint> pending;
         std::vector<V3NativeObject> objects;
         std::unordered_map<uint64_t, size_t> by_row;
@@ -570,6 +601,10 @@ namespace
         // engine later freed and reused, passes every heap-range check but reads back a foreign
         // vtable here - so we never write a matrix into whatever now owns that block.
         uint64_t child_vtable = 0;
+        bool child_vtable_logged = false;
+        uint32_t cx_attempts = 0;  // frames spent waiting for a child's render entry
+        bool emph_dirty = false;   // a re-decide is owed; spent a slice per frame
+        size_t emph_cursor = 0;
         // The parent (WorldMapItem container) vtable, captured lazily once the parent is genuinely
         // alive. Unlike child_vtable (shared by thousands of marker sprites) there is exactly one
         // such container, so a match is strong proof the cached parent pointer is still THIS live
@@ -647,6 +682,35 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             out = 0;
+            return false;
+        }
+    }
+
+    // Raw block read/write. SEH leaves, no C++ temporaries (MSVC rejects __try in a
+    // function that owns objects with destructors). Used by the colour lever, which
+    // writes into the same render-node data the matrix already goes into.
+    bool v3_read_bytes(uintptr_t addr, void *out, size_t n)
+    {
+        __try
+        {
+            memcpy(out, reinterpret_cast<const void *>(addr), n);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool v3_write_bytes(uintptr_t addr, const void *src, size_t n)
+    {
+        __try
+        {
+            memcpy(reinterpret_cast<void *>(addr), src, n);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
             return false;
         }
     }
@@ -938,6 +1002,277 @@ namespace
 
     constexpr float V3_HIDDEN_MAP_POS = -100000.0f;
 
+    // Where the colour transform sits inside the render-node data, learned from the first
+    // child built (see v3_find_cx_offset). 0 = not proven -> no colour lever at all.
+    // The window below is only the range the one-shot scan reports identity runs over, for
+    // the log: the offset itself is anchored on the MATRIX, not on an identity run.
+    constexpr size_t V3_CX_SCAN_FIRST = 0x10;
+    constexpr size_t V3_CX_SCAN_LAST = 0x100;
+    size_t g_v3_cx_offset = 0;
+    bool g_v3_cx_searched = false;
+
+    // ── Location emphasis ───────────────────────────────────────────────────────────
+    // A dungeon lies UNDER the overworld, so its markers are drawn on the same patch of
+    // map as the surface ones around its entrance. Which icon belongs to the cave you are
+    // standing in is then only answerable by hovering every one of them. Both sides of the
+    // comparison are already here: a marker carries the map it belongs to (the
+    // WorldMapPointParam area/grid triple) and the player carries one too.
+    //
+    // The whole overworld counts as ONE location - a marker two tiles away is still "out
+    // here with me", and a per-tile rule would flicker the emphasis every time the player
+    // walked over a tile seam. Each interior map is its own location, so a cave, the cave
+    // next door and the surface above them all read differently from each other.
+    bool v3_same_location(uint8_t a1, uint16_t x1, uint16_t z1,
+                          uint8_t a2, uint16_t x2, uint16_t z2)
+    {
+        const bool over1 = (a1 == 60 || a1 == 61);
+        const bool over2 = (a2 == 60 || a2 == 61);
+        if (over1 || over2) return over1 && over2 && a1 == a2;
+        return a1 == a2 && x1 == x2 && z1 == z2;
+    }
+
+    // Is the emphasis answerable at all? Off, or a player map we could not read, means an
+    // unresolved read can only ever leave the map looking exactly as it did before this
+    // feature existed.
+    bool v3_emphasis_possible()
+    {
+        return goblin::config::locationEmphasis && g_v3_native.player_map != 0;
+    }
+
+    // Does this marker belong to the map the player is standing in? Pure comparison - used
+    // to decide whether the emphasis has anything to say on this tab in the first place.
+    bool v3_own_raw(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        const uint32_t pm = g_v3_native.player_map;
+        return v3_same_location(area, gx, gz,
+                                static_cast<uint8_t>((pm >> 24) & 0xFF),
+                                static_cast<uint16_t>((pm >> 16) & 0xFF),
+                                static_cast<uint16_t>((pm >> 8) & 0xFF));
+    }
+
+    bool v3_is_own_location(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        return v3_emphasis_possible() && g_v3_native.emph_active &&
+               v3_own_raw(area, gx, gz);
+    }
+
+    // Size factor for one marker against the player's current map.
+    float v3_emphasis(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        if (!v3_emphasis_possible() || !g_v3_native.emph_active)
+            return 1.0f;
+        const float f = v3_is_own_location(area, gx, gz)
+                            ? goblin::config::locationEmphasisOwnScale
+                            : goblin::config::locationEmphasisOtherScale;
+        // A bad ini value must not park markers on top of each other or blow them up
+        // across the whole screen; clamp to a range that still reads as "an icon".
+        return std::clamp(f, 0.35f, 2.5f);
+    }
+
+    // Colour factor for one marker. The player's own map keeps the icon untouched; every
+    // other map fades. Clamped away from 0 so a marker can never be faded into invisibility
+    // - the whole feature's contract is that nothing is ever hidden.
+    float v3_fade(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        // No proven colour offset means no colour at all - and saying so HERE keeps every
+        // caller consistent, so nothing ends up re-writing transforms every merge chasing
+        // a fade that can never be applied.
+        if (g_v3_cx_offset == 0 || !v3_emphasis_possible() || !g_v3_native.emph_active ||
+            v3_is_own_location(area, gx, gz))
+            return 1.0f;
+        return std::clamp(goblin::config::locationEmphasisOtherFade, 0.2f, 1.0f);
+    }
+
+    // How far this marker's hue is pushed cold, on top of the fade. Same gating as the
+    // fade, so an own-location marker is never touched at all.
+    float v3_cool(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        if (g_v3_cx_offset == 0 || !v3_emphasis_possible() || !g_v3_native.emph_active ||
+            v3_is_own_location(area, gx, gz))
+            return 0.0f;
+        return std::clamp(goblin::config::locationEmphasisOtherCool, 0.0f, 1.0f);
+    }
+
+    // ── Colour: the second emphasis lever ───────────────────────────────────────────
+    // Scaleform GFx SDK 4.0 (Src/Render/Render_TreeNode.h, Src/GFx/GFx_DisplayObject.h)
+    // settles what the vtable could not: DisplayObjectBase::Get/SetCxform are NOT virtual
+    // - they forward to the render node, `GetWritableData(Change_CxForm)->Cx = cx`. So the
+    // colour is a field of the same node data our matrix already goes into, not a vtable
+    // slot, and no amount of dumping slots would ever have found it.
+    //
+    // The SDK declares Cxform as `float M[4][2]` = [R,G,B,A][mult,add], but THIS build
+    // stores it the other way round - four multipliers, then four addends, the shape the
+    // SDK's own GetAsFloat2x4() produces (newer Scaleform keeps it that way for SIMD).
+    // Dumped live at nodeData+0x50: 1,1,1,1 / 0,0,0,0. Searching for the DECLARED
+    // interleaving finds nothing at all, which is exactly what the first attempt did.
+    //
+    // The offset is FOUND rather than hardcoded - a game patch would move it, and the
+    // surrounding layout is this build's own business - but it is found off the matrix we
+    // wrote ourselves, not off the identity run (see v3_find_cx_offset). Anything less than
+    // one unambiguous hit means "not proven": the tint stays off and size and order do the job.
+    // The render side of a marker child is NOT at child+0x80: that field is the SDK's
+    // `pRenNode` and a live dump showed it NULL for every one of ours (which is why the
+    // matrix goes through the display object's fallback branch instead). It is the
+    // Context::Entry at `child+0x48`, and the node data behind it is reached by pure
+    // arithmetic - Scaleform packs entries 0x48 bytes apart inside 4K pages starting at
+    // page+0x30, and the data pointer for entry i lives at `*(page+0x20) + 0x28 + i*8`.
+    // That is GetReadOnlyData inlined; safe to mirror for READS. Live check on the first
+    // child: entry 0x...198, (0x198 - 0x30) / 0x48 = 5 exactly.
+    uintptr_t v3_node_data_ro(uintptr_t child)
+    {
+        uint64_t entry = 0;
+        if (!v3_read64(child + 0x48, entry) || !v3_heap_ptr(entry)) return 0;
+        const uint64_t page = entry & ~0xFFFull;
+        const uint64_t off = entry - page;
+        // Refuse anything that is not exactly on an entry slot rather than compute a
+        // plausible-looking pointer out of a field that turned out to be something else.
+        if (off < 0x30 || ((off - 0x30) % 0x48) != 0) return 0;
+        uint64_t arr = 0, data = 0;
+        if (!v3_read64(page + 0x20, arr) || !v3_heap_ptr(arr)) return 0;
+        if (!v3_read64(arr + 0x28 + ((off - 0x30) / 0x48) * 8, data) || !v3_heap_ptr(data))
+            return 0;
+        return static_cast<uintptr_t>(data);
+    }
+
+    // The WRITABLE node data. Not mirrored: GetWritableData does copy-on-write and
+    // registers the change with the context, which is how the renderer learns anything
+    // happened - reimplementing that would be reimplementing the snapshot machinery.
+    // Resolved by AOB; a miss simply leaves the colour lever off.
+    using V3GetWritableDataFn = void *(void *entry, uint32_t change_flags);
+    V3GetWritableDataFn *g_v3_get_writable_data = nullptr;
+    constexpr uint32_t V3_CHANGE_CXFORM = 0x2;  // Render_Constants.h Change_CxForm
+
+    uintptr_t v3_node_data_rw(uintptr_t child)
+    {
+        if (!g_v3_get_writable_data) return 0;
+        uint64_t entry = 0;
+        if (!v3_read64(child + 0x48, entry) || !v3_heap_ptr(entry)) return 0;
+        const uint64_t off = entry - (entry & ~0xFFFull);
+        if (off < 0x30 || ((off - 0x30) % 0x48) != 0) return 0;
+        void *data = nullptr;
+        __try
+        {
+            data = g_v3_get_writable_data(reinterpret_cast<void *>(entry),
+                                          V3_CHANGE_CXFORM);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            data = nullptr;
+        }
+        return v3_heap_ptr(reinterpret_cast<uint64_t>(data))
+                   ? reinterpret_cast<uintptr_t>(data)
+                   : 0;
+    }
+
+    bool v3_read_matrix(uintptr_t node, float *m8);  // defined with the other matrix helpers
+
+    void v3_find_cx_offset(uintptr_t child)
+    {
+        g_v3_cx_searched = true;
+        const uintptr_t node = v3_node_data_ro(child);
+        if (!node)
+        {
+            spdlog::info("[v3native] colour: no node data behind child 0x{:X} "
+                         "(entry at +0x48 did not resolve); emphasis keeps to size and order",
+                         child);
+            return;
+        }
+        uint8_t buf[V3_CX_SCAN_LAST + 32]{};
+        if (!v3_read_bytes(node, buf, sizeof buf))
+        {
+            spdlog::info("[v3native] colour: node data 0x{:X} unreadable", node);
+            return;
+        }
+        // An identity colour transform is 1,1,1,1,0,0,0,0 - a common enough run of bytes
+        // that a live node offered TWO candidates (+0x50 and +0xF0). So it is not the
+        // anchor. The MATRIX is: we wrote it ourselves, its translation is a pair of large
+        // distinctive twip values, and the colour sits a fixed distance behind it -
+        // Matrix3F (12 floats) then StateBag, per the SDK's member order. Find the matrix,
+        // step over it, and only accept what is sitting there if it IS an identity.
+        float mine[8]{};
+        size_t mat_off = 0, mat_hits = 0;
+        if (v3_read_matrix(child, mine))
+            for (size_t off = 0; off + sizeof mine <= sizeof buf; off += 4)
+                if (memcmp(buf + off, mine, sizeof mine) == 0)
+                {
+                    mat_off = off;
+                    ++mat_hits;
+                }
+
+        std::string found;
+        for (size_t off = V3_CX_SCAN_FIRST; off <= V3_CX_SCAN_LAST; off += 4)
+        {
+            float m[8]{};
+            memcpy(m, buf + off, sizeof m);
+            bool identity = true;
+            for (int i = 0; i < 8 && identity; ++i)
+                identity = (i < 4) ? m[i] == 1.0f : m[i] == 0.0f;
+            if (!identity) continue;
+            char b[16];
+            snprintf(b, sizeof b, " +0x%zX", off);
+            found += b;
+        }
+
+        // 0x30 = Matrix3F's own 12 floats, 0x10 = the StateBag between it and the colour.
+        constexpr size_t V3_MATRIX_TO_CX = 0x30 + 0x10;
+        const size_t cand = mat_hits == 1 ? mat_off + V3_MATRIX_TO_CX : 0;
+        bool ok = false;
+        if (cand && cand + 32 <= sizeof buf)
+        {
+            float m[8]{};
+            memcpy(m, buf + cand, sizeof m);
+            ok = true;
+            for (int i = 0; i < 8 && ok; ++i)
+                ok = (i < 4) ? m[i] == 1.0f : m[i] == 0.0f;
+        }
+        if (ok && g_v3_get_writable_data)
+        {
+            g_v3_cx_offset = cand;
+            spdlog::info("[v3native] colour transform at nodeData+0x{:X} (matrix at +0x{:X};"
+                         " identity runs seen:{})",
+                         cand, mat_off, found.empty() ? std::string(" none") : found);
+        }
+        else
+        {
+            spdlog::info("[v3native] colour transform not usable (matrix matches={} at "
+                         "+0x{:X}, identity runs:{}, writable getter {}); emphasis keeps to "
+                         "size and order",
+                         mat_hits, mat_off,
+                         found.empty() ? std::string(" none") : found,
+                         g_v3_get_writable_data ? "ok" : "MISSING");
+        }
+    }
+
+    // Write one marker's colour. `fade` scales all four multipliers: our icons are
+    // PREMULTIPLIED alpha, so scaling colour and alpha by the same number is exactly a
+    // fade - scaling alpha alone would leave the colour too strong. 1.0 restores the
+    // untouched icon. The caller re-writes the matrix right after, which is what runs the
+    // node's change bookkeeping.
+    bool v3_write_cxform(uintptr_t child, float fade, float cool)
+    {
+        if (g_v3_cx_offset == 0) return false;
+        // Same dead-generation guard the matrix write carries: a child our own reference
+        // kept alive across a map close, whose block the engine has since freed and handed
+        // to something else, passes every heap check - and writing into it corrupts
+        // whatever now lives there.
+        uint64_t vt = 0;
+        if (!v3_read64(child, vt) || vt == 0 ||
+            (g_v3_native.child_vtable != 0 && vt != g_v3_native.child_vtable))
+            return false;
+        const uintptr_t node = v3_node_data_rw(child);
+        if (!node) return false;
+        // Multipliers are [R, G, B, A]. Alpha carries the fade; holding blue while dropping
+        // red and green is the nearest a per-channel transform gets to "washed out", and it
+        // reads as cold/distant rather than grey. The weights are picked so the shift is
+        // visible without turning an icon blue: at cool = 1 red keeps 0.65 and green 0.85.
+        // Addends stay ZERO - the art is premultiplied, so a positive addend would light up
+        // the transparent part of every icon quad, not just the drawn pixels.
+        const float r = fade * (1.0f - 0.35f * cool);
+        const float g = fade * (1.0f - 0.15f * cool);
+        const float cx[8] = {r, g, fade, fade, 0.0f, 0.0f, 0.0f, 0.0f};
+        return v3_write_bytes(node + g_v3_cx_offset, cx, sizeof cx);
+    }
+
     bool v3_position_child(uintptr_t child, float map_x, float map_y,
                            float base_tx, float base_ty,
                            const float *basis = nullptr,
@@ -957,7 +1292,7 @@ namespace
         // else, passes the heap checks above - and writing a matrix into it corrupts whatever now
         // lives there. Cleared by the manager reset.
         if (g_v3_native.child_vtable == 0)
-            g_v3_native.child_vtable = vt;
+            g_v3_native.child_vtable = vt;  // reported by the tick (no spdlog in an SEH leaf)
         else if (vt != g_v3_native.child_vtable)
             return false;
 
@@ -1057,6 +1392,44 @@ namespace
     }
 
     // GetMatrix (DisplayObject vtbl+0x10) into m8[8], SEH-guarded.
+    // Debug, one-shot: print a marker child and the object its matrix lives in, as bytes.
+    // The colour transform is a run of four 1.0f and four 0.0f (0x3F800000 / 0x00000000)
+    // somewhere in there while the icon is untinted; the byte view is what says WHERE,
+    // which no amount of reading the vtable answered - the display-object accessors carry
+    // no symbols and slots 2..11 turned out to be matrix/projection/view, not colour.
+    void v3_dump_child_layout(uintptr_t child)
+    {
+        constexpr size_t N = 0x120;
+        uint8_t buf[N]{};
+        uint64_t entry = 0;
+        v3_read64(child + 0x48, entry);
+        const uintptr_t node = v3_node_data_ro(child);
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            const uintptr_t base = pass == 0   ? child
+                                   : pass == 1 ? static_cast<uintptr_t>(entry)
+                                               : node;
+            const char *what = pass == 0 ? "child" : pass == 1 ? "entry" : "nodeData";
+            if (!base || !v3_read_bytes(base, buf, N))
+            {
+                spdlog::info("[v3dump] {} 0x{:X}: unreadable", what, base);
+                continue;
+            }
+            for (size_t off = 0; off < N; off += 32)
+            {
+                std::string line;
+                for (size_t i = 0; i < 32; ++i)
+                {
+                    char b[4];
+                    snprintf(b, sizeof(b), "%02X", buf[off + i]);
+                    line += b;
+                    if ((i & 3) == 3) line += ' ';
+                }
+                spdlog::info("[v3dump] {} +0x{:02X}: {}", what, off, line);
+            }
+        }
+    }
+
     bool v3_read_matrix(uintptr_t node, float *m8)
     {
         uint64_t vt = 0, get_addr = 0;
@@ -1319,6 +1692,13 @@ namespace
         return true;
     }
 
+    // One marker's final basis factor: the widget scale the whole layer follows, times
+    // this marker's location emphasis. Both ride the SAME multiplier on purpose - the
+    // centring pivot inside v3_position_child is multiplied by it too, so an icon grows
+    // and shrinks around its own point instead of walking off it.
+    inline float v3_obj_fx(const V3NativeObject &obj) { return g_v3_native.cur_fx * obj.emph; }
+    inline float v3_obj_fy(const V3NativeObject &obj) { return g_v3_native.cur_fy * obj.emph; }
+
     void v3_native_set_visible(V3NativeObject &obj, bool visible)
     {
         if (!v3_heap_ptr(obj.child) || obj.visible == visible) return;
@@ -1326,8 +1706,45 @@ namespace
                               visible ? obj.map_x : V3_HIDDEN_MAP_POS,
                               visible ? obj.map_z : V3_HIDDEN_MAP_POS,
                               obj.base_tx, obj.base_ty,
-                              obj.base_m, g_v3_native.cur_fx, g_v3_native.cur_fy))
+                              obj.base_m, v3_obj_fx(obj), v3_obj_fy(obj)))
             obj.visible = visible;
+    }
+
+    // Re-apply an object's transform in place: same position and visibility, whatever
+    // emphasis and widget scale say NOW. Used when the player's location changes under
+    // an open map (or the emphasis is toggled), where nothing about the marker moved.
+    void v3_native_reapply(V3NativeObject &obj)
+    {
+        if (!v3_heap_ptr(obj.child)) return;
+        // Colour first, matrix second, deliberately: the matrix goes in through the display
+        // object's own setter, so whatever change bookkeeping that setter does runs AFTER
+        // the colour landed in the same node data.
+        const float want_fade = v3_fade(obj.area, obj.gx, obj.gz);
+        const float want_cool = v3_cool(obj.area, obj.gx, obj.gz);
+        if ((want_fade != obj.fade || want_cool != obj.cool) &&
+            v3_write_cxform(obj.child, want_fade, want_cool))
+        {
+            obj.fade = want_fade;
+            obj.cool = want_cool;
+        }
+        v3_position_child(obj.child,
+                          obj.visible ? obj.map_x : V3_HIDDEN_MAP_POS,
+                          obj.visible ? obj.map_z : V3_HIDDEN_MAP_POS,
+                          obj.base_tx, obj.base_ty, obj.base_m,
+                          v3_obj_fx(obj), v3_obj_fy(obj));
+    }
+
+    // Move a child that already exists. Costs exactly what showing or hiding one costs - a transform
+    // written to the child - because that is all any of those do; nothing is created or destroyed, so
+    // this is safe outside a build burst, which creating is not.
+    void v3_native_move(V3NativeObject &obj, float mx, float mz)
+    {
+        if (!v3_heap_ptr(obj.child) || (mx == obj.map_x && mz == obj.map_z)) return;
+        obj.map_x = mx;
+        obj.map_z = mz;
+        if (obj.visible)
+            v3_position_child(obj.child, mx, mz, obj.base_tx, obj.base_ty, obj.base_m,
+                              v3_obj_fx(obj), v3_obj_fy(obj));
     }
 
     void v3_native_merge_snapshot(const std::vector<goblin::NativeMarkerPoint> &snapshot,
@@ -1337,6 +1754,37 @@ namespace
         {
             for (auto &obj : g_v3_native.objects) v3_native_set_visible(obj, false);
             return;
+        }
+
+        // Does this tab hold any marker of the player's own map? Answered BEFORE anything
+        // is sized or sorted, because both read it. The layer of the tab, not of the
+        // manager: a tab switch keeps the same parent, and it is the tab that decides
+        // whether "here" is on screen at all. Visibility is deliberately not part of the
+        // test - collecting the last item in a cave should not flip the whole map's look.
+        {
+            const int shown_layer = goblin::maphover::map_layer();
+            bool active = false;
+            if (v3_emphasis_possible())
+                for (const auto &point : snapshot)
+                    if (point.layer == shown_layer &&
+                        v3_own_raw(point.area, point.gx, point.gz))
+                    {
+                        active = true;
+                        break;
+                    }
+            if (active != g_v3_native.emph_active)
+            {
+                g_v3_native.emph_active = active;
+                g_v3_native.emph_dirty = true;   // the tick re-applies, a slice per frame
+                g_v3_native.emph_cursor = 0;
+                spdlog::info("[v3native] location emphasis {} on layer {} (player map "
+                             "m{:02d}_{:02d}_{:02d}_{:02d})",
+                             active ? "applies" : "has nothing here - neutral", shown_layer,
+                             (g_v3_native.player_map >> 24) & 0xFF,
+                             (g_v3_native.player_map >> 16) & 0xFF,
+                             (g_v3_native.player_map >> 8) & 0xFF,
+                             g_v3_native.player_map & 0xFF);
+            }
         }
 
         size_t visible_count = 0;
@@ -1353,24 +1801,34 @@ namespace
                 // drive visibility (retire+recreate here used to dead-queue
                 // the row and stall the refresh).
                 V3NativeObject &obj = g_v3_native.objects[found->second];
-                // Focus rings are the one kind of child that MOVES after the build burst: the
-                // pool is created once and then re-aimed at whatever the player isolates. The
-                // stored map position is what set_visible replays, so update it and force the
-                // reposition (hide-then-show, since set_visible is a no-op when the flag is
-                // already what we ask for). Real markers keep their position for life.
-                if ((point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0)
+                // A ring is re-pointed at a different marker between merges, so its map
+                // travels with it; a marker's own never changes. Re-deciding the emphasis
+                // from the point costs a compare and keeps both correct.
+                if (obj.area != point.area || obj.gx != point.gx || obj.gz != point.gz)
                 {
-                    float mx = 0.0f, mz = 0.0f;
-                    if (goblin::mapproject::to_map(point.area, point.gx, point.gz, point.px,
-                                                   point.pz, mx, mz) &&
-                        (mx != obj.map_x || mz != obj.map_z))
-                    {
-                        obj.map_x = mx;
-                        obj.map_z = mz;
-                        if (obj.visible)
-                            v3_native_set_visible(obj, false); // replay from the new position
-                    }
+                    obj.area = point.area;
+                    obj.gx = point.gx;
+                    obj.gz = point.gz;
+                    obj.emph = v3_emphasis(obj.area, obj.gx, obj.gz);
+                    v3_native_reapply(obj);
                 }
+                // Deliberately NOT re-deciding the emphasis of every object here: a merge
+                // walks all ~9500 of them, and doing a transform write for each in one call
+                // is the spike that has to be spread over frames instead. Only an object
+                // whose MAP changed is handled above (in practice just the focus rings,
+                // which are re-pointed at other markers), and everything else is left to
+                // the budgeted pass in the tick.
+                // EVERY child follows its point's position, not just the focus rings. Rings were the
+                // only ones that ever moved, so this used to be theirs alone - and then the live
+                // de-overlap started moving markers too (a marker's spot depends on which of its
+                // neighbours are visible, so isolating a category or collecting an item changes it).
+                // With markers frozen, a ring would step onto the marker's new spot while the icon
+                // stayed on the old one until the map was reopened. Moving costs a transform write,
+                // the same as the show/hide right below it.
+                float mx = 0.0f, mz = 0.0f;
+                if (goblin::mapproject::to_map(point.area, point.gx, point.gz, point.px, point.pz,
+                                               mx, mz))
+                    v3_native_move(obj, mx, mz);
                 v3_native_set_visible(obj, point.visible);
                 continue;
             }
@@ -1391,17 +1849,31 @@ namespace
             // Seed build order = draw order (append = on top), so sort by:
             // (1) visible rows FIRST - the pulse pool is finite and any
             //     shortfall must land on rows the player cannot see anyway;
-            // (2) row id DESCENDING - the registry z-order contract is
+            // (2) markers of the player's OWN map after everything else - where a
+            //     dungeon's icons and the surface's land on the same spot, the ones
+            //     that belong to the place the player is actually in are the ones
+            //     that must be readable. Only ordering: nothing is hidden, and with
+            //     the emphasis off the key is constant and the old order stands;
+            // (3) row id DESCENDING - the registry z-order contract is
             //     "lower row id draws on top" (row_id_registry LAYER_ORDER),
             //     so lower ids must be created LAST;
-            // (3) a cleared-badge twin right AFTER its base row - the badge
+            // (4) a cleared-badge twin right AFTER its base row - the badge
             //     draws above its own icon.
+            // This is the one part of the emphasis that a build decides rather than a
+            // transform: depth is fixed when a child is created and the factory only
+            // pulses during a build burst. A reopen that reuses the movie therefore
+            // keeps the previous open's order (size and, later, colour still update
+            // live) - it re-sorts itself the next time the map builds from scratch.
             std::stable_sort(
                 g_v3_native.pending.begin(), g_v3_native.pending.end(),
                 [](const goblin::NativeMarkerPoint &a,
                    const goblin::NativeMarkerPoint &b) {
                     if (a.visible != b.visible)
                         return a.visible > b.visible;
+                    const bool oa = v3_is_own_location(a.area, a.gx, a.gz);
+                    const bool ob = v3_is_own_location(b.area, b.gx, b.gz);
+                    if (oa != ob)
+                        return oa < ob;
                     const uint64_t ab =
                         a.original_row_id & ~goblin::NATIVE_CLEARED_KEY_BIT;
                     const uint64_t bb =
@@ -1441,6 +1913,18 @@ namespace
         if (g_v3_target_layer.load(std::memory_order_relaxed) < 0)
             g_v3_target_layer.store(layer, std::memory_order_relaxed);
 
+        // Report the marker children's display-object vtable as an exe RVA, once per
+        // generation. The colour transform - the one emphasis lever the matrix call
+        // cannot reach - is a slot of this same vtable, so finding it is a static read
+        // of these bytes offline rather than another live probe.
+        if (g_v3_native.child_vtable != 0 && !g_v3_native.child_vtable_logged)
+        {
+            g_v3_native.child_vtable_logged = true;
+            const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            const uint64_t vt = g_v3_native.child_vtable;
+            spdlog::info("[v3native] marker child vtable = 0x{:X} (exe+0x{:X})", vt,
+                         (exe && vt > exe) ? static_cast<uintptr_t>(vt) - exe : 0);
+        }
         if (g_v3_native.parent != parent)
         {
             v3_native_reset();
@@ -1489,6 +1973,103 @@ namespace
                          g_v3_native.layer, layer, g_v3_native.objects.size());
             g_v3_native.layer = layer;
             g_v3_native.next_refresh_ms = 0;
+        }
+
+        // ── Location emphasis, from here on ─────────────────────────────────────────────
+        // EVERYTHING that touches a child for the emphasis lives BELOW the retarget branch
+        // above, and that placement is load-bearing. It used to sit at the top of the tick,
+        // where it ran on the frame the map re-anchored to a NEW movie - i.e. over the
+        // previous generation's children, whose blocks the engine had already freed. The
+        // matrix write survived that on its vtable guard; the colour write does not, because
+        // it hands a stale render entry to an ENGINE function that walks and writes through
+        // it. Log of the crash: RETARGET, then "3867 of 9454 markers resized", then an
+        // access violation inside GetWritableData. Below the branch, the manager is proven
+        // to be the live generation.
+
+        // Learn where the colour transform lives, from a child that exists and is untinted
+        // by definition - it was built from our own frame and nothing has touched its
+        // colour. Retried for a few frames because a freshly created child's render entry
+        // is not necessarily hooked up the instant it appears; after that, give up loudly
+        // rather than scan every frame forever.
+        if (!g_v3_cx_searched && !g_v3_native.objects.empty() &&
+            v3_heap_ptr(g_v3_native.objects.front().child))
+        {
+            const uintptr_t c = g_v3_native.objects.front().child;
+            if (v3_node_data_ro(c) || ++g_v3_native.cx_attempts >= 60)
+            {
+                v3_find_cx_offset(c);
+                if (goblin::config::debugLogging) v3_dump_child_layout(c);
+            }
+        }
+
+        // Where the player stands, resampled every map frame. The character cannot walk
+        // while the map is up, so in practice this changes between opens - but a fast
+        // travel closes the map from a different place than it opened in, and a marker
+        // that kept the old answer would be emphasising the wrong dungeon. Reading it is
+        // three derefs; deciding what to DO about it costs nothing unless it changed.
+        // The two scales and the on/off ride the same signature so a toggle flipped in
+        // the menu lands on the OPEN map, exactly like a category toggle does.
+        {
+            uint32_t pm = 0;
+            if (!goblin::collected::read_player_map_id(pm)) pm = 0;
+            uint64_t sig = 0;
+            if (goblin::config::locationEmphasis)
+            {
+                // Every input the answer depends on, mixed into one compare - the player's
+                // map AND all four tuning values, so editing any of them in the ini lands
+                // on the OPEN map instead of waiting for the next build.
+                const float vals[4] = {goblin::config::locationEmphasisOwnScale,
+                                       goblin::config::locationEmphasisOtherScale,
+                                       goblin::config::locationEmphasisOtherFade,
+                                       goblin::config::locationEmphasisOtherCool};
+                sig = 0xcbf29ce484222325ull ^ pm;
+                for (float v : vals)
+                {
+                    uint32_t bits = 0;
+                    memcpy(&bits, &v, 4);
+                    sig = (sig ^ bits) * 0x100000001b3ull;
+                }
+                sig |= 1;  // never 0 while the feature is on (0 means "off")
+            }
+            if (sig != g_v3_native.emph_sig)
+            {
+                g_v3_native.emph_sig = sig;
+                g_v3_native.player_map = pm;
+                g_v3_native.emph_dirty = true;
+                g_v3_native.emph_cursor = 0;
+                spdlog::info("[v3native] location emphasis: player map "
+                             "m{:02d}_{:02d}_{:02d}_{:02d}, re-deciding {} markers",
+                             (pm >> 24) & 0xFF, (pm >> 16) & 0xFF, (pm >> 8) & 0xFF,
+                             pm & 0xFF, g_v3_native.objects.size());
+            }
+        }
+
+        // Re-apply a SLICE per frame. Touching all ~9500 at once froze the game for
+        // seconds: a colour write is not a bare store but GetWritableData, which
+        // copy-on-writes the node data and registers a change with the render context, so
+        // thousands in one frame is thousands of allocations and change records. Only
+        // objects whose factor actually changed are written, and the budget counts those.
+        if (g_v3_native.emph_dirty)
+        {
+            constexpr size_t V3_EMPH_WRITES_PER_FRAME = 192;
+            size_t written = 0;
+            while (g_v3_native.emph_cursor < g_v3_native.objects.size() &&
+                   written < V3_EMPH_WRITES_PER_FRAME)
+            {
+                V3NativeObject &obj = g_v3_native.objects[g_v3_native.emph_cursor++];
+                const float emph = v3_emphasis(obj.area, obj.gx, obj.gz);
+                if (emph == obj.emph && obj.fade == v3_fade(obj.area, obj.gx, obj.gz) &&
+                    obj.cool == v3_cool(obj.area, obj.gx, obj.gz))
+                    continue;
+                obj.emph = emph;
+                v3_native_reapply(obj);
+                ++written;
+            }
+            if (g_v3_native.emph_cursor >= g_v3_native.objects.size())
+            {
+                g_v3_native.emph_dirty = false;
+                g_v3_native.emph_cursor = 0;
+            }
         }
 
         if (!g_v3_native.seeded)
@@ -1601,12 +2182,7 @@ namespace
                 g_v3_native.cur_fx = fx;
                 g_v3_native.cur_fy = fy;
                 for (auto &obj : g_v3_native.objects)
-                    if (v3_heap_ptr(obj.child))
-                        v3_position_child(obj.child,
-                                          obj.visible ? obj.map_x : V3_HIDDEN_MAP_POS,
-                                          obj.visible ? obj.map_z : V3_HIDDEN_MAP_POS,
-                                          obj.base_tx, obj.base_ty,
-                                          obj.base_m, fx, fy);
+                    v3_native_reapply(obj);
             }
         }
 
@@ -2949,39 +3525,9 @@ namespace
     // Optional graphic progress bar: the row's Conflict sprite is the only spare graphic
     // in the 02_160 row clip, so show it, squash it to the fraction and tint it
     // (recon_draw_primitives.md: setScale 0x733280, setColor 0x74A1D0).
-    void draw_row_bar_clip(uintptr_t base, void *rowProxy, int done, int total)
-    {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
-        auto p_scale = reinterpret_cast<SetScaleFn *>(base + 0x733280);
-        float frac = 0.f;
-        if (total > 0)
-            frac = static_cast<float>(done) / static_cast<float>(total);
-        if (frac < 0.f)
-            frac = 0.f;
-        if (frac > 1.f)
-            frac = 1.f;
-        __try
-        {
-            uint8_t buf[0x60] = {};
-            void *r = p_resolve(rowProxy, buf, "Conflict");
-            if (p_valid(r))
-            {
-                // Scale only: 0x74A1D0 turned out to be a TEXT-colour setter (its single call
-                // site targets a text field, and its four terms are the ADD half of a colour
-                // transform), so tinting a plain clip with it is off-label. The clip's own art
-                // provides the colour.
-                p_visible(r, 1);
-                p_scale(r, frac, 0.35f);
-            }
-            p_dtor(buf + 0x28);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-    }
+    // The experimental clip progress bar (scale the row own Conflict clip to the fraction) lived
+    // here until 2026-07-29. Measured in game: it draws, but reads no better than the text bar, so
+    // the text bar is the only one now. The RVA note stays in tools/rva_anchors.py.
 
     void draw_our_row(uintptr_t base, void *rowProxy, const char *styleFrame,
                       const wchar_t *label, const wchar_t *value, bool plate)
@@ -3483,141 +4029,10 @@ namespace
     // all we do at runtime is resolve it by name and pick its frame - which is exactly what we
     // already do safely for Text_0 and friends. The code stays as the record of what the live
     // route can and cannot do.
-    constexpr bool kEnableOwnIconPath = false;
 
     // Returns true if the icon was drawn by the independent path.
-    bool draw_row_icon_own(uintptr_t base, void *rowProxy, int32_t icon_id)
-    {
-        if (!kEnableOwnIconPath || icon_id < 0 ||
-            g_own_icon_state.load(std::memory_order_relaxed) < 0)
-            return false;
-        void *res = icon_resource_for(icon_id);
-        if (!res)
-        {
-            static std::atomic<int> s_nores{0};
-            if (s_nores.exchange(1) == 0)
-                spdlog::info("[sfimage] no image resource for icon {} (art missing or "
-                             "RawImage/resource creation refused)", icon_id);
-            goblin::sfimage::set_icon_state(goblin::sfimage::IconState::NoImage);
-            return false;
-        }
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
-        // Our own child clip only - borrowing one of the row's own clips is not an option:
-        // "Conflict" is the RED key-conflict plate, so leaving it visible painted whole rows
-        // red, and "CursorLock" has a named child that crashed the movie when re-pointed.
-        // The proxy the renderer hands us is the PARENT handle the resolver takes, not the
-        // wrapper a resolve RETURNS, so it cannot be asked for its own GFx::Value (the first
-        // run showed exactly that: a null interface before the call was even made). Resolving
-        // the empty path gives us the row itself as a proper clip proxy.
-        // The row proxy carries a second level of indirection: the engine's own text setter is
-        // handed proxy+8 and dereferences it before asking for the value. So the object that
-        // owns the display value is *(proxy+8), not the proxy we were given. Try both, and
-        // dump the raw words once so a wrong guess is visible instead of silent.
-        uint8_t self[0x60] = {};
-        void *rowClip = p_resolve(rowProxy, self, "");
-        const bool have_row = p_valid(rowClip) != 0;
-        // EXPERIMENT (2026-07-28): the key-binding host lays its grid out in the LEFT half of the screen
-        // (it is a two-column screen: action + bound key), while the graphics host is centred. Shifting
-        // each row clip right is the cheapest way to find out whether the position sticks or the engine's
-        // own layout overwrites it every frame. Same primitive we already use for the row icon. Set
-        // kRowShiftX to 0 to switch the experiment off.
-        constexpr int32_t kRowShiftX = 220;
-        if (kRowShiftX && have_row)
-        {
-            using SetPosFn2 = void(void *proxy, int32_t x, int32_t y);
-            reinterpret_cast<SetPosFn2 *>(base + 0x733230)(rowClip, kRowShiftX, 0);
-            static std::atomic<int> once{0};
-            if (once.exchange(1) == 0)
-                spdlog::info("[form] row-shift experiment: moving row clips {} px right", kRowShiftX);
-        }
-        void *inner = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(rowProxy) + 8);
-        if (!g_icon_diag_done.exchange(true, std::memory_order_acq_rel))
-        {
-            std::string words;
-            for (int w = 0; w < 12; ++w)
-            {
-                char one[24];
-                _snprintf_s(one, sizeof(one), _TRUNCATE, "%llX ",
-                            static_cast<unsigned long long>(
-                                *reinterpret_cast<uint64_t *>(
-                                    reinterpret_cast<uint8_t *>(rowProxy) + w * 8)));
-                words += one;
-            }
-            spdlog::info("[sfimage] row proxy vt +0x{:X} inner 0x{:X}, row-as-clip {}",
-                         *reinterpret_cast<uintptr_t *>(rowProxy) - base,
-                         reinterpret_cast<uintptr_t>(inner), have_row ? "valid" : "invalid");
-            spdlog::info("[sfimage] row proxy words: {}", words);
-        }
-        // The dump settled it: the row handle carries NO display value (words +0x40/+0x48 are
-        // zero). It resolves paths against the movie context at +0x20 instead, which is why
-        // naming a child works while the handle itself is not a display object - and why it can
-        // never be the parent of a clip we create. A resolved child IS a real display object,
-        // so the icon gets a home inside one of the row's own clips. HitArea comes first: it
-        // spans the row and the menu never draws anything in it.
-        // Find the row clip that will host the icon, and only CREATE the child when it is not
-        // there yet: CreateEmptyMovieClip appends a brand new sprite on every call, so creating
-        // per draw would add one clip per frame. The movie is loaded once for the whole run, so
-        // after the first open the clips are simply found again.
-        bool made = false;
-        const char *host_name = nullptr;
-        uint8_t hostbuf[0x60] = {};
-        void *hostClip = nullptr;
-        for (const char *cand : {"HitArea", "Cursor", "Conflict"})
-        {
-            std::memset(hostbuf, 0, sizeof(hostbuf));
-            void *c = p_resolve(rowProxy, hostbuf, cand);
-            if (!p_valid(c))
-            {
-                p_dtor(hostbuf + 0x28);
-                continue;
-            }
-            uint8_t probe[0x60] = {};
-            void *existing = p_resolve(c, probe, kOwnIconClip);
-            const bool already = p_valid(existing) != 0;
-            p_dtor(probe + 0x28);
-            if (already || goblin::sfimage::ensure_child_clip(c, kOwnIconClip, kOwnIconDepth))
-            {
-                made = true;
-                host_name = cand;
-                hostClip = c;
-                break;
-            }
-            p_dtor(hostbuf + 0x28);
-        }
-        if (!g_icon_host_logged.exchange(true, std::memory_order_acq_rel))
-            spdlog::info("[sfimage] icon host clip: {}", host_name ? host_name : "none accepted");
-        bool drawn = false, resolved = false;
-        uint8_t buf[0x60] = {};
-        void *r = hostClip ? p_resolve(hostClip, buf, kOwnIconClip) : nullptr;
-        resolved = r && p_valid(r) != 0;
-        if (resolved)
-        {
-            using SetPosFn = void(void *proxy, int32_t x, int32_t y);
-            reinterpret_cast<SetPosFn *>(base + 0x733230)(r, 2, 4);
-            drawn = goblin::sfimage::draw_into(r, res, 0.f, 0.f, kOwnIconPx, kOwnIconPx);
-            if (drawn)
-                reinterpret_cast<SetVisibleFn *>(base + 0x733340)(r, 1);
-        }
-        p_dtor(buf + 0x28);
-        p_dtor(hostbuf + 0x28);
-        p_dtor(self + 0x28);
-        {
-            static std::atomic<int> s_steps{0};
-            if (s_steps.exchange(1) == 0)
-                spdlog::info("[sfimage] steps: image=yes clip_created={} clip_resolved={} "
-                             "drawn={}", made, resolved, drawn);
-        }
-        goblin::sfimage::set_icon_state(drawn      ? goblin::sfimage::IconState::Drawn
-                                        : resolved ? goblin::sfimage::IconState::NoDraw
-                                                   : goblin::sfimage::IconState::NoClip);
-        const int want = drawn ? 1 : -1;
-        int prev = 0;
-        if (g_own_icon_state.compare_exchange_strong(prev, want))
-            spdlog::info("[sfimage] own-clip icon path: {}", drawn ? "working" : "unavailable");
-        return drawn;
-    }
+    // draw_row_icon_own() lived here until 2026-07-29, permanently disabled by
+    // kEnableOwnIconPath = false. Its state reporting is what the retired "Row icons" row read.
 
     // ── Icons with NO movie edited at all (native_menu_icons = 3) ───────────────────
     // The two strip variants need the screen's movie rebuilt at load, which means our icon
@@ -3637,51 +4052,9 @@ namespace
     // ("clip=false" for a row whose HitArea the earlier probe had found). The slot to address
     // comes from the engine's own row-path helper, which is already hooked for the strip
     // variants.
-    void draw_row_icon_direct(uintptr_t base, int32_t slot, int32_t icon_id)
-    {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
-        const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
-        if (!dlg || slot < 0)
-            return;
-        // Column 0, always: every row of ours is appended as the LEFT half of a pair (the
-        // right half is the engine's empty filler). The captured column is simply whichever
-        // path the engine formatted last, and the first run caught it on the right-hand one.
-        const int32_t column = 0;
-        void *res = icon_id >= 0 ? icon_resource_for(icon_id) : nullptr;
-        if (res)
-            g_blank_resource = res; // any resource will do to clear with a zero-sized rectangle
-        bool drawn = false, have_clip = false;
-        char path[96];
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "KeySetting/ItemList/Item_%d_%d/HitArea", slot,
-                    column);
-        uint8_t buf[0x60] = {};
-        void *clip = p_resolve(reinterpret_cast<void *>(dlg + 0x120), buf, path);
-        if (p_valid(clip))
-        {
-            have_clip = true;
-            // A row without an icon still needs the previous row's icon gone: the clips are
-            // reused down the list, and a zero-sized rectangle clears the context without
-            // drawing anything into it.
-            if (res)
-                drawn = goblin::sfimage::draw_into(clip, res, 4.f, 4.f, kOwnIconPx, kOwnIconPx);
-            else if (g_direct_icon_seen && g_blank_resource)
-                goblin::sfimage::draw_into(clip, g_blank_resource, 0.f, 0.f, 0.f, 0.f);
-        }
-        p_dtor(buf + 0x28);
-        if (drawn)
-            g_direct_icon_seen = true;
-        if (icon_id >= 0)
-            goblin::sfimage::set_icon_state(drawn      ? goblin::sfimage::IconState::Drawn
-                                            : have_clip ? goblin::sfimage::IconState::NoDraw
-                                                        : goblin::sfimage::IconState::NoClip);
-        static std::atomic<int> s_reported{0};
-        if (icon_id >= 0 && s_reported.exchange(1) == 0)
-            spdlog::info("[sfimage] direct icon draw: '{}' clip={} drawn={} (icon {}) - {} "
-                         "(value type 0x{:X})", path, have_clip, drawn, icon_id,
-                         goblin::sfimage::draw_failure(), goblin::sfimage::last_value_type());
-    }
+    // draw_row_icon_direct() (the former native_menu_icons = 3: our own pixels straight into the
+    // row clip, editing no movie) lived here until 2026-07-29. It rode on the own-clip path that
+    // kEnableOwnIconPath had switched off, so it was never confirmed to draw in game.
 
     // Show the category icon in a row, if the movie carries our spliced icon sprite.
     // The sprite has one frame per icon; the frame number for an ini key comes from the
@@ -3804,12 +4177,23 @@ namespace
     using RowPathFn = void *(void *list, void *out, const RowSlotPair *pair);
     RowPathFn *o_row_path = nullptr;
 
+    std::atomic<int32_t> g_row_slot_max{-1};
+
     void *row_path_detour(void *list, void *out, const RowSlotPair *pair)
     {
         if (pair)
         {
             g_row_slot.store(pair->slot, std::memory_order_release);
             g_row_column.store(pair->column, std::memory_order_release);
+            // The engine formats the row name itself, so the highest slot it ever asks for IS the
+            // number of rows it is willing to show. That is the one fact that decides whether adding
+            // clips to the movie buys anything, so it goes in the log the first time it grows.
+            if (pair->column == 0 && pair->slot > g_row_slot_max.load(std::memory_order_relaxed))
+            {
+                g_row_slot_max.store(pair->slot, std::memory_order_relaxed);
+                spdlog::info("[form] engine asked for row slot {} (movie now has {} left-column "
+                             "clips)", pair->slot, goblin::own_movie::kRowSlots);
+            }
         }
         return o_row_path(list, out, pair);
     }
@@ -3825,7 +4209,9 @@ namespace
     // identical pdata at +0x50, measured side by side), so the cell can be identified instead
     // of guessed: resolve each cell once, remember its object, and match. The eleven clips
     // belong to the movie and live as long as it does, so the table is built once.
-    constexpr int kGridSlots = 11;
+    // Sized from the movie, not repeated here: goblin_own_movie adds row clips, and a slot table
+    // that stopped at eleven would leave the added rows without icons.
+    constexpr int kGridSlots = goblin::own_movie::kRowSlots;
     uint64_t g_slot_obj[kGridSlots] = {};
     bool g_slot_table_ready = false;
 
@@ -3937,9 +4323,6 @@ namespace
         // that has no MfgIcon, so the left column's strip never gets shifted and every row
         // shows the same cell.
         const int32_t column = 0;
-        const uint8_t variant = goblin::config::nativeMenuIcons;
-        if (variant != 1 && variant != 2)
-            return;
         // Icons stop appearing after a row is toggled and come back only on a fresh open, yet
         // neither of the two obvious faults reports itself: the slot resolves and the MfgIcon
         // child is found. So trace what is ACTUALLY applied for a short burst after every view
@@ -3963,24 +4346,9 @@ namespace
         using SetPosFn = void(void *proxy, int32_t x, int32_t y);
         __try
         {
-            if (variant == 1)
             {
-                // One strip of all icons behind a one-cell mask: the icon IS the horizontal
-                // offset, and cell 0 is empty, so a row without an icon needs nothing else.
-                _snprintf_s(path, sizeof(path), _TRUNCATE,
-                            "KeySetting/ItemList/Item_%d_%d/MfgIcon/Strip", slot, column);
-                uint8_t buf[0x60] = {};
-                void *r = p_resolve(root, buf, path);
-                if (p_valid(r))
-                    reinterpret_cast<SetPosFn *>(base + 0x733230)(
-                        r, -frame * goblin::menu_icon_tags::ICON_CELL_PX, 14);
-                p_dtor(buf + 0x28);
-            }
-            else
-            {
-                // Variant 2 is now the same shape as variant 1 - one named child holding the
-                // strip, masked by a sibling - so both are a single resolve and a single move.
-                // The placement already sits at (ICON_X, ICON_Y); the position we set is
+                // One named child holding the strip, masked by a sibling: a single resolve and a
+                // single move. The placement already sits at (ICON_X, ICON_Y); the position we set is
                 // absolute within the row, so the cell offset is folded into x.
                 // WHERE the child is resolved from matters. By path from the movie root the shift
                 // measurably lands on something that is not what the row draws: after a toggle
@@ -4030,14 +4398,13 @@ namespace
         // pre-hide pass could actually reach - "resolved 0 of 64" and "hidden but still drawn"
         // are different faults and must not look alike in the log.
         if (s_reported.load() == 0)
-            spdlog::info("[menuicons] strip resolved: {} (variant {} slot {} column {}, cell {}, "
+            spdlog::info("[menuicons] strip resolved: {} (slot {} column {}, cell {}, "
                          "x {})",
                          g_prehide_report.load(std::memory_order_acquire) == 1 ? "yes" : "no",
-                         variant, slot, column, frame,
+                         slot, column, frame,
                          -frame * goblin::menu_icon_tags::ICON_CELL_PX);
         if (s_reported.exchange(1) == 0)
-            spdlog::info("[menuicons] icons via variant {} (slot {} column {})", variant, slot,
-                         column);
+            spdlog::info("[menuicons] icons drawn (slot {} column {})", slot, column);
     }
 
     void *row_render_detour(void *item, void *rowProxy)
@@ -4103,7 +4470,6 @@ namespace
         // clips differ per frame); the spliced icon child is the opposite - it must be updated
         // AFTER, because a gotoAndStop rebuilds the row's display list and would hand back a
         // fresh child, visible and playing from frame 1, undoing whatever we just set.
-        const bool icon_own = draw_row_icon_own(base, rowProxy, row->icon_id);
         // Identify the grid cell while the row handle is still alive: draw_our_row ends with
         // the native renderer's own proxy dtor, and both icon routes run after it.
         const uintptr_t icon_dlg = g_form_dialog.load(std::memory_order_acquire);
@@ -4112,22 +4478,15 @@ namespace
         // icon reaches x=34, so a row with a picture gets a small text indent.
         const wchar_t *label = row->label;
         wchar_t indented[512];
-        if (row->icon_id >= 0 && label && label[0] &&
-            goblin::config::nativeMenuIcons != 0)
+        if (row->icon_id >= 0 && label && label[0])
         {
-            _snwprintf_s(indented, _TRUNCATE, L"    %s", label);
+            // Six spaces, not four: at 22 px the four the row started with left the caption touching
+            // the icon once the icons moved right for their own left margin.
+            _snwprintf_s(indented, _TRUNCATE, L"      %s", label);
             label = indented;
         }
         draw_our_row(base, rowProxy, style, label, row->value, row->plate);
-        if (!icon_own)
-        {
-            if (goblin::config::nativeMenuIcons == 3)
-                draw_row_icon_direct(base, icon_slot, row->icon_id);
-            else
-                draw_row_icon(base, icon_slot, row->ini_key, rowProxy);
-        }
-        if (row->kind == goblin::nmenu::RowKind::Progress && goblin::nmenu::graphic_bar())
-            draw_row_bar_clip(base, rowProxy, row->collected, row->total);
+        draw_row_icon(base, icon_slot, row->ini_key, rowProxy);
         return item;
     }
 
@@ -4537,8 +4896,7 @@ namespace
 
     void repaint_row_icons(uintptr_t dlg)
     {
-        const uint8_t variant = goblin::config::nativeMenuIcons;
-        if (!dlg || (variant != 1 && variant != 2))
+        if (!dlg)
             return;
         int32_t top = 0, flat_base = 0;
         uint32_t cols = 1;
@@ -5746,7 +6104,15 @@ namespace
             return;
         below.hidden = false;
         set_screen_visible(below.dlg, true);
-        spdlog::info("[form] page 0x{:X} back on screen while the screen over it closes",
+        // Rebuild it, do not just show it. Each page is its own SCREEN, so the parent still holds the
+        // rows it was built with - which is why a filter set on a child page only showed up on the
+        // parent after the whole menu was reopened, and why a rebound key read as "not saved" there.
+        // The rebuild goes through the hooked builder, which takes the page from this screen's record.
+        goblin::nmenu::set_page(below.page);
+        goblin::nmenu::rebuild(); // unconditional: set_page is a no-op when the ids already match
+        build_form_rows();
+        refresh_form_view(below.dlg);
+        spdlog::info("[form] page 0x{:X} back on screen (rows rebuilt) while the screen over it closes",
                      below.dlg);
     }
 
@@ -6033,18 +6399,42 @@ namespace
             __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
 
-        if (goblin::config::nativeMenu)
+        if (goblin::config::native_menu_enabled())
         {
             // F8: open OUR menu - the game's keybinding screen carrying our rows, on the
             // map when it is up and over whatever else is on screen otherwise. F8 only OPENS:
             // closing belongs to the screen's own Back/Esc, and a press while it is up is
             // ignored (making it a toggle stacked a second screen on the first, because the
             // close is not instantaneous).
-            static bool s_f8_down = false;
-            const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-            if (f8 && !s_f8_down)
-                open_screen(goblin::nmenu::kPageRoot, 0);
-            s_f8_down = f8;
+            // F8 is the DEVELOPER's door, so it only exists in `dev` - there the player's key opens
+            // the overlay and this one opens the in-game menu, which is the whole point of that mode.
+            // In `native` the player's own toggle_key opens this menu (below), and F8 answering as well
+            // was a leftover of the arrangement where the two menus had separate keys.
+            if (goblin::config::menu_mode() == goblin::config::MenuMode::Dev)
+            {
+                static bool s_f8_down = false;
+                const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+                // ...unless this press is the one that just got bound to something (key_swallowed).
+                if (f8 && !s_f8_down && !goblin::nmenu::key_swallowed(VK_F8))
+                    open_screen(goblin::nmenu::kPageRoot, 0);
+                s_f8_down = f8;
+            }
+
+            // In `native` mode the PLAYER'S key opens this menu - F8 is only the developer's door.
+            // The overlay owns that key in the other two modes (it is the overlay that opens there),
+            // so this must not also run in `dev`, or one press would open both menus.
+            if (!goblin::config::overlay_menu_enabled() && goblin::config::menuEnabled)
+            {
+                static bool s_key_down = false;
+                const int vk = static_cast<int>(goblin::config::toggleInjectionKey);
+                const uint16_t mask = goblin::config::toggleGamepadMask;
+                const bool down = (vk && (GetAsyncKeyState(vk) & 0x8000) != 0) ||
+                                  (mask && goblin::overlay::gamepad_mask_down(mask));
+                if (down && !s_key_down &&
+                    !goblin::nmenu::key_swallowed(static_cast<uint32_t>(vk)))
+                    open_screen(goblin::nmenu::kPageRoot, 0);
+                s_key_down = down;
+            }
             // F6 (the graphics screen as a second host) was REMOVED 2026-07-28: measured in game, its
             // list caps at the same sixteen items and does not scroll, so it bought visible rows and
             // nothing else. Its reverse engineering, and the two things worth harvesting from it
@@ -6606,7 +6996,11 @@ namespace
                 ++g_v3_native.failed;
                 continue;
             }
-            const uint16_t depth = g_v3_native.next_depth++;
+            // Rings from their own high band; markers from the normal one.
+            const bool is_ring =
+                (point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0;
+            const uint16_t depth =
+                is_ring ? g_v3_native.next_ring_depth++ : g_v3_native.next_depth++;
             // Arm the slot BEFORE issuing: capture can fire synchronously
             // inside the Execute call.
             auto &s = g_v3_factory_slots[0];
@@ -6674,12 +7068,23 @@ namespace
                     uint64_t child_parent = 0;
                     v3_read64(s.child + 0x38, child_parent);
                     const bool attached = exc == 0 && child_parent == g_v3_native.parent;
+                    // Born with its emphasis already applied: a marker that only got it on
+                    // the next merge would pop a frame after appearing. (The colour offset
+                    // is learned in the tick, not here - a child's render entry is not
+                    // necessarily hooked up yet at the instant it is created, and the first
+                    // markers get their fade from the merge a moment later.)
+                    const float emph = v3_emphasis(s.point.area, s.point.gx, s.point.gz);
+                    const float fade = v3_fade(s.point.area, s.point.gx, s.point.gz);
+                    const float cool = v3_cool(s.point.area, s.point.gx, s.point.gz);
+                    if (fade != 1.0f || cool != 0.0f)
+                        v3_write_cxform(s.child, fade, cool);
                     const bool positioned = attached &&
                         v3_position_child(s.child,
                                           s.point.visible ? s.map_x : V3_HIDDEN_MAP_POS,
                                           s.point.visible ? s.map_z : V3_HIDDEN_MAP_POS,
                                           s.base_tx, s.base_ty, s.basis,
-                                          g_v3_native.cur_fx, g_v3_native.cur_fy);
+                                          g_v3_native.cur_fx * emph,
+                                          g_v3_native.cur_fy * emph);
                     if (!positioned)
                         spdlog::warn("[v3native] attach failed: seh=0x{:08X} "
                                      "parent=0x{:X} expected=0x{:X}",
@@ -6716,6 +7121,12 @@ namespace
                 obj.base_tx = s.base_tx;
                 obj.base_ty = s.base_ty;
                 memcpy(obj.base_m, s.basis, sizeof(obj.base_m));
+                obj.area = s.point.area;
+                obj.gx = s.point.gx;
+                obj.gz = s.point.gz;
+                obj.emph = v3_emphasis(obj.area, obj.gx, obj.gz);
+                obj.fade = v3_fade(obj.area, obj.gx, obj.gz);
+                obj.cool = v3_cool(obj.area, obj.gx, obj.gz);
                 obj.visible = s.point.visible;
                 // We kept the build reference above iff B was on -> this child may be
                 // safely detached/re-attached by the viewport reconcile.
@@ -6861,7 +7272,7 @@ namespace
             if (exc == 0 && child_parent == parent)
             {
                 v3_position_child(o.child, o.map_x, o.map_z, o.base_tx, o.base_ty,
-                                  o.base_m, g_v3_native.cur_fx, g_v3_native.cur_fy);
+                                  o.base_m, v3_obj_fx(o), v3_obj_fy(o));
                 o.attached = true;
                 ++attached_now;
             }
@@ -8520,6 +8931,26 @@ void goblin::stall_probe::setup()
                      e.what());
     }
 
+    // Render-node GetWritableData(entry, changeFlags): the copy-on-write + change-record
+    // step every visual property of a display object goes through. Identified from the
+    // Scaleform SDK, not guessed - the projection-matrix setter calls it with 0x100000,
+    // which is exactly Render_Constants.h Change_State_ProjectionMatrix3D. Used by the
+    // location emphasis to fade the markers of other maps; a miss only costs the colour.
+    try
+    {
+        g_v3_get_writable_data = reinterpret_cast<V3GetWritableDataFn *>(
+            modutils::scan<void>({.aob = "48 89 6C 24 20 56 41 54 41 56 48 83 EC 20 "
+                                         "48 8B F1 4C 8B C1 48 81 E6 00 F0 FF FF"}));
+        spdlog::info("[stallprobe] node writable-data getter resolved @ 0x{:X}",
+                     reinterpret_cast<uintptr_t>(g_v3_get_writable_data));
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::warn("[stallprobe] node writable-data AOB miss (location emphasis keeps "
+                     "to size and order): {}",
+                     e.what());
+    }
+
     // Lever C self-detach: the engine's remove-from-container primitive
     // FUN_1410c87c0 (the removal half of the reparent path FUN_1410c8440). A miss
     // just disables self-detach (close falls back to the engine's full teardown).
@@ -8582,6 +9013,21 @@ void goblin::stall_probe::setup()
         spdlog::warn("[solidfill] DrawingContext primitive AOB miss (spike off): {}", e.what());
     }
 
+    // Load-time movie interception (see goblin_own_movie.hpp). ABOVE the menu-mode gate on purpose:
+    // it serves BOTH movies, and the map's half (our own hover panel and banner) is not part of the
+    // in-game menu. Its menu half checks the mode itself.
+    goblin::own_movie::install();
+
+    if (!goblin::config::native_menu_enabled())
+    {
+        // menu_render_mode = imgui: everything from here down exists only to serve the IN-GAME menu
+        // - its tab, its page and row hooks, its row icons, the load-time movie transform - so none of
+        // it is patched into the game. What sits above this line (the map's own native panels among
+        // them) is unaffected and keeps working.
+        spdlog::info("[optmenu] in-game menu not injected (menu_render_mode = imgui)");
+        return;
+    }
+
     // The list's row-path helper: its argument pair is the slot about to be drawn, which is how
     // row icons find their clip. A miss only costs icons.
     try
@@ -8616,10 +9062,6 @@ void goblin::stall_probe::setup()
     {
         spdlog::warn("[action] input-action hook unavailable: {}", e.what());
     }
-
-    // Load-time movie interception (see goblin_own_movie.hpp). Independent of everything
-    // else: if it fails to arm, the screen simply loads the stock movie.
-    goblin::own_movie::install();
 
     // Menu-movie graphics probe hook: CSMenuMan::updateTask (v2.6.x 0x766980). The
     // detour reads the active menu and (dev-only) tests solid-fill rendering on menu

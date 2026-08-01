@@ -1,5 +1,7 @@
 #include "goblin_native_menu.hpp"
 
+#include "version.h" // PROJECT_VERSION (generated) for the About page
+
 #include "goblin_own_movie.hpp"
 
 #include "goblin_config.hpp"
@@ -8,6 +10,7 @@
 #include "goblin_inject.hpp"
 #include "goblin_menu_addons.hpp"
 #include "goblin_gfx_probe.hpp"
+#include "goblin_diag.hpp"     // report() for the copy-status row
 #include "goblin_sfimage.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp" // lookup_text() names the hidden markers
@@ -28,7 +31,10 @@
 namespace
 {
     namespace tr = goblin::i18n;
-    using goblin::nmenu::BarStyle;
+    // The menu is the GAME's screen, so it speaks the GAME's language - not ui_language, which
+    // belongs to the overlay (our own window). Every lookup below passes this explicitly, because
+    // the i18n defaults resolve to current_language(), which honours the override.
+    inline tr::Language mlang() { return tr::game_language(); }
     using goblin::nmenu::Row;
     using goblin::nmenu::RowKind;
 
@@ -46,7 +52,6 @@ namespace
     std::vector<Row> g_preview_rows;
     std::deque<std::wstring> g_preview_arena;
     bool g_dirty = false;
-    BarStyle g_bar_style = BarStyle::Ascii;
 
     // The entry a value page / rebind page is editing. Pointers into the ini schema, which
     // outlives every page, so holding them across a rebuild is safe.
@@ -79,7 +84,7 @@ namespace
         return w;
     }
 
-    const wchar_t *text(tr::TextId id) { return hold(wide(tr::tr(id))); }
+    const wchar_t *text(tr::TextId id) { return hold(wide(tr::tr(id, mlang()))); }
 
     // ── numeric row metadata ─────────────────────────────────────────────────────────
     // The ini schema stores defaults as text and has no range info, so ranges for the
@@ -113,25 +118,16 @@ namespace
     // The two ini values with a fixed option list (both mirror the overlay's combos).
     const char *const kLanguages[] = {"auto",    "english", "schinese", "tchinese", "korean",
                                       "russian", "german",  "french",   "spanish"};
-    const char *const kRenderModes[] = {"auto", "window", "swapchain_2"};
-
-    bool is_render_mode_key(const char *key)
-    {
-        return key && std::strcmp(key, "overlay_render_mode") == 0;
-    }
 
     // ── markup ───────────────────────────────────────────────────────────────────────
     // The row's text fields are html=1 EditText, and the setter the mod already uses
     // (RVA 0x74A000 -> FUN_140D842A0) passes isHtml=1 unconditionally - so <font>, <b>
     // and friends work with no extra plumbing (recon_draw_primitives.md section 2).
     // Kept behind a switch so a single in-game run can compare markup on vs off.
-    bool g_markup = true;
-    bool g_graphic_bar = false;
-
+    // Row colour is unconditional: the toggle that used to gate it was a comparison row and
+    // colour won. The fields are html=1, so a <font> tag is the only way to paint text here.
     std::wstring colored(const std::wstring &text, uint32_t rgb)
     {
-        if (!g_markup)
-            return text;
         wchar_t open[32];
         _snwprintf_s(open, _TRUNCATE, L"<font color=\"#%06X\">", rgb & 0xFFFFFF);
         return std::wstring(open) + text + L"</font>";
@@ -142,6 +138,9 @@ namespace
     constexpr uint32_t kColValue = 0xE8D9A0; // parchment - neutral value
     constexpr uint32_t kColBarOn = 0x7FD97F;
     constexpr uint32_t kColBarOff = 0x50504A;
+    // The mod's name as it should read on screen, in one place.
+    const wchar_t *const kProductName = L"Map for Goblins";
+
     constexpr uint32_t kColFocus = 0xE86A6A;  // the category isolated on the map right now
     constexpr uint32_t kColHeader = 0x9ED1FF; // mega-section captions, as in the overlay
 
@@ -200,7 +199,6 @@ namespace
     // The glyph is a STAND-IN for a picture. Where a real icon draws, showing both put a
     // coloured dot right next to the image that replaced it; where there is no icon, the row
     // still needs its marker. So the caller passes whether this row has one.
-    bool row_icons_drawn() { return goblin::config::nativeMenuIcons != 0; }
 
     const SectionMark *mark_for(const char *section)
     {
@@ -213,35 +211,127 @@ namespace
     }
 
     // ── value formatting ─────────────────────────────────────────────────────────────
-    std::wstring bar_text(int collected, int total, BarStyle style)
+    // The value field (Text_1, cid 185) is 260 px wide and the row font is now 21 px, so roughly a
+    // quarter more characters fit than when the eight-cell bar was chosen. How many EXACTLY is a
+    // question for the eye, not for arithmetic - the font is proportional, so a digit, a '#' and a '.'
+    // are all different widths. Hence the styles below and the rulers on the Debug page: pick what
+    // reads best in game, then set kBarStyle to it.
+    constexpr uint32_t kColBarDone = 0x8CE68C; // a finished zone reads green, numbers and all
+    // Anything short of finished is yellow. Green used to mean "some of it is done", which is the one
+    // thing a colour should not say when green also means finished two rows below.
+    constexpr uint32_t kColBarPart = 0xE8D96A;
+    constexpr int kBarStyle = 9;
+
+    // Cells filled, rounded to NEAREST rather than up: with ceiling, one collected marker out of a
+    // hundred already lit a cell, which read as progress that was not there. Nothing but a complete
+    // zone may show a full bar, and nothing but an empty one may show none.
+    int bar_filled(int collected, int total, int width)
     {
-        // The value field is only ~260px wide, so the NUMBERS come first - in-game the
-        // trailing count was being clipped off the right edge. The bar itself is plain
-        // ASCII: this client's font has no block or shade glyphs (they drew as tofu).
-        const int width = 8;
-        int filled = 0;
-        if (total > 0)
-            filled = std::clamp(static_cast<int>((static_cast<double>(collected) / total) * width +
-                                                 0.5),
-                                0, width);
-        wchar_t head[32];
-        _snwprintf_s(head, _TRUNCATE, L"%d/%d ", collected, total);
-        std::wstring out(head);
-        if (g_markup)
+        if (total <= 0 || collected <= 0)
+            return 0;
+        if (collected >= total)
+            return width;
+        int n = static_cast<int>((static_cast<double>(collected) / total) * width + 0.5);
+        return std::clamp(n, 1, width - 1);
+    }
+
+    std::wstring bar_render(int collected, int total, int style)
+    {
+        const bool done = total > 0 && collected >= total;
+        wchar_t head[40];
+        _snwprintf_s(head, _TRUNCATE, L"%d/%d", collected, total);
+        const int pct = total > 0 ? static_cast<int>((100.0 * collected) / total + 0.5) : 0;
+        auto cells = [&](int width, wchar_t on, wchar_t off, uint32_t con, uint32_t coff) {
+            const int f = bar_filled(collected, total, width);
+            std::wstring b = colored(std::wstring(static_cast<size_t>(f), on), con);
+            if (f < width)
+                b += colored(std::wstring(static_cast<size_t>(width - f), off), coff);
+            return b;
+        };
+        const uint32_t on_col = done ? kColBarDone : kColBarPart;
+        switch (style)
         {
-            out += colored(std::wstring(static_cast<size_t>(filled), L'#'), kColBarOn);
-            out += colored(std::wstring(static_cast<size_t>(width - filled), L'-'), kColBarOff);
+        case 0: // as it was: numbers, then eight cells
+            return std::wstring(head) + L" " + cells(8, L'#', L'-', on_col, kColBarOff);
+        case 1: // numbers, then a bracketed sixteen-cell bar - the wider bar the field can now hold
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   colored(L"[", kColBarOff) + cells(16, L'=', L'-', on_col, kColBarOff) +
+                   colored(L"]", kColBarOff);
+        case 2: // percent first, for comparing zones rather than counting markers
+            {
+                wchar_t pc[16];
+                _snwprintf_s(pc, _TRUNCATE, L"%3d%% ", pct);
+                return colored(std::wstring(pc), done ? kColBarDone : kColValue) +
+                       cells(14, L'=', L'.', on_col, kColBarOff);
+            }
+        case 3: // numbers only, as large as they get - the "how much room is there" case
+            return colored(std::wstring(head), done ? kColBarDone : kColValue);
+        case 4: // numbers, percent, and a short bar: everything, if it fits
+            {
+                wchar_t all[64];
+                _snwprintf_s(all, _TRUNCATE, L"%d/%d %d%%", collected, total, pct);
+                return colored(std::wstring(all), done ? kColBarDone : kColValue) + L" " +
+                       cells(6, L'#', L'-', on_col, kColBarOff);
+            }
+        case 5: // pipes and dots - a lighter texture than '=' at the same cell count
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(16, L'|', L'.', on_col, kColBarOff);
+        case 6: // no numbers at all: the widest bar the column can take
+            return cells(24, L'=', L'-', on_col, kColBarOff);
+        // 7..12 exist to be COMPARED, not chosen blind: the field clips on pixel width, and these
+        // glyphs are 1.5x apart in width, so the same cell count reads very differently. Same numbers
+        // in front for all of them, so only the bar differs.
+        case 7:
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(20, L'#', L'-', on_col, kColBarOff);
+        case 8:
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(24, L'|', L'-', on_col, kColBarOff);
+        case 9: // CHOSEN. The empty cell is U+00B7 MIDDLE DOT, not a full stop: the dot sits on the
+                // same line as the colons instead of on the baseline. 26 cells measured to fit the
+                // 260 px column with the counts still in front of them.
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(26, L':', L'·', on_col, kColBarOff);
+        case 10:
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(20, L'+', L'-', on_col, kColBarOff);
+        case 11: // Latin-1: the base font carries 0x20-0xFF, so these draw
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(24, L'¦', L'·', on_col, kColBarOff);
+        case 12:
+            return colored(std::wstring(head), done ? kColBarDone : kColValue) + L" " +
+                   cells(20, L'°', L'·', on_col, kColBarOff);
+        default:
+            return std::wstring(head);
         }
-        else
-        {
-            out += L'[';
-            out.append(static_cast<size_t>(filled), L'#');
-            out.append(static_cast<size_t>(width - filled), L'-');
-            out += L']';
-        }
-        (void)style;
+    }
+
+    // The help block under the list is 1670 px wide and reads at 18 px, so it can carry a bar with a
+    // hundred cells - fine detail the 260 px value column cannot show. Progress rows put one there.
+    std::wstring long_bar(int collected, int total)
+    {
+        const bool done = total > 0 && collected >= total;
+        const int width = 100;
+        const int f = bar_filled(collected, total, width);
+        const int pct = total > 0 ? static_cast<int>((100.0 * collected) / total + 0.5) : 0;
+        wchar_t head[48];
+        _snwprintf_s(head, _TRUNCATE, L"%d/%d  ", collected, total);
+        std::wstring out = colored(std::wstring(head), done ? kColBarDone : kColValue);
+        // Same glyph pair as the rows, so the two readings of the same number look like each other.
+        out += colored(std::wstring(static_cast<size_t>(f), L':'), done ? kColBarDone : kColBarPart);
+        if (f < width)
+            out += colored(std::wstring(static_cast<size_t>(width - f), L'·'), kColBarOff);
+        wchar_t tail[16];
+        _snwprintf_s(tail, _TRUNCATE, L"  %d%%", pct); // after the bar: the eye lands on the bar first
+        out += colored(std::wstring(tail), done ? kColBarDone : kColValue);
         return out;
     }
+
+    std::wstring bar_text(int collected, int total) { return bar_render(collected, total, kBarStyle); }
+
+    // Is this zone finished? Its label goes green as well, so a completed zone reads as done from the
+    // label column without looking at the numbers.
+    bool zone_done(int collected, int total) { return total > 0 && collected >= total; }
 
     std::wstring value_of(const goblin::IniEntry &e)
     {
@@ -251,7 +341,7 @@ namespace
         case goblin::IniType::Bool:
         {
             const bool on = e.target && *static_cast<bool *>(e.target);
-            return colored(wide(tr::tr(on ? tr::TextId::ValueOn : tr::TextId::ValueOff)),
+            return colored(wide(tr::tr(on ? tr::TextId::ValueOn : tr::TextId::ValueOff, mlang())),
                            on ? kColOn : kColOff);
         }
         case goblin::IniType::Float:
@@ -306,7 +396,7 @@ namespace
     {
         if (e.type == goblin::IniType::Bool)
             return RowKind::Toggle;
-        if (e.type == goblin::IniType::Language || is_render_mode_key(e.key))
+        if (e.type == goblin::IniType::Language)
             return RowKind::Enum;
         if (e.type == goblin::IniType::VkKey)
             return RowKind::Rebind;
@@ -323,8 +413,6 @@ namespace
     {
         if (e.type == goblin::IniType::Language)
             return sizeof(kLanguages) / sizeof(kLanguages[0]);
-        if (is_render_mode_key(e.key))
-            return sizeof(kRenderModes) / sizeof(kRenderModes[0]);
         const NumRange *r = range_for(e.key);
         if (!r || r->step <= 0.f)
             return 0;
@@ -335,8 +423,6 @@ namespace
     {
         if (e.type == goblin::IniType::Language)
             return wide(tr::language_option_label(kLanguages[index]));
-        if (is_render_mode_key(e.key))
-            return wide(kRenderModes[index]);
         const NumRange *r = range_for(e.key);
         if (!r)
             return L"";
@@ -362,14 +448,6 @@ namespace
                     return static_cast<int>(i);
             return -1;
         }
-        if (is_render_mode_key(e.key))
-        {
-            const std::string &cur = *static_cast<std::string *>(e.target);
-            for (size_t i = 0; i < sizeof(kRenderModes) / sizeof(kRenderModes[0]); ++i)
-                if (cur == kRenderModes[i])
-                    return static_cast<int>(i);
-            return -1;
-        }
         const NumRange *r = range_for(e.key);
         if (!r || r->step <= 0.f)
             return -1;
@@ -386,8 +464,6 @@ namespace
             return;
         if (e.type == goblin::IniType::Language)
             *static_cast<std::string *>(e.target) = kLanguages[index];
-        else if (is_render_mode_key(e.key))
-            *static_cast<std::string *>(e.target) = kRenderModes[index];
         else if (const NumRange *r = range_for(e.key))
         {
             const float v = r->min + r->step * static_cast<float>(index);
@@ -402,6 +478,8 @@ namespace
 
     bool entry_visible(const goblin::IniEntry &e)
     {
+        if (e.ini_only) // decided in the ini alone - see IniEntry::ini_only
+            return false;
         return !(e.err_only && goblin::profile_is_vanilla());
     }
     bool section_visible(const goblin::IniSection &s)
@@ -440,73 +518,414 @@ namespace
         spdlog::info("[nmenu] unhid {} manually hidden markers", n);
     }
 
-    void action_save_ini()
-    {
-        goblin::save_config(goblin::g_ini_path);
-        g_dirty = false;
-        spdlog::info("[nmenu] ini saved on request");
-    }
-
-    void action_toggle_graphic_bar()
-    {
-        g_graphic_bar = !g_graphic_bar;
-        spdlog::info("[nmenu] graphic bar {}", g_graphic_bar ? "on" : "off");
-    }
-
-    void action_toggle_markup()
-    {
-        g_markup = !g_markup;
-        spdlog::info("[nmenu] rich text {}", g_markup ? "on" : "off");
-    }
-
-    void action_cycle_bar_style()
-    {
-        g_bar_style = static_cast<BarStyle>((static_cast<int>(g_bar_style) + 1) % 3);
-        spdlog::info("[nmenu] bar style -> {}", static_cast<int>(g_bar_style));
-    }
-
     // ── page builders ────────────────────────────────────────────────────────────────
     void push(Row row) { g_rows.push_back(row); }
 
-    void add_back_row()
+    // ── menu layout ─────────────────────────────────────────────────────────────────
+    // Pages, in order. A page is either a CONCATENATION of ini sections (each preceded by a
+    // valueless Info row, which is what makes the row clip draw it on the PadCategory frame) or an
+    // explicit ordered KEY list, which is how a page shows only some of a section's entries.
+    // Page id = kPageSectionBase + index into this table, so all the existing id arithmetic and the
+    // host's set_page/subpage_target keep working unchanged.
+    //
+    // Keys deliberately absent from every page: `native_menu` (it gates the menu itself - switching
+    // it off from inside would be a trap) and the overlay-only settings (window geometry, opacity,
+    // font scale, render mode), which say nothing about the native menu.
+    struct LayoutPage
     {
+        const char *label;             // section name used for the title/label lookup
+        const char *const *sections;   // sections to concatenate, each with a separator
+        size_t section_count;
+        const char *const *keys;       // ...or an explicit ordered key list
+        size_t key_count;
+        bool toggle_all;               // add the aggregate "all icon categories" row
+        bool dump_rows;                // add the dump / copy rows (Debug)
+    };
+
+    const char *const kCategorySections[] = {"Equipment", "Key Items", "Loot",     "Magic",
+                                             "Quest",     "World",     "Reforged", "ERR Markers"};
+    const char *const kCompatSections[] = {"Compatibility"};
+    const char *const kDebugSections[] = {"Debug"};
+    // The menu-settings page: only what actually concerns the menu and the hotkeys.
+    // ui_language is deliberately NOT here: the menu follows the game's language (see mlang()), so
+    // offering the overlay's language override on a game-drawn screen would only be confusing. It
+    // stays available in the ini and on the overlay, where it is our own window and does apply.
+    const char *const kMenuSettingKeys[] = {
+        "enable_toggle_hotkey", "toggle_key",          "toggle_gamepad_combo",
+        "enable_manual_hide",   "hide_marker_key",     "hide_marker_gamepad", "hover_info",
+    };
+
+    const LayoutPage kLayout[] = {
+        {"Categories", kCategorySections, 8, nullptr, 0, true, false},
+        {"Compatibility", kCompatSections, 1, nullptr, 0, false, false},
+        {"Menu settings", nullptr, 0, kMenuSettingKeys, 7, false, false},
+        {"Debug", kDebugSections, 1, nullptr, 0, false, true},
+    };
+    constexpr size_t kLayoutCount = sizeof(kLayout) / sizeof(kLayout[0]);
+    // Named so the root page and the dispatch cannot drift apart.
+    constexpr int32_t kPageCategories = goblin::nmenu::kPageSectionBase + 0;
+
+    // Rows the player must see but must not change from here: shown with their value, as an Info
+    // row, which the host draws on the Grayout frame - so "disabled" needs no new row kind.
+    bool key_is_readonly(const char *key)
+    {
+        // enable_toggle_hotkey decides whether the key that OPENS this menu does that at all;
+        // flipping it from inside is how a player locks themselves out.
+        return std::strcmp(key, "enable_toggle_hotkey") == 0;
+    }
+
+    const goblin::IniEntry *entry_by_key(const char *key)
+    {
+        for (const auto &sec : goblin::ini_schema())
+            for (const auto &e : sec.entries)
+                if (std::strcmp(e.key, key) == 0)
+                    return &e;
+        return nullptr;
+    }
+
+    // One schema entry -> one row. Shared by every page so the pages cannot disagree about how an
+    // entry looks; `section` only decides the colour of the fallback bullet.
+    void push_entry_row(const goblin::IniEntry &e, const char *section)
+    {
+        std::wstring label = wide(tr::entry_label(e.key, mlang()));
+        if (label.empty())
+            label = wide(e.key);
+        const int32_t row_icon = icon_for_key(e.key);
+        if (const SectionMark *mk = section ? mark_for(section) : nullptr)
+            if (std::strncmp(e.key, "show_", 5) == 0 && row_icon < 0)
+                label = colored(std::wstring(1, mk->glyph), mk->rgb) + L"  " + label;
         Row r;
-        r.kind = RowKind::Back;
-        // The row's text fields are html=1, so a literal '<' opens a tag and the parser eats
-        // the whole label - in game this row came out completely blank. Escaped, and the
-        // glyphs stay ASCII because the menu font has no arrows.
-        r.value = hold(L"&lt;&lt;  " + wide(tr::tr(tr::TextId::MenuBack)));
+        r.kind = key_is_readonly(e.key) ? RowKind::Info : kind_of(e);
+        {
+            std::wstring tip = wide(tr::entry_comment(e.key, e.comment ? e.comment : "", mlang()));
+            if (!tip.empty())
+                r.help = hold(std::move(tip));
+        }
+        r.label = hold(std::move(label));
+        r.value = hold(value_of(e));
+        r.ini_key = e.key;
+        r.icon_id = row_icon;
+        r.target = e.target;
+        r.type_tag = static_cast<uint8_t>(e.type);
         push(r);
     }
 
-    void build_root()
+    void push_separator(const char *section)
     {
-        g_title = L"MapForGoblins";
-        const auto &schema = goblin::ini_schema();
-        for (size_t s = 0; s < schema.size(); ++s)
+        std::wstring name = wide(tr::section_label(section, mlang()));
+        if (name.empty())
+            name = wide(section);
+        Row h;
+        h.kind = RowKind::Info; // valueless -> PadCategory frame, one wide caption
+        h.label = hold(colored(std::move(name), kColHeader));
+        push(h);
+    }
+
+    // Every icon category across the whole schema, not just one section - the same thing the
+    // overlay's "show all / hide all" pair does.
+    void set_all_categories(bool on)
+    {
+        for (const auto &sec : goblin::ini_schema())
+            for (const auto &e : sec.entries)
+                if (e.type == goblin::IniType::Bool && e.target && entry_visible(e) &&
+                    std::strncmp(e.key, "show_", 5) == 0)
+                    *static_cast<bool *>(e.target) = on;
+        g_dirty = true;
+        goblin::reapply_live_settings();
+    }
+    // Drop the map filter set from a progress row. Kept next to the pages that offer it so the
+    // enabled/disabled rule and the action cannot drift apart.
+    void action_clear_focus()
+    {
+        if (goblin::focus_category() < 0)
+            return; // nothing isolated - the row is shown greyed out in that state
+        goblin::set_focus_category(-1);
+        goblin::reapply_live_settings();
+    }
+
+    // First row of the progress and region pages. With no category focused it is an Info row
+    // carrying its own label as the value, which the host draws on the Grayout frame - so
+    // "disabled" costs no new row kind and confirming it does nothing.
+    void push_clear_focus_row()
+    {
+        const bool active = goblin::focus_category() >= 0;
+        Row r;
+        if (active)
         {
-            if (!section_visible(schema[s]))
+            r.kind = RowKind::Action;
+            r.action = &action_clear_focus;
+            r.label = hold(colored(wide(tr::tr(tr::TextId::ProgressFocusClear, mlang())), kColFocus));
+        }
+        else
+        {
+            r.kind = RowKind::Info;
+            r.label = hold(wide(tr::tr(tr::TextId::ProgressFocusClear, mlang())));
+            r.value = hold(L"-"); // valued Info -> Grayout frame
+        }
+        push(r);
+    }
+
+    // How many icon categories are on, out of how many exist. Drives both the row value and what
+    // confirming it does, so the two can never disagree.
+    void count_categories(int *on, int *total)
+    {
+        *on = 0;
+        *total = 0;
+        for (const auto &sec : goblin::ini_schema())
+            for (const auto &e : sec.entries)
+                if (e.type == goblin::IniType::Bool && e.target && entry_visible(e) &&
+                    std::strncmp(e.key, "show_", 5) == 0)
+                {
+                    ++*total;
+                    if (*static_cast<bool *>(e.target))
+                        ++*on;
+                }
+    }
+
+    // ONE row, not a pair: everything on -> turn everything off, anything else -> turn everything
+    // on. A Toggle row is not usable here because there is no single bool to point at - the state
+    // is an aggregate, and the row shows it as a count.
+    // The dump the player can copy out. Held here so the "copy" row has something to copy and can
+    // report its size, exactly like the overlay's byte counter.
+    std::string g_dump_text;
+
+    // Plain Win32: put UTF-8 text on the clipboard as UTF-16 (CF_UNICODETEXT), which is what every
+    // paste target expects. Returns false if another process owns the clipboard right now.
+    bool copy_to_clipboard(const std::string &utf8)
+    {
+        if (utf8.empty())
+            return false;
+        const int wide_len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+        if (wide_len <= 0)
+            return false;
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wide_len) * sizeof(wchar_t));
+        if (!mem)
+            return false;
+        if (void *dst = GlobalLock(mem))
+        {
+            MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, static_cast<wchar_t *>(dst), wide_len);
+            GlobalUnlock(mem);
+        }
+        if (!OpenClipboard(nullptr))
+        {
+            GlobalFree(mem);
+            return false;
+        }
+        EmptyClipboard();
+        const bool ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        CloseClipboard();
+        if (!ok)
+            GlobalFree(mem); // ownership only passes to the clipboard on success
+        return ok;
+    }
+
+    void take_dump(goblin::markers::DumpSel sel)
+    {
+        g_dump_text = goblin::markers::dump_to_string(sel);
+        spdlog::info("[nmenu] dump taken: {} bytes", g_dump_text.size());
+    }
+    void action_dump_beacons() { take_dump(goblin::markers::DUMP_BEACONS); }
+    void action_dump_stamps() { take_dump(goblin::markers::DUMP_STAMPS); }
+    void action_copy_dump()
+    {
+        spdlog::info("[nmenu] copy dump ({} bytes): {}", g_dump_text.size(),
+                     copy_to_clipboard(g_dump_text) ? "ok" : "refused");
+    }
+
+    // ── About ────────────────────────────────────────────────────────────────────────
+    // Host and path are SEPARATE literals, joined only at runtime: a full URL sitting in an unsigned
+    // DLL that installs hooks reads to an AV engine like "fetch a payload", and that verdict has cost
+    // us a release round before. Same split as the overlay's About tab.
+    struct AboutLink
+    {
+        tr::TextId label;
+        const char *host;
+        const char *path;
+    };
+    const AboutLink kAboutLinks[] = {
+        {tr::TextId::LinkNexus, "www.nexusmods.com", "/eldenring/mods/10062"},
+        {tr::TextId::LinkGithub, "github.com", "/VirusAlex/ERR-MapForGoblins-DLL"},
+        {tr::TextId::LinkDiscord, "discord.gg", "/JvTMwPCygB"},
+    };
+    constexpr size_t kAboutLinkCount = sizeof(kAboutLinks) / sizeof(kAboutLinks[0]);
+
+    std::string about_url(size_t i)
+    {
+        if (i >= kAboutLinkCount)
+            return {};
+        return std::string("https://") + kAboutLinks[i].host + kAboutLinks[i].path;
+    }
+
+    // One action per link: a row's action takes no argument, so the index is baked into three tiny
+    // functions rather than smuggled through a global that a rebuild could desynchronise.
+    void copy_link(size_t i)
+    {
+        const std::string url = about_url(i);
+        spdlog::info("[nmenu] copy link {} ({}): {}", i, url.size(),
+                     copy_to_clipboard(url) ? "ok" : "refused");
+    }
+    void action_copy_link_0() { copy_link(0); }
+    void action_copy_link_1() { copy_link(1); }
+    void action_copy_link_2() { copy_link(2); }
+
+    void action_toggle_all_categories()
+    {
+        int on = 0, total = 0;
+        count_categories(&on, &total);
+        set_all_categories(on < total);
+    }
+
+    void build_about()
+    {
+        g_title = hold(wide(tr::tr(tr::TextId::TabAbout, mlang())));
+        // Version first: it is the one line a bug report always needs.
+        Row ver;
+        ver.kind = RowKind::Info;
+        ver.label = hold(wide(tr::tr(tr::TextId::Version, mlang())));
+        ver.value = hold(wide(PROJECT_VERSION));
+        ver.help = hold(wide(tr::tr(tr::TextId::AboutDescription, mlang())));
+        push(ver);
+
+        void (*const copiers[])() = {&action_copy_link_0, &action_copy_link_1, &action_copy_link_2};
+        for (size_t i = 0; i < kAboutLinkCount; ++i)
+        {
+            Row r;
+            r.kind = RowKind::Action;
+            r.label = text(kAboutLinks[i].label);
+            // The row shows the address and confirming copies it - there is no browser to open from
+            // inside the game, so copy IS the action rather than a secondary button.
+            r.value = hold(wide(about_url(i).c_str()));
+            r.help = hold(wide(tr::tr(tr::TextId::Copy, mlang())));
+            r.action = copiers[i];
+            push(r);
+        }
+    }
+
+    void build_layout_page(size_t ix)
+    {
+        if (ix >= kLayoutCount)
+            return;
+        const LayoutPage &lp = kLayout[ix];
+        std::wstring title = wide(tr::section_label(lp.label, mlang()));
+        if (title.empty())
+            title = wide(lp.label);
+        g_title = title;
+        if (lp.toggle_all)
+        {
+            int on = 0, total = 0;
+            count_categories(&on, &total);
+            Row all;
+            all.kind = RowKind::Action;
+            all.label = text(tr::TextId::AllIconCategories);
+            all.action = &action_toggle_all_categories;
+            wchar_t v[32];
+            _snwprintf_s(v, _TRUNCATE, L"%d/%d", on, total);
+            all.value = hold(colored(v, on == total ? kColOn : on == 0 ? kColOff : kColHeader));
+            push(all);
+        }
+        for (size_t si = 0; si < lp.section_count; ++si)
+        {
+            const char *name = lp.sections[si];
+            const goblin::IniSection *sec = nullptr;
+            for (const auto &cand : goblin::ini_schema())
+                if (std::strcmp(cand.name, name) == 0)
+                    sec = &cand;
+            if (!sec || !section_visible(*sec))
                 continue;
-            std::wstring name = wide(tr::section_label(schema[s].name));
-            if (name.empty())
-                name = wide(schema[s].name);
             size_t shown = 0;
-            for (const auto &e : schema[s].entries)
+            for (const auto &e : sec->entries)
                 if (entry_visible(e))
                     ++shown;
+            if (!shown)
+                continue;
+            if (lp.section_count > 1) // a single-section page needs no separator
+                push_separator(name);
+            for (const auto &e : sec->entries)
+                if (entry_visible(e))
+                    push_entry_row(e, name);
+        }
+        for (size_t ki = 0; ki < lp.key_count; ++ki)
+            if (const goblin::IniEntry *e = entry_by_key(lp.keys[ki]))
+                if (entry_visible(*e))
+                    push_entry_row(*e, nullptr);
+        if (lp.dump_rows)
+        {
+            // The progress-bar workshop lived here until 2026-07-29: thirteen styles at a
+            // part-done value plus character rulers, used to pick the look and to measure how
+            // much the 260 px value column actually holds (25 digits, 20 '=' - it clips on
+            // pixel width, not on count). Style 9 won: colons filled, middle dots empty, 26
+            // cells. bar_render() still has every style, so bringing the samples back is a
+            // loop over them again.
+            struct DumpRow { tr::TextId id; void (*fn)(); };
+            const DumpRow rows[] = {{tr::TextId::DumpBeacons, &action_dump_beacons},
+                                    {tr::TextId::DumpStamps, &action_dump_stamps}};
+            // The same paragraph the overlay prints above its dump buttons, as the row's help -
+            // which is where a per-row explanation belongs on this screen.
+            const wchar_t *dump_help = hold(wide(tr::tr(tr::TextId::DebugDumpDescription, mlang())));
+            for (const DumpRow &d : rows)
+            {
+                Row r;
+                r.kind = RowKind::Action;
+                r.label = text(d.id);
+                r.action = d.fn;
+                r.help = dump_help;
+                push(r);
+            }
+            // The copy row reports what it would copy, so pressing it is never a guess.
+            Row cp;
+            cp.kind = g_dump_text.empty() ? RowKind::Info : RowKind::Action;
+            cp.label = text(tr::TextId::Copy);
+            if (!g_dump_text.empty())
+                cp.action = &action_copy_dump;
+            wchar_t sz[32];
+            _snwprintf_s(sz, _TRUNCATE, L"%zu B", g_dump_text.size());
+            cp.value = hold(sz);
+            cp.help = dump_help;
+            push(cp);
+
+        }
+    }
+
+    // add_back_row() lived here until 2026-07-29: a "<< Back" row at the top of every page.
+    // Removed as a duplicate - Q and the pad's circle run the engine's own Back, and the row cost a
+    // slot out of the sixteen a page can show, plus it was where the cursor started.
+    void build_root()
+    {
+        g_title = kProductName;
+        // Two settings are important enough to sit at the top level rather than inside a
+        // page: what the map is allowed to show at all, and how it tells the place you are
+        // in from the places that merely sit under (or over) it.
+        if (const goblin::IniEntry *rmf = entry_by_key("require_map_fragments"))
+            push_entry_row(*rmf, nullptr);
+        if (const goblin::IniEntry *le = entry_by_key("location_emphasis"))
+            push_entry_row(*le, nullptr);
+        for (size_t i = 0; i < kLayoutCount; ++i)
+        {
+            const LayoutPage &lp = kLayout[i];
+            std::wstring name = wide(tr::section_label(lp.label, mlang()));
+            if (name.empty())
+                name = wide(lp.label);
+            // Only the row count. A page row used to borrow the icon of the first entry inside it,
+            // which put a loot icon next to "Categories" and a compatibility entry's icon next to
+            // "Compatibility" - a picture that stood for one setting out of dozens.
+            size_t shown = 0;
+            for (size_t si = 0; si < lp.section_count; ++si)
+                for (const auto &sec : goblin::ini_schema())
+                    if (std::strcmp(sec.name, lp.sections[si]) == 0 && section_visible(sec))
+                        for (const auto &e : sec.entries)
+                            if (entry_visible(e))
+                                ++shown;
+            for (size_t ki = 0; ki < lp.key_count; ++ki)
+                if (const goblin::IniEntry *e = entry_by_key(lp.keys[ki]))
+                    if (entry_visible(*e))
+                        ++shown;
+            if (!shown)
+                continue;
             Row r;
             r.kind = RowKind::SubPage;
-            r.page_id = goblin::nmenu::kPageSectionBase + static_cast<int32_t>(s);
-            if (const goblin::IniEntry *pick = section_icon_entry(schema[s]))
+            r.page_id = goblin::nmenu::kPageSectionBase + static_cast<int32_t>(i);
             {
-                r.icon_id = icon_for_key(pick->key);
-                r.ini_key = pick->key; // the draw route finds the strip cell by key
-            }
-            if (const SectionMark *mk = mark_for(schema[s].name))
-                if (!row_icons_drawn() || r.icon_id < 0)
-                    name = colored(std::wstring(1, mk->glyph), mk->rgb) + L"  " + name;
-            {
-                std::wstring tip = wide(tr::section_comment(schema[s].name, ""));
+                std::wstring tip = wide(tr::section_comment(lp.label, "", mlang()));
                 if (!tip.empty())
                     r.help = hold(std::move(tip));
             }
@@ -515,29 +934,41 @@ namespace
             _snwprintf_s(cnt, _TRUNCATE, L"%zu  >", shown);
             r.value = hold(cnt);
             push(r);
+            // Progress and Hidden sit between Categories and the rest, per the agreed layout.
+            if (r.page_id == kPageCategories)
+            {
+                Row prog;
+                prog.kind = RowKind::SubPage;
+                prog.page_id = goblin::nmenu::kPageProgress;
+                // Red while a category is isolated on the map, so the filter is visible from the
+                // top level instead of only inside the page that set it.
+                // Both marks, not one: the red text reads at a glance, and the plate is the same
+                // background the isolated category itself wears, so the two screens agree.
+                const bool filtering = goblin::focus_category() >= 0;
+                prog.label = filtering
+                                 ? hold(colored(wide(tr::tr(tr::TextId::TabProgress, mlang())), kColFocus))
+                                 : text(tr::TextId::TabProgress);
+                prog.plate = filtering;
+                prog.value = hold(L">");
+                push(prog);
+
+                Row hid;
+                hid.kind = RowKind::SubPage;
+                hid.page_id = goblin::nmenu::kPageHidden;
+                hid.label = text(tr::TextId::HiddenMarkers);
+                wchar_t hc[24];
+                _snwprintf_s(hc, _TRUNCATE, L"%zu  >", goblin::manual_hidden_count());
+                hid.value = hold(hc);
+                push(hid);
+            }
         }
-        Row prog;
-        prog.kind = RowKind::SubPage;
-        prog.page_id = goblin::nmenu::kPageProgress;
-        prog.label = text(tr::TextId::TabProgress);
-        prog.value = hold(L">");
-        push(prog);
-
-        Row hid;
-        hid.kind = RowKind::SubPage;
-        hid.page_id = goblin::nmenu::kPageHidden;
-        hid.label = text(tr::TextId::HiddenMarkers);
-        wchar_t hc[24];
-        _snwprintf_s(hc, _TRUNCATE, L"%zu  >", goblin::manual_hidden_count());
-        hid.value = hold(hc);
-        push(hid);
-
-        Row act;
-        act.kind = RowKind::SubPage;
-        act.page_id = goblin::nmenu::kPageActions;
-        act.label = text(tr::TextId::MenuTools);
-        act.value = hold(L">");
-        push(act);
+        // About last: version and the links, the least-used page but the one a bug report needs.
+        Row ab;
+        ab.kind = RowKind::SubPage;
+        ab.page_id = goblin::nmenu::kPageAbout;
+        ab.label = text(tr::TextId::TabAbout);
+        ab.value = hold(L">");
+        push(ab);
 
         // Pages contributed by other mods (sdk/mfg_menu_api.h). They appear as ordinary
         // rows, so a player sees one menu for everything.
@@ -561,8 +992,7 @@ namespace
         const auto *ap = goblin::addons::build_page(index);
         if (!ap)
         {
-            g_title = L"MapForGoblins";
-            add_back_row();
+            g_title = kProductName;
             Row r;
             r.kind = RowKind::Info;
             r.label = text(tr::TextId::MenuUnavailable);
@@ -570,7 +1000,6 @@ namespace
             return;
         }
         g_title = ap->title;
-        add_back_row();
         for (const auto &ar : ap->rows)
         {
             Row r;
@@ -593,7 +1022,7 @@ namespace
             }
             r.label = hold(ar.label);
             r.value = ar.kind == 5 && ar.value.empty()
-                          ? hold(bar_text(ar.done, ar.total, g_bar_style))
+                          ? hold(bar_text(ar.done, ar.total))
                           : hold(ar.value);
             r.collected = ar.done;
             r.total = ar.total;
@@ -606,70 +1035,12 @@ namespace
         }
     }
 
-    void build_section(size_t ix)
-    {
-        const auto &schema = goblin::ini_schema();
-        if (ix >= schema.size())
-            return;
-        const auto &sec = schema[ix];
-        std::wstring name = wide(tr::section_label(sec.name));
-        if (name.empty())
-            name = wide(sec.name);
-        g_title = name;
-        add_back_row();
-        size_t bools = 0;
-        for (const auto &e : sec.entries)
-        {
-            if (!entry_visible(e))
-                continue;
-            if (e.type == goblin::IniType::Bool)
-                ++bools;
-            std::wstring label = wide(tr::entry_label(e.key));
-            if (label.empty())
-                label = wide(e.key);
-            // Icon-category rows (show_*) carry the section's marker, so a long list
-            // still reads as grouped.
-            const int32_t row_icon = icon_for_key(e.key);
-            if (const SectionMark *mk = mark_for(sec.name))
-                if (std::strncmp(e.key, "show_", 5) == 0 &&
-                    (!row_icons_drawn() || row_icon < 0))
-                    label = colored(std::wstring(1, mk->glyph), mk->rgb) + L"  " + label;
-            Row r;
-            r.kind = kind_of(e);
-            // The same explanatory text the overlay shows as a tooltip; the form has a wide
-            // multiline help line at the bottom, which is exactly where it belongs.
-            {
-                std::wstring tip = wide(tr::entry_comment(e.key, e.comment ? e.comment : ""));
-                if (!tip.empty())
-                    r.help = hold(std::move(tip));
-            }
-            r.label = hold(std::move(label));
-            r.value = hold(value_of(e));
-            r.ini_key = e.key;
-            r.icon_id = row_icon;
-            r.target = e.target;
-            r.type_tag = static_cast<uint8_t>(e.type);
-            push(r);
-        }
-        if (bools >= 3) // bulk switches only pay off on the long toggle lists
-        {
-            Row on;
-            on.kind = RowKind::Action;
-            on.label = text(tr::TextId::AllOn);
-            on.action = &action_all_on;
-            push(on);
-            Row off;
-            off.kind = RowKind::Action;
-            off.label = text(tr::TextId::AllOff);
-            off.action = &action_all_off;
-            push(off);
-        }
-    }
+    // build_section() lived here until 2026-07-29: it built one page per ini section. Pages now
+    // come from the layout table above, so a page can merge several sections or list keys by hand.
 
     void build_progress()
     {
-        g_title = wide(tr::tr(tr::TextId::TabProgress));
-        add_back_row();
+        g_title = wide(tr::tr(tr::TextId::TabProgress, mlang()));
         goblin::progress::rebuild();
         const auto &regions = goblin::progress::snapshot();
         if (regions.empty())
@@ -680,6 +1051,7 @@ namespace
             push(r);
             return;
         }
+        push_clear_focus_row();
         int done = 0, all = 0;
         for (const auto &reg : regions)
         {
@@ -691,7 +1063,8 @@ namespace
         tot.label = text(tr::TextId::MenuTotal);
         tot.collected = done;
         tot.total = all;
-        tot.value = hold(bar_text(done, all, g_bar_style));
+        tot.value = hold(bar_text(done, all));
+        tot.help = hold(long_bar(done, all));
         push(tot);
         // Mega-section headers, exactly where the overlay's progress tab puts them: whenever the
         // group changes, and never before the trailing "Other" bucket (place id < 0). The row
@@ -712,7 +1085,7 @@ namespace
                                                                      : tr::TextId::MegaShadow;
                 Row head;
                 head.kind = RowKind::Info; // valueless -> drawn on the PadCategory frame
-                head.label = hold(colored(wide(tr::tr(mid)), kColHeader));
+                head.label = hold(colored(wide(tr::tr(mid, mlang())), kColHeader));
                 push(head);
             }
             // A region opens its own page with the per-category breakdown, the same numbers
@@ -720,10 +1093,21 @@ namespace
             Row r;
             r.kind = RowKind::SubPage;
             r.page_id = goblin::nmenu::kPageRegionBase + static_cast<int32_t>(i);
-            r.label = hold(wide(reg.name.c_str()));
+            // The region holding the isolated category wears the same red as the category row, so
+            // the active filter is visible in the list instead of only inside the region.
+            const bool focused_here = goblin::focus_category() >= 0 &&
+                                      goblin::focus_region() == reg.place_name_id;
+            // Focus wins over completion: a red row says "this is what the map is filtered to", and
+            // that has to stay readable even on a zone that is finished.
+            r.label = focused_here ? hold(colored(wide(reg.name.c_str()), kColFocus))
+                      : zone_done(reg.collected, reg.total)
+                          ? hold(colored(wide(reg.name.c_str()), kColBarDone))
+                          : hold(wide(reg.name.c_str()));
+            r.plate = focused_here;
             r.collected = reg.collected;
             r.total = reg.total;
-            r.value = hold(bar_text(reg.collected, reg.total, g_bar_style));
+            r.value = hold(bar_text(reg.collected, reg.total));
+            r.help = hold(long_bar(reg.collected, reg.total)); // the wide block below has the room
             push(r);
         }
     }
@@ -733,19 +1117,19 @@ namespace
         const auto &regions = goblin::progress::snapshot();
         if (index >= regions.size())
         {
-            g_title = wide(tr::tr(tr::TextId::TabProgress));
-            add_back_row();
+            g_title = wide(tr::tr(tr::TextId::TabProgress, mlang()));
             return;
         }
         const auto &reg = regions[index];
         g_title = hold(wide(reg.name.c_str()));
-        add_back_row();
+        push_clear_focus_row();
         Row tot;
         tot.kind = RowKind::Progress;
         tot.label = text(tr::TextId::MenuTotal);
         tot.collected = reg.collected;
         tot.total = reg.total;
-        tot.value = hold(bar_text(reg.collected, reg.total, g_bar_style));
+        tot.value = hold(bar_text(reg.collected, reg.total));
+        tot.help = hold(long_bar(reg.collected, reg.total));
         push(tot);
         for (int ci = 0; ci < goblin::progress::kCategoryCount; ++ci)
         {
@@ -757,7 +1141,7 @@ namespace
             const char *key = goblin::category_config_key(cat);
             Row r;
             r.kind = RowKind::Progress;
-            r.label = hold(wide(key ? tr::entry_label(key)
+            r.label = hold(wide(key ? tr::entry_label(key, mlang())
                                     : goblin::markers::category_name(cat)));
             if (key)
             {
@@ -770,16 +1154,18 @@ namespace
             r.total = reg.cats[ci].total;
             r.type_tag = static_cast<uint8_t>(ci);
             r.page_id = reg.place_name_id;
-            std::wstring val = bar_text(r.collected, r.total, g_bar_style);
+            std::wstring val = bar_text(r.collected, r.total);
             // The focused category reads in red. A real background fill is not available:
             // these fields take HTML, and GFx HTML has font colour but no background - that is
             // an ActionScript property of the text field, which we do not drive.
             if (goblin::focus_category() == ci && goblin::focus_region() == reg.place_name_id)
             {
-                val = colored(bar_text(r.collected, r.total, g_bar_style), kColFocus);
+                val = colored(bar_text(r.collected, r.total), kColFocus);
+                r.label = hold(colored(std::wstring(r.label), kColFocus)); // label too, like the rows above
                 r.plate = true; // the row's own red plate marks what is isolated on the map
             }
             r.value = hold(std::move(val));
+            r.help = hold(long_bar(r.collected, r.total));
             push(r);
         }
     }
@@ -810,8 +1196,7 @@ namespace
 
     void build_hidden()
     {
-        g_title = hold(wide(tr::tr(tr::TextId::HiddenMarkers)));
-        add_back_row();
+        g_title = hold(wide(tr::tr(tr::TextId::HiddenMarkers, mlang())));
         g_hidden_view = goblin::manual_hidden_snapshot();
         if (g_hidden_view.empty())
         {
@@ -850,7 +1235,7 @@ namespace
             {
                 r.icon_id = icon_for_key(ckey);
                 r.ini_key = ckey; // same reason as the progress rows
-                r.help = hold(wide(tr::entry_label(ckey)));
+                r.help = hold(wide(tr::entry_label(ckey, mlang())));
             }
             if (r.icon_id < 0)
                 r.label = hold(colored(L" 22", kColValue) + L"  " +
@@ -865,13 +1250,11 @@ namespace
         const goblin::IniEntry *e = g_edit_entry;
         if (!e)
         {
-            g_title = L"MapForGoblins";
-            add_back_row();
+            g_title = kProductName;
             return;
         }
-        std::wstring name = wide(tr::entry_label(e->key));
+        std::wstring name = wide(tr::entry_label(e->key, mlang()));
         g_title = name.empty() ? wide(e->key) : name;
-        add_back_row();
         const int cur = current_option(*e);
         const size_t n = option_count(*e);
         for (size_t i = 0; i < n; ++i)
@@ -897,13 +1280,11 @@ namespace
         const goblin::IniEntry *e = g_edit_entry;
         if (!e)
         {
-            g_title = L"MapForGoblins";
-            add_back_row();
+            g_title = kProductName;
             return;
         }
-        std::wstring name = wide(tr::entry_label(e->key));
+        std::wstring name = wide(tr::entry_label(e->key, mlang()));
         g_title = name.empty() ? wide(e->key) : name;
-        add_back_row();
         Row prompt;
         prompt.kind = RowKind::Info;
         prompt.label = text(tr::TextId::MenuPressKey);
@@ -915,72 +1296,9 @@ namespace
         push(keep);
     }
 
-    void build_actions()
-    {
-        g_title = hold(wide(tr::tr(tr::TextId::MenuTools)));
-        add_back_row();
-        Row save;
-        save.kind = RowKind::Action;
-        save.label = text(tr::TextId::MenuSaveNow);
-        save.action = &action_save_ini;
-        push(save);
-        // Everything below is diagnostics for us, not settings for the player: the strings
-        // are deliberately un-localized because they never reach a release screen.
-        if (!goblin::config::nativeMenuDevRows)
-            return;
-        Row bar;
-        bar.kind = RowKind::Action;
-        bar.label = hold(L"Progress bar style");
-        bar.value = hold(g_bar_style == BarStyle::Ascii   ? L"ascii"
-                         : g_bar_style == BarStyle::Blocks ? L"blocks"
-                                                           : L"both");
-        bar.action = &action_cycle_bar_style;
-        push(bar);
-        Row markup;
-        markup.kind = RowKind::Action;
-        markup.label = hold(L"Rich text (colour)");
-        markup.value = hold(g_markup ? colored(L"on", kColOn) : std::wstring(L"off"));
-        markup.action = &action_toggle_markup;
-        push(markup);
-        Row gbar;
-        gbar.kind = RowKind::Action;
-        gbar.label = hold(L"Graphic bar (clip scale)");
-        gbar.value = hold(g_graphic_bar ? colored(L"on", kColOn) : std::wstring(L"off"));
-        gbar.action = &action_toggle_graphic_bar;
-        push(gbar);
-        Row icons;
-        icons.kind = RowKind::Info;
-        icons.label = hold(L"Row icons");
-        {
-            // Report the path we actually use (our own pixels into a row clip), not the
-            // retired movie-splice experiment.
-            const auto st = goblin::sfimage::icon_state();
-            const bool ok = st == goblin::sfimage::IconState::Drawn;
-            icons.value = hold(colored(wide(goblin::sfimage::icon_state_name()),
-                                       ok ? kColOn : kColOff));
-        }
-        push(icons);
-        Row movie;
-        movie.kind = RowKind::Info;
-        movie.label = hold(L"Own movie");
-        movie.value = hold(wide(goblin::own_movie::status()));
-        push(movie);
-        Row demo;
-        demo.kind = RowKind::Progress;
-        demo.label = hold(L"Bar preview");
-        demo.collected = 7;
-        demo.total = 10;
-        demo.value = hold(bar_text(7, 10, g_bar_style));
-        push(demo);
-        // A row whose value shows raw markup, so one glance tells us whether the field
-        // renders HTML or prints the tags verbatim.
-        Row probe;
-        probe.kind = RowKind::Info;
-        probe.label = hold(L"Markup check");
-        probe.value = hold(L"<font color=\"#FF6060\">red</font> plain");
-        push(probe);
-    }
-
+    // The Tools page is gone (2026-07-29). Its only surviving row, "Save settings now", duplicated
+    // the save that menu_torn_down() already performs on close, and the diagnostic rows below it were
+    // retired earlier - so the page had nothing left to show.
     // Build the right-hand preview for `page` (currently: the rows of an ini section as
     // "name  value" lines).
     void build_preview(int32_t page)
@@ -998,7 +1316,7 @@ namespace
             g_preview_arena.push_back(std::move(t));
             return g_preview_arena.back().c_str();
         };
-        std::wstring head = wide(tr::section_label(schema[ix].name));
+        std::wstring head = wide(tr::section_label(schema[ix].name, mlang()));
         if (head.empty())
             head = wide(schema[ix].name);
         Row title;
@@ -1010,7 +1328,7 @@ namespace
         {
             if (!entry_visible(e))
                 continue;
-            std::wstring label = wide(tr::entry_label(e.key));
+            std::wstring label = wide(tr::entry_label(e.key, mlang()));
             if (label.empty())
                 label = wide(e.key);
             if (label.size() > 26)
@@ -1035,8 +1353,8 @@ namespace
             build_progress();
         else if (g_page == goblin::nmenu::kPageHidden)
             build_hidden();
-        else if (g_page == goblin::nmenu::kPageActions)
-            build_actions();
+        else if (g_page == goblin::nmenu::kPageAbout)
+            build_about();
         else if (g_page == goblin::nmenu::kPageValue)
             build_value();
         else if (g_page == goblin::nmenu::kPageRebind)
@@ -1046,7 +1364,7 @@ namespace
         else if (g_page >= goblin::nmenu::kPageAddonBase)
             build_addon(static_cast<size_t>(g_page - goblin::nmenu::kPageAddonBase));
         else if (g_page >= goblin::nmenu::kPageSectionBase)
-            build_section(static_cast<size_t>(g_page - goblin::nmenu::kPageSectionBase));
+            build_layout_page(static_cast<size_t>(g_page - goblin::nmenu::kPageSectionBase));
         else
             build_root();
         build_preview(g_preview_page);
@@ -1277,14 +1595,30 @@ bool goblin::nmenu::rebind_pending()
     return g_rebind_waiting && g_page == kPageRebind && g_edit_entry != nullptr;
 }
 
+std::atomic<uint32_t> g_swallow_vk{0};
+
+bool goblin::nmenu::key_swallowed(uint32_t vk)
+{
+    if (!vk || g_swallow_vk.load(std::memory_order_relaxed) != vk)
+        return false;
+    if (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000)
+        return true; // still held from the rebind
+    g_swallow_vk.store(0, std::memory_order_relaxed);
+    return false;
+}
+
 void goblin::nmenu::rebind_apply(uint32_t vk)
 {
     if (g_edit_entry && g_edit_entry->target && vk != 0)
     {
         *static_cast<uint32_t *>(g_edit_entry->target) = vk;
         g_dirty = true;
+        // Written to disk now rather than at menu close: a key binding is the one setting the player
+        // verifies by USING it, and using it may well mean closing the game.
+        goblin::save_config(goblin::g_ini_path);
+        g_swallow_vk.store(vk, std::memory_order_relaxed); // this very press must not also act
         goblin::reapply_live_settings();
-        spdlog::info("[nmenu] {} rebound to 0x{:02X}", g_edit_entry->key, vk);
+        spdlog::info("[nmenu] {} rebound to 0x{:02X} (saved)", g_edit_entry->key, vk);
     }
     g_rebind_waiting = false;
     if (g_nested)
@@ -1299,6 +1633,3 @@ size_t goblin::nmenu::depth() { return g_stack.size(); }
 
 bool goblin::nmenu::dirty() { return g_dirty; }
 void goblin::nmenu::clear_dirty() { g_dirty = false; }
-void goblin::nmenu::set_bar_style(BarStyle style) { g_bar_style = style; }
-goblin::nmenu::BarStyle goblin::nmenu::bar_style() { return g_bar_style; }
-bool goblin::nmenu::graphic_bar() { return g_graphic_bar; }

@@ -63,7 +63,8 @@ namespace goblin::nmenu
     constexpr int32_t kPageRoot = 0;
     constexpr int32_t kPageProgress = 1;
     constexpr int32_t kPageHidden = 2;
-    constexpr int32_t kPageActions = 3;
+    // id 3: the About page (version + links). It took the slot the removed Tools page left free.
+    constexpr int32_t kPageAbout = 3;
     // The list of choices for one Number/Enum entry, and the "press a key" screen for one
     // hotkey entry. Both edit a single entry, remembered by the model while the page is up,
     // so one page id each is enough.
@@ -136,19 +137,9 @@ namespace goblin::nmenu
     // Apply the captured virtual-key code (0 = the player cancelled) and leave the page.
     void rebind_apply(uint32_t vk);
 
-    // Progress-bar glyph set. Which of these actually renders depends on the menu font,
-    // so the first in-game run shows all of them side by side and we keep the winner.
-    enum class BarStyle : uint8_t
-    {
-        Ascii,  // [####----]
-        Blocks, // [****....] using U+2588 / U+2591
-        Both,   // both, for the one-off comparison run
-    };
-    void set_bar_style(BarStyle style);
-    BarStyle bar_style();
-
-    // Experiment: draw the progress bar as a SCALED CLIP in the row instead of text.
-    // Uses the row's own Conflict sprite (the only spare graphic in the 02_160 row clip)
-    // with setScale/setColor - so it needs no new movie assets.
-    bool graphic_bar();
+    // The press that FINISHES a rebind is still a press of that key, so whatever the key now does
+    // would fire immediately - bind the overlay key and the overlay opens on the spot. rebind_apply
+    // marks the key, and every hotkey edge detector asks here before acting; the mark clears itself
+    // once the key comes back up, so nothing is suppressed for longer than the player holds it.
+    bool key_swallowed(uint32_t vk);
 }

@@ -194,6 +194,25 @@ STAGES = [
           script='extract_itemlot_csv.py',
           also_scripts=['config.py']),
 
+    # BEFORE extract_items on purpose: the item database is enriched from this mapping, and
+    # enrich cannot revert a stale upgrade. With the scan running after the extract, a change to
+    # the scanner only reached the bake on the NEXT pipeline run - which silently left a phantom
+    # marker in every profile built once (2026-07-30). The scan reads the event files, the
+    # regulation and the entity index, never the database, so nothing wanted the old order.
+
+
+    Stage('entity_index',
+          inputs=[MSB_DIR],
+          outputs=[DATA / 'msb_entity_index.json'],
+          script='build_entity_index.py',
+          also_scripts=['config.py']),
+
+    Stage('emevd_scan',
+          inputs=[EVENT_DIR, REGULATION, DATA / 'msb_entity_index.json'],
+          outputs=[DATA / 'emevd_lot_mapping.json'],
+          script='scan_emevd_awards.py',
+          also_scripts=['config.py']),
+
     Stage('extract_items',
           # emevd_lot_mapping is NOT read by extract_all_items, but listed as an input
           # on purpose: enrich_fallback mutates items_database.json IN PLACE using the
@@ -209,11 +228,6 @@ STAGES = [
           script='extract_all_items.py',
           also_scripts=['unreachable.py'] + COMMON),
 
-    Stage('entity_index',
-          inputs=[MSB_DIR],
-          outputs=[DATA / 'msb_entity_index.json'],
-          script='build_entity_index.py',
-          also_scripts=['config.py']),
 
     Stage('grace_index',
           inputs=[REGULATION, MSGBND],
@@ -221,11 +235,6 @@ STAGES = [
           script='build_grace_index.py',
           also_scripts=['config.py']),
 
-    Stage('emevd_scan',
-          inputs=[EVENT_DIR, REGULATION, DATA / 'msb_entity_index.json'],
-          outputs=[DATA / 'emevd_lot_mapping.json'],
-          script='scan_emevd_awards.py',
-          also_scripts=['config.py']),
 
     Stage('enrich_fallback',
           inputs=[DATA / 'items_database.json',

@@ -38,7 +38,12 @@ namespace goblin
         const char *def;         // default, exactly as written in the ini
         const char *comment;     // may contain '\n' for multi-line; nullptr = none
         bool err_only;           // omitted + disabled in the vanilla build
-        const char *rename_from; // previous key name in this section, or nullptr
+        // Previous key name(s), newest first, comma-separated - a key that has been renamed twice
+        // still has to find a value written under either of its old names. nullptr = never renamed.
+        const char *rename_from;
+        // Editable in the ini and NOWHERE else: neither menu offers it. For settings whose value
+        // decides which menu exists at all - a menu cannot sensibly host the switch that turns it off.
+        bool ini_only = false;
     };
 
     struct IniSection

@@ -1,4 +1,6 @@
 #include "goblin_gfx_probe.hpp"
+
+#include "goblin_guarded.hpp" // engine calls that fault by design stay out of the crash log
 #include "generated_shared/goblin_menu_icon_tags.hpp"
 
 #include "goblin_config.hpp"
@@ -538,8 +540,12 @@ namespace
     // SEH-isolated call into the native lossless loader (kept object-free for __try/__except).
     void *seh_call_lossless(void *ctx, void *taginfo)
     {
-        __try { return o_lossless(ctx, taginfo); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+        void *res = nullptr;
+        ++goblin::guarded::depth;
+        __try { res = o_lossless(ctx, taginfo); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { res = nullptr; }
+        --goblin::guarded::depth;
+        return res;
     }
 
 
@@ -1038,11 +1044,499 @@ namespace
 
 
 
+    // ── which movie is this? ─────────────────────────────────────────────────────────
+    // Cached offset of the movie definition's file-name pointer, discovered on first use.
+    std::atomic<int> g_url_off{-1};
+
+    // A movie name is a short asset path; the buffer is ours so nothing downstream reads game memory.
+    constexpr size_t kUrlMax = 192;
+
+    // Copy a candidate name out of the definition into our own buffer, then judge the COPY.
+    // Every read is guarded on purpose: looks_heap only says "this number could be a pointer", and
+    // the discovery pass below tries about a hundred of them, so one raw dereference here would be a
+    // crash waiting for the first object layout we did not anticipate.
+    // Scaleform's String does not point AT the characters: it points at a reference-counted header
+    // (size + refcount) with the characters behind it, and the pointer can carry flag bits in its low
+    // bits. So a candidate is tried both as a plain char* and at the handful of offsets a header of
+    // that shape puts the text at - which is why the first version, testing only offset 0, found
+    // nothing and quietly fell back to the sprite-shape heuristic.
+    const int kCharsAt[] = {0, 0x08, 0x0C, 0x10};
+
+    bool read_chars_at(uint64_t p, char *out, size_t cap);
+
+    bool read_name_at(uint64_t movieDef, int off, char *out, size_t cap)
+    {
+        uint64_t p = rq(movieDef + (uint32_t)off);
+        if (!looks_heap(p))
+            return false;
+        p &= ~3ull; // drop any flag bits kept in the low two bits
+        for (int k = 0; k < (int)(sizeof(kCharsAt) / sizeof(kCharsAt[0])); ++k)
+            if (read_chars_at(p + (uint32_t)kCharsAt[k], out, cap))
+                return true;
+        return false;
+    }
+
+    bool read_chars_at(uint64_t p, char *out, size_t cap)
+    {
+        if (!looks_heap(p))
+            return false;
+        // Shrink on failure rather than giving up: a perfectly valid short string can sit near the end
+        // of a page, where a full-length read would fault on the next one.
+        size_t got = 0;
+        for (size_t want = cap - 1; want >= 16; want /= 2)
+            if (safe_copy(out, (const void *)p, want))
+            {
+                got = want;
+                break;
+            }
+        if (!got)
+            return false;
+        out[got] = 0;
+        size_t i = 0;
+        for (; i < got; ++i)
+        {
+            const unsigned char c = (unsigned char)out[i];
+            if (c == 0)
+                break;
+            if (c < 0x20 || c > 0x7E) // a path is printable ASCII; anything else is another field
+                return false;
+        }
+        if (i < 5 || i >= got) // no terminator inside the copy means this is not a short path
+            return false;
+        out[i] = 0;
+        const char *dot = std::strrchr(out, '.');
+        if (!dot)
+            return false;
+        return _stricmp(dot, ".gfx") == 0 || _stricmp(dot, ".swf") == 0;
+    }
+
+    // Read a movie's own file name through its definition. false = it could not be established, and
+    // callers must then fall back to whatever they did before.
+    bool movie_file_url(uint64_t movieDef, char *out, size_t cap)
+    {
+        if (!looks_heap(movieDef) || cap < 32)
+            return false;
+        const int known = g_url_off.load(std::memory_order_relaxed);
+        if (known >= 0 && read_name_at(movieDef, known, out, cap))
+            return true;
+        // Discovery pass: the field's offset is not hardcoded, because this SDK build may lay the
+        // object out differently than the published headers. One hit is enough to cache.
+        for (int off = 0; off <= 0x300; off += 8)
+            if (read_name_at(movieDef, off, out, cap))
+            {
+                if (g_url_off.exchange(off, std::memory_order_relaxed) != off)
+                    spdlog::info("[gfxprobe] movie name found at def+0x{:X}: '{}'", off, out);
+                return true;
+            }
+        return false;
+    }
+
+    bool name_contains(const char *hay, const char *needle)
+    {
+        const size_t n = std::strlen(needle);
+        for (const char *p = hay; *p; ++p)
+            if (_strnicmp(p, needle, n) == 0)
+                return true;
+        return false;
+    }
+
+    // ── is the discovered field really the movie's own name? ─────────────────────────
+    // The offset is found by pattern, so it could in principle latch onto some unrelated path that
+    // happens to sit in the object. Letting such a field say "this is NOT the worldmap" would delete
+    // the icons for everyone, so a name may only rule a movie out after the field has PROVEN it varies
+    // between movies - which a constant or mis-latched field never will. Until then the name can only
+    // confirm, and everything falls back to the sprite-shape heuristic exactly as before.
+    char g_seen_name[kUrlMax] = {};
+    std::atomic<int> g_seen_set{0};
+    std::atomic<int> g_name_varies{0};
+
+    void note_name(const char *url)
+    {
+        if (g_name_varies.load(std::memory_order_relaxed))
+            return;
+        if (g_seen_set.exchange(1, std::memory_order_relaxed) == 0)
+        {
+            strncpy_s(g_seen_name, sizeof(g_seen_name), url, _TRUNCATE);
+            return;
+        }
+        if (_stricmp(g_seen_name, url) != 0)
+        {
+            g_name_varies.store(1, std::memory_order_relaxed);
+            spdlog::info("[gfxprobe] movie-name field verified: it differs between movies "
+                         "('{}' vs '{}'), so a name may now rule a movie out", g_seen_name, url);
+        }
+    }
+
+    // 1 = this movie IS the worldmap by its own name, 0 = the name did not match, -1 = no name.
+    int ctx_is_worldmap(uint64_t ctx)
+    {
+        uint64_t movieDef = rq(ctx + 0x38);
+        if (!looks_heap(movieDef))
+            movieDef = ctx; // pre-0x38 layout, same fallback compute_safe_base uses
+        char url[kUrlMax] = {};
+        if (!movie_file_url(movieDef, url, sizeof(url)))
+            return -1;
+        note_name(url);
+        return name_contains(url, "02_120_worldmap") ? 1 : 0;
+    }
+
+    // ══ the map's own panels, added to the PARSED movie ══════════════════════════════
+    // The mod's two map panels (the height readout and the focus banner) are a SECOND placement of the
+    // clip the game itself uses to name a place. The load-time byte transform that adds them
+    // (goblin_own_movie.cpp) needs to see the movie's bytes, and whether it does is the LOADER's
+    // decision: ModEngine2 substitutes an overridden file below the engine's own opener, so the call
+    // still happens and we see modded bytes; ModEngine3 serves an overridden movie without that call at
+    // all (measured on Convergence: of the 22 movies it overrides, our opener saw 0, while all 90 it does
+    // not override came through). So the placement is added here instead, to the structures the parser
+    // has just built - the same ground the icon frames already stand on, and independent of any loader.
+    //
+    // Nothing below is assumed about the movie. The host sprite identifies ITSELF: the clip the game
+    // names places by is called `PlaceName`, so the sprite whose frame places a child under that name is
+    // the one to add ours to, that child's character is the sprite to place, and the depths in that frame
+    // say what depth is free. A movie the game can still show a place name on therefore carries
+    // everything this needs, whoever authored it.
+    constexpr const char *kHostChildName = "PlaceName";  // the game's own tooltip clip
+    constexpr const char *kTipChildName = "MfgTip";
+    constexpr const char *kBannerChildName = "MfgBanner";
+    // Parked far off screen. The panels are positioned by goblin_maphover on every frame they are shown,
+    // and this keeps them from appearing at the clip's own origin for the frame before the first hover.
+    // The same six bytes the load-time transform parks with: MATRIX {HasScale 0, HasRotate 0,
+    // nTranslateBits 20, tx = ty = -400000 twips}.
+    const unsigned char kParkedMatrix[6] = {0x29, 0x3C, 0xB0, 0x13, 0xCB, 0x00};
+
+    std::atomic<int> g_panels_state{0};        // 0 = not done, 1 = placed by us, 2 = already in the movie
+    std::atomic<unsigned> g_panel_scan_at{0};  // ring cursor, so each SpriteDef is examined once
+    // The ring holds every movie's sprites. The cursor starts at the sprite the worldmap movie was
+    // loading when we first got here, so nothing another movie defined can be mistaken for the host.
+    std::atomic<int> g_panel_scan_init{0};
+
+    uint64_t build_named_place_tag(uint16_t charId, uint16_t depth, const unsigned char *matrix,
+                                   unsigned matLen, const char *name);  // defined below
+
+    // ── just enough SWF bit reading to reach a placement's instance name ─────────────
+    // Between the character id and the name sit a MATRIX and a colour transform, both bit-packed and
+    // variable-length. Reading past them is what makes the name reachable; going by the tag's vtable
+    // instead would tie this to an address that moves on a game update, while the body layout does not.
+    struct BodyCur
+    {
+        const unsigned char *b;
+        uint32_t len;
+        uint32_t bit;
+        bool bad;
+    };
+
+    uint32_t body_bits(BodyCur &c, uint32_t n)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            if ((c.bit >> 3) >= c.len)
+            {
+                c.bad = true;
+                return 0;
+            }
+            v = (v << 1) | ((c.b[c.bit >> 3] >> (7 - (c.bit & 7))) & 1u);
+            ++c.bit;
+        }
+        return v;
+    }
+
+    void body_align(BodyCur &c) { c.bit = (c.bit + 7u) & ~7u; }
+
+    // depth, character id and morph ratio are ordinary LITTLE-ENDIAN u16 byte fields, not bit-packed -
+    // reading them through the bit reader byte-swaps them (an offline check of this decoder against the
+    // real movies reported character 57600 for 225 and depth 24064 for 94 before this existed). They are
+    // always byte-aligned where they occur: the flags come first and are whole bytes.
+    uint32_t body_u16(BodyCur &c)
+    {
+        const uint32_t at = c.bit >> 3;
+        if ((c.bit & 7u) != 0 || at + 1 >= c.len)
+        {
+            c.bad = true;
+            return 0;
+        }
+        c.bit += 16;
+        return static_cast<uint32_t>(c.b[at]) | (static_cast<uint32_t>(c.b[at + 1]) << 8);
+    }
+
+    void body_skip_matrix(BodyCur &c)
+    {
+        if (body_bits(c, 1))
+            body_bits(c, body_bits(c, 5) * 2);  // scale
+        if (body_bits(c, 1))
+            body_bits(c, body_bits(c, 5) * 2);  // rotate/skew
+        body_bits(c, body_bits(c, 5) * 2);      // translate
+        body_align(c);
+    }
+
+    void body_skip_cxform(BodyCur &c)
+    {
+        const uint32_t has_add = body_bits(c, 1);
+        const uint32_t has_mult = body_bits(c, 1);
+        const uint32_t nbits = body_bits(c, 4);
+        if (has_mult)
+            body_bits(c, nbits * 4);
+        if (has_add)
+            body_bits(c, nbits * 4);
+        body_align(c);
+    }
+
+    // Decode one placement tag body: is this a NAMED placement, and if so, what does it place, at what
+    // depth, under what name? PlaceObject2 and PlaceObject3 differ by one byte (the second flags byte),
+    // so both readings are tried and the one whose name comes out as a plain printable string is taken -
+    // a wrong reading shifts every field and cannot produce one.
+    bool decode_named_place(const unsigned char *body, uint32_t len, uint16_t *depth, uint16_t *cid,
+                            char *name, uint32_t namecap)
+    {
+        for (int form = 0; form < 2; ++form)
+        {
+            BodyCur c{body, len, 0, false};
+            const uint32_t flags = body_bits(c, 8);
+            if (form)
+                body_bits(c, 8);  // PlaceObject3's second flags byte
+            if (!(flags & 0x20))
+                continue;  // no instance name: not one of the placements we read
+            const uint32_t dep = body_u16(c);
+            uint32_t ch = 0;
+            if (flags & 0x02)
+                ch = body_u16(c);
+            if (flags & 0x04)
+                body_skip_matrix(c);
+            if (flags & 0x08)
+                body_skip_cxform(c);
+            if (flags & 0x10)
+                body_u16(c);  // morph ratio
+            if (c.bad)
+                continue;
+            const uint32_t at = c.bit >> 3;
+            uint32_t n = 0;
+            while (at + n < len && body[at + n] && n + 1 < namecap)
+            {
+                const unsigned char k = body[at + n];
+                if (k < 0x20 || k > 0x7E)
+                {
+                    n = 0;
+                    break;
+                }
+                ++n;
+            }
+            if (!n || at + n >= len || body[at + n] != 0)
+                continue;  // no terminator inside the copy: this reading is not the right one
+            for (uint32_t i = 0; i < n; ++i)
+                name[i] = static_cast<char>(body[at + i]);
+            name[n] = 0;
+            *depth = static_cast<uint16_t>(dep);
+            *cid = static_cast<uint16_t>(ch);
+            return true;
+        }
+        return false;
+    }
+
+    // Walk one frame's tag list, reporting what the frame places by name. `wanted`/`already` are matched
+    // against the instance names; maxDepth comes back as the highest depth any tag in the frame uses.
+    bool scan_frame_names(uint64_t sd, uint16_t *hostCid, uint16_t *maxDepth, int *already)
+    {
+        const uint64_t fdata = rq(sd + OFF_FRAMEARR_DATA);
+        const uint32_t fcnt = rd32(sd + OFF_FRAMEARR_COUNT);
+        if (!looks_heap(fdata) || fcnt == 0 || fcnt > 8192)
+            return false;
+        uint64_t tags = 0;
+        uint32_t tagCount = 0;
+        if (!safe_copy(&tags, (void *)fdata, 8) ||
+            !safe_copy(&tagCount, (void *)(fdata + 8), 4))
+            return false;
+        if (!looks_heap(tags) || tagCount == 0 || tagCount > 4096)
+            return false;
+        bool found = false;
+        for (uint32_t i = 0; i < tagCount; ++i)
+        {
+            uint64_t tag = 0;
+            if (!safe_copy(&tag, (void *)(tags + i * 8), 8) || !looks_heap(tag))
+                continue;
+            unsigned char body[0x60] = {};
+            uint32_t got = 0;
+            for (uint32_t want = sizeof(body); want >= 0x10; want /= 2)
+                if (safe_copy(body, (void *)(tag + 8), want))  // the SWF body starts at tag+8
+                {
+                    got = want;
+                    break;
+                }
+            if (!got)
+                continue;
+            uint16_t dep = 0, ch = 0;
+            char nm[64] = {};
+            if (!decode_named_place(body, got, &dep, &ch, nm, sizeof(nm)))
+                continue;
+            if (dep > *maxDepth)
+                *maxDepth = dep;
+            if (std::strcmp(nm, kTipChildName) == 0)
+                *already = 1;  // the load-time transform got here first
+            if (std::strcmp(nm, kHostChildName) == 0 && ch)
+            {
+                *hostCid = ch;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    // Add tags to a frame's tag list. Both the list and the tag objects are ARENA-owned in stock
+    // Scaleform and the engine frees neither (Frame::DestroyTags only runs each tag's non-deleting
+    // destructor, and nothing releases pTagPtrList - audited 2026-07-28), so a longer array from the
+    // game's own malloc is safe here and the old one is simply left where it lies. That is the same
+    // ownership rule the icon frames stand on; the FRAME array is the one that must come from
+    // Scaleform's heap, and this does not touch it.
+    bool append_frame_tags(uint64_t sd, const uint64_t *add, uint32_t addN)
+    {
+        const uint64_t fdata = rq(sd + OFF_FRAMEARR_DATA);
+        if (!looks_heap(fdata))
+            return false;
+        uint64_t tags = 0;
+        uint32_t tagCount = 0;
+        if (!safe_copy(&tags, (void *)fdata, 8) || !safe_copy(&tagCount, (void *)(fdata + 8), 4))
+            return false;
+        if (!looks_heap(tags) || tagCount == 0 || tagCount > 4096)
+            return false;
+        uint64_t *arr = (uint64_t *)gfx_alloc(((size_t)tagCount + addN) * 8);
+        if (!arr)
+            return false;
+        if (!safe_copy(arr, (void *)tags, (size_t)tagCount * 8))
+            return false;
+        for (uint32_t i = 0; i < addN; ++i)
+            arr[tagCount + i] = add[i];
+        const uint32_t total = tagCount + addN;
+        // The pointer first, the count second: the frame is played from the game's own thread, and a
+        // count that reached it before the array would send it through the old array's end.
+        if (!safe_copy((void *)fdata, &arr, 8))
+            return false;
+        return safe_copy((void *)(fdata + 8), &total, 4);
+    }
+
+    // Examine every SpriteDef the parser has finished, once each, for the panel host. Runs while the
+    // worldmap movie loads; stops for good as soon as the panels are in.
+    void inject_map_panels()
+    {
+        // Only with the tag vtable CAPTURED from this movie's own tags. The RVA fallback would be an
+        // address from another game version, and unlike a read that faults into a skipped feature, a
+        // wrong vtable in a frame the engine PLAYS is a call through whatever sits there.
+        if (!g_po3_vt.load(std::memory_order_relaxed))
+        {
+            static std::atomic<int> s_said{0};
+            if (s_said.exchange(1, std::memory_order_relaxed) == 0)
+                spdlog::info("[panels] the placement tag vtable has not been captured from this movie "
+                             "yet - it comes from the icon sprite, which loads first, so this only says "
+                             "the host was reached before it");
+            return;
+        }
+        const unsigned head = g_idx.load(std::memory_order_relaxed);
+        if (g_panel_scan_init.exchange(1, std::memory_order_relaxed) == 0)
+            g_panel_scan_at.store(head ? head - 1 : 0, std::memory_order_relaxed);
+        unsigned at = g_panel_scan_at.load(std::memory_order_relaxed);
+        if (head > (unsigned)RING && at < head - (unsigned)RING)
+            at = head - (unsigned)RING;  // the ring wrapped past what we had not looked at yet
+        for (; at < head; ++at)
+        {
+            const uint64_t sd = (uint64_t)g_sprites[at % RING];
+            if (!looks_heap(sd))
+                continue;
+            if (!rd32(sd + OFF_FRAMEARR_COUNT))
+            {
+                // No tags yet. For the newest def that means it is still being parsed, so the cursor
+                // stays on it; for an older one it means it never got any, and waiting for it would
+                // park the cursor short of the host forever.
+                if (at + 1 < head)
+                    continue;
+                break;
+            }
+            uint16_t hostCid = 0, maxDepth = 0;
+            int already = 0;
+            const bool host = scan_frame_names(sd, &hostCid, &maxDepth, &already);
+            if (already)
+            {
+                g_panel_scan_at.store(at + 1, std::memory_order_relaxed);
+                g_panels_state.store(2, std::memory_order_relaxed);
+                spdlog::info("[panels] '{}' is already in this movie - the load-time transform saw the "
+                             "file, so nothing is added here",
+                             kTipChildName);
+                return;
+            }
+            if (!host)
+                continue;
+            // Above everything the frame already uses, so the panels draw over the clips they share the
+            // host with, and two apart so each keeps a depth of its own.
+            const uint16_t d1 = static_cast<uint16_t>(maxDepth + 2);
+            const uint16_t d2 = static_cast<uint16_t>(maxDepth + 4);
+            const uint64_t t1 = build_named_place_tag(hostCid, d1, kParkedMatrix, sizeof(kParkedMatrix),
+                                                      kTipChildName);
+            const uint64_t t2 = build_named_place_tag(hostCid, d2, kParkedMatrix, sizeof(kParkedMatrix),
+                                                      kBannerChildName);
+            if (!t1 || !t2)
+            {
+                spdlog::warn("[panels] tag allocation failed - the map panels stay absent on this run");
+                g_panel_scan_at.store(at + 1, std::memory_order_relaxed);
+                return;
+            }
+            const uint64_t add[2] = {t1, t2};
+            const bool ok = append_frame_tags(sd, add, 2);
+            g_panel_scan_at.store(at + 1, std::memory_order_relaxed);
+            if (ok)
+            {
+                g_panels_state.store(1, std::memory_order_relaxed);
+                spdlog::info("[panels] '{}' + '{}' placed in the parsed movie: host sprite {} (charId "
+                             "{}), placing character {}, depths {} and {}",
+                             kTipChildName, kBannerChildName, sd, rd32(sd + OFF_CHARID), hostCid, d1,
+                             d2);
+            }
+            else
+            {
+                spdlog::warn("[panels] the host frame's tag list could not be extended - the map panels "
+                             "stay absent on this run");
+            }
+            return;
+        }
+        g_panel_scan_at.store(at, std::memory_order_relaxed);
+    }
+
+    void seh_inject_map_panels()
+    {
+        __try
+        {
+            inject_map_panels();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
     void *spriteloader_detour(void *rcx, void *rdx)
     {
         uint32_t cid = (rcx ? peek_charid((uint64_t)rcx) : 0xFFFFFFFF); // charId before the load consumes it
         void *ret = o_spriteloader(rcx, rdx);
-        if (cid == 171 && rcx && !g_qmark_injected.load(std::memory_order_relaxed))
+        // Ask the movie for its own name. Sampling it on ordinary loads too is what lets the field prove
+        // it varies between movies (see note_name) - the cost after the first call is one guarded read,
+        // and it stops once proven.
+        if (rcx && !g_name_varies.load(std::memory_order_relaxed))
+            ctx_is_worldmap((uint64_t)rcx);
+        // The map's own panels go into the parsed movie, so they exist even on a build whose file the
+        // load-time transform never saw. Tried after each of the WORLDMAP movie's sprites finished
+        // parsing, and only until they are in: the host sprite is one of the last it defines, and which
+        // one it is has to come from the sprite itself rather than from a charId we guessed.
+        if (rcx && !g_panels_state.load(std::memory_order_relaxed))
+        {
+            const int wm = ctx_is_worldmap((uint64_t)rcx);
+            if (wm == 1 || (wm < 0 && (uint64_t)rcx == g_worldmap_ctx.load(std::memory_order_relaxed)))
+                seh_inject_map_panels();
+        }
+        const int is_wm = (cid == 171 && rcx) ? ctx_is_worldmap((uint64_t)rcx) : -1;
+        if (cid == 171 && rcx && is_wm == 0 && g_name_varies.load(std::memory_order_relaxed))
+        {
+            // Ruled out by a name from a field that has proven itself. Before this existed, a sprite 171
+            // belonging to some other movie could be taken for the worldmap's.
+            static std::atomic<int> s_said{0};
+            if (s_said.exchange(1) == 0)
+                spdlog::info("[gfxprobe] sprite 171 belongs to another movie - not ours to touch");
+        }
+        else if (cid == 171 && rcx && !g_qmark_injected.load(std::memory_order_relaxed))
         {
             // Find the WORLDMAP sprite-171 among ALL recorded ctors (charId 171 + worldmap-sized
             // frameCount), NOT just the last-ctor'd sprite. The previous "last ctor" proxy was a
@@ -1052,6 +1546,9 @@ namespace
             // already scans the ring for charId==171 with a frame array of fc in [100,4096] (skips
             // 1-frame "other movie" 171s), so it returns the real worldmap sprite on any base.
             uint64_t sd = locate_sprite171();
+            if (is_wm == 1)
+                spdlog::info("[gfxprobe] worldmap confirmed BY NAME (sprite {} located: {})", cid,
+                             sd ? "yes" : "no");
             if (sd)
             {
                 uint32_t fcnt = rd32(sd + OFF_FRAMECOUNT);
@@ -1099,6 +1596,41 @@ namespace
     // DIAGNOSTIC detour on RemoveObject2::Execute. For OUR injected RM2 tags, inspect the display list
     // (ctx+0x28 base, ctx+0x30 count; node depth@+0x14, sticky flag@+0x71) for an entry at our depth,
     // BEFORE the original runs - tells us whether the anon's layer is present and sticky.
+    // ── which display-list contexts do we actually get? ──────────────────────────────
+    // A context is only alive inside the callback that hands it to us (retaining one across frames
+    // crashed the first V3 build), so knowing WHICH sprites' contexts pass through decides whether a
+    // panel can be created at runtime at all - and under which callback.
+    constexpr int kCtxSeenMax = 16;
+    uint64_t g_ctx_seen[kCtxSeenMax] = {};
+    uint32_t g_ctx_seen_n = 0;
+
+    // Print the candidate fields rather than trusting one offset: the marker factory reads the sprite
+    // at ctx+0x58, and that produced a nonsense character id here - so the layout in THIS callback is
+    // something the log has to tell us. Deduplicated by CONTEXT, so one bad read cannot silence the
+    // rest (which is what happened the first time).
+    void note_context(uint64_t ctx, const char *via)
+    {
+        if (!goblin::config::debugLogging || !ctx)
+            return;
+        for (uint32_t i = 0; i < g_ctx_seen_n; ++i)
+            if (g_ctx_seen[i] == ctx)
+                return;
+        if (g_ctx_seen_n >= kCtxSeenMax)
+            return;
+        g_ctx_seen[g_ctx_seen_n++] = ctx;
+        for (uint32_t off = 0x18; off <= 0x78; off += 8)
+        {
+            const uint64_t p = rq(ctx + off);
+            if (!looks_heap(p))
+                continue;
+            const uint32_t cid = rd32(p + OFF_CHARID);
+            const uint32_t fc = rd32(p + OFF_FRAMECOUNT);
+            const bool sprite_like = cid > 0 && cid < 8192 && fc > 0 && fc < 100000;
+            spdlog::info("[ctxprobe] {} ctx 0x{:X} +0x{:X} -> 0x{:X} charId {} frames {}{}", via, ctx,
+                         off, p, cid, fc, sprite_like ? "  <-- looks like a sprite" : "");
+        }
+    }
+
     void *rm2exec_detour(void *thisTag, void *ctx, uint32_t frame)
     {
         uint64_t t = (uint64_t)thisTag;
@@ -1129,6 +1661,7 @@ namespace
         const bool exact_sprite171 = exact_count != 0 &&
             std::binary_search(g_sprite171_rm2_tags,
                                g_sprite171_rm2_tags + exact_count, t);
+        note_context(reinterpret_cast<uint64_t>(ctx), "rm2");
         void *ret = o_rm2exec(thisTag, ctx, frame);
         // Execute queued native placements only while this callback's timeline
         // context is live. Retaining ctx for a later map frame caused the first
@@ -1436,21 +1969,38 @@ namespace
 
     // POD-only SEH wrappers: MSVC forbids C++ object unwinding (spdlog temporaries) in a __try frame, so
     // the raw game-function calls live here (no C++ objects) and callers log outside the try.
+    //
+    // Each raises goblin::guarded::depth around the call so the crash logger does not record a fault we
+    // asked for and handle. The result goes through a variable rather than a `return` inside the __try:
+    // a return from in there would skip the decrement and leave the counter up for the life of the
+    // thread, which would silence the log for a REAL crash.
     bool safe_resolve(void *scene, void *out, const char *name)
     {
-        __try { o_resolve(scene, out, name, nullptr); return true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try { o_resolve(scene, out, name, nullptr); ok = true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+        --goblin::guarded::depth;
+        return ok;
     }
     bool safe_exec_tag(uint64_t execFn, uint64_t tag, uint64_t ctx, uint32_t frame)
     {
-        __try { reinterpret_cast<ExecTagFn *>(execFn)((void *)tag, (void *)ctx, frame); return true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try { reinterpret_cast<ExecTagFn *>(execFn)((void *)tag, (void *)ctx, frame); ok = true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+        --goblin::guarded::depth;
+        return ok;
     }
     void *safe_add_disp(uint64_t add, uint64_t root, void *pos, void *name)
     {
         using AddDisp9 = void *(void *, void *, void *, void *, void *, int, unsigned, void *, void *);
-        __try { return reinterpret_cast<AddDisp9 *>(add)((void *)root, pos, name, nullptr, nullptr, -1, 1u, nullptr, nullptr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return (void *)~0ull; } // sentinel = faulted
+        void *res = nullptr;
+        ++goblin::guarded::depth;
+        __try { res = reinterpret_cast<AddDisp9 *>(add)((void *)root, pos, name, nullptr, nullptr, -1, 1u, nullptr, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { res = (void *)~0ull; } // sentinel = faulted
+        --goblin::guarded::depth;
+        return res;
     }
 
     // A NAMED PlaceObject3 ExecuteTag: same synth as build_clean_place_tag but flags0 adds HasName (0x20)
@@ -1741,6 +2291,19 @@ void *goblin::gfx_probe::game_alloc(size_t bytes)
     return gfx_alloc(bytes);
 }
 
+bool goblin::gfx_probe::movie_name(void *ctx, char *out, size_t cap)
+{
+    if (!ctx || !out || cap < 32)
+        return false;
+    // Same two steps the icon path identifies the world map by: the definition hangs off the load
+    // context at +0x38 (older layouts keep the name on the context itself), and the name field's offset
+    // inside it is discovered once and then cached.
+    uint64_t def = rq(reinterpret_cast<uint64_t>(ctx) + 0x38);
+    if (!looks_heap(def))
+        def = reinterpret_cast<uint64_t>(ctx);
+    return movie_file_url(def, out, cap);
+}
+
 uint32_t goblin::gfx_probe::injected_iconid(int srcIconId)
 {
     if (srcIconId < 0 || srcIconId >= ICON_MAP_SIZE)
@@ -1895,7 +2458,7 @@ void goblin::gfx_probe::v3_on_map_close()
 void goblin::gfx_probe::tick()
 {
     // Called from the DLL's background watcher thread (setup_mod), NOT the overlay's Present hook - so the
-    // collision self-heal and (dev) diagnostics run independently of enable_overlay. Icon/resource injection
+    // collision self-heal and (dev) diagnostics run independently of menu_enabled. Icon/resource injection
     // itself is UNCONDITIONAL and happens at LOAD (the sprite-loader hook), independent of this tick; this
     // only runs the functional collision self-heal (always) + the read-only dumps (`probe` = debug_logging).
     // The background loop already paces us (100ms-2s), so no frame throttle here; the work below is one-shot.

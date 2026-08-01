@@ -33,12 +33,13 @@
 
 #include "goblin_overlay.hpp"
 #include "goblin_config.hpp"
+#include "goblin_native_menu.hpp" // key_swallowed: do not act on the press that just got bound
 #include "goblin_config_schema.hpp"
 #include "goblin_i18n.hpp"
 #include "goblin_overlay_icons.hpp"
 #include "goblin_map_icons.hpp" // shared DefineBitsLossless2 icon tags (decoded here for the atlas)
 #include "miniz.h"              // zlib inflate to decode the tags
-// sc2: in-swapchain D3D12 backend. Selected by overlay_render_mode = swapchain_2; it draws our
+// sc2: in-swapchain D3D12 backend - the only one built. It draws our
 // ImGui into the game's OWN swapchain instead of a separate window, which is what removes the
 // focus steal under Linux/Proton.
 #include "sc2/hooks.hpp"
@@ -46,6 +47,7 @@
 #include "sc2/overlay_present.hpp"
 #include "goblin_inject.hpp"
 #include "goblin_markers.hpp"
+#include "goblin_build_variants.hpp" // which overlay backend is in this build
 #include "goblin_maphover.hpp"   // hovered_row() for the passive hover-info panel
 #include "goblin_mapproject.hpp" // world->screen projection for the highlight rings
 #include "goblin_messages.hpp"   // lookup_text() for the hovered marker's name
@@ -65,6 +67,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <chrono>
+#include <cmath>
 #include <thread>
 #include <vector>
 #include <commdlg.h> // GetOpenFileNameW (WIN32_LEAN_AND_MEAN excludes it from windows.h)
@@ -113,7 +117,7 @@ UINT g_back_w = 0, g_back_h = 0; // current swapchain back-buffer size
 // UpdateLayeredWindow (render ImGui to an offscreen RT -> CPU readback -> per-pixel
 // alpha blit). Windows keeps the DComp path unchanged. g_use_layered selects the path.
 bool g_use_layered = false;
-// Render mode is chosen by ini `overlay_render_mode`:
+// Render mode WAS chosen by the ini (that key now picks which MENU runs, see menu_render_mode):
 //   layered  = WS_EX_LAYERED + UpdateLayeredWindow (GDI, NO DXGI swapchain -> invisible to
 //              swapchain hooks: OBS Game Capture / ReShade / RivaTuner-RTSS / Special K). Default.
 //   surface  = DirectComposition SURFACE (GPU-composited, still NO swapchain -> same compat, no
@@ -427,6 +431,9 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
     {
         for (const auto &e : sec.entries)
         {
+            if (e.ini_only)
+                continue; // the ini decides it alone: menu_render_mode picks WHICH menu
+                          // exists, so no menu may offer it (IniEntry::ini_only)
             if (goblin::profile_is_vanilla() && e.err_only)
                 continue;
             if (std::strcmp(e.key, "overlay_font_scale") == 0 ||
@@ -482,11 +489,11 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
 
             if (e.type == goblin::IniType::Bool)
             {
-                // Lock the overlay/hotkey master switches: unchecking enable_overlay would
+                // Lock the menu/hotkey master switches: unchecking menu_enabled would
                 // close the overlay with no way to reopen it, and enable_toggle_hotkey only
                 // matters when the overlay is OFF. We grey them but keep them navigable so
                 // their tooltip is reachable by keyboard/gamepad; the toggle is ignored.
-                const bool locked = std::strcmp(e.key, "enable_overlay") == 0 ||
+                const bool locked = std::strcmp(e.key, "menu_enabled") == 0 ||
                                     std::strcmp(e.key, "enable_toggle_hotkey") == 0;
                 bool v = *static_cast<bool *>(e.target);
                 const bool box_clicked = ImGui::Checkbox("##k", &v);  // wrapped label drawn separately
@@ -552,21 +559,12 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
             }
             else if (e.type == goblin::IniType::Text)
             {
-                // The only Text entry is overlay_render_mode: a 3-way combo. Option names are
-                // technical (kept literal); the row label is the localized name beside it.
+                // Read-only. The one Text key is menu_render_mode, and it is ini_only - it decides
+                // WHICH menu exists, so the menu it would appear in must not offer it. This branch is
+                // kept for the next Text setting, and shows the value rather than a combo of options
+                // that no longer exist (it used to list surface / layered / swapchain).
                 inline_label();
-                std::string &value = *static_cast<std::string *>(e.target);
-                ImGui::SetNextItemWidth(inline_ctrl_w());
-                if (ImGui::BeginCombo("##k", value.c_str()))
-                {
-                    for (const char *opt : {"surface", "layered", "swapchain"})
-                    {
-                        const bool sel = value == opt;
-                        if (ImGui::Selectable(opt, sel)) { value = opt; changed = true; }
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
+                ImGui::TextDisabled("%s", static_cast<std::string *>(e.target)->c_str());
                 hovered = hovered || ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
             }
             else // VkKey / GamepadMask: name + value + in-place rebind, all on one line
@@ -688,23 +686,10 @@ void draw_debug_tab()
     namespace tr = goblin::i18n;
     const tr::Language lang = tr::current_language();
 
-    // ── Map icon status (top of the tab) ───────────────────────────────────
-    // A live readout of every load step (hooks, world-map icons, bitmaps, remap,
-    // logo, overlay, + a live heap-pointer sample) with a reason for anything that
-    // failed. Players can screenshot or Copy this for a bug report so we can
-    // pinpoint the fault (incl. pointer-range issues like the looks_heap bug).
-    ImGui::TextColored(ImVec4(0.80f, 0.68f, 0.40f, 1.0f), "%s", tr::tr(tr::TextId::InjectStatusTitle, lang));
-    ImGui::TextDisabled("%s", tr::tr(tr::TextId::InjectStatusHint, lang));
-    {
-        std::string rep = goblin::diag::report();
-        ImGui::BeginChild("##injstatus", ImVec2(-1, 150), true, ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::TextUnformatted(rep.c_str());
-        ImGui::EndChild();
-        if (ImGui::Button(tr::tr(tr::TextId::CopyStatus, lang)))
-            ImGui::SetClipboardText(rep.c_str());
-    }
-    ImGui::Separator();
-
+    // The inject-status readout (goblin::diag::report() plus a Copy button) lived at the top of this
+    // tab until 2026-07-29: a live summary of every load step with a reason for anything that failed,
+    // meant to be screenshotted into a bug report. It went unused, and every state it summarised is
+    // already logged where it is set, so the log file is the single source now.
     bool changed = false;
     for (const auto &sec : goblin::ini_schema())
         if (std::strcmp(sec.name, "Debug") == 0)
@@ -1747,6 +1732,13 @@ void cover_game_window(int &out_w, int &out_h)
     out_h = h;
 }
 
+// ── Our own window's three backends: NOT BUILT unless MFG_OVERLAY_OWN_WINDOW=1 ──────────────────
+// Everything from here to the raw-input hook exists only to get our ImGui onto the screen through a
+// window of our own: the Wine/GDI layered blit, the DComp surface, the DComp swapchain, the D3D11
+// device they share, and render_frame() which presents whichever one is active. The shipping build
+// draws into the game's own frame instead (sc2_frontend_loop), so none of this is compiled in.
+#if MFG_OVERLAY_OWN_WINDOW
+
 // ── Proton/Wine layered-window fallback helpers (used when DComp is E_NOTIMPL) ──
 static void release_layered_targets()
 {
@@ -2087,6 +2079,7 @@ static void seh_resize(UINT w, UINT h)
     __try { resize_swapchain(w, h); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+#endif // MFG_OVERLAY_OWN_WINDOW - the hover-row helper below is needed by every backend
 
 // One rendered frame (SEH-wrapped). Clears to transparent; draws ImGui only when
 // the menu is open; presents. POD-only locals.
@@ -2101,156 +2094,29 @@ static void seh_resize(UINT w, UINT h)
 // goblin::overlay::native_hover_row() lives past the anonymous namespace.
 static void *native_hover_row_impl()
 {
-    const int layer = goblin::maphover::map_layer();
-    if (layer < 0 || layer > 2) return nullptr;
-    goblin::mapproject::MapView view;
-    if (!goblin::mapproject::read_view(view)) return nullptr;
-    const goblin::mapproject::Calib &c = goblin::mapproject::calib();
-    const float cw = static_cast<float>(g_back_w ? g_back_w : 1920);
-    const float chh = static_cast<float>(g_back_h ? g_back_h : 1080);
-    const float cx = cw * 0.5f, cy = chh * 0.5f;
-    constexpr float PICK_RADIUS = 26.0f; // ~native pin focus feel
-    float best = PICK_RADIUS * PICK_RADIUS;
-    void *best_row = nullptr;
-    for (const auto &p : goblin::native_marker_snapshot(layer))
-    {
-        if (!p.visible || !p.rowptr) continue;
-        float sx = 0, sy = 0;
-        if (!goblin::mapproject::project(p.area, p.gx, p.gz, p.px, p.pz,
-                                         view, c, cw, chh, sx, sy))
-            continue;
-        const float dx = sx - cx, dy = sy - cy;
-        if (dx * dx + dy * dy < best)
-        {
-            best = dx * dx + dy * dy;
-            best_row = p.rowptr;
-        }
-    }
-    return best_row;
+    // One pick, one anchor. This used to run its own nearest-to-the-screen-centre search, which meant
+    // the manual-hide hotkey and the popup could disagree about which marker is under the reticle - and
+    // on a build whose reticle is not centred, both were wrong in the same way. goblin::native_reticle_row
+    // is that search, in map space, with the anchor measured from the game's own hover.
+    return goblin::native_reticle_row();
 }
 
-static void draw_hover_tooltip(void *row)
-{
-    if (!row) return;
-    // Don't keep a tooltip on a marker that just got hidden (manual hide / pickup): its
-    // icon + highlight are gone, so the label must go too - even if the game still reports
-    // it as the focused pin until the cursor moves.
-    if (goblin::is_row_ptr_hidden(row)) return;
-    goblin::HoveredMarker hm = goblin::hovered_marker(row);
-    if (!hm.matched) return;
+// RETIRED 2026-07-28: draw_hover_tooltip / draw_focus_banner_onscreen / draw_map_highlights.
+// All three had native equivalents by then and were being drawn ON TOP of them:
+//   * the hover panel  -> the MfgTip panel   (goblin_maphover.cpp, drive_own_tip)
+//   * the focus banner -> the MfgBanner panel (goblin_maphover.cpp, drive_own_banner)
+//   * the highlight rings -> the glow-icon swap in goblin::apply_focus_highlight()
+// so the overlay now renders NOTHING but the F10 menu. What was lost with them, deliberately: the
+// tooltip's marker NAME line (the game's own popup already shows the name, which is why the native
+// panel never repeated it) and the ring drawn per projected point (the glow icon marks the same
+// markers, in the game's own render, with no projection to drift).
+// Consequences worth knowing before reviving any of this: the world->screen projection
+// (goblin_mapproject) has no overlay consumer left, HIGHLIGHT_PX is gone, and g_highlight_tex /
+// g_highlight_srv / g_highlight_texid / g_highlight_uv* are now written but never read - the atlas
+// rect and the D3D11 texture are still built, which is a few KB of waste kept on purpose so this
+// change does not touch atlas packing. Details: docs/research_overlay_map_visuals_retired.md.
 
-    char name[256] = "?";
-    const wchar_t *w = goblin::lookup_text(hm.textId);
-    if (w && *w)
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, name, sizeof name, nullptr, nullptr);
-
-    const ImGuiIO &io = ImGui::GetIO();
-    // Just right of and below screen centre (near the reticle, not covering it).
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + 28.0f, io.DisplaySize.y * 0.5f + 28.0f),
-                            ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.72f);
-    const ImGuiWindowFlags fl =
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("##goblin_hover_info", nullptr, fl))
-    {
-        namespace tr = goblin::i18n;
-        const tr::Language lang = tr::current_language();
-        ImGui::TextUnformatted(name);
-        float px = 0, pz = 0, py = 0;
-        bool have_player = goblin::collected::read_player_pos(px, pz, py);
-        if (hm.posY != 0.0f && have_player)
-        {
-            float dy = hm.posY - py;
-            float ad = dy < 0 ? -dy : dy;
-            if (ad < 1.5f)
-                ImGui::TextDisabled("%s", tr::tr(tr::TextId::HoverLevel, lang));
-            else
-                ImGui::Text(tr::tr(dy > 0 ? tr::TextId::HoverAbove : tr::TextId::HoverBelow, lang), ad);
-        }
-    }
-    ImGui::End();
-}
-
-// Top-left on-screen banner mirroring the progress-tab "Showing only: <category> - <region>"
-// filter text, so the active filter is visible on the map itself (not just inside the menu).
-// Drawn while a focus filter is active and the map is open. Informational (NoInputs).
-static void draw_focus_banner_onscreen()
-{
-    const int fc = goblin::focus_category();
-    if (fc < 0) return;
-    namespace tr = goblin::i18n;
-    const tr::Language lang = tr::current_language();
-    const int32_t fr = goblin::focus_region();
-    const char *regName = "?";
-    for (const auto &r : goblin::progress::snapshot())
-        if (r.place_name_id == fr) { regName = r.name.c_str(); break; }
-    const auto fcat = static_cast<goblin::generated::Category>(fc);
-    const char *fkey = goblin::category_config_key(fcat);
-    const char *fname = fkey ? tr::entry_label(fkey, lang) : goblin::markers::category_name(fcat);
-
-    ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.72f);
-    const ImGuiWindowFlags fl =
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("##goblin_focus_banner", nullptr, fl))
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.78f, 0.35f, 1.0f));
-        ImGui::Text("%s %s - %s", tr::tr(tr::TextId::ProgressShowingOnly, lang), fname, regName);
-        ImGui::PopStyleColor();
-        // Second line: how to clear the filter (the "Reset filter" button is in the menu).
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::Text(tr::tr(tr::TextId::ProgressFocusResetHint, lang),
-                    tr::tr(tr::TextId::ProgressFocusClear, lang));
-        ImGui::PopStyleColor();
-    }
-    ImGui::End();
-}
-
-// On-map highlight footprint (screen px, edge length) of the highlight.png ring drawn
-// over each focused marker. Its center is transparent, so the ring frames the game icon.
-// Tune here if it reads too big/small relative to the game pins.
-static constexpr float HIGHLIGHT_PX = 46.0f;
-
-// Draw a highlight over each focused marker on the open world map: the embedded
-// highlight.png ring (transparent center) centered on the projected marker, so it frames
-// the game-rendered icon with no baked glow variants and no map reopen. Falls back to a
-// drawn amber ring only if the texture isn't ready yet. Uses the live dialog transform
-// (goblin::mapproject). Called between ImGui::NewFrame and Render while the map is open.
-static void draw_map_highlights()
-{
-    goblin::mapproject::MapView view;
-    if (!goblin::mapproject::read_view(view)) return;
-    const auto pts = goblin::focus_highlight_points();
-    if (pts.empty()) return;
-    const goblin::mapproject::Calib &c = goblin::mapproject::calib();
-    const float cw = static_cast<float>(g_back_w ? g_back_w : 1920);
-    const float chh = static_cast<float>(g_back_h ? g_back_h : 1080);
-    const int cur_layer = goblin::maphover::map_layer();  // 0=OW,1=UG,2=DLC (-1 unknown)
-    ImDrawList *dl = ImGui::GetForegroundDrawList();
-    const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    const float r = HIGHLIGHT_PX * 0.5f;
-    const ImTextureID tex = g_highlight_texid;
-    for (const auto &p : pts)
-    {
-        // Only draw markers on the currently displayed layer (dispMask vs current layer).
-        // Guard on a decoded 0..2 layer; if the current layer is unknown, draw all.
-        if (cur_layer >= 0 && cur_layer <= 2 && p.layer != cur_layer) continue;
-        float sx = 0, sy = 0;
-        if (!goblin::mapproject::project(p.area, p.gx, p.gz, p.px, p.pz, view, c, cw, chh, sx, sy))
-            continue;
-        // Cull off-screen (and wildly out-of-range) points cheaply.
-        if (sx < -64 || sy < -64 || sx > disp.x + 64 || sy > disp.y + 64) continue;
-        if (tex)
-            dl->AddImage(tex, ImVec2(sx - r, sy - r), ImVec2(sx + r, sy + r));
-        else
-            dl->AddCircle(ImVec2(sx, sy), 13.0f, IM_COL32(255, 216, 64, 235), 0, 2.5f);
-    }
-}
-
+#if MFG_OVERLAY_OWN_WINDOW
 static void render_frame(bool draw)
 {
     __try
@@ -2322,6 +2188,8 @@ static void render_frame(bool draw)
         // A bad frame must never take the whole game down.
     }
 }
+
+#endif // MFG_OVERLAY_OWN_WINDOW
 
 // ── Raw-input hook: block the game's keyboard/mouse while the menu is open ──
 // We do NOT steal the game's focus (that caused cursor breakage, alt-tab-on-close, and a
@@ -2420,7 +2288,10 @@ void update_menu_toggle()
     const uint16_t pad_mask = goblin::config::toggleGamepadMask;
     const bool combo = g_pad_ok && pad_mask && (g_pad.wButtons & pad_mask) == pad_mask;
     const bool open_in = kd(open_key) || combo;
-    if (open_in && !prev_open_in && !rebinding)
+    // A key that was JUST bound in the native menu is still held down; acting on it here would open
+    // the overlay the instant the player finished binding it to the overlay.
+    const bool just_bound = goblin::nmenu::key_swallowed(static_cast<uint32_t>(open_key));
+    if (open_in && !prev_open_in && !rebinding && !just_bound)
         g_menu_open.store(!g_menu_open.load());
     prev_open_in = open_in;
 
@@ -2463,7 +2334,7 @@ void update_menu_toggle()
 
 // ── The overlay thread: window + D3D11 + DComp + ImGui + render loop ──
 // ── sc2 (backend v2) frontend: in-swapchain D3D12 overlay ──
-// When overlay_render_mode = swapchain_2 we do NOT create our own window / D3D11
+// In the shipped build we do NOT create our own window / D3D11
 // / DComp. We install the ported in-swapchain backend (src/sc2/), which draws our
 // published ImGui packet into the game's OWN backbuffer just before its Present,
 // so there is NO separate top-level window -> no focus-steal (the Linux/Proton
@@ -2683,19 +2554,15 @@ static void sc2_frontend_loop()
         const bool canvas_ok = canvas.ready && canvas.width > 0 && canvas.height > 0;
 
         const bool open = g_menu_open.load();
-        void *hover_row = goblin::maphover::hovered_row();
-        if (!hover_row && !open && goblin::config::enableHoverInfo)
-            // Use the 200ms-CACHED reticle hover, NOT native_hover_row_impl():
-            // the latter rebuilds the full ~9k-row snapshot (with per-row event-
-            // flag reads from game memory) on EVERY call. On the map the reticle
-            // is almost always near a marker, so at this loop rate that heavy scan
-            // ran continuously and contended with the game's render thread -> map
-            // FPS collapse + hitches. native_reticle_row() refreshes at 200ms.
-            hover_row = goblin::native_reticle_row();
-        const bool hovering = !open && goblin::config::enableHoverInfo && hover_row != nullptr;
-        const bool projecting = goblin::focus_category() >= 0 &&
-                                goblin::maphover::map_dialog() != nullptr;
-        const bool want = open || hovering || projecting;
+        // The overlay now draws NOTHING but the F10 menu. The hover tooltip, the focus banner and
+        // the projected highlight rings were retired on 2026-07-28: all three exist natively (the
+        // MfgTip / MfgBanner panels in goblin_maphover.cpp and the glow-icon swap in
+        // apply_focus_highlight), so the overlay copies were duplicates drawn on top of them.
+        // Two things fall out of that, both wanted: with the menu closed there is nothing to show,
+        // so the overlay is simply not visible; and the per-loop hover lookup is gone - it existed
+        // only to feed the tooltip, and its heavy variant was once responsible for a map FPS
+        // collapse (it rebuilt the ~9k-row snapshot with per-row event-flag reads every call).
+        const bool want = open;
 
         const ULONGLONG now = GetTickCount64();
         if (now - last_log > 3000)
@@ -2742,14 +2609,11 @@ static void sc2_frontend_loop()
         if (open)
         {
             io.MouseDrawCursor = true;
-            if (projecting) draw_map_highlights();
             draw_settings_window();
         }
         else
         {
             io.MouseDrawCursor = false;
-            if (projecting) { draw_map_highlights(); draw_focus_banner_onscreen(); }
-            if (hovering) draw_hover_tooltip(hover_row);
         }
         ImGui::Render();
         const ImDrawData *draw_data = ImGui::GetDrawData();
@@ -2782,10 +2646,18 @@ static void sc2_frontend_loop()
 
 void overlay_thread()
 {
+#if !MFG_OVERLAY_OWN_WINDOW
+    // ONE backend is built (goblin_build_variants.hpp): our ImGui goes into the game's own frame,
+    // with no window, no D3D11 device and no DirectComposition of ours. no ini value chooses
+    // between backends any more; menu_render_mode picks which MENU runs, not how it is drawn.
+    sc2_frontend_loop();
+    return;
+}
+#else
     // swapchain_2: no window, no D3D11, no DComp - our ImGui goes into the game's own swapchain.
     // Taken before any of the window setup below, so the shipped surface/layered/swapchain modes
     // run exactly the code they always did.
-    if (goblin::config::overlayRenderMode == "swapchain_2")
+    if (false) // historical: the value that used to select this backend now names a MENU
     {
         sc2_frontend_loop();
         return;
@@ -2874,13 +2746,7 @@ void overlay_thread()
         update_menu_toggle();
 
         const bool open = g_menu_open.load();
-        void *hover_row = goblin::maphover::hovered_row();
-        if (!hover_row && !open && goblin::config::enableHoverInfo)
-            // V3 native markers have no engine pin - our own reticle-distance
-            // hover keeps the tooltip working for migrated categories.
-            hover_row = native_hover_row_impl();
-        const bool hovering = !open && goblin::config::enableHoverInfo &&
-                              hover_row != nullptr;
+        // Nothing but the F10 menu is drawn here any more - see the note in the sc2 loop above.
         // Only paint while the game (a window in our own process) is the foreground
         // app. Our window is HWND_TOPMOST, so without this an alt-tab to another app
         // would leave the menu/hover panel drawn over whatever is now in front, with
@@ -2893,14 +2759,14 @@ void overlay_thread()
         // overlay window must also be shown for the passive hover-info panel, which
         // appears while the menu is CLOSED. Shown = (menu open OR marker hovered) AND
         // the game is focused.
-        // Highlight rings project onto the OPEN map even when the menu is closed and
-        // nothing is hovered (the focus-set highlight from the region-progress tab).
-        const bool projecting = goblin::focus_category() >= 0 &&
-                                goblin::maphover::map_dialog() != nullptr;
         {
             static bool win_shown = false;
             static bool win_clickthru = false;  // current WS_EX_TRANSPARENT state
-            const bool want = (open || hovering || projecting) && game_focused;
+            // Shown for the menu and nothing else now, so the window's whole lifetime matches the
+            // menu's. The previous "shown while closed for the tooltip/rings" state is what needed
+            // the click-through dance below; it stays because it is still what keeps the game owning
+            // the cursor in the frames around opening and closing.
+            const bool want = open && game_focused;
             // Click-through UNLESS the menu is open. While the window is shown only for the
             // hover tooltip / highlight rings (menu closed), it must be transparent to input
             // so the GAME fully owns the cursor - otherwise our topmost window steals cursor
@@ -2944,34 +2810,23 @@ void overlay_thread()
                 ImGui::GetIO().FontGlobalScale = fs < 0.8f ? 0.8f : (fs > 3.0f ? 3.0f : fs);
             }
             ImGui::GetIO().MouseDrawCursor = true; // our window has no system cursor over the game
-            if (projecting) draw_map_highlights();
             draw_settings_window();
             draw_preview_window();
             ImGui::Render();
             render_frame(true);
         }
-        else if ((hovering || projecting) && game_focused)
-        {
-            // Menu closed but the map is open: draw the passive hover-info panel and/or
-            // the projected highlight rings. No input hook, no cursor - informational.
-            ImGui_ImplDX11_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
-            ImGui::GetIO().MouseDrawCursor = false;
-            if (projecting) draw_map_highlights();
-            if (projecting) draw_focus_banner_onscreen();  // mirror the "showing only" filter text on screen
-            if (hovering) draw_hover_tooltip(hover_row);
-            ImGui::Render();
-            render_frame(true);
-        }
         else
         {
-            // Menu closed, nothing hovered: present a fully-transparent frame.
+            // Menu closed: nothing of ours is on screen at all. The branch that used to draw the
+            // hover panel and the highlight rings here is gone with them - what the player sees on
+            // the map is now entirely the game's own rendering, driven by our native panels and
+            // icon swaps.
             render_frame(false);
             Sleep(16); // idle pacing while closed (no vsync wait from a cleared present)
         }
     }
 }
+#endif // MFG_OVERLAY_OWN_WINDOW
 
 // ── Best-effort teardown (the process usually just exits). ──
 void teardown()
@@ -2998,8 +2853,10 @@ void teardown()
     if (g_dcomp_target) { g_dcomp_target->Release(); g_dcomp_target = nullptr; }
     if (g_dcomp_device) { g_dcomp_device->Release(); g_dcomp_device = nullptr; }
     if (g_swapchain) { g_swapchain->Release(); g_swapchain = nullptr; }
+#if MFG_OVERLAY_OWN_WINDOW
     release_layered_targets(); // Proton fallback RT/staging/DIB
     release_surface_targets(); // 'surface' mode DComp surface + intermediate RT
+#endif
     if (g_d3d_ctx) { g_d3d_ctx->Release(); g_d3d_ctx = nullptr; }
     if (g_d3d_device) { g_d3d_device->Release(); g_d3d_device = nullptr; }
     if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
@@ -3017,10 +2874,49 @@ bool goblin::overlay::gamepad_mask_down(uint16_t mask)
 
 void goblin::overlay::setup()
 {
-    if (!goblin::config::enableOverlay)
+    if (!goblin::config::menuEnabled)
     {
-        spdlog::info("[OVERLAY] disabled via ini (enable_overlay = false)");
+        spdlog::info("[OVERLAY] disabled via ini (menu_enabled = false)");
         goblin::diag::set_overlay(goblin::diag::OverlayState::OffByConfig, "");
+        return;
+    }
+    if (!goblin::config::overlay_menu_enabled())
+    {
+        // menu_render_mode = native: no window, no device, no ImGui, no input hooks - the menu the
+        // player opens is the game's own screen. One thing still has to run: the pad state that
+        // gamepad_mask_down() reports is polled HERE, and the marker-hide / master-toggle hotkeys and
+        // the in-game menu's own pad combo all read it. So a poll-only thread stands in for the
+        // overlay thread - it touches nothing but XInput.
+        spdlog::info("[OVERLAY] not created: menu_render_mode = native (the in-game menu is the "
+                     "one on the hotkey). Polling the pad only.");
+        goblin::diag::set_overlay(goblin::diag::OverlayState::OffByConfig, "native menu mode");
+        if (g_running.exchange(true))
+            return;
+        std::thread([] {
+            const char *xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
+            for (const char *d : xdlls)
+                if (HMODULE h = GetModuleHandleA(d))
+                    if (auto fn = reinterpret_cast<XInputGetState_t>(
+                            GetProcAddress(h, "XInputGetState")))
+                    {
+                        pXInputGetState = fn;
+                        break;
+                    }
+            if (!pXInputGetState)
+                if (HMODULE h = LoadLibraryA("xinput1_4.dll"))
+                    pXInputGetState =
+                        reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
+            if (!pXInputGetState)
+            {
+                spdlog::info("[OVERLAY] no XInput: gamepad hotkeys are keyboard-only this run");
+                return;
+            }
+            while (true)
+            {
+                poll_gamepad();
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+        }).detach();
         return;
     }
     if (g_running.exchange(true))

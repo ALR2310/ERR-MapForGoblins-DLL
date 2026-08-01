@@ -35,4 +35,10 @@ namespace goblin::own_movie
 
     // One-line state for the Tools page and the log: what happened on the last load.
     const char *status();
+
+    // How many row clips the LEFT column of the row pool has once we are done with the movie.
+    // The screen ships eleven, spaced 63.75 px apart; we tighten the pitch and add placements, so
+    // the host's own slot table has to be sized from the same number rather than a copy of it.
+    // Whether the engine actually asks for the added slots is reported by the row-path hook.
+    constexpr int kRowSlots = 15;
 }

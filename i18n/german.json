@@ -68,9 +68,7 @@
     "MegaShadow": "Schattenland",
     "ProgressFocusResetHint": "Zum Zurücksetzen '%s' im Menü drücken",
     "MenuBack": "Zurück",
-    "MenuTools": "Werkzeuge",
     "MenuTotal": "Gesamt",
-    "MenuSaveNow": "Einstellungen speichern",
     "MenuUnavailable": "Diese Seite ist nicht verfuegbar",
     "MenuPressKey": "Taste druecken...",
     "MenuKeepCurrent": "Unveraendert lassen"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "Markierungsexport fehlgeschlagen - erneut drücken"
   },
   "section_labels": {
+    "Categories": "Kategorien",
+    "Menu settings": "Mod-Einstellungen",
     "Goblin": "Basis",
     "Equipment": "Ausrüstung",
     "Key Items": "Schlüsselobjekte",
@@ -92,18 +92,19 @@
     "World": "Welt",
     "ERR Markers": "ERR-eigene Markierungen",
     "Compatibility": "Kompatibilität",
-    "Overlay & Hotkeys": "Overlay & Hotkeys",
+    "Menu & Hotkeys": "Menü & Tastenkürzel",
     "Debug": "Debug"
   },
   "section_comments": {
     "Reforged": "Nur Inhalte von Elden Ring Reforged. Im Vanilla-Build nicht vorhanden.",
     "ERR Markers": "Dieser Abschnitt wendet die Anzeigeregeln dieses Mods auf ERRs EIGENE\nvorplatzierte Kartenmarkierungen an (Lager, Händler, Bosse, Verlies-Eingänge) -\nNICHT auf die Symbole, die dieser Mod injiziert - damit beide Symbolsätze\nderselben Sichtbarkeitslogik folgen (Kartenfragment-Entdeckung, Ausblenden nach\nAbschluss). Deaktiviere einen Schalter, um diese Markierungsgruppe genau so zu\nlassen, wie ERR sie ausliefert. Unsere eigenen Boss-Markierungen sind\n[World] show_bosses und unabhängig von diesem Abschnitt.",
     "Compatibility": "Optionen für den Betrieb neben anderen Mods, die die Gegenstandsplatzierung ändern.",
-    "Overlay & Hotkeys": "Das Konfigurations-Overlay im Spiel und die Taste/der Knopf, der es öffnet. toggle_key\n(Tastatur) / toggle_gamepad_combo (Gamepad) ÖFFNEN das Overlay, wenn enable_overlay\naktiv ist, oder schalten ALLE Kartensymbole an/aus, wenn es aus ist. Tastennamen: F1-F24, A-Z,\n0-9, Space, Escape, Tab, Enter, Backspace, Home, End, PageUp, PageDown, Insert,\nDelete, Pfeiltasten.",
+    "Menu & Hotkeys": "Das MENÜ der Mod und die Taste, die es öffnet. toggle_key (Tastatur) /\ntoggle_gamepad_combo (Controller) ÖFFNEN das Menü, wenn menu_enabled an ist, sonst\nschalten sie ALLE Kartensymbole ein/aus. Welches Menü sich öffnet, legt\nmenu_render_mode fest. Tastennamen: F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter,\nBackspace, Home, End, PageUp, PageDown, Insert, Delete, Pfeiltasten.",
     "Debug": "Diagnose, angezeigt im Debug-Tab des Overlays."
   },
   "entry_labels": {
     "require_map_fragments": "Kartenfragmente erforderlich",
+    "location_emphasis": "Ortshervorhebung",
     "fast_map_open": "Karte schneller öffnen",
     "show_armaments": "Waffen",
     "show_armour": "Rüstung",
@@ -179,8 +180,8 @@
     "live_loot_icons": "Live-Beutesymbole",
     "anonymous_loot": "Anonyme Beute",
     "rebind": "Neu belegen",
-    "ui_language": "Menüsprache",
-    "enable_overlay": "Overlay aktivieren",
+    "overlay_ui_language": "Overlay-Sprache",
+    "menu_enabled": "Menü aktivieren",
     "enable_toggle_hotkey": "Umschalt-Hotkey aktivieren",
     "toggle_key": "Umschalt-Taste",
     "toggle_gamepad_combo": "Gamepad-Kombination",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "Marker manuell ausblenden",
     "hide_marker_key": "Taste zum Ausblenden",
     "hover_info": "Marker-Info beim Überfahren",
-    "overlay_render_mode": "Overlay-Rendermodus",
+    "menu_render_mode": "Menütyp",
     "hide_marker_gamepad": "Ausblenden-Knopf"
   },
   "entry_comments": {
     "require_map_fragments": "Erfordert das Entdecken des Kartenfragments, bevor Symbole in diesem Gebiet angezeigt werden",
+    "location_emphasis": "Marker der Karte, auf der du dich befindest, werden größer gezeichnet; Marker, die nur nahe wirken (ein Verlies unter dir oder die Oberfläche darüber), kleiner. Es wird nie etwas ausgeblendet.",
     "fast_map_open": "BETA: lässt die Weltkarte schneller öffnen, wenn viele Symbole angezeigt werden.\nAusschalten, wenn die Karte fehlerhaft ist oder abstürzt.",
     "show_armaments": "Waffen, Schilde, Bögen, Stecken usw.",
     "show_armour": "Rüstungsteile (Helme, Brust, Armschienen, Beinschienen)",
@@ -270,19 +272,19 @@
     "live_loot_labels": "Benennt jede Beute-Markierung mit dem Gegenstand um, den ihr Lot aktuell gibt, damit die Namen zum\nRandomizer passen. Verbraucht mehr Speicher (kopiert Gegenstandsnamen in die Namenstabelle der Karte).",
     "live_loot_icons": "Gibt jeder Beute-Markierung das Symbol und die Kategorie des Gegenstands, den ihr Lot aktuell\ngibt, damit Symbole und show_*-Schalter zum Randomizer passen.",
     "anonymous_loot": "Spoilerfrei: jede Beute-Markierung zeigt ein graues \"?\" und eine allgemeine Bezeichnung statt\ndes echten Gegenstands. Überschreibt live_loot_labels/icons; Markierungen verschwinden weiterhin beim Aufnehmen.",
-    "ui_language": "Overlay-Sprache. auto folgt der Steam-Spielsprache; nicht erkannte Sprachen\nfallen auf Englisch zurück.",
-    "enable_overlay": "Konfigurations-Overlay im Spiel (Dear ImGui), geöffnet mit der Toggle-Taste unten.\nAuf false setzen, wenn ein DX-Hook-Konflikt (Steam-Overlay/RTSS/GeForce Experience) oder ein\nGPU-Treiberproblem das Spiel instabil macht.",
+    "overlay_ui_language": "Sprache des OVERLAY-Menüs. auto folgt der Steam-Spielsprache; unbekannte Sprachen\nfallen auf Englisch zurück. Das spieleigene Menü ignoriert dies und folgt immer der\nSprache des Spiels.",
+    "menu_enabled": "Das Menü der Mod auf der Taste unten. Ist dies aus, schalten dieselben Tasten ALLE\nKartensymbole ein/aus und es öffnet sich kein Menü - das ist auch die Einstellung\nbei einem DX-Hook-Konflikt (Steam-Overlay/RTSS/GeForce Experience) oder\nTreiberproblemen mit dem Overlay-Menü.",
     "enable_toggle_hotkey": "Aktiviert toggle_key / toggle_gamepad_combo, um ALLE Kartensymbole an/aus zu schalten, wenn\ndas Overlay DEAKTIVIERT ist. (Wenn das Overlay aktiviert ist, öffnen sie es stattdessen.)",
-    "toggle_key": "Tastatur-Toggle: ÖFFNET das Konfigurations-Overlay, wenn enable_overlay aktiv ist, oder\nschaltet ALLE Kartensymbole an/aus, wenn das Overlay deaktiviert ist. Standard: F10.",
-    "toggle_gamepad_combo": "Gamepad-Toggle, gleiche Rolle wie toggle_key (öffnet das Overlay oder schaltet alle\nSymbole, wenn das Overlay deaktiviert ist). Tokens verbunden mit '+': A,B,X,Y,LB,RB,\nL3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT. Standard: Y+R3.",
+    "toggle_key": "Tastatur-Toggle: ÖFFNET das Konfigurations-Overlay, wenn menu_enabled aktiv ist, oder\nschaltet ALLE Kartensymbole an/aus, wenn das Overlay deaktiviert ist. Standard: F10.",
+    "toggle_gamepad_combo": "Gamepad-Umschalter, gleiche Rolle wie toggle_key: öffnet das Overlay oder schaltet\nALLE Kartensymbole ein/aus, wenn das Overlay deaktiviert ist. Im Menü drücken Sie\neinfach die gewünschten Tasten. Beim Bearbeiten dieser Datei werden Namen mit '+'\nverbunden (A, B, X, Y, LB, RB, L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT).",
     "debug_logging": "Aktiviert ausführliches Debug-Protokoll (Speicheradressen, Param-Details, FMG-Interna)",
     "enable_marker_dump": "Hauptschalter für den Markierungsexport-Hotkey",
     "marker_dump_key": "Taste zum Exportieren dekodierter Markierungen nach logs/MapForGoblins_markers.log. Standard: F9.",
-    "overlay_render_mode": "Wie das Overlay gezeichnet wird: surface (Standard), layered (max. Kompatibilität) oder swapchain (am leichtesten). Erfordert einen Spielneustart.",
+    "menu_render_mode": "WELCHES Menü die Taste öffnet: native (das Menü, das das Spiel selbst zeichnet) oder\nimgui (das separate Overlay-Fenster). Nur hier änderbar - ein Menü kann nicht den\nSchalter enthalten, der über seine Existenz entscheidet. Neustart erforderlich.",
     "show_world_maps_ignore_fragments": "Kartenfragment-Marker immer anzeigen, auch wenn die Fragment-Sperre aktiv ist (damit du ein Fragment finden kannst, bevor du es besitzt).",
     "enable_manual_hide": "Zeige mit dem Cursor auf einen Marker auf der Weltkarte und drücke die Ausblenden-Taste. Ausgeblendete Marker bleiben erhalten und lassen sich im Tab 'Ausgeblendet' wiederherstellen.",
     "hide_marker_key": "Taste, die den Kartenmarker unter dem Cursor ausblendet.",
-    "hover_info": "Zeigt bei geöffneter Karte ein kleines Feld (oben links) mit dem Namen des anvisierten Markers und seiner Höhe relativ zu dir.",
+    "hover_info": "Zeigt bei offener Karte LINKS ein kleines Feld damit, wie weit die Markierung unter\ndem Zeiger über oder unter Ihnen liegt. Der Name wird nicht wiederholt - das\neigene Popup des Spiels zeigt ihn bereits.",
     "hide_marker_gamepad": "Gamepad-Knopf zum Ausblenden des Markers unter dem Cursor (wie die Ausblenden-Taste)."
   }
 }

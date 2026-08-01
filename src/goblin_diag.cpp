@@ -165,7 +165,7 @@ namespace goblin::diag
         o << "Overlay (DX12): ";
         switch (s_ov)
         {
-        case OverlayState::OffByConfig: o << "disabled in ini (enable_overlay=false)\n"; break;
+        case OverlayState::OffByConfig: o << "disabled in ini (menu_enabled=false)\n"; break;
         case OverlayState::Active:      o << "active\n"; break;
         case OverlayState::Failed:      o << "FAILED - " << (s_ov_reason.empty() ? "unknown" : s_ov_reason) << "\n"; break;
         case OverlayState::Pending:     o << (s_ov_set ? "initializing...\n" : "active\n"); break;

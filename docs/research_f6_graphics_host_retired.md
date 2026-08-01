@@ -32,6 +32,14 @@ padding our page to 30 rows (recycled labels, filler value pointers):
 - So the list is capped at **sixteen items** - the `BasicViewItemList<EditProperty,16>` the interface
   audit named (`docs/audit_2026-07-28_interface_contracts.md`) - and it does **not** scroll.
 
+**CORRECTION 2026-07-29: the sentence below was wrong about OUR host.** The sixteen-row cap was measured
+on the GRAPHICS screen only; extending it to the key-binding host was an inference from the shared
+`BasicViewItemList<EditProperty,16>` template, never a measurement. In game the F8 host displays well
+past sixteen rows - the progress page alone lists a Total row, three mega-section headers and every
+region with markers. So a page may hold more than sixteen rows, the grid scrolls (its top is
+`grid+0x348`, 11 visible cells), and "more than sixteen settings has to be PAGED" does NOT apply to
+the shipping menu. Do not use this paragraph to reject a layout.
+
 The key-binding host caps at the same sixteen; it merely shows fewer at once (12 vs 15). So the graphics
 screen buys **visible rows, not scrolling**. More than sixteen settings has to be PAGED, which the F8
 screen-per-page model already does - so there was nothing to gain by developing this host further, and

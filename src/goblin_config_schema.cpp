@@ -14,11 +14,14 @@ namespace goblin::config
     bool requireMapFragments = true;
     bool debugLogging = false;        // key debug_logging: verbose diagnostics. LOGGING ONLY - it must never
                                       // arm behaviour. Anything functional gets its own key below.
-    bool nativeMenuDevRows = false;   // key native_menu_dev_rows: append our diagnostic rows to the
                                       // native menu (un-localized, for us, not for players).
-    bool nativeMenu = false;          // key native_menu: the in-game native menu (F8 opens it, F6 opens
-                                      // the graphics-screen host). Under development.
     // (icon/resource injection is unconditional - it IS how icons render without a gfx; no ini toggle.)
+
+    bool locationEmphasis = true;
+    float locationEmphasisOwnScale = 1.05f;
+    float locationEmphasisOtherScale = 0.95f;
+    float locationEmphasisOtherFade = 0.75f;
+    float locationEmphasisOtherCool = 0.90f;
 
     bool showArmaments = true, showArmour = true, showAshesOfWar = true,
          showSpirits = true, showTalismans = true;
@@ -74,11 +77,10 @@ namespace goblin::config
          patchCampIcons = true, patchMerchantIcons = true,
          hideDungeonIconsOnClear = false;
 
-    std::string uiLanguage = "auto";
-    std::string overlayRenderMode = "surface";
-    uint8_t nativeMenuIcons = 2;  // which icon construction the native menu movie gets
+    std::string overlayUiLanguage = "auto"; // key overlay_ui_language (was ui_language)
+    std::string menuRenderMode = "native"; // native | imgui (| dev, undocumented)
     float fontScale = 1.0f;  // overlay text size multiplier (live io.FontGlobalScale)
-    bool enableOverlay = true;
+    bool menuEnabled = true; // key menu_enabled (was enable_menu, was enable_overlay)
     float overlayOpacity = 1.0f;                 // overlay menu panel opacity (window bg alpha)
     // Menu window geometry. overlayWinX = the window's CENTER x as a fraction of screen
     // width (0.5 = horizontally centered); overlayWinY = the window's TOP y as a fraction
@@ -125,12 +127,23 @@ namespace
             {"Goblin", nullptr, false, {
                 B("require_map_fragments", requireMapFragments, "true",
                   "Require map fragment discovery before showing icons in that area"),
+                B("location_emphasis", locationEmphasis, "true",
+                  "Tell apart the markers of the place you are IN from the ones that only\n"
+                  "look nearby: a dungeon sits under the overworld, so its icons land on the\n"
+                  "same spot of the map as the surface ones. Markers of your own map draw\n"
+                  "bigger, markers of any other map draw smaller. Nothing is ever hidden."),
+                IniEntry{"location_emphasis_own_scale", IniType::Float, &cfg::locationEmphasisOwnScale, "1.05",
+                         "Size of the markers that belong to the map you are standing in (1.0 = unchanged).", false, nullptr},
+                IniEntry{"location_emphasis_other_scale", IniType::Float, &cfg::locationEmphasisOtherScale, "0.95",
+                         "Size of the markers that belong to any other map (1.0 = unchanged).", false, nullptr},
+                IniEntry{"location_emphasis_other_fade", IniType::Float, &cfg::locationEmphasisOtherFade, "0.75",
+                         "How much the markers of another map fade (1.0 = no fade, 0.2 = faintest).\n"
+                         "They stay fully visible and clickable - only quieter than the ones around you.", false, nullptr},
+                IniEntry{"location_emphasis_other_cool", IniType::Float, &cfg::locationEmphasisOtherCool, "0.90",
+                         "How far the markers of another map are pushed cold, on top of the fade\n"
+                         "(0.0 = colour untouched, 1.0 = strongest). Red and green drop, blue holds.", false, nullptr},
                 // fast_map_open / native_self_detach / native_viewport_window used to live here as
                 // BETA toggles. They are compile-time variants now - see goblin_build_variants.hpp.
-                B("native_menu_dev_rows", nativeMenuDevRows, "false",
-                  "Adds our own diagnostic rows to the in-game menu. Development only."),
-                B("native_menu", nativeMenu, "false",
-                  "EXPERIMENTAL: in-game native menu drawn by the game itself.\nF8 opens it, F6 opens the graphics-screen variant."),
             }},
 
             {"Equipment", nullptr, false, {
@@ -258,33 +271,61 @@ namespace
                   "Spoiler-free: every loot marker shows a gray \"?\" and a generic label instead\nof the real item. Overrides live_loot_labels/icons; markers still hide on pickup."),
             }},
 
-            {"Overlay & Hotkeys",
-             "The in-game config overlay and the key/button that opens it. toggle_key\n(keyboard) / toggle_gamepad_combo (gamepad) OPEN the overlay when enable_overlay\nis on, or toggle ALL map icons on/off when it's off. Key names: F1-F24, A-Z,\n0-9, Space, Escape, Tab, Enter, Backspace, Home, End, PageUp, PageDown, Insert,\nDelete, arrows.",
+            {"Menu & Hotkeys",
+             "The mod's MENU and the key/button that opens it. toggle_key (keyboard) /\n"
+             "toggle_gamepad_combo (gamepad) OPEN the menu when menu_enabled is on, or toggle\n"
+             "ALL map icons on/off when it is off. Which menu opens is menu_render_mode.\n"
+             "Key names: F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter, Backspace, Home, End,\n"
+             "PageUp, PageDown, Insert, Delete, arrows.",
              false, {
-                IniEntry{"ui_language", IniType::Language, &cfg::uiLanguage, "auto",
-                         "Overlay language: auto, english, schinese, tchinese, korean, russian, german,\nfrench, spanish. auto follows the Steam game language; unrecognized languages\nfall back to English.", false, nullptr},
+                IniEntry{"menu_enabled", IniType::Bool, &cfg::menuEnabled, "true",
+                         "The mod's menu on toggle_key / toggle_gamepad_combo. With this off those\n"
+                         "controls switch ALL map icons on/off instead, and no menu opens - which is\n"
+                         "also what to reach for if a DX overlay conflict (Steam overlay / RTSS /\n"
+                         "GeForce Experience) or a driver issue makes the game unstable with the\n"
+                         "overlay menu.",
+                         // Renamed twice: enable_overlay in every released build, then enable_menu
+                         // for a few hours here. Both names still find their value.
+                         false, "enable_menu,enable_overlay"},
+
+                IniEntry{"menu_render_mode", IniType::Text, &cfg::menuRenderMode, "native",
+                         "WHICH MENU the mod puts on toggle_key / toggle_gamepad_combo." "\n"
+                         "native (default) - the in-game menu the game draws itself; the overlay is" "\n"
+                         "not created at all." "\n"
+                         "imgui - the separate overlay window; the in-game menu is not injected (the" "\n"
+                         "map panels keep working, they have their own switch)." "\n"
+                         "Editable HERE ONLY: neither menu offers it, because it decides which menu" "\n"
+                         "exists. Change needs a game restart.",
+                         false, "overlay_render_mode", true},
+                IniEntry{"overlay_ui_language", IniType::Language, &cfg::overlayUiLanguage, "auto",
+                         "Language of the OVERLAY menu: auto, english, schinese, tchinese, korean,\n"
+                         "russian, german, french, spanish. auto follows the Steam game language;\n"
+                         "unrecognized languages fall back to English. The in-game menu ignores this\n"
+                         "and always follows the GAME language.", false, "ui_language"},
                 IniEntry{"overlay_font_scale", IniType::Float, &cfg::fontScale, "1.0",
                          "Overlay menu text size multiplier (1.0 = default). Raise on 4K / high-DPI\nscreens if the menu text is too small. Also adjustable live from the slider at\nthe top of the overlay's Settings tab.", false, nullptr},
                 IniEntry{"overlay_opacity", IniType::Float, &cfg::overlayOpacity, "1.0",
                          "Overlay menu panel opacity, 0.3 to 1.0 (1.0 = solid). Lower it to see more\nof the map behind the menu. Also adjustable live from a slider in the Settings tab.", false, nullptr},
-                B("enable_overlay", enableOverlay, "true",
-                  "In-game config overlay (Dear ImGui) opened with the toggle key below.\nSet false if a DX overlay conflict (Steam overlay/RTSS/GeForce Experience) or a\nGPU driver issue makes the game unstable."),
                 // Overlay menu window geometry - auto-managed (saved when you move/resize the
                 // menu and close it, restored on open). X = the window CENTER as a fraction of
                 // screen width (0.5 = centered); Y = the window TOP as a fraction of screen
                 // height (0 = flush top). Fractions keep the position sensible after a
                 // resolution/aspect change; W/H are in pixels (clamped to fit the screen).
-                IniEntry{"overlay_render_mode", IniType::Text, &cfg::overlayRenderMode, "surface", "How the overlay is drawn: surface (default, GPU-composited, low overhead, compatible with screen-recording and monitoring utilities), layered (CPU-composited, maximum compatibility but higher CPU/FPS cost), swapchain (lightest, but some external utilities may not read it correctly), or swapchain_2 (EXPERIMENTAL: drawn inside the game's own frame with no separate window - best compatibility with Linux/Proton, frame generators and other overlays). Change needs a game restart.", false, nullptr},
                 IniEntry{"overlay_window_x", IniType::Float, &cfg::overlayWinX, "0.5", "Overlay menu horizontal CENTER, fraction of screen width (0.5 = centered). Auto-saved.", false, nullptr},
                 IniEntry{"overlay_window_y", IniType::Float, &cfg::overlayWinY, "0.03", "Overlay menu TOP edge, fraction of screen height (0.0 = top). Auto-saved.", false, nullptr},
                 IniEntry{"overlay_window_w", IniType::Float, &cfg::overlayWinW, "560", "Overlay menu window width in pixels (auto-saved, clamped to screen).", false, nullptr},
                 IniEntry{"overlay_window_h", IniType::Float, &cfg::overlayWinH, "680", "Overlay menu window height in pixels (auto-saved, clamped to screen).", false, nullptr},
                 B("enable_toggle_hotkey", enableToggleHotkey, "true",
-                  "Enable toggle_key / toggle_gamepad_combo to switch ALL map icons on/off when\nthe overlay is DISABLED. (When the overlay is enabled, they open it instead.)"),
+                  "Let toggle_key / toggle_gamepad_combo switch ALL map icons on/off while\n"
+                  "menu_enabled is off. (With the menu on, those controls open it instead.)"),
                 IniEntry{"toggle_key", IniType::VkKey, &cfg::toggleInjectionKey, "F10",
-                         "Keyboard toggle: OPENS the config overlay when enable_overlay is on, or\ntoggles ALL map icons on/off when the overlay is disabled. Default: F10.", false, "toggle_injection_key"},
+                         "Keyboard key: OPENS the mod's menu when menu_enabled is on, or toggles ALL\n"
+                         "map icons on/off when it is off. Default: F10.", false, "toggle_injection_key"},
                 IniEntry{"toggle_gamepad_combo", IniType::GamepadMask, &cfg::toggleGamepadMask, "Y+R3",
-                         "Gamepad toggle, same role as toggle_key (opens the overlay, or toggles all\nicons if the overlay is disabled). Tokens joined with '+': A,B,X,Y,LB,RB,\nL3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT. Default: Y+R3.", false, nullptr},
+                         "Gamepad combo, same role as toggle_key (opens the menu, or toggles all\n"
+                         "icons when menu_enabled is off). Tokens joined with '+': A,B,X,Y,LB,RB,\n"
+                         "L3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT.\n"
+                         "Default: Y+R3.", false, nullptr},
                 // Marker-interaction options (shown at the bottom of the Settings tab, not Debug):
                 B("enable_manual_hide", enableManualHide, "true",
                   "Let you hide individual markers: hover a marker on the world map and press\nhide_marker_key to hide it. Hidden markers persist across sessions; un-hide them\nfrom the in-game menu (Hidden markers section)."),
@@ -302,13 +343,6 @@ namespace
                 B("debug_logging", debugLogging, "false",
                   "Enable verbose debug logging (memory addresses, param details, FMG internals)"),
                 B("enable_marker_dump", enableMarkerDump, "false", "Master switch for the marker dump hotkey"),
-                IniEntry{"native_menu_icons", IniType::U8, &cfg::nativeMenuIcons, "2",
-                         "How the in-game (native) menu draws its category icons: 0 = none, "
-                         "1 = one strip behind a mask, 2 = one child per icon, 3 = drawn "
-                         "directly from our own pixels (edits no movie at all, so it survives "
-                         "game updates and overhaul mods). 1 and 2 rebuild the screen's movie "
-                         "when it loads, so changing between them needs a game restart.",
-                         false, nullptr},
                 IniEntry{"marker_dump_key", IniType::VkKey, &cfg::markerDumpKey, "F9",
                          "Key to dump decoded markers to logs/MapForGoblins_markers.log. Default: F9.", false, nullptr},
             }},
@@ -333,6 +367,27 @@ const std::vector<const char *> &goblin::ini_retired_keys()
     };
     return keys;
 }
+
+// -- which menu is on the hotkey ---------------------------------------------------------------
+// One ini value decides it, and every gate asks here instead of comparing the string again:
+//   native - the game draws the menu; the overlay is never created
+//   imgui  - the overlay window; nothing of the in-game menu is injected
+//   dev    - both, the overlay on the hotkey and the in-game menu on F8. Undocumented on purpose:
+//            it exists for working on the two side by side, not as a user-facing choice.
+goblin::config::MenuMode goblin::config::menu_mode()
+{
+    const std::string &v = menuRenderMode;
+    if (v == "imgui")
+        return MenuMode::ImGui;
+    if (v == "dev")
+        return MenuMode::Dev;
+    // Anything else - including every legacy drawing mode (surface / layered / swapchain*) - reads as
+    // the default. load_config() rewrites such a value so the file says what is actually in force.
+    return MenuMode::Native;
+}
+
+bool goblin::config::native_menu_enabled() { return menu_mode() != MenuMode::ImGui; }
+bool goblin::config::overlay_menu_enabled() { return menu_mode() != MenuMode::Native; }
 
 const std::vector<goblin::IniSection> &goblin::ini_schema()
 {

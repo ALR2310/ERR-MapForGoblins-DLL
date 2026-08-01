@@ -143,6 +143,20 @@ SIGNATURES = [
                 "-> marker hover-detect (manual hide / hover overlay). Miss disables hover.",
     },
     {
+        "name": "node_get_writable_data",
+        "pattern": "48 89 6C 24 20 56 41 54 41 56 48 83 EC 20 "
+                   "48 8B F1 4C 8B C1 48 81 E6 00 F0 FF FF",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Render::Context GetWritableData(entry, changeFlags) - the copy-on-write + "
+                "change-record step every visual property of a display object goes through "
+                "(FUN_141157a70 v2.6.2.0). Identified via the Scaleform SDK: the projection "
+                "setter calls it with 0x100000 = Change_State_ProjectionMatrix3D. The "
+                "location emphasis uses it to fade other-map markers; a miss costs only "
+                "the colour, size and draw order still apply.",
+    },
+    {
         "name": "record_materialize_driver",
         "pattern": "4C 8B DC 55 56 41 55 49 8D 6B D8 48 81 EC 10 01 00 00 "
                    "48 8D 41 48 4C 8B EA",
@@ -225,6 +239,19 @@ SIGNATURES = [
         "slot": None,
         "critical": True,
         "refs": ["goblin_gfx_probe.cpp:1180"],
+    },
+    {
+        "name": "gfx_tag_loop",
+        "pattern": "4C 89 44 24 18 53 55 56 57 41 55 41 56 48 83 EC 68 48 8B AA 18 04 00 00 "
+                   "49 8B F8 4C 8B EA 4C 8B F1 48 85 ED",
+        "slot": None,
+        "critical": True,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "The movie tag loop. Entered with the header read and no tag read yet, which is where "
+                "our own bytes are handed to the parser - the only point that sees a movie whichever "
+                "loader served the file (ME3 answers for its overrides above the engine's own opener). "
+                "The pattern covers the three facts the route rests on: arg3 saved, reader at ctx+0x418, "
+                "inline reader fallback at ctx+0x50.",
     },
     {
         "name": "game_crt_malloc",

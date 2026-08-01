@@ -68,9 +68,7 @@
     "MegaShadow": "幽影之地",
     "ProgressFocusResetHint": "重置請在選單中點擊「%s」",
     "MenuBack": "返回",
-    "MenuTools": "工具",
     "MenuTotal": "總計",
-    "MenuSaveNow": "立即儲存設定",
     "MenuUnavailable": "此頁面無法使用",
     "MenuPressKey": "請按一個鍵...",
     "MenuKeepCurrent": "保持目前"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "標記匯出失敗，請再按一次"
   },
   "section_labels": {
+    "Categories": "分類",
+    "Menu settings": "模組設定",
     "Goblin": "基礎",
     "Equipment": "裝備",
     "Key Items": "關鍵道具",
@@ -92,18 +92,19 @@
     "World": "世界",
     "ERR Markers": "ERR 原生標記",
     "Compatibility": "相容性",
-    "Overlay & Hotkeys": "選單與快捷鍵",
+    "Menu & Hotkeys": "選單與快速鍵",
     "Debug": "偵錯"
   },
   "section_comments": {
     "Reforged": "僅 Elden Ring Reforged 內容。原版建置中不會出現。",
     "ERR Markers": "本節會把本 MOD 的顯示規則套用到 ERR 自帶的預設地圖標記\n（營地、商人、Boss、地下城入口）上，而不是本 MOD 注入的圖示。\n如此兩套圖示會遵循相同的可見性邏輯（地圖碎片發現、清除後隱藏）。\n關閉某個開關即可讓對應標記組保持 ERR 原樣。本 MOD 自己的 Boss 標記\n由 [World] show_bosses 控制，和本節相互獨立。",
     "Compatibility": "與改變物品擺放的其他 MOD 共用時的選項。",
-    "Overlay & Hotkeys": "遊戲內設定選單，以及開啟選單的鍵盤/手把按鍵。enable_overlay 開啟時，\ntoggle_key（鍵盤）/ toggle_gamepad_combo（手把）會開啟選單；關閉時則會\n開關所有地圖圖示。按鍵名稱支援：F1-F24、A-Z、0-9、Space、Escape、Tab、\nEnter、Backspace、Home、End、PageUp、PageDown、Insert、Delete、方向鍵。",
+    "Menu & Hotkeys": "模組的選單以及開啟它的按鍵。啟用 menu_enabled 時，toggle_key（鍵盤）與\ntoggle_gamepad_combo（手把）會開啟選單；關閉時，它們改為開關全部地圖圖示。\n開啟哪個選單由 menu_render_mode 決定。按鍵名稱：F1-F24、A-Z、0-9、Space、\nEscape、Tab、Enter、Backspace、Home、End、PageUp、PageDown、Insert、Delete、方向鍵。",
     "Debug": "診斷選項，會顯示在選單的「偵錯」分頁。"
   },
   "entry_labels": {
     "require_map_fragments": "需要地圖碎片",
+    "location_emphasis": "當前區域強調",
     "fast_map_open": "加快地圖開啟",
     "show_armaments": "武器",
     "show_armour": "防具",
@@ -179,8 +180,8 @@
     "live_loot_icons": "即時戰利品圖示",
     "anonymous_loot": "匿名戰利品",
     "rebind": "重新綁定",
-    "ui_language": "選單語言",
-    "enable_overlay": "啟用遊戲內選單",
+    "overlay_ui_language": "覆蓋層語言",
+    "menu_enabled": "啟用選單",
     "enable_toggle_hotkey": "啟用快捷鍵",
     "toggle_key": "選單快捷鍵",
     "toggle_gamepad_combo": "手把組合鍵",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "手動隱藏標記",
     "hide_marker_key": "隱藏標記按鍵",
     "hover_info": "懸停標記資訊",
-    "overlay_render_mode": "覆蓋層渲染模式",
+    "menu_render_mode": "選單類型",
     "hide_marker_gamepad": "隱藏標記按鍵"
   },
   "entry_comments": {
     "require_map_fragments": "需要先發現對應區域的地圖碎片，才顯示該區域圖示。",
+    "location_emphasis": "你所在地圖的標記會畫得更大；只是看起來在附近的標記（腳下的地下城，或其上方的地表）會畫得更小。不會隱藏任何標記。",
     "fast_map_open": "測試功能：顯示大量圖示時加快世界地圖開啟速度。\n如果地圖異常或崩潰，請關閉。",
     "show_armaments": "武器、盾牌、弓、杖等。",
     "show_armour": "防具部位（頭盔、胸甲、臂甲、腿甲）。",
@@ -270,19 +272,19 @@
     "live_loot_labels": "把每個戰利品標記改名為目前 lot 實際給予的物品，使名稱符合隨機器。\n會使用更多記憶體（把物品名稱複製到地圖名稱表中）。",
     "live_loot_icons": "讓每個戰利品標記使用目前 lot 實際物品的圖示和類別，\n使圖示和 show_* 開關符合隨機器。",
     "anonymous_loot": "無劇透：所有戰利品標記顯示灰色「?」和通用名稱，而不顯示真實物品。\n會覆蓋 live_loot_labels/icons；標記仍會在拾取後隱藏。",
-    "ui_language": "選單語言。auto 會跟隨 Steam 遊戲語言；無法辨識時回退到英文。",
-    "enable_overlay": "遊戲內設定選單（Dear ImGui），用下方快捷鍵開啟。\n如果 DX Hook 與 Steam 覆蓋層/RTSS/GeForce Experience 衝突，或 GPU 驅動導致遊戲不穩，可設為 false。",
+    "overlay_ui_language": "覆蓋層選單的語言。auto 依照 Steam 遊戲語言；無法識別的語言會退回英文。\n遊戲內選單不使用此設定，一律依照遊戲語言。",
+    "menu_enabled": "由下方切換鍵開啟的模組選單。關閉後，同一按鍵改為開關全部地圖圖示，不會開啟選單；\n若 DX 掛鉤衝突（Steam 覆蓋層/RTSS/GeForce Experience）或顯示卡驅動使覆蓋層選單\n導致遊戲不穩定，也應關閉此項。",
     "enable_toggle_hotkey": "當選單被停用時，允許 toggle_key / toggle_gamepad_combo 開關所有地圖圖示。\n選單啟用時，這些按鍵會開啟選單。",
-    "toggle_key": "鍵盤快捷鍵：enable_overlay 開啟時開啟設定選單；選單停用時開關所有地圖圖示。\n預設：F10。",
-    "toggle_gamepad_combo": "手把組合鍵，作用同 toggle_key（開啟選單；選單停用時開關所有圖示）。\n按鍵用 + 連接：A,B,X,Y,LB,RB,L3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,\nSTART/MENU,UP/DOWN/LEFT/RIGHT。預設：Y+R3。",
+    "toggle_key": "鍵盤快捷鍵：menu_enabled 開啟時開啟設定選單；選單停用時開關所有地圖圖示。\n預設：F10。",
+    "toggle_gamepad_combo": "手把開關，與 toggle_key 作用相同：開啟覆蓋層，或在覆蓋層關閉時開關所有地圖圖示。\n在選單中只需按下想要的按鍵即可。手動編輯本檔案時用 '+' 連接名稱\n(A, B, X, Y, LB, RB, L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT)。",
     "debug_logging": "啟用詳細偵錯記錄（記憶體位址、param 詳情、FMG 內部資訊）。",
     "enable_marker_dump": "標記匯出快捷鍵的總開關。",
     "marker_dump_key": "把已解碼標記匯出到 logs/MapForGoblins_markers.log 的按鍵。預設：F9。",
-    "overlay_render_mode": "覆蓋層的繪製方式：surface（預設）、layered（最大相容性）或 swapchain（最輕量）。需重新啟動遊戲。",
+    "menu_render_mode": "切換鍵開啟哪個選單：native（由遊戲自行繪製的遊戲內選單）或 imgui（獨立的覆蓋層視窗）。\n僅能在此處修改：決定某個選單是否存在的開關不能放在該選單內。需要重新啟動遊戲。",
     "show_world_maps_ignore_fragments": "始終顯示地圖殘片標記，即使開啟了依殘片解鎖的限制（這樣你能在取得殘片前找到它）。",
     "enable_manual_hide": "在世界地圖上將游標懸停在標記上並按下隱藏鍵即可隱藏。隱藏的標記會保留，可在'已隱藏'分頁還原。",
     "hide_marker_key": "隱藏游標下方地圖標記的按鍵。",
-    "hover_info": "開啟地圖時，在左上角顯示一個小面板，展示所懸停標記的名稱及其相對你的高度。",
+    "hover_info": "開啟地圖時，在左側顯示一個小面板，說明游標下的標記比你高多少或低多少。\n其名稱不再重複顯示——遊戲內建的彈出視窗已經顯示了。",
     "hide_marker_gamepad": "隱藏游標下方地圖標記的手把按鍵（與隱藏鍵相同）。"
   }
 }

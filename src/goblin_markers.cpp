@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <set>  // the unplaced-row keys the dump reports, in a stable order
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -420,6 +421,8 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
     std::unordered_set<const void *> ourset(ours.begin(), ours.end());
 
     std::vector<NearbyEntry> out;
+    size_t unplaced = 0;
+    std::set<uint32_t> unplaced_keys;  // (areaNo << 8) | gridXNo
     // Iterate the LIVE WorldMapPointParam so the dump lists EVERY marker on the map
     // (vanilla + overhaul + ours), not only the ones we injected.
     try
@@ -433,7 +436,15 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
             float ewx, ewz;
             if (!compute_world_coords(row.areaNo, row.gridXNo, row.gridZNo,
                                       row.posX, row.posZ, ewx, ewz))
+            {
+                // Not silently. A row we cannot place is a row the dump does not mention at all, and
+                // "no markers there" then reads as a fact about the game rather than a gap in this
+                // list - which is exactly how 253 Shunning-Grounds and Deeproot rows went missing
+                // from every report without a word (scratch/bugs_2026-07-29_*).
+                ++unplaced;
+                unplaced_keys.insert((static_cast<uint32_t>(row.areaNo) << 8) | row.gridXNo);
                 continue;
+            }
             float dx = ewx - beacon_wx;
             float dz = ewz - beacon_wz;
             float d2 = dx * dx + dz * dz;
@@ -454,6 +465,19 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
     catch (...)
     {
         spdlog::warn("Marker dump: WorldMapPointParam not available - live marker list skipped");
+    }
+    if (unplaced)
+    {
+        std::string keys;
+        for (uint32_t k : unplaced_keys)
+        {
+            if (!keys.empty())
+                keys += ", ";
+            keys += "(area " + std::to_string(k >> 8) + ", gx " + std::to_string(k & 0xFF) + ")";
+        }
+        spdlog::info("Marker dump: {} row(s) could not be placed on the overworld and are absent from "
+                     "this list - no conversion for {}",
+                     unplaced, keys);
     }
     std::sort(out.begin(), out.end(),
               [](const NearbyEntry &a, const NearbyEntry &b) { return a.dist < b.dist; });
@@ -500,6 +524,30 @@ static int dump_impl(std::ostream &f, DumpSel sel)
             return;
         }
         f << "      " << nearby.size() << " markers within 50u (all map markers, not just ours):\n";
+        // Highlight rings, when a focus is on. A ring is drawn from the same position as the icon it
+        // belongs to, so "the ring is not on its marker" has to be answered with both numbers side by
+        // side - otherwise the eye cannot tell a ring sitting on a NEIGHBOUR from a ring whose art is
+        // centred differently from the icon's.
+        {
+            const auto rings = goblin::focus_highlight_points();
+            size_t near_rings = 0;
+            for (const auto &r : rings)
+            {
+                const float rwx = static_cast<float>(r.gx) * 256.0f + r.px;
+                const float rwz = static_cast<float>(r.gz) * 256.0f + r.pz;
+                const float dx = rwx - (s.x + 7042.0f), dz = rwz - (-s.z + 16511.0f);
+                if (dx * dx + dz * dz > RADIUS * RADIUS) continue;
+                if (near_rings++ == 0)
+                    f << "      focus highlight rings within 50u (each should sit exactly on its "
+                         "marker's drawn position):\n";
+                f << "        ring  m" << std::setw(2) << std::setfill('0')
+                  << static_cast<unsigned>(r.area) << "_" << std::setw(2)
+                  << static_cast<unsigned>(r.gx) << "_" << std::setw(2)
+                  << static_cast<unsigned>(r.gz) << std::setfill(' ')
+                  << "  layer=" << static_cast<unsigned>(r.layer)
+                  << "  at=(" << std::fixed << std::setprecision(2) << r.px << "," << r.pz << ")\n";
+            }
+        }
         char tile[16];
         for (const auto &n : nearby)
         {
@@ -517,6 +565,16 @@ static int dump_impl(std::ostream &f, DumpSel sel)
               << "  " << status
               << "  pos=(" << std::fixed << std::setprecision(2)
               << n.posX << "," << n.posY << "," << n.posZ << ")";
+            // The row's own coordinates are NOT where the icon is any more: the live de-overlap moves
+            // markers that would sit on each other, per map open, from the set visible then. Print the
+            // drawn position whenever it differs, or a dump taken to check spacing measures the wrong
+            // numbers - which is exactly what happened when this was read to judge the spacing.
+            {
+                float dpx = 0.0f, dpz = 0.0f;
+                if (n.is_ours && n.data && goblin::display_position(n.data, dpx, dpz) &&
+                    (std::fabs(dpx - n.posX) > 0.01f || std::fabs(dpz - n.posZ) > 0.01f))
+                    f << "  drawn=(" << dpx << "," << dpz << ")";
+            }
             f << "\n";
 
             // Compact per-slot textId diagnostic, one line for the whole marker.

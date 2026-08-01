@@ -79,6 +79,27 @@ def load_lot_ids():
     return map_lots, enemy_lots
 
 
+# Instructions whose args carry ids but which award nothing, so a lot-looking value in them is a
+# coincidence. Kept as an explicit list rather than a rule about banks: this scan is deliberately
+# id-shaped rather than instruction-aware (a treasure lot usually arrives as a generic PARAMETER of an
+# InitializeCommonEvent template, so requiring a declared "item lot" argument would throw the real
+# mechanism away), and the price of that is exactly this - a few instructions have to be named.
+# Signatures read from DarkScript's er-common.emedf.json, which is what says these carry no lot at all:
+#   2009[00] Register Ladder(Disable Top Event Flag ID, Disable Bottom Event Flag ID, Entity ID)
+#   2009[03] Register Bonfire(Event Flag ID, Entity ID, Reaction Distance, Reaction Angle,
+#                             Set Standard Kindling Level, Enemy Deactivation Distance)
+# Every "lot" this scan used to find in them was a flag or an entity id that happens to equal a real
+# ItemLotParam_map id. Measured on the err data: 65 lots lost a candidate record, and it changed 7 of
+# 9201 markers - the phantom Golden Rune [1] went away, and six others moved off a BONFIRE
+# (AEG099_060, entity ...1950) onto the pickup asset their treasure template actually names
+# (AEG099_090), each still inside its own map.
+# (2009[01] is not an instruction in Elden Ring - do not add it back.)
+NON_AWARD_INSTRUCTIONS = {
+    (2009, 0),
+    (2009, 3),
+}
+
+
 def scan_arg_blob(arg_bytes, lot_set, entity_set, skip_offsets=()):
     """Find all (lot_id, entity_id) co-occurrences in one arg blob.
 
@@ -118,6 +139,7 @@ def main():
 
     # lot -> list of candidate mappings
     mapping = defaultdict(list)
+    non_award_skipped = defaultdict(int)  # (bank, idx) -> how many were passed over
 
     for idx, p in enumerate(emevd_files):
         if (idx + 1) % 100 == 0:
@@ -139,7 +161,17 @@ def main():
                 # args = [slot, event_id, params...] - the event-id at byte
                 # offset 4 is never an item lot (dungeon event ids collide
                 # with the lot numbering, e.g. 12020700).
-                skip = (4,) if (int(inst.Bank) == 2000 and int(inst.ID) in (0, 6)) else ()
+                bank, iid = int(inst.Bank), int(inst.ID)
+                # An instruction that AWARDS nothing cannot tell us where a lot is, however many of
+                # its arg bytes happen to match a lot id. RegisterLadder is the proven case: it takes
+                # (2009[0]) three ids, one of them numerically equal to map lot 35000580, and this scan
+                # read that as "the lot is at the ladder" - which put a Golden Rune [1] marker on the
+                # Leyndell map that nothing in the game ever awards (the lot is cut content: its
+                # getItemFlag appears in no EMEVD at all). See scratch/bugs_2026-07-29_*.
+                if (bank, iid) in NON_AWARD_INSTRUCTIONS:
+                    non_award_skipped[(bank, iid)] += 1
+                    continue
+                skip = (4,) if (bank == 2000 and iid in (0, 6)) else ()
                 lots, ents = scan_arg_blob(ab, lot_set, entity_set, skip)
                 # Filter trivial lot IDs (0-9999) that collide with common small integers
                 lots = [l for l in lots if l >= 10000]

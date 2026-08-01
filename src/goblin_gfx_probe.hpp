@@ -22,6 +22,12 @@ namespace goblin::gfx_probe
     /// Returns null if the allocator could not be resolved.
     void *game_alloc(size_t bytes);
 
+    /// A movie's own file name, read from the definition its load context points at (ctx+0x38). This is
+    /// how a parse is told apart from another movie's: the field reads the same whether the file came
+    /// out of an archive or out of a mod's folder. false = no name could be established, and a caller
+    /// must then not assume anything about which movie this is.
+    bool movie_name(void *ctx, char *out, size_t cap);
+
     // Injected iconId (1-based frame appended at worldmap load) for a category's source gfx iconId,
     // or 0 if that source icon wasn't injected / before load. goblin_inject's remap_injected_icons
     // points every marker at injected_iconid(its baked iconId) so our embedded bitmaps render without
@@ -42,7 +48,7 @@ namespace goblin::gfx_probe
     // remap = two DLL instances injected; resolves to the wrong frame when the ranges overlap).
     void injected_iid_range(uint32_t &lo, uint32_t &hi);
     // Called periodically from the DLL's background watcher thread (NOT the overlay Present hook, so it
-    // runs regardless of enable_overlay): locates the worldmap icon sprite (charId 171), runs the charId
+    // runs regardless of menu_enabled): locates the worldmap icon sprite (charId 171), runs the charId
     // collision self-heal, and (when debug_logging) the read-only diagnostic dumps. Injection itself is
     // done by the load-time hooks, independent of this.
     void tick();

@@ -31,4 +31,12 @@ namespace goblin::collected
     /// X/Z/Y. Returns false if the manager isn't resolved/available. Used by the
     /// map hover-info overlay for the "height vs player" readout.
     bool read_player_pos(float &x, float &z, float &y);
+
+    /// The map the PLAYER is standing in, packed the way the game packs a map id:
+    /// m{AA}_{BB}_{CC}_{DD} -> 0xAABBCCDD (area, gridX, gridZ, index). This is the
+    /// block the block-local coordinates above belong to, which is why it sits right
+    /// behind them in the same ChrIns field group. false = no live player.
+    /// Not to be confused with goblin::maphover::map_layer(), which is the map TAB
+    /// being looked at; this is where the character actually is.
+    bool read_player_map_id(uint32_t &map_id);
 };

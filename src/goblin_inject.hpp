@@ -55,6 +55,12 @@ namespace goblin
     // no live hide/cleared flag set). Empty when no focus is active.
     std::vector<HighlightPoint> focus_highlight_points();
 
+    /// Where one of OUR markers is DRAWN, by its live param row pointer, which is not where its row
+    /// says it is: the live de-overlap moves markers that would land on each other. false = not one of
+    /// ours. The beacon dump reports both, because reading the row alone answers a question nobody
+    /// asked once the drawing stopped coming from it.
+    bool display_position(const void *rowptr, float &px, float &pz);
+
     // Lightweight native-marker input. During the category-by-category debug
     // rollout, only rows whose stock WorldMapItem has been suppressed are
     // returned. The native manager consumes this snapshot on the map thread.

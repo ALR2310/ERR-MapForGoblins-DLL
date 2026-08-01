@@ -175,6 +175,49 @@ bool goblin::collected::read_player_pos(float &x, float &z, float &y)
     return true;
 }
 
+// Player map id. The ChrIns field group read above is not three loose floats but a
+// five-field block - X, Y, Z, radius, mapId - and the map id is the piece that makes
+// the block-local X/Z mean anything: they are local to THAT block. So it sits one
+// field past the radius, at +0x6D0. A SECOND identical block follows at +0x6D4..+0x6E4
+// (the chunk/tile one); its id is logged beside the first under debug_logging so the
+// two can be told apart from real play instead of assumed.
+// (Layout cross-checked against a maintained CE table, whose build has the whole group
+// 0x10 lower - +0x6B0 there for the coordinates we read at +0x6C0.)
+bool goblin::collected::read_player_map_id(uint32_t &map_id)
+{
+    uintptr_t slot = world_chr_man_slot();
+    if (!slot) return false;
+    uintptr_t wcm = 0;
+    if (!safe_read((void *)slot, &wcm, 8) || !wcm) return false;
+    uintptr_t lp = 0;
+    if (!safe_read((void *)(wcm + 0x1E508), &lp, 8) || !lp) return false;
+    uint32_t ids[2] = {0, 0};
+    if (!safe_read((void *)(lp + 0x6D0), &ids[0], 4)) return false;
+    safe_read((void *)(lp + 0x6E4), &ids[1], 4);
+    if (goblin::config::debugLogging)
+    {
+        static uint32_t s_last[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+        if (ids[0] != s_last[0] || ids[1] != s_last[1])
+        {
+            s_last[0] = ids[0];
+            s_last[1] = ids[1];
+            spdlog::info("[playermap] +0x6D0 = m{:02d}_{:02d}_{:02d}_{:02d} (0x{:08X}) | "
+                         "+0x6E4 = m{:02d}_{:02d}_{:02d}_{:02d} (0x{:08X})",
+                         (ids[0] >> 24) & 0xFF, (ids[0] >> 16) & 0xFF,
+                         (ids[0] >> 8) & 0xFF, ids[0] & 0xFF, ids[0],
+                         (ids[1] >> 24) & 0xFF, (ids[1] >> 16) & 0xFF,
+                         (ids[1] >> 8) & 0xFF, ids[1] & 0xFF, ids[1]);
+        }
+    }
+    // 0xFFFFFFFF is the game's "no map" value; an area byte outside the shipped
+    // range means we are not looking at a map id at all - report nothing rather
+    // than emphasise a random group of markers.
+    const uint32_t area = (ids[0] >> 24) & 0xFF;
+    if (ids[0] == 0xFFFFFFFFu || area == 0 || area > 61) return false;
+    map_id = ids[0];
+    return true;
+}
+
 // SEH-guarded single byte write. Returns true on success, false if the
 // write access-violated (stale param pointer after another mod or the
 // game relocated our buffer). Used per-pointer in refresh() so we can

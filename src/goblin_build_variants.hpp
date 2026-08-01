@@ -65,6 +65,35 @@ namespace goblin::variants
     inline constexpr bool kViewportWindow = MFG_ATTACH_ALL_MARKERS == 0;
 }
 
+// ── Overlay backend: ONE is built, and it is the in-swapchain one ────────────────────────────────
+// The overlay had four ways to reach the screen, all shipping in one binary and picked by the
+// `menu_render_mode` ini key (then named overlay_render_mode):
+//   layered    WS_EX_LAYERED + UpdateLayeredWindow - GDI, CPU readback per frame, our own window
+//   surface    a DirectComposition SURFACE + an intermediate RT, our own window
+//   swapchain  a DirectComposition composition SWAPCHAIN, our own window
+//   swapchain_2  our ImGui drawn INTO THE GAME'S OWN frame - no window, no D3D11 device, no DComp
+//
+// SHIPPING as of 2026-07-28: swapchain_2 only. The three own-window backends exist because DComp is
+// unreliable under Proton and because capture/overlay tools react differently to a real swapchain -
+// problems that having no window of our own removes rather than works around. Keeping all four also
+// meant three of them were never exercised while the fourth was the one under development.
+//
+// ALTERNATIVE (MFG_OVERLAY_OWN_WINDOW=1): build the three own-window backends back in, with
+// the ini key choosing between them exactly as it used to (including the Wine override that
+// forces `layered`). With the variant at 0 the key is not consulted at all - its migration to the new
+// meaning is a separate change, so nothing about the key itself is touched here.
+#ifndef MFG_OVERLAY_OWN_WINDOW
+#define MFG_OVERLAY_OWN_WINDOW 0
+#endif
+
+namespace goblin::variants
+{
+    // true = our own window (layered/surface/swapchain) is built and selectable by ini;
+    // false = the in-swapchain backend is the only one compiled in.
+    inline constexpr bool kOverlayOwnWindow = MFG_OVERLAY_OWN_WINDOW != 0;
+    inline constexpr bool kOverlayInSwapchainOnly = !kOverlayOwnWindow;
+}
+
 // ── Stall profiler: OFF in every normal build ────────────────────────────────────────────────────
 // The map-open/close stall sampler SUSPENDS the map UI thread and reads its context in a loop for the
 // whole measurement window (1.5 s on open, 3 s on close), plus sweeps the other ~100 threads. That is

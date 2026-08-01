@@ -102,6 +102,43 @@ namespace
     }
 }
 
+// A key's former names, newest first. rename_from holds them comma-separated because a key can
+// outlive more than one rename, and the value has to follow it every time.
+static std::vector<std::string> former_names(const char *rename_from)
+{
+    std::vector<std::string> out;
+    if (!rename_from)
+        return out;
+    std::string cur;
+    for (const char *p = rename_from;; ++p)
+    {
+        if (*p == ',' || *p == 0)
+        {
+            while (!cur.empty() && cur.front() == ' ')
+                cur.erase(cur.begin());
+            while (!cur.empty() && cur.back() == ' ')
+                cur.pop_back();
+            if (!cur.empty())
+                out.push_back(cur);
+            cur.clear();
+            if (*p == 0)
+                break;
+            continue;
+        }
+        cur.push_back(*p);
+    }
+    return out;
+}
+
+// The first former name actually present in this section, or an empty string.
+static std::string first_present(const mINI::INIMap<std::string> &cfg, const char *rename_from)
+{
+    for (const std::string &was : former_names(rename_from))
+        if (cfg.has(was))
+            return was;
+    return {};
+}
+
 void goblin::ensure_ini(const std::filesystem::path &ini_path)
 {
     namespace fs = std::filesystem;
@@ -128,12 +165,13 @@ void goblin::ensure_ini(const std::filesystem::path &ini_path)
             consumed.insert({lsec, to_lower(e.key)});
             return true;
         }
-        if (e.rename_from && existing.has(section) && existing[section].has(e.rename_from))
-        {
-            out = existing[section].get(e.rename_from);
-            consumed.insert({lsec, to_lower(e.rename_from)});
-            return true;
-        }
+        for (const std::string &was : former_names(e.rename_from))
+            if (existing.has(section) && existing[section].has(was))
+            {
+                out = existing[section].get(was);
+                consumed.insert({lsec, to_lower(was)});
+                return true;
+            }
         // Cross-section fallback: a key (or its rename_from) that moved to a
         // different section in a newer schema still keeps its user value. Schema
         // keys are globally unique, so matching by key name in any section is safe.
@@ -145,29 +183,74 @@ void goblin::ensure_ini(const std::filesystem::path &ini_path)
                 consumed.insert({to_lower(sp.first), to_lower(e.key)});
                 return true;
             }
-            if (e.rename_from && sp.second.has(e.rename_from))
-            {
-                out = sp.second.get(e.rename_from);
-                consumed.insert({to_lower(sp.first), to_lower(e.rename_from)});
-                return true;
-            }
+            for (const std::string &was : former_names(e.rename_from))
+                if (sp.second.has(was))
+                {
+                    out = sp.second.get(was);
+                    consumed.insert({to_lower(sp.first), to_lower(was)});
+                    return true;
+                }
         }
         return false;
     };
 
-    std::string language_value = goblin::config::uiLanguage;
+    // The comments in the file we are about to write are localized, so the language has to be read
+    // BEFORE the schema pass. Both spellings are accepted: a file from an older build still says
+    // ui_language, and it is renamed by the same pass that writes the new one.
+    std::string language_value = goblin::config::overlayUiLanguage;
     if (had)
     {
         for (auto const &sp : existing)
         {
-            if (sp.second.has("ui_language"))
-            {
-                language_value = sp.second.get("ui_language");
-                break;
-            }
+            for (const char *key : {"overlay_ui_language", "ui_language"})
+                if (sp.second.has(key))
+                {
+                    language_value = sp.second.get(key);
+                    break;
+                }
         }
     }
     auto emit_language = goblin::i18n::language_from_config(language_value);
+
+    // Before writing: say what this rewrite is about to CHANGE. `existing` is still the file as the
+    // player left it, so this is the only place that can tell a preserved value from a lost one -
+    // a flag that comes back at its default after an upgrade has to be visible in the log, not just
+    // in the file.
+    if (had)
+    {
+        int changed = 0;
+        for (auto const &sec : ini_schema())
+        {
+            if (sec.err_only && !include_err)
+                continue;
+            for (auto const &e : sec.entries)
+            {
+                if (e.err_only && !include_err)
+                    continue;
+                std::string before_val;
+                bool found = false;
+                for (auto const &sp : existing)
+                    if (sp.second.has(e.key))
+                    {
+                        before_val = sp.second.get(e.key);
+                        found = true;
+                        break;
+                    }
+                if (!found)
+                    continue; // a key the file never had - nothing to lose
+                std::string after_val;
+                if (!resolve(sec.name, e, after_val))
+                    after_val = e.def;
+                if (after_val == before_val)
+                    continue;
+                spdlog::warn("Config: rewrite changes {} : {} -> {}", e.key, before_val, after_val);
+                ++changed;
+            }
+        }
+        if (changed)
+            spdlog::warn("Config: the ini rewrite changed {} value(s) - if any of them was yours, "
+                         "that is a bug in the migration, not a setting", changed);
+    }
 
     std::ostringstream ss;
     emit_ini(ss, include_err, resolve, emit_language);
@@ -276,6 +359,37 @@ void goblin::save_config(const std::filesystem::path &ini_path)
     };
 
     std::ostringstream ss;
+    // Audit: name every value this write CHANGES. A settings file that quietly comes back with
+    // different flags is the one bug report nobody can act on, so each change is logged with its old
+    // and new value - whoever wrote it (a menu row, a migration, a reset) is then visible in the log.
+    {
+        mINI::INIFile before_file(ini_path.string());
+        mINI::INIStructure before;
+        if (before_file.read(before))
+        {
+            int changed = 0;
+            for (auto const &sec : ini_schema())
+            {
+                if (!before.has(sec.name))
+                    continue;
+                auto &old_sec = before[sec.name];
+                for (auto const &e : sec.entries)
+                {
+                    if (!old_sec.has(e.key))
+                        continue;
+                    std::string now;
+                    if (!resolve(sec.name, e, now))
+                        continue;
+                    if (old_sec.get(e.key) == now)
+                        continue;
+                    spdlog::info("Config: {} = {} (was {})", e.key, now, old_sec.get(e.key));
+                    ++changed;
+                }
+            }
+            if (changed)
+                spdlog::info("Config: {} value(s) changed by this save", changed);
+        }
+    }
     emit_ini(ss, include_err, resolve, goblin::i18n::current_language());
 
     std::error_code ec;
@@ -319,11 +433,26 @@ void goblin::load_config(const std::filesystem::path &ini_path)
             std::string v;
             if (cfg.has(e.key))
                 v = cfg.get(e.key);
-            else if (e.rename_from && cfg.has(e.rename_from))
-                v = cfg.get(e.rename_from);
+            else if (const std::string was = first_present(cfg, e.rename_from); !was.empty())
+                v = cfg.get(was);
             else
                 continue;
             set_from_string(e, v);
+        }
+    }
+
+    // This key used to name a DRAWING mode (surface / layered / swapchain / swapchain_2).
+    // It now names WHICH MENU is on the hotkey, so a file written by an older build carries a value
+    // that no longer means anything. Rewrite it to the default and say so: leaving the old word in
+    // the file would have it read as "native" while looking like a setting that does something else.
+    {
+        const std::string &m = goblin::config::menuRenderMode;
+        if (m != "native" && m != "imgui" && m != "dev")
+        {
+            spdlog::info("Config: menu_render_mode '{}' is from an older build (it named a drawing "
+                         "mode); migrating to 'native'.", m);
+            goblin::config::menuRenderMode = "native";
+            save_config(ini_path);
         }
     }
 }

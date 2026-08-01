@@ -232,31 +232,27 @@ def read_markers(save_path, slot):
 
 
 def _load_legacy_conv(data_dir):
-    """Load dungeon-to-overworld coordinate conversion table."""
+    """Dungeon-to-overworld conversion, with CHAINED areas resolved (tools/legacy_conv.py). Keeping only
+    the rows that land straight on an overworld tile - which this did - drops every chained area, and the
+    Shunning-Grounds and Deeproot markers then vanish from whatever this feeds without a word."""
     conv_path = Path(data_dir) / "WorldMapLegacyConvParam.json"
     if not conv_path.exists():
         return {}
-    with open(conv_path) as f:
-        rows = json.load(f)
-    conv = {}
-    for r in rows:
-        src_area = int(r.get("srcAreaNo", 0))
-        src_gx = int(r.get("srcGridXNo", 0))
-        dst_area = int(r.get("dstAreaNo", 0))
-        if dst_area not in (60, 61):
-            continue
-        key = (src_area, src_gx)
-        if key not in conv:
-            conv[key] = {
-                "dstArea": dst_area,
-                "dstGridX": int(r.get("dstGridXNo", 0)),
-                "dstGridZ": int(r.get("dstGridZNo", 0)),
-                "dstPosX": float(r.get("dstPosX", 0)),
-                "dstPosZ": float(r.get("dstPosZ", 0)),
-                "srcPosX": float(r.get("srcPosX", 0)),
-                "srcPosZ": float(r.get("srcPosZ", 0)),
-            }
-    return conv
+    import legacy_conv
+    entries, chains, unresolved = legacy_conv.resolve(conv_path)
+    legacy_conv.report(chains, unresolved)
+    return {
+        key: {
+            "dstArea": e["dst_area"],
+            "dstGridX": e["dst_gx"],
+            "dstGridZ": e["dst_gz"],
+            "dstPosX": e["dst_pos_x"],
+            "dstPosZ": e["dst_pos_z"],
+            "srcPosX": e["src_pos_x"],
+            "srcPosZ": e["src_pos_z"],
+        }
+        for key, e in entries.items()
+    }
 
 
 def load_massedit_entries(massedit_dir, category_filter=None):

@@ -36,7 +36,8 @@ GFX = str(config.GAME_DIR / 'menu' / '02_160_keyconfiguration.gfx')
 OUT = 'src/generated_shared/goblin_menu_icon_tags.hpp'
 ROW_CID = 189          # the row clip we extend
 ICON_PX = 32           # icons are drawn into a 40px-tall row
-ICON_X = 2.0           # px, left of Text_0 (which starts at x=26.8)
+ICON_X = 14.0          # px. Was 2.0 - flush with the separator caption, which ate the indent
+                       # ordinary rows have; 14 leaves that indent visible and still clears the label
 ICON_Y = 11.0         # rows are 63.7 apart; 4 sat too high and 18 too low, measured in game
 
 PLACE2, PLACE3, SHOWFRAME, END, DEFSPRITE, REMOVE2, LOSSLESS2 = 26, 70, 1, 0, 39, 28, 36
@@ -405,7 +406,14 @@ def main():
     strip_b = bytearray()
     for i, (cid, size) in enumerate(bitmap_cids):
         scale = ICON_PX / float(max(size))
-        strip_b += place2(cid, i + 1, matrix_bytes(scale, ICON_X + (i + 1) * ICON_PX, ICON_Y))
+        # CENTRE each icon in its cell. The scale fits the longer side to the cell, so a tall narrow
+        # icon came out only a few pixels wide and sat flush against the cell's left edge, leaving a
+        # visible gap before the label while a round icon had none. Half the leftover on each side
+        # makes every icon read as being in the same column.
+        dx = (ICON_PX - size[0] * scale) / 2.0
+        dy = (ICON_PX - size[1] * scale) / 2.0
+        strip_b += place2(cid, i + 1,
+                          matrix_bytes(scale, ICON_X + (i + 1) * ICON_PX + dx, ICON_Y + dy))
     strip_b += build_tag(SHOWFRAME, b'')
     strip_b += build_tag(END, b'')
     blob_b += build_tag(DEFSPRITE, struct.pack('<HH', strip_b_cid, 1) + bytes(strip_b))
@@ -473,8 +481,11 @@ def main():
         f.write(f'    constexpr uint16_t FIRST_CID = {base};\n')
         f.write(f'    constexpr uint16_t LAST_CID = {sprite_b_cid};\n')
         f.write(f'    constexpr int ICON_COUNT = {len(bitmap_cids)};\n')
-        for name, data in (('ICON_BLOB_A', blob_a), ('ROW_TAG_A', row_tag_a),
-                           ('ICON_BLOB_B', blob_b), ('ROW_TAG_B', row_tag_b)):
+        # Only variant B is emitted since 2026-07-29: the strip-behind-a-mask variant (A) was
+        # removed from the DLL, and its blob was ~160 KB of data nothing read. blob_a/row_tag_a are
+        # still BUILT above so the layout arithmetic stays honest and reviving A stays a one-line
+        # change here.
+        for name, data in (('ICON_BLOB_B', blob_b), ('ROW_TAG_B', row_tag_b)):
             f.write(f'    constexpr size_t {name}_LEN = {len(data)};\n')
             f.write(f'    inline const unsigned char {name}[] = {{\n')
             for i in range(0, len(data), 20):

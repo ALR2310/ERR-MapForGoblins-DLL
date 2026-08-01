@@ -11,6 +11,9 @@
 #include "goblin_item_icons.hpp"
 #include "goblin_location_alt.hpp"
 #include "goblin_gfx_probe.hpp"
+#include <cstring>
+
+#include "version.h" // BUILD_NAME: the starting anchor
 #include "goblin_maphover.hpp"   // map_layer() for the native reticle-hover proxy
 #include "goblin_mapproject.hpp" // read_view/to_map for the native reticle-hover proxy
 #include "goblin_overlay.hpp"
@@ -93,8 +96,15 @@ struct CategoryRow
     uint8_t native_layer;
     uint16_t native_gx;
     uint16_t native_gz;
+    // Where this marker is DRAWN, and where it actually is. They differ when it shares a spot with
+    // others: see the de-overlap below, which recomputes native_px/native_pz from real_px/real_pz for
+    // the markers that are visible RIGHT NOW. Everything that positions anything - the icon factory's
+    // snapshot, the hover pick, the highlight rings - reads native_px, so the spread reaches all of
+    // them without any of them knowing about it.
     float native_px;
     float native_pz;
+    float real_px;
+    float real_pz;
 };
 
 // textEnableFlagId1..8 of a row, as a pointer array (the paramdef has them as
@@ -570,18 +580,45 @@ static bool row_marker_info(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p,
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+static void refresh_deoverlap(int layer);  // defined with the de-overlap, further down
+static std::vector<uint8_t> g_vis;   // per row index; 1 = on screen right now
+static int g_vis_layer = -1;         // which layer that answer was for (-1 = none yet)
+
+bool goblin::display_position(const void *rowptr, float &px, float &pz)
+{
+    for (const auto &cr : g_category_rows)
+    {
+        if (static_cast<const void *>(cr.p) != rowptr) continue;
+        px = cr.native_px;
+        pz = cr.native_pz;
+        return true;
+    }
+    return false;
+}
+
 std::vector<goblin::HighlightPoint> goblin::focus_highlight_points()
 {
     std::vector<HighlightPoint> out;
     const int focus = g_focus_category;
     if (focus < 0) return out;
-    for (auto &cr : g_category_rows)
+    // A ring has to land ON its icon, so it reads the display positions the icons were drawn at. This
+    // is also called from INSIDE the snapshot, which has just refreshed them for this layer - so it
+    // refreshes only when nothing has answered for this layer yet, instead of repeating the pass.
     {
+        const int layer = goblin::maphover::map_layer();
+        if (layer >= 0 && (g_vis_layer != layer || g_vis.size() != g_category_rows.size()))
+            refresh_deoverlap(layer);
+    }
+    for (size_t idx = 0; idx < g_category_rows.size(); ++idx)
+    {
+        auto &cr = g_category_rows[idx];
         if (!cr.p) continue;
         if (static_cast<int>(cr.cat) != focus || cr.region_id != g_focus_region) continue;
-        // Only ring markers whose icon is actually shown: not collected/hidden, and not
-        // gated off by a group-2 ENABLE flag (switched-chest absent variant / pre-event area).
-        if (row_is_hidden(cr) || row_group2_gate_off(cr.p)) continue;
+        // A ring exists for exactly the icons being DRAWN, and reads the same answer they did: this is
+        // the visibility the refresh above computed, not a second nearly-identical test. The old test
+        // here missed the eventFlagId gate, so a marker the engine does not draw could still be ringed
+        // - which looks the same as a ring that missed its marker.
+        if (idx >= g_vis.size() || !g_vis[idx]) continue;
         // Coordinates/layer come from the CAPTURED native_* fields, NOT from the
         // live row: migrated rows run with dispMask zeroed (stock widget
         // suppression), so a live read derives layer "none" and the overlay's
@@ -648,6 +685,10 @@ void goblin::inject_map_entries()
         Category category;
         uint32_t lotId;    // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;   // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
+        // MSB-true position, before the offline de-overlap spiralled the baked one. The live
+        // de-overlap spreads from THIS, so it never spirals an already-spiralled position.
+        float real_px;
+        float real_pz;
     };
 
     // Live-loot icons (config::liveLootIcons): a randomized lot may now hold an
@@ -718,7 +759,8 @@ void goblin::inject_map_entries()
         // the two - hiding e.g. Armaments missed randomized weapons and hid
         // unrelated markers whose baked category happened to be Armaments.
         // (Spoiler-free and non-lot rows leave gate_cat == e.category.)
-        entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType});
+        entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType,
+                           e.real_posX, e.real_posZ});
     }
 
     spdlog::info("Adding {} map entries ({} skipped by config, {} live-recategorized)",
@@ -828,6 +870,8 @@ void goblin::inject_map_entries()
         uint64_t original_row_id;  // pre-remap id (matches locationOverrides keys); 0 for vanilla rows
         uint32_t lotId;            // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;           // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
+        float real_px;             // MSB-true position (see InjectedEntry)
+        float real_pz;
     };
 
     std::vector<RowSource> all_rows;
@@ -836,13 +880,14 @@ void goblin::inject_map_entries()
     for (uint16_t i = 0; i < orig_num_rows; i++)
     {
         auto *data = old_param_file + old_table->rows[i].param_offset;
-        all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false, {}, 0, 0, 0});
+        all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false, {}, 0, 0, 0,
+                            0.0f, 0.0f});  // vanilla rows: filled from the row itself below
     }
     for (auto &entry : entries)
     {
         all_rows.push_back({entry.row_id, reinterpret_cast<const uint8_t *>(entry.data),
                             entry.is_piece, entry.is_kindling, entry.category, entry.original_row_id,
-                            entry.lotId, entry.lotType});
+                            entry.lotId, entry.lotType, entry.real_px, entry.real_pz});
     }
 
     std::sort(all_rows.begin(), all_rows.end(),
@@ -890,8 +935,16 @@ void goblin::inject_map_entries()
                               (wp->dispMask02 ? 2 : 0xFF));
             cr.native_gx = wp->gridXNo;
             cr.native_gz = wp->gridZNo;
-            cr.native_px = wp->posX;
-            cr.native_pz = wp->posZ;
+            // The row carries the BAKED position, which the offline pass may already have spiralled
+            // away from the real one. Take the real coordinates as the truth and let the live
+            // de-overlap decide the display position; starting from the baked one would spiral a
+            // spiral.
+            cr.real_px = all_rows[i].real_px != 0.0f || all_rows[i].real_pz != 0.0f
+                             ? all_rows[i].real_px : wp->posX;
+            cr.real_pz = all_rows[i].real_px != 0.0f || all_rows[i].real_pz != 0.0f
+                             ? all_rows[i].real_pz : wp->posZ;
+            cr.native_px = cr.real_px;
+            cr.native_pz = cr.real_pz;
             unsigned *en[8];
             enable_flag_ptrs(wp, en);
             for (int k = 0; k < 8; ++k) cr.baked_enable[k] = *en[k];
@@ -1404,28 +1457,233 @@ static bool native_row_hidden(const CategoryRow &cr)
     return false;
 }
 
+// ══ de-overlap, live ═════════════════════════════════════════════════════════════════════════════
+// Markers that sit on top of each other are pulled apart onto a square spiral. That has always been
+// done, but OFFLINE, once, for all ~9200 markers - so a collected pickup, a category the player turned
+// off and a focus filter all kept reserving their spot and pushing the neighbour aside, and a marker
+// left alone in its cluster still stood where the crowd had put it.
+//
+// The native render path made the live version possible: the icon is drawn from native_px/native_pz
+// rather than from the param row, and this file already decides, per map open, which markers are
+// visible. So the spread is recomputed from the visible set instead of being baked into the data.
+//
+// Spacing stays in WORLD units, as the offline pass had it (chosen so icons read apart at the map's
+// closest zoom). Whether the engine rebuilds pins on a zoom step - which is what a screen-constant
+// spacing would need - is not established, and this deliberately does not depend on it.
+namespace
+{
+    // Spacing in WORLD units, as the offline pass had it: chosen so two icons read apart at the map's
+    // closest zoom.
+    constexpr float kMinDist = 8.0f;
+
+    // The square spiral of candidate positions around a marker's real spot: (0,0), (0,-1), (1,-1),
+    // (1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1), (0,-2)...
+    void spiral_offset(int n, float &ox, float &oz)
+    {
+        int x = 0, z = 0, d = 1, k = 0;
+        auto step = [&](int dx, int dz) { x += dx; z += dz; ++k; };
+        while (k < n)
+        {
+            for (int i = 0; i < d && k < n; ++i) step(0, -1);
+            for (int i = 0; i < d && k < n; ++i) step(1, 1);
+            for (int i = 0; i < d && k < n; ++i) step(0, 1);
+            for (int i = 0; i < 2 * d && k < n; ++i) step(-1, 0);
+            for (int i = 0; i < 2 * d && k < n; ++i) step(0, -1);
+            for (int i = 0; i < d && k < n; ++i) step(1, 0);
+            ++d;
+        }
+        ox = static_cast<float>(x) * kMinDist;
+        oz = static_cast<float>(z) * kMinDist;
+    }
+
+    // Where the markers already placed on this map are, bucketed into cells of kMinDist so a candidate
+    // only has to look at its own cell and the eight around it.
+    //
+    // This replaces the "cluster, then spiral inside it" approach the offline pass uses, because that
+    // one only spaces a marker from the group it was ASSIGNED to: two nearby groups spiral outward
+    // independently and their members can land on top of each other. A beacon dump at Fort Haight
+    // showed exactly that - markers 2.8u and 5.3u apart with the spacing set to 8u. Asking "is anything
+    // already within 8 units of here" instead makes the answer global, and it costs one hash lookup.
+    //
+    // Each placed marker also carries the ANCHOR of the lattice it sits on. A marker that finds its own
+    // spot free is its own anchor; one that has to move adopts the anchor of whoever it collided with,
+    // so everything pushed out of one crowded spot lands on ONE grid, a clean kMinDist apart. Anchoring
+    // each marker's candidates at its own position instead - which is what this did first - leaves the
+    // lattices of neighbours unaligned, and a crowd comes out ragged: 8u to one neighbour and 11.3u
+    // diagonally to another.
+    struct Placed
+    {
+        float x, z;    // where it ended up
+        float ax, az;  // origin of the lattice it belongs to
+    };
+
+    struct Occupancy
+    {
+        std::unordered_map<uint64_t, std::vector<Placed>> cells;
+
+        static uint64_t key(uint64_t tile, int32_t cx, int32_t cz)
+        {
+            return (tile << 26) ^ (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 13) ^
+                   static_cast<uint64_t>(static_cast<uint32_t>(cz) & 0x1FFFu);
+        }
+
+        template <class Fn>
+        void around(uint64_t tile, float x, float z, Fn &&fn) const
+        {
+            const int32_t cx = static_cast<int32_t>(std::floor(x / kMinDist));
+            const int32_t cz = static_cast<int32_t>(std::floor(z / kMinDist));
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dz = -1; dz <= 1; ++dz)
+                {
+                    auto it = cells.find(key(tile, cx + dx, cz + dz));
+                    if (it == cells.end()) continue;
+                    for (const Placed &p : it->second) fn(p);
+                }
+        }
+
+        bool free_at(uint64_t tile, float x, float z) const
+        {
+            bool ok = true;
+            around(tile, x, z, [&](const Placed &p) {
+                const float ddx = p.x - x, ddz = p.z - z;
+                if (ddx * ddx + ddz * ddz < kMinDist * kMinDist) ok = false;
+            });
+            return ok;
+        }
+
+        // The lattice to join: the one belonging to the nearest marker already standing here.
+        bool anchor_at(uint64_t tile, float x, float z, float &ax, float &az) const
+        {
+            float best = kMinDist * kMinDist;
+            bool found = false;
+            around(tile, x, z, [&](const Placed &p) {
+                const float ddx = p.x - x, ddz = p.z - z;
+                const float d2 = ddx * ddx + ddz * ddz;
+                if (d2 < best) { best = d2; ax = p.ax; az = p.az; found = true; }
+            });
+            return found;
+        }
+
+        void take(uint64_t tile, float x, float z, float ax, float az)
+        {
+            const int32_t cx = static_cast<int32_t>(std::floor(x / kMinDist));
+            const int32_t cz = static_cast<int32_t>(std::floor(z / kMinDist));
+            cells[key(tile, cx, cz)].push_back({x, z, ax, az});
+        }
+    };
+}  // namespace
+
+// Is this marker on screen right now? ONE definition, used by the de-overlap, by the snapshot the
+// icon factory and the hover pick read, and by the highlight rings - if they disagreed, an icon would
+// be pulled aside by something the player cannot see, or a ring would sit next to its icon.
+static bool native_row_visible(const CategoryRow &cr, int layer, int focus)
+{
+    if (!cr.p || cr.original_row_id == 0 || !native_category_migrated(cr.cat)) return false;
+    if (cr.native_layer != layer) return false;
+    const bool eligible = (focus >= 0)
+                              ? (static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region)
+                              : is_category_enabled(cr.cat);
+    if (!eligible) return false;
+    if (cr.p->eventFlagId != 0 && !goblin::flag_is_set(cr.p->eventFlagId)) return false;
+    return !native_row_hidden(cr) && !row_group2_gate_off(cr.p);
+}
+
+// Visibility answered ONCE per refresh and then read by everyone. It is the expensive half: each row
+// asks the engine's event-flag system about its gate and up to eight disable flags, so evaluating it
+// twice - which the first version of this did, since the highlight builder runs INSIDE the snapshot -
+// is the thing to avoid, not the spiral.
+// Recompute display positions for `layer`. Everything invisible keeps its real coordinates and, more
+// to the point, takes up no room - which is the whole difference from baking this offline.
+//
+// Placement is first-come on a stable order (row index), so the same visible set always produces the
+// same layout: a marker keeps its spot while its neighbours come and go, rather than the map
+// reshuffling itself every time something is collected.
+static void refresh_deoverlap(int layer)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const int focus = g_focus_category;
+    g_vis.assign(g_category_rows.size(), 0);
+    size_t shown = 0;
+    for (size_t i = 0; i < g_category_rows.size(); ++i)
+    {
+        CategoryRow &cr = g_category_rows[i];
+        cr.native_px = cr.real_px;
+        cr.native_pz = cr.real_pz;
+        if (native_row_visible(cr, layer, focus)) { g_vis[i] = 1; ++shown; }
+    }
+
+    static Occupancy occ;  // kept across refreshes to hold its buckets; cleared here
+    for (auto &kv : occ.cells) kv.second.clear();
+    size_t moved = 0, crowded = 0;
+    for (size_t i = 0; i < g_category_rows.size(); ++i)
+    {
+        if (!g_vis[i]) continue;
+        CategoryRow &cr = g_category_rows[i];
+        if (cr.native_area == 99) continue;  // parked/hidden coordinate trick
+        const uint64_t tile = (static_cast<uint64_t>(cr.native_area) << 40) |
+                              (static_cast<uint64_t>(cr.native_gx) << 20) | cr.native_gz;
+        if (occ.free_at(tile, cr.real_px, cr.real_pz))
+        {
+            // Nothing near it: it stands where it really is, and becomes the anchor of a lattice for
+            // anything that arrives here later.
+            occ.take(tile, cr.real_px, cr.real_pz, cr.real_px, cr.real_pz);
+            continue;
+        }
+        ++crowded;
+        // Join the lattice of whoever is already standing here, so a crowd comes out as one grid
+        // rather than as overlapping grids of its own members.
+        float ax = cr.real_px, az = cr.real_pz;
+        occ.anchor_at(tile, cr.real_px, cr.real_pz, ax, az);
+        constexpr int kMaxCandidates = 96;
+        bool placed = false;
+        for (int k = 1; k < kMaxCandidates && !placed; ++k)
+        {
+            float ox = 0.0f, oz = 0.0f;
+            spiral_offset(k, ox, oz);
+            const float x = ax + ox, z = az + oz;
+            if (!occ.free_at(tile, x, z)) continue;
+            cr.native_px = x;
+            cr.native_pz = z;
+            occ.take(tile, x, z, ax, az);
+            placed = true;
+            ++moved;
+        }
+        if (!placed) occ.take(tile, cr.real_px, cr.real_pz, ax, az);  // give up rather than search forever
+    }
+    g_vis_layer = layer;
+    // Timed, not assumed: this runs on the map UI thread, so its cost is the thing to know. Said on
+    // the first refresh and then rarely, because a per-refresh line would drown the log.
+    static int s_said = 0;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    if (s_said == 0 || (goblin::config::debugLogging && ++s_said % 200 == 0))
+    {
+        if (s_said == 0) s_said = 1;
+        spdlog::info("[deoverlap] layer {}: {} of {} markers visible, {} of them had company, {} moved "
+                     "aside, in {} us (spacing {}u)",
+                     layer, shown, g_category_rows.size(), crowded, moved, us, kMinDist);
+    }
+}
+
 std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer)
 {
     std::vector<NativeMarkerPoint> out;
     if (layer < 0 || layer > 2 || icons_hidden()) return out;
     out.reserve(g_category_rows.size());
     const int focus = g_focus_category;
-    for (const auto &cr : g_category_rows)
+    // Pull crowded markers apart FIRST, from the set that is visible on this layer right now, so the
+    // positions emitted below already carry the spread. Everything downstream - the icon factory, the
+    // hover pick, the highlight rings - reads those positions and needs no idea this happened.
+    refresh_deoverlap(layer);
+    for (size_t idx = 0; idx < g_category_rows.size(); ++idx)
     {
+        const CategoryRow &cr = g_category_rows[idx];
         // Rows of EVERY map layer are returned: the map hosts all layers'
         // markers in one shared parent, so a layer switch is pure show/hide
         // (the layer match is part of `visible`, not a row filter).
         if (!cr.p || cr.original_row_id == 0 ||
             !native_category_migrated(cr.cat)) continue;
-        const bool eligible =
-            (focus >= 0) ? (static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region)
-                         : is_category_enabled(cr.cat);
-        bool event_gate = false;
-        if (cr.p->eventFlagId != 0)
-            event_gate = !goblin::flag_is_set(cr.p->eventFlagId);
-        const bool visible = eligible && !event_gate && !native_row_hidden(cr) &&
-                             !row_group2_gate_off(cr.p) &&
-                             cr.native_layer == layer;
+        const bool visible = g_vis[idx] != 0;  // answered once, by the refresh above
         const int source_icon = goblin::gfx_probe::source_iconid(cr.p->iconId);
         if (source_icon < 0) continue;
         out.push_back({cr.original_row_id, source_icon, cr.native_area, cr.native_layer,
@@ -1546,6 +1804,100 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         cache_layer = layer;
         cache_at = now;
     }
+    // ── the anchor: where the reticle is, not where we assumed it is ──────────────
+    // (cU, cV) is the centre of the view, which IS the reticle on vanilla and ERR. On a build whose
+    // map reticle follows the mouse (Convergence) it is not, and the popup then described the icon in
+    // the middle of the screen while the player pointed at another one.
+    //
+    // Which of the two this build does is measured, not assumed: while the game hovers one of its own
+    // pins it tells us where its reticle is (maphover::reticle_map, map space), and that either sits on
+    // the view centre or on the cursor. One sample settles it for the session; with no sample the
+    // centre stands, i.e. the old behaviour.
+    enum class Anchor
+    {
+        Unknown,
+        Centre,
+        Cursor,
+    };
+    // The STARTING value comes from the build, because a profile's DLL only ever runs on the mod it was
+    // built from: Convergence is the one measured to follow the cursor. It is a starting value, not a
+    // belief - the measurement below still decides, and this only fixes the first few seconds before a
+    // sample arrives (until then the popup used to sit at the centre).
+    static Anchor s_anchor =
+        std::strstr(BUILD_NAME, "convergence") != nullptr ? Anchor::Cursor : Anchor::Centre;
+    static bool s_measured = false;
+    // Cursor -> map space: the inverse of the projection the markers use.
+    auto cursor_map = [&](float &out_mx, float &out_mz) -> bool {
+        POINT pt{};
+        if (!GetCursorPos(&pt))
+            return false;
+        HWND hw = GetForegroundWindow();
+        RECT rc{};
+        if (!hw || !ScreenToClient(hw, &pt) || !GetClientRect(hw, &rc))
+            return false;
+        const float cw = static_cast<float>(rc.right - rc.left);
+        const float ch = static_cast<float>(rc.bottom - rc.top);
+        if (cw < 100.0f || ch < 100.0f || zoom <= 0.0f)
+            return false;
+        if (pt.x < 0 || pt.y < 0 || pt.x > rc.right || pt.y > rc.bottom)
+            return false;
+        out_mx = (static_cast<float>(pt.x) - cw * 0.5f) / (zoom * (cw / 1920.0f)) + cU;
+        out_mz = (static_cast<float>(pt.y) - ch * 0.5f) / (zoom * (ch / 1080.0f)) + cV;
+        return true;
+    };
+    float ax = cU, ay = cV;
+    // FIRST CHOICE: the position the GAME searches around this frame, read from its own dialog
+    // (maphover::reticle_live). It needs no anchor guess at all, and it is the only one that is right
+    // at full zoom-out, where the map stops panning and the reticle leaves the centre of the view - the
+    // regime in which the two-anchor guess below quietly described the icon in the middle of the screen.
+    bool live_anchor = false;
+    {
+        float lmx = 0.0f, lmz = 0.0f;
+        bool ptr_mode = false;
+        if (goblin::maphover::reticle_live(&lmx, &lmz, &ptr_mode))
+        {
+            ax = lmx;
+            ay = lmz;
+            live_anchor = true;
+        }
+    }
+    if (!live_anchor)
+    {
+        // Fallback: infer it. Kept because it is what shipped and it is still right in the common case,
+        // but it is now only reached when that field could not be read at all.
+        float rmx = 0.0f, rmz = 0.0f;
+        const bool have_sample = goblin::maphover::reticle_map(&rmx, &rmz, 400);
+        if (!s_measured && have_sample)
+        {
+            float kmx = 0.0f, kmz = 0.0f;
+            const bool have_cursor = cursor_map(kmx, kmz);
+            const float d_centre = (rmx - cU) * (rmx - cU) + (rmz - cV) * (rmz - cV);
+            const float d_cursor = have_cursor ? (rmx - kmx) * (rmx - kmx) + (rmz - kmz) * (rmz - kmz)
+                                               : 1e18f;
+            const Anchor was = s_anchor;
+            s_anchor = d_cursor < d_centre ? Anchor::Cursor : Anchor::Centre;
+            s_measured = true;
+            if (was != s_anchor)
+                spdlog::info("[hover] the build's starting anchor was wrong - corrected by measurement");
+            spdlog::info("[hover] reticle anchor measured: {} (sample {:.0f},{:.0f}; centre "
+                         "{:.0f},{:.0f} d2={:.0f}; cursor {:.0f},{:.0f} d2={:.0f})",
+                         s_anchor == Anchor::Cursor ? "THE CURSOR" : "the view centre", rmx, rmz, cU,
+                         cV, d_centre, kmx, kmz, have_cursor ? d_cursor : -1.0f);
+        }
+        if (s_anchor == Anchor::Cursor)
+        {
+            float kmx = 0.0f, kmz = 0.0f;
+            if (cursor_map(kmx, kmz))
+            {
+                ax = kmx;
+                ay = kmz;
+            }
+        }
+        else if (have_sample && s_anchor == Anchor::Centre)
+        {
+            // Centred build: the sample and the centre agree, so nothing to do.
+        }
+    }
     constexpr float PICK_CANVAS_PX = 40.0f; // ~engine pin focus radius
     float best = PICK_CANVAS_PX * PICK_CANVAS_PX;
     void *best_row = nullptr;
@@ -1556,8 +1908,8 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         float mx = 0.0f, mz = 0.0f;
         if (!goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz))
             continue;
-        const float dx = (mx - cU) * zoom;
-        const float dy = (mz - cV) * zoom;
+        const float dx = (mx - ax) * zoom;
+        const float dy = (mz - ay) * zoom;
         const float d2 = dx * dx + dy * dy;
         if (d2 < best)
         {
@@ -1922,7 +2274,7 @@ void goblin::toggle_hotkey_loop()
         // overlay's hkPresent). This master show/hide path only fires when the
         // overlay is DISABLED, so the same press never both opens the menu AND
         // toggles icons.
-        const bool master_mode = !config::enableOverlay;
+        const bool master_mode = !config::menuEnabled; // no menu on the key -> the key is the master switch
         bool kbd = master_mode &&
                    goblin::overlay::key_down(static_cast<int>(config::toggleInjectionKey));
         bool pad = master_mode && gamepad_combo_held();

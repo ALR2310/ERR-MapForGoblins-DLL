@@ -68,9 +68,7 @@
     "MegaShadow": "Tierras de la Sombra",
     "ProgressFocusResetHint": "Para restablecer, pulsa '%s' en el menú",
     "MenuBack": "Atrás",
-    "MenuTools": "Herramientas",
     "MenuTotal": "Total",
-    "MenuSaveNow": "Guardar ajustes",
     "MenuUnavailable": "Pagina no disponible",
     "MenuPressKey": "Pulsa una tecla...",
     "MenuKeepCurrent": "Mantener actual"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "Fallo al volcar marcadores - pulsa de nuevo"
   },
   "section_labels": {
+    "Categories": "Categorías",
+    "Menu settings": "Ajustes del mod",
     "Goblin": "Goblin",
     "Equipment": "Equipamiento",
     "Key Items": "Objetos clave",
@@ -92,18 +92,19 @@
     "World": "Mundo",
     "ERR Markers": "Marcadores de ERR",
     "Compatibility": "Compatibilidad",
-    "Overlay & Hotkeys": "Interfaz y teclas rápidas",
+    "Menu & Hotkeys": "Menú y atajos",
     "Debug": "Depuración"
   },
   "section_comments": {
     "Reforged": "Contenido exclusivo de Elden Ring Reforged. Ausente en la versión vanilla.",
     "ERR Markers": "Esta sección aplica las reglas de visualización de este mod a los marcadores\nde mapa que ERR ya coloca de serie (campamentos, mercaderes, jefes, entradas\nde mazmorra), NO a los iconos que este mod inyecta, de modo que ambos conjuntos\nde iconos siguen la misma lógica de visibilidad (descubrimiento por fragmento\nde mapa, ocultar al completar). Desactiva una opción para dejar ese grupo de\nmarcadores exactamente como lo entrega ERR. Nuestros propios marcadores de\njefe son [World] show_bosses e independientes de esta sección.",
     "Compatibility": "Opciones para usarlo junto a otros mods que cambian la colocación de objetos.",
-    "Overlay & Hotkeys": "La interfaz de configuración dentro del juego y la tecla/botón que la abre. toggle_key\n(teclado) / toggle_gamepad_combo (mando) ABREN la interfaz cuando enable_overlay\nestá activado, o activan/desactivan TODOS los iconos del mapa cuando está desactivado.\nNombres de teclas: F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter, Backspace, Home, End,\nPageUp, PageDown, Insert, Delete, flechas.",
+    "Menu & Hotkeys": "El MENÚ del mod y la tecla/botón que lo abre. toggle_key (teclado) /\ntoggle_gamepad_combo (mando) ABREN el menú cuando menu_enabled está activado; si no,\nactivan/desactivan TODOS los iconos del mapa. Qué menú se abre lo decide\nmenu_render_mode. Nombres de teclas: F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter,\nBackspace, Home, End, PageUp, PageDown, Insert, Delete, flechas.",
     "Debug": "Diagnósticos, mostrados en la pestaña Depuración de la interfaz."
   },
   "entry_labels": {
     "require_map_fragments": "Requerir fragmentos de mapa",
+    "location_emphasis": "Énfasis de ubicación",
     "fast_map_open": "Apertura rápida del mapa",
     "show_armaments": "Armamento",
     "show_armour": "Armadura",
@@ -179,8 +180,8 @@
     "live_loot_icons": "Iconos de botín en vivo",
     "anonymous_loot": "Botín anónimo",
     "rebind": "Reasignar",
-    "ui_language": "Idioma",
-    "enable_overlay": "Activar interfaz",
+    "overlay_ui_language": "Idioma del overlay",
+    "menu_enabled": "Activar el menú",
     "enable_toggle_hotkey": "Activar tecla de alternancia",
     "toggle_key": "Tecla de alternancia",
     "toggle_gamepad_combo": "Combinación de mando",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "Ocultar marcadores manualmente",
     "hide_marker_key": "Tecla para ocultar marcador",
     "hover_info": "Info al pasar el cursor",
-    "overlay_render_mode": "Modo de renderizado",
+    "menu_render_mode": "Tipo de menú",
     "hide_marker_gamepad": "Botón de ocultar"
   },
   "entry_comments": {
     "require_map_fragments": "Requerir el descubrimiento del fragmento de mapa antes de mostrar iconos en esa zona",
+    "location_emphasis": "Los marcadores del mapa en el que estás se dibujan más grandes; los que solo parecen cercanos (una mazmorra bajo tus pies, o la superficie sobre ella) más pequeños. Nunca se oculta nada.",
     "fast_map_open": "BETA: hace que el mapa del mundo se abra más rápido cuando se muestran muchos iconos.\nDesactívalo si el mapa falla o se cierra.",
     "show_armaments": "Armas, escudos, arcos, báculos, etc.",
     "show_armour": "Piezas de armadura (yelmos, pecho, guanteletes, piernas)",
@@ -270,19 +272,19 @@
     "live_loot_labels": "Reetiqueta cada marcador de botín con el objeto que su lot da actualmente, para que los nombres coincidan\ncon el randomizer. Usa más memoria (copia los nombres de objeto a la tabla de nombres del mapa).",
     "live_loot_icons": "Da a cada marcador de botín el icono y la categoría del objeto que su lot da\nactualmente, para que los iconos y las opciones show_* coincidan con el randomizer.",
     "anonymous_loot": "Sin spoilers: cada marcador de botín muestra un \"?\" gris y una etiqueta genérica en lugar\ndel objeto real. Anula live_loot_labels/icons; los marcadores siguen ocultándose al recoger.",
-    "ui_language": "Idioma de la interfaz. auto sigue el idioma del juego en Steam; los idiomas no reconocidos\nrecurren al inglés.",
-    "enable_overlay": "Interfaz de configuración dentro del juego (Dear ImGui) abierta con la tecla de alternancia de abajo.\nPonlo en false si un conflicto de DX-hook (interfaz de Steam/RTSS/GeForce Experience) o un\nproblema del controlador de GPU hace que el juego sea inestable.",
+    "overlay_ui_language": "Idioma del menú OVERLAY. auto sigue el idioma del juego en Steam; los\nidiomas no reconocidos vuelven al inglés. El menú del juego ignora esto y\nsigue siempre el idioma del juego.",
+    "menu_enabled": "El menú del mod en la tecla de abajo. Si está desactivado, esos controles\nactivan/desactivan TODOS los iconos del mapa y no se abre ningún menú; es\ntambién el ajuste indicado si un conflicto de hook DX (overlay de Steam/RTSS/\nGeForce Experience) o el driver de la GPU hacen inestable el juego con el menú\noverlay.",
     "enable_toggle_hotkey": "Activa toggle_key / toggle_gamepad_combo para encender/apagar TODOS los iconos del mapa cuando\nla interfaz está DESACTIVADA. (Cuando la interfaz está activada, la abren en su lugar.)",
-    "toggle_key": "Tecla de alternancia de teclado: ABRE la interfaz de configuración cuando enable_overlay está activado, o\nenciende/apaga TODOS los iconos del mapa cuando la interfaz está desactivada. Por defecto: F10.",
-    "toggle_gamepad_combo": "Alternancia de mando, misma función que toggle_key (abre la interfaz, o alterna todos\nlos iconos si la interfaz está desactivada). Tokens unidos con '+': A,B,X,Y,LB,RB,\nL3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT. Por defecto: Y+R3.",
+    "toggle_key": "Tecla de alternancia de teclado: ABRE la interfaz de configuración cuando menu_enabled está activado, o\nenciende/apaga TODOS los iconos del mapa cuando la interfaz está desactivada. Por defecto: F10.",
+    "toggle_gamepad_combo": "Alternar con mando, mismo papel que toggle_key: abre la superposición o activa y\ndesactiva TODOS los iconos si la superposición está desactivada. En el menú basta\ncon pulsar los botones deseados. Al editar este archivo, los nombres se unen con\n'+' (A, B, X, Y, LB, RB, L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT).",
     "debug_logging": "Activar registro de depuración detallado (direcciones de memoria, detalles de param, internos de FMG)",
     "enable_marker_dump": "Interruptor principal de la tecla rápida de volcado de marcadores",
     "marker_dump_key": "Tecla para volcar los marcadores decodificados a logs/MapForGoblins_markers.log. Por defecto: F9.",
-    "overlay_render_mode": "Cómo se dibuja el overlay: surface (predeterminado), layered (máxima compatibilidad) o swapchain (más ligero). Requiere reiniciar el juego.",
+    "menu_render_mode": "QUÉ menú abre la tecla: native (el menú que dibuja el propio juego) o imgui (la\nventana overlay aparte). Solo se cambia aquí: un menú no puede contener el ajuste\nque decide si existe. Requiere reiniciar el juego.",
     "show_world_maps_ignore_fragments": "Mostrar siempre los marcadores de fragmentos de mapa, aunque el filtrado por fragmentos esté activo (para encontrar un fragmento antes de tenerlo).",
     "enable_manual_hide": "Pasa el cursor sobre un marcador del mapa del mundo y pulsa la tecla de ocultar. Los marcadores ocultos se conservan y puedes restaurarlos en la pestaña 'Ocultos'.",
     "hide_marker_key": "Tecla que oculta el marcador del mapa bajo el cursor.",
-    "hover_info": "Con el mapa abierto, muestra un pequeño panel (arriba a la izquierda) con el nombre del marcador señalado y su altura respecto a ti.",
+    "hover_info": "Con el mapa abierto, muestra a la IZQUIERDA un pequeño panel con cuánto más alto o\nbajo que tú está el marcador bajo el cursor. Su nombre no se repite: ya lo muestra\nla ventana del propio juego.",
     "hide_marker_gamepad": "Botón del mando que oculta el marcador bajo el cursor (igual que la tecla de ocultar)."
   }
 }

@@ -25,8 +25,22 @@ namespace goblin
     {
         extern bool requireMapFragments;
         extern bool debugLogging;
-        extern bool nativeMenuDevRows;    // ini key: native_menu_dev_rows (our diagnostic menu rows)
-        extern bool nativeMenu;           // ini key: native_menu (the in-game native menu + its hotkeys)
+
+        // Location emphasis: markers of the map the player is standing in draw at
+        // ownScale, markers of any OTHER map at otherScale. A dungeon lies under the
+        // overworld, so both sets share the same patch of map; the size difference is
+        // what says which is which without hovering.
+        extern bool locationEmphasis;
+        extern float locationEmphasisOwnScale;
+        extern float locationEmphasisOtherScale;
+        // Colour half of the same lever: how much a marker of another map fades. Our icons
+        // are premultiplied, so one factor scales colour and alpha together = a clean fade.
+        extern float locationEmphasisOtherFade;
+        // ...and how far its hue is pushed cold on top of that (0 = none, 1 = full). True
+        // desaturation is out of reach - a colour transform is per-channel and cannot mix
+        // luminance back in - so the nearest honest thing is holding blue while dropping
+        // red and green.
+        extern float locationEmphasisOtherCool;
         // The map-open levers (fast open, self-detach at close, near-view attach window) are no longer
         // ini keys: they are compile-time variants in goblin_build_variants.hpp.
         // NOTE: icon/resource injection is unconditional now (no ini toggle) - it's how icons render without
@@ -147,14 +161,27 @@ namespace goblin
         // In-game config overlay (Dear ImGui on a DX12 hook). Opens with the
         // toggle key. Set false if a DX-hook conflict (Steam overlay/RTSS/etc.)
         // or a GPU driver issue makes the game unstable.
-        extern std::string uiLanguage; // auto, english, schinese, tchinese, korean
+        extern std::string overlayUiLanguage; // OVERLAY menu language (ini overlay_ui_language);
+                                              // the in-game menu follows the GAME language
     // key native_menu_icons: how the in-game menu draws category icons - 0 off,
     // 1 masked strip, 2 one child per icon (both need the movie rebuilt at load),
     // 3 drawn straight from our own pixels into a clip the row already has.
-    extern uint8_t nativeMenuIcons;
     extern float fontScale;        // overlay text size multiplier (live io.FontGlobalScale)
-        extern bool enableOverlay;
-        extern std::string overlayRenderMode; // layered | surface | swapchain (ini overlay_render_mode)
+        extern bool menuEnabled; // ini menu_enabled (was enable_menu, was enable_overlay)
+        extern std::string menuRenderMode; // native | imgui | dev (ini menu_render_mode)
+
+        // WHICH menu the hotkey opens. Parsed from overlay_render_mode in ONE place - ask through
+        // these rather than comparing the string, so a legacy value cannot come to mean two
+        // different things in two files.
+        enum class MenuMode
+        {
+            Native, // the game's own screen; the overlay is never created
+            ImGui,  // the overlay window; nothing of the in-game menu is injected
+            Dev,    // both: hotkey opens the overlay, F8 the in-game menu
+        };
+        MenuMode menu_mode();
+        bool native_menu_enabled();  // Native or Dev
+        bool overlay_menu_enabled(); // ImGui or Dev
         extern float overlayOpacity;   // overlay menu panel opacity 0.3..1.0 (window bg alpha)
         // Overlay menu window geometry, persisted across sessions. overlayWinX = window
         // CENTER x as a fraction of screen width (0.5 = centered); overlayWinY = window

@@ -68,9 +68,7 @@
     "MegaShadow": "Terres de l'Ombre",
     "ProgressFocusResetHint": "Pour réinitialiser, appuyez sur '%s' dans le menu",
     "MenuBack": "Retour",
-    "MenuTools": "Outils",
     "MenuTotal": "Total",
-    "MenuSaveNow": "Enregistrer les reglages",
     "MenuUnavailable": "Page indisponible",
     "MenuPressKey": "Appuyez sur une touche...",
     "MenuKeepCurrent": "Conserver"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "Échec de l'exportation des marqueurs - réappuyez"
   },
   "section_labels": {
+    "Categories": "Catégories",
+    "Menu settings": "Réglages du mod",
     "Goblin": "Goblin",
     "Equipment": "Équipement",
     "Key Items": "Objets-clés",
@@ -92,18 +92,19 @@
     "World": "Monde",
     "ERR Markers": "Marqueurs natifs ERR",
     "Compatibility": "Compatibilité",
-    "Overlay & Hotkeys": "Menu et raccourcis",
+    "Menu & Hotkeys": "Menu et raccourcis",
     "Debug": "Débogage"
   },
   "section_comments": {
     "Reforged": "Contenu propre à Elden Ring Reforged. Absent de la version vanilla.",
     "ERR Markers": "Cette section applique les règles d'affichage de ce mod aux marqueurs de carte\npré-placés PROPRES à ERR (camps, marchands, boss, entrées de donjons) - PAS les\nicônes injectées par ce mod - afin que les deux jeux d'icônes suivent la même\nlogique de visibilité (découverte de fragment de carte, masquage après nettoyage).\nDésactivez une option pour laisser ce groupe de marqueurs exactement tel qu'ERR le\nfournit. Nos propres marqueurs de boss relèvent de [World] show_bosses et sont\nindépendants de cette section.",
     "Compatibility": "Options pour fonctionner aux côtés d'autres mods qui modifient le placement des objets.",
-    "Overlay & Hotkeys": "L'overlay de configuration en jeu et la touche/le bouton qui l'ouvre. toggle_key\n(clavier) / toggle_gamepad_combo (manette) OUVRENT l'overlay quand enable_overlay\nest activé, ou activent/désactivent TOUTES les icônes de carte quand il est désactivé.\nNoms de touches : F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter, Backspace, Home, End,\nPageUp, PageDown, Insert, Delete, flèches.",
+    "Menu & Hotkeys": "Le MENU du mod et la touche/le bouton qui l'ouvre. toggle_key (clavier) /\ntoggle_gamepad_combo (manette) OUVRENT le menu quand menu_enabled est activé, sinon\nils activent/désactivent TOUTES les icônes de carte. Le menu ouvert dépend de\nmenu_render_mode. Noms de touches : F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter,\nBackspace, Home, End, PageUp, PageDown, Insert, Delete, flèches.",
     "Debug": "Diagnostics, affichés dans l'onglet Débogage de l'overlay."
   },
   "entry_labels": {
     "require_map_fragments": "Exiger les fragments de carte",
+    "location_emphasis": "Mise en avant du lieu",
     "fast_map_open": "Ouverture rapide de la carte",
     "show_armaments": "Armes",
     "show_armour": "Armures",
@@ -179,8 +180,8 @@
     "live_loot_icons": "Icônes de butin dynamiques",
     "anonymous_loot": "Butin anonyme",
     "rebind": "Réassigner",
-    "ui_language": "Langue",
-    "enable_overlay": "Activer le menu",
+    "overlay_ui_language": "Langue de l'overlay",
+    "menu_enabled": "Activer le menu",
     "enable_toggle_hotkey": "Activer le raccourci de bascule",
     "toggle_key": "Touche de bascule",
     "toggle_gamepad_combo": "Combinaison manette",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "Masquage manuel des marqueurs",
     "hide_marker_key": "Touche masquer marqueur",
     "hover_info": "Infos au survol",
-    "overlay_render_mode": "Mode de rendu de l'overlay",
+    "menu_render_mode": "Type de menu",
     "hide_marker_gamepad": "Bouton de masquage"
   },
   "entry_comments": {
     "require_map_fragments": "Exiger la découverte du fragment de carte avant d'afficher les icônes de cette zone",
+    "location_emphasis": "Les marqueurs de la carte où vous vous trouvez sont plus grands; ceux qui semblent seulement proches (un donjon sous vos pieds, ou la surface au-dessus) sont plus petits. Rien n'est jamais masqué.",
     "fast_map_open": "BETA : accélère l'ouverture de la carte du monde quand beaucoup d'icônes sont affichées.\nDésactivez si la carte a des bugs ou plante.",
     "show_armaments": "Armes, boucliers, arcs, sceptres, etc.",
     "show_armour": "Pièces d'armure (casques, torse, gantelets, jambes)",
@@ -270,19 +272,19 @@
     "live_loot_labels": "Renommer chaque marqueur de butin avec l'objet que son lot donne actuellement, pour que les noms\ncorrespondent au randomizer. Utilise plus de mémoire (copie les noms d'objets dans la table de noms de la carte).",
     "live_loot_icons": "Donner à chaque marqueur de butin l'icône et la catégorie de l'objet que son lot donne\nactuellement, pour que les icônes et les bascules show_* correspondent au randomizer.",
     "anonymous_loot": "Sans spoiler : chaque marqueur de butin affiche un \"?\" gris et une étiquette générique au lieu\nde l'objet réel. Prévaut sur live_loot_labels/icons ; les marqueurs se masquent toujours au ramassage.",
-    "ui_language": "Langue de l'overlay. auto suit la langue du jeu Steam ; les langues non reconnues\nreviennent à l'anglais.",
-    "enable_overlay": "Overlay de configuration en jeu (Dear ImGui) ouvert avec la touche de bascule ci-dessous.\nMettez false si un conflit de hook DX (overlay Steam/RTSS/GeForce Experience) ou un\nproblème de pilote GPU rend le jeu instable.",
+    "overlay_ui_language": "Langue du menu OVERLAY. auto suit la langue du jeu Steam ; les langues non reconnues\nreviennent à l'anglais. Le menu en jeu ignore ce réglage et suit toujours la langue\ndu jeu.",
+    "menu_enabled": "Le menu du mod sur la touche ci-dessous. Désactivé, ces mêmes commandes\nactivent/désactivent TOUTES les icônes de carte et aucun menu ne s'ouvre - c'est\naussi le réglage à utiliser si un conflit de hook DX (overlay Steam/RTSS/GeForce\nExperience) ou un pilote GPU rend le jeu instable avec le menu overlay.",
     "enable_toggle_hotkey": "Activer toggle_key / toggle_gamepad_combo pour basculer TOUTES les icônes de carte quand\nl'overlay est DÉSACTIVÉ. (Quand l'overlay est activé, elles l'ouvrent à la place.)",
-    "toggle_key": "Bascule clavier : OUVRE l'overlay de configuration quand enable_overlay est activé, ou\nbascule TOUTES les icônes de carte quand l'overlay est désactivé. Par défaut : F10.",
-    "toggle_gamepad_combo": "Bascule manette, même rôle que toggle_key (ouvre l'overlay, ou bascule toutes les\nicônes si l'overlay est désactivé). Jetons joints par '+' : A,B,X,Y,LB,RB,\nL3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT. Par défaut : Y+R3.",
+    "toggle_key": "Bascule clavier : OUVRE l'overlay de configuration quand menu_enabled est activé, ou\nbascule TOUTES les icônes de carte quand l'overlay est désactivé. Par défaut : F10.",
+    "toggle_gamepad_combo": "Bascule manette, même rôle que toggle_key : ouvre la surcouche, ou active/désactive\nTOUTES les icônes de la carte si la surcouche est désactivée. Dans le menu, appuyez\nsimplement sur les boutons voulus. En modifiant ce fichier, les noms se joignent\navec '+' (A, B, X, Y, LB, RB, L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT).",
     "debug_logging": "Activer la journalisation de débogage détaillée (adresses mémoire, détails de param, internes FMG)",
     "enable_marker_dump": "Interrupteur principal du raccourci d'exportation des marqueurs",
     "marker_dump_key": "Touche pour exporter les marqueurs décodés vers logs/MapForGoblins_markers.log. Par défaut : F9.",
-    "overlay_render_mode": "Méthode de rendu de l'overlay : surface (défaut), layered (compatibilité max) ou swapchain (plus léger). Nécessite un redémarrage du jeu.",
+    "menu_render_mode": "QUEL menu la touche ouvre : native (le menu que le jeu dessine lui-même) ou imgui\n(la fenêtre overlay séparée). Modifiable ici uniquement - un menu ne peut pas\nhéberger le réglage qui décide de son existence. Redémarrage requis.",
     "show_world_maps_ignore_fragments": "Toujours afficher les marqueurs de fragments de carte, même si le filtrage par fragment est actif (pour trouver un fragment avant de le posséder).",
     "enable_manual_hide": "Survolez un marqueur sur la carte du monde et appuyez sur la touche de masquage. Les marqueurs masqués sont conservés et peuvent être réaffichés dans l'onglet 'Masqués'.",
     "hide_marker_key": "Touche qui masque le marqueur de carte sous le curseur.",
-    "hover_info": "Quand la carte est ouverte, affiche un petit panneau (en haut à gauche) avec le nom du marqueur survolé et sa hauteur par rapport à vous.",
+    "hover_info": "Carte ouverte, affiche à GAUCHE un petit panneau indiquant de combien le marqueur\nsous le curseur est au-dessus ou en dessous de vous. Son nom n'y est pas répété :\nla fenêtre du jeu l'affiche déjà.",
     "hide_marker_gamepad": "Bouton de manette qui masque le marqueur sous le curseur (comme la touche de masquage)."
   }
 }

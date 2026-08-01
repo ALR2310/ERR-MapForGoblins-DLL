@@ -11,7 +11,9 @@
 // that row ptr; the inject layer matches it to one of our CategoryRow::p.
 #include "goblin_maphover.hpp"
 
+#include "goblin_guarded.hpp"     // these engine calls fault on purpose; the logger stays quiet
 #include "goblin_collected.hpp"  // read_player_pos() for the height line
+#include "goblin_config.hpp"     // hover_info: this panel is now its ONLY consumer
 #include "goblin_i18n.hpp"    // the localized hover sentences
 #include "goblin_progress.hpp" // region names for the focus banner    // the localized hover sentences
 #include "goblin_inject.hpp"
@@ -50,6 +52,10 @@ namespace
     std::atomic<bool> g_root_probed{false};
 
     std::atomic<void *> g_hovered_row{nullptr};
+    // Where the game last told us its reticle is (map space), and when.
+    std::atomic<float> g_reticle_mx{0.0f};
+    std::atomic<float> g_reticle_mz{0.0f};
+    std::atomic<uint64_t> g_reticle_ms{0};
     std::atomic<void *> g_dialog{nullptr};
     std::atomic<void *> g_map_owner{nullptr};  // buildMarkers `this` (r15); its +0x398 map = current-layer pins
     std::atomic<uint64_t> g_last_hook_ms{0};
@@ -129,6 +135,55 @@ namespace
     // pan @+0x378/+0x37C, zoom/scale @+0x380, fullRect side @+0x358 (10496). We publish
     // this object directly (no dialog hunt) for the overlay projection. Verified live.
 
+    // ── where the game itself looks for a pin ────────────────────────────────────────
+    // Its per-frame update (FUN_1409C32F0, the routine that calls our hook) hands its own pin finder a
+    // position pair, and it has TWO of them: the dialog's flag at +0x2F01 selects which. That is the
+    // very question our own pick used to answer by guessing from the build ("the reticle is the view
+    // centre, unless this is Convergence, where it follows the pointer") - and that guess was only true
+    // while the map can still pan. At full zoom-out it cannot, the reticle leaves the centre, and the
+    // guess described whatever sat in the middle of the screen instead.
+    //
+    // Both pairs are MAP space - the same space the pins the finder returns carry at pin+0x10 - so they
+    // can be handed straight to our own nearest-marker search. Offsets are on the DIALOG, which is
+    // MapArea - 0x27D8 (the same relation the map-layer field uses).
+    constexpr size_t kDlgFromArea = 0x27D8;
+    constexpr size_t kDlgSearchMode = 0x2F01;   // 0 = search around the pair below, else the other one
+    constexpr size_t kDlgReticlePair = 0xA38;   // float x, float z (the dialog copies it from +0x2EB4)
+    constexpr size_t kDlgPointerPair = 0x2EBC;  // float x, float z
+    // The map is a square of a bit over 10000 units a side, so anything far outside that is not a
+    // position and the caller keeps whatever it did before.
+    constexpr float kMapCoordLo = -4000.0f;
+    constexpr float kMapCoordHi = 18000.0f;
+
+    bool read_reticle_pair(void *map_area, float *mx, float *mz, bool *pointer_mode)
+    {
+        if (!map_area)
+            return false;
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try
+        {
+            const uintptr_t dlg = reinterpret_cast<uintptr_t>(map_area) - kDlgFromArea;
+            const bool ptr_mode = *reinterpret_cast<uint8_t *>(dlg + kDlgSearchMode) != 0;
+            const float *p = reinterpret_cast<const float *>(
+                dlg + (ptr_mode ? kDlgPointerPair : kDlgReticlePair));
+            const float x = p[0], z = p[1];
+            if (x > kMapCoordLo && x < kMapCoordHi && z > kMapCoordLo && z < kMapCoordHi)
+            {
+                *mx = x;
+                *mz = z;
+                *pointer_mode = ptr_mode;
+                ok = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+        --goblin::guarded::depth;
+        return ok;
+    }
+
     bool read_vt(void *obj, uintptr_t &out)
     {
         __try { out = *reinterpret_cast<uintptr_t *>(obj); return true; }
@@ -145,6 +200,16 @@ namespace
     // projection would drift from the map's view transform on every zoom/pan change.
     constexpr uintptr_t kSetVisible = 0x733340;
     constexpr uintptr_t kSetPosI = 0x7331A0;
+    // ── the game's own wrappers are a different type from a resolved proxy ───────────
+    // A path lookup hands back a PLAIN proxy: the object itself, and the two primitives above take it
+    // directly. The popup and each of its lines are a RICH wrapper that embeds such a proxy at +8 and
+    // remembers what it last applied: visibility at +0x69, position at +0x78/+0x7C. Both of the
+    // game's own setters below take that wrapper, and they SKIP a write that matches their memory -
+    // so touching one of those objects through its inner proxy instead would leave the memory lying,
+    // and the game's own next write would be dropped as redundant. That is why the popup is shown
+    // with kPanelVisible and placed with kPanelPosF, never with the two primitives above.
+    constexpr uintptr_t kPanelVisible = 0x735A60;  // FUN_140735A60(wrapper, 0|1)
+    constexpr uintptr_t kPanelPosF = 0x7356E0;     // FUN_1407356E0(wrapper, float[2])
     constexpr uintptr_t kSetTextHtml = 0x74A000;
     constexpr uintptr_t kResolve = 0x74A2F0;
     constexpr uintptr_t kProxyValid = 0x733150;
@@ -156,6 +221,8 @@ namespace
     constexpr int kTipLines = 8;
     constexpr const char *kTipPanel = "MfgTip";
     constexpr const char *kBannerPanel = "MfgBanner";
+    // The game's own name popup. Only the fallback path touches it - see drive_own_tip.
+    constexpr const char *kGamePanel = "PlaceName";
     constexpr uint32_t kBannerRed = 0xFFE05050; // top byte = alpha, or it draws clear
     // Set explicitly rather than left to the field's authored colour, which read as grey.
     constexpr uint32_t kTipColor = 0xFFE8D9A0;  // the parchment the menu uses for values
@@ -187,6 +254,8 @@ namespace
     // span can be checked against 1080 instead of assumed.
     bool map_bounds(void *map_area, float *left, float *top, float *right, float *bottom)
     {
+        bool ok = false;
+        ++goblin::guarded::depth;
         __try
         {
             const uintptr_t a = reinterpret_cast<uintptr_t>(map_area);
@@ -194,12 +263,14 @@ namespace
             *top = *reinterpret_cast<float *>(a + 0x344);
             *right = *reinterpret_cast<float *>(a + 0x348);
             *bottom = *reinterpret_cast<float *>(a + 0x34C);
-            return true;
+            ok = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return false;
+            ok = false;
         }
+        --goblin::guarded::depth;
+        return ok;
     }
 
     bool map_x_bounds(void *map_area, float *left, float *right)
@@ -230,16 +301,191 @@ namespace
         return static_cast<int>(t + span * 0.5f);
     }
 
+    // ── where is the game's own popup right now? ─────────────────────────────────────
+    // FUN_1407356E0(wrapper, float[2]) stores the position it is about to apply at wrapper+0x78
+    // before applying it, and the popup's wrapper is `panel + 8` (the hook's rcx + 8, the object the
+    // game shows/hides and places). So this pair IS the popup's live position, in the same space our
+    // own panel is placed in - Body's - with the game's own clamping already folded in. Reading it
+    // beats re-deriving the projection: the game clamps against the map's bounds with the panel's own
+    // shoulder widths, and any drift there would show as a panel sitting a few pixels off.
+    constexpr size_t kWrapperPosOff = 8 + 0x78;
+
+    bool popup_pos(void *panel, float *x, float *y)
+    {
+        if (!panel)
+            return false;
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try
+        {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(panel);
+            const float px = *reinterpret_cast<float *>(p + kWrapperPosOff);
+            const float py = *reinterpret_cast<float *>(p + kWrapperPosOff + 4);
+            // Before the first hover the cache is still zero while the clip sits at its authored
+            // spot, and a delta computed from that would be wrong by exactly that offset. One frame
+            // without our line is better than one frame with it in the wrong place.
+            if (px != 0.0f || py != 0.0f)
+            {
+                *x = px;
+                *y = py;
+                ok = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+        --goblin::guarded::depth;
+        return ok;
+    }
+
+    // Where the sprite's first line sits inside its panel, and how far apart the lines are (authored;
+    // identical in the vanilla movie and in the Convergence one, which is vanilla-derived). Borrowing
+    // a line of the game's panel means placing the LINE, so these keep it exactly where our own
+    // panel's lines land.
+    constexpr float kLineInsetX = 17.0f;
+    constexpr float kLineInsetY = -39.0f;
+    constexpr float kLinePitch = 35.9f;
+
+    // Place / show the game's popup through the very primitives it uses on it itself: the float
+    // placer also refreshes the wrapper's remembered position, so the game's next hover still moves
+    // the popup wherever it wants instead of deciding it is already there.
+    bool popup_place(uintptr_t base, void *panel, const float *at)
+    {
+        if (!panel)
+            return false;
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try
+        {
+            reinterpret_cast<char (*)(void *, const float *)>(base + kPanelPosF)(
+                reinterpret_cast<uint8_t *>(panel) + 8, at);
+            ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+        --goblin::guarded::depth;
+        return ok;
+    }
+
+    void popup_show(uintptr_t base, void *panel, bool show)
+    {
+        if (!panel)
+            return;
+        ++goblin::guarded::depth;
+        __try
+        {
+            reinterpret_cast<void (*)(void *, char)>(base + kPanelVisible)(
+                reinterpret_cast<uint8_t *>(panel) + 8, show ? 1 : 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        --goblin::guarded::depth;
+    }
+
+    // The game's own wrapper for line `i` of its popup, at the address its per-frame loop walks:
+    // panel + 0x108 + variant * 0xC80, rounded up to 8, then i * 0x180 - with the slot count at
+    // +0xC08 of that base. null when the layout is not the one we parsed or the slot is out of range.
+    void *game_line(void *panel, int i)
+    {
+        if (!panel || i < 0)
+            return nullptr;
+        void *res = nullptr;
+        ++goblin::guarded::depth;
+        __try
+        {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(panel);
+            const uint32_t variant = *reinterpret_cast<uint32_t *>(p + 0x19C0);
+            uintptr_t b = p + 0x108 + static_cast<uintptr_t>(variant) * 0xC80;
+            b += (-static_cast<intptr_t>(b)) & 7;
+            const int64_t slots = *reinterpret_cast<int64_t *>(b + 0xC08);
+            if (slots > 0 && slots <= 64 && i < slots)
+                res = reinterpret_cast<void *>(b + static_cast<uintptr_t>(i) * 0x180);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            res = nullptr;
+        }
+        --goblin::guarded::depth;
+        return res;
+    }
+
+    // Hide one of the game's OWN lines the way the game would, so its wrapper's memory stays true and
+    // its next "show this line" is not dropped as redundant (that would stop the map naming places).
+    void game_line_hide(uintptr_t base, void *panel, int i)
+    {
+        void *w = game_line(panel, i);
+        if (!w)
+        {
+            // Said once: without it the popup we force visible for the banner can keep showing the
+            // last place name it was given, and that would otherwise look like a phantom label.
+            static bool s_said = false;
+            if (!s_said)
+            {
+                s_said = true;
+                spdlog::info("[maphover] the popup's line array is not where we parse it - the game's "
+                             "own lines cannot be blanked while the focus banner borrows the panel");
+            }
+            return;
+        }
+        ++goblin::guarded::depth;
+        __try
+        {
+            reinterpret_cast<void (*)(void *, char)>(base + kPanelVisible)(w, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        --goblin::guarded::depth;
+    }
+
     // POD-only worker (SEH): set one of our lines, or hide it.
+    // Is a panel actually in this movie? Resolved once per map open: the answer only changes when a
+    // different 02_120 is loaded. -1 unknown, 0 no, 1 yes.
+    int g_have_own_tip = -1;
+
+    bool panel_present(uintptr_t base, void *root, const char *panel)
+    {
+        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(base + kResolve);
+        auto p_valid = reinterpret_cast<char (*)(void *)>(base + kProxyValid);
+        auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
+        bool ok = false;
+        ++goblin::guarded::depth;
+        __try
+        {
+            char path[128];
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "Body/%s", panel);
+            uint8_t buf[0x60] = {};
+            void *pp = p_resolve(root, buf, path);
+            ok = p_valid(pp) != 0;
+            p_dtor(buf + 0x28);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+        --goblin::guarded::depth;
+        return ok;
+    }
+
+    // `at` (optional, 2 floats) moves the line inside its panel. Only the borrowed-panel path uses it:
+    // our own panel is placed as a whole, while a line of the GAME's panel has to be pulled out from
+    // under a panel that follows the marker. The game never positions these lines itself (its
+    // per-frame routine only sets each line's text and visibility), so the write is not fought.
     void tip_line(uintptr_t base, void *root, const char *panel, int i, const wchar_t *text,
-                  uint32_t rgb)
+                  uint32_t rgb, const float *at = nullptr)
     {
         auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(base + kResolve);
         auto p_valid = reinterpret_cast<char (*)(void *)>(base + kProxyValid);
         auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
         auto p_visible = reinterpret_cast<void (*)(void *, char)>(base + kSetVisible);
+        auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(base + kSetPosI);
         auto p_settext =
             reinterpret_cast<void (*)(void *, const wchar_t *)>(base + kSetTextHtml);
+        ++goblin::guarded::depth;
         __try
         {
             char path[128];
@@ -249,6 +495,8 @@ namespace
             if (p_valid(line))
             {
                 p_visible(line, text ? 1 : 0);
+                if (text && at)
+                    p_pos(line, static_cast<int32_t>(at[0]), static_cast<int32_t>(at[1]));
                 if (text)
                 {
                     _snprintf_s(path, sizeof(path), _TRUNCATE,
@@ -280,6 +528,38 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+        --goblin::guarded::depth;
+    }
+
+    // ── where is the reticle? (measurement, not assumption) ─────────────────────────
+    // Offset of the position pair inside a display object, discovered once by writing a known
+    // position and looking for it. -1 until found. The proxy holds the display object at +0x50 (the
+    // same pdata the icon work identified), and Scaleform keeps the transform in twips, so the pair
+    // we look for is (x*20, y*20) as floats.
+
+    uintptr_t proxy_object(void *proxy)
+    {
+        __try
+        {
+            return *reinterpret_cast<uintptr_t *>(reinterpret_cast<uint8_t *>(proxy) + 0x50);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    bool read_float(uintptr_t at, float *out)
+    {
+        __try
+        {
+            *out = *reinterpret_cast<float *>(at);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     // POD-only: show/hide our panel root and place it.
@@ -290,6 +570,7 @@ namespace
         auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
         auto p_visible = reinterpret_cast<void (*)(void *, char)>(base + kSetVisible);
         auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(base + kSetPosI);
+        ++goblin::guarded::depth;
         __try
         {
             char path[128];
@@ -300,7 +581,9 @@ namespace
             {
                 p_visible(tip, show ? 1 : 0);
                 if (show)
+                {
                     p_pos(tip, x, y);
+                }
             }
             p_dtor(buf + 0x28);
             // The sprite carries two text variants; only ours is used, so the other stays off.
@@ -314,6 +597,7 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+        --goblin::guarded::depth;
     }
 
     // Map space -> the space Body's children live in. The game's converter (FUN_1409CC470) is
@@ -323,6 +607,8 @@ namespace
     // the first attempt (which needed one) never showed anything on hover.
     bool tip_pos_from_map(void *map_area, float map_x, float map_z, float *out2)
     {
+        bool ok = false;
+        ++goblin::guarded::depth;
         __try
         {
             const uintptr_t a = reinterpret_cast<uintptr_t>(map_area);
@@ -331,16 +617,47 @@ namespace
             const float zoom = *reinterpret_cast<float *>(a + 0x380);
             out2[0] = zoom * map_x - pan_x;
             out2[1] = zoom * map_z - pan_z;
-            return true;
+            ok = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return false;
+            ok = false;
         }
+        --goblin::guarded::depth;
+        return ok;
     }
 
-    // Fill and place OUR panel for `row`, or hide it when nothing is hovered. Everything here is
-    // ours: our clip, our lines, our text, our position. The game's Body/PlaceName is untouched.
+    // Does this movie carry our own panels? Answered once, from the movie itself: a mod that ships
+    // its own 02_120_worldmap is served by a route the load-time transform never sees, and then our
+    // named placements are simply not there.
+    void detect_own_tip(uintptr_t base, void *root)
+    {
+        if (g_have_own_tip >= 0)
+            return;
+        g_have_own_tip = panel_present(base, root, kTipPanel) ? 1 : 0;
+        spdlog::info("[maphover] own panels in this movie: {}. {}", g_have_own_tip ? "yes" : "NO",
+                     g_have_own_tip
+                         ? "the height line and the focus banner go into our own panels"
+                         : "the movie was replaced by a mod, so both borrow spare lines of the game's "
+                           "own name popup (height on the last, banner on three before it) and are "
+                           "placed against it so they stand still");
+    }
+
+    // Take the hover line off screen. The borrowed line has to be hidden EXPLICITLY: the game only
+    // ever shows as many lines as its own pin has text for, so ours would otherwise stay up and hang
+    // under the next place name the map shows.
+    void clear_own_tip(uintptr_t base, void *root)
+    {
+        if (g_have_own_tip)
+            tip_root(base, root, kTipPanel, false, 0, 0);
+        else
+            tip_line(base, root, kGamePanel, kTipLines - 1, nullptr, 0);
+    }
+
+    // Fill and place the hover line for `row`, or hide it when nothing is hovered. On a normal build
+    // that is OUR clip, our lines, our text and our position, with the game's Body/PlaceName
+    // untouched. When the movie was replaced (so our clip is absent) it is the spare last line of the
+    // game's own popup, pulled to the same corner our panel would occupy.
     void drive_own_tip(void *map_area, void *row, bool have_map, float map_x, float map_z)
     {
         if (!map_area)
@@ -348,13 +665,22 @@ namespace
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         void *root =
             reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(map_area) - 0x27D8 + 0x120);
+        detect_own_tip(base, root);
+        // hover_info used to gate the OVERLAY's hover panel, retired in favour of this one. Honour
+        // it here, or the setting silently becomes a no-op: the player turns hover info off and this
+        // panel keeps showing. It is now the only consumer of that key.
+        if (!goblin::config::enableHoverInfo)
+        {
+            clear_own_tip(base, root);
+            return;
+        }
         const goblin::HoveredMarker hm =
             row ? goblin::hovered_marker(row) : goblin::HoveredMarker{};
         (void)map_x;
         (void)map_z;
         if (!hm.matched || !have_map)
         {
-            tip_root(base, root, kTipPanel, false, 0, 0);
+            clear_own_tip(base, root);
             return;
         }
         // No name line: the game's own popup already shows it, so ours would only repeat it.
@@ -380,21 +706,58 @@ namespace
                             ad);
             MultiByteToWideChar(CP_UTF8, 0, utf8, -1, l1, 192);
         }
-        tip_line(base, root, kTipPanel, 0, l1[0] ? l1 : nullptr, kTipColor);
-        for (int i = 1; i < kTipLines; ++i)
-            tip_line(base, root, kTipPanel, i, nullptr, 0);
+        if (!l1[0])
+        {
+            clear_own_tip(base, root);  // nothing to say about this marker's height
+            return;
+        }
         // STATIC in the corner, like the overlay's hover panel was. Letting the vertical follow
         // the marker made it ride the map while panning, and worse: the reticle re-picks the
         // nearest marker every frame, so the panel also jumped between different ones.
         float left = 0.0f, right = 0.0f;
         map_x_bounds(map_area, &left, &right);
-        tip_root(base, root, kTipPanel, true, static_cast<int>(left + kPanelLeftInset),
-                 map_middle_y(map_area, kTipTopY));
+        const float tx = left + kPanelLeftInset;
+        const float ty = static_cast<float>(map_middle_y(map_area, kTipTopY));
+        if (!g_have_own_tip)
+        {
+            // Borrowed line. Its host panel is the game's, and the game keeps that panel ON the
+            // marker - so the line is placed against the panel rather than with it: the position we
+            // give a line is relative to its panel, and subtracting where the panel currently is
+            // leaves the line standing still at our corner while the name above keeps following the
+            // pin. Without this the height line rode the popup down to the reticle.
+            float hx = 0.0f, hy = 0.0f;  // where the host panel is
+            if (popup_pos(g_popup_panel.load(std::memory_order_relaxed), &hx, &hy))
+            {
+                const float local[2] = {tx + kLineInsetX - hx, ty + kLineInsetY - hy};
+                tip_line(base, root, kGamePanel, kTipLines - 1, l1, kTipColor, local);
+            }
+            else
+            {
+                // The popup's position is not established yet (nothing has been hovered since the
+                // map opened). Show the text where the panel puts it rather than nowhere; the very
+                // next frame has the position.
+                tip_line(base, root, kGamePanel, kTipLines - 1, l1, kTipColor);
+            }
+            return;
+        }
+        tip_line(base, root, kTipPanel, 0, l1, kTipColor);
+        for (int i = 1; i < kTipLines; ++i)
+            tip_line(base, root, kTipPanel, i, nullptr, 0);
+        tip_root(base, root, kTipPanel, true, static_cast<int>(tx), static_cast<int>(ty));
     }
+
+    // Which lines of the GAME's popup the banner borrows when our own clip is absent. The last line is
+    // the height line's, so the banner takes the three before it - the ones a place name never reaches
+    // (the map's own pins carry one or two lines).
+    constexpr int kBorrowBannerFirst = 3;
+    constexpr int kBorrowBannerLines = 3;
 
     // The focus banner: the same two red lines the overlay put in the corner while a progress
     // category is isolated on the map. Its own panel, so it and the hover tooltip never fight.
-    void drive_own_banner(void *map_area)
+    // `popup_hidden` says the game had nothing to name this frame, so it left its own popup hidden
+    // with the lines it owns still carrying the last name - which the borrowed path has to undo, or
+    // the banner would only ever appear while the reticle happens to sit on something.
+    void drive_own_banner(void *map_area, bool popup_hidden)
     {
         if (!map_area)
             return;
@@ -404,7 +767,11 @@ namespace
         const int cat = goblin::focus_category();
         if (cat < 0)
         {
-            tip_root(base, root, kBannerPanel, false, 0, 0);
+            if (g_have_own_tip)
+                tip_root(base, root, kBannerPanel, false, 0, 0);
+            else
+                for (int i = 0; i < kBorrowBannerLines; ++i)
+                    tip_line(base, root, kGamePanel, kBorrowBannerFirst + i, nullptr, 0);
             return;
         }
         // Line 1: what is being shown. Category name from its ini key (the same label the menu
@@ -420,33 +787,67 @@ namespace
         const char *reg_name = reg_name_buf.c_str();
         // Two lines, not one: a line's text field is 454px wide, and the heading plus the
         // category plus the region ran past it and came out clipped.
+        wchar_t wl[kBorrowBannerLines][320] = {};
         _snprintf_s(utf8, sizeof(utf8), _TRUNCATE, "%s",
                     goblin::i18n::tr(goblin::i18n::TextId::ProgressShowingOnly));
-        wchar_t w0[320] = {};
-        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w0, 320);
-        tip_line(base, root, kBannerPanel, 0, w0, kBannerRed);
+        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wl[0], 320);
         char subject[320] = {};
         _snprintf_s(subject, sizeof(subject), _TRUNCATE, "%s - %s",
                     ckey ? goblin::i18n::entry_label(ckey) : "?", reg_name);
-        wchar_t wsub[320] = {};
-        MultiByteToWideChar(CP_UTF8, 0, subject, -1, wsub, 320);
-        tip_line(base, root, kBannerPanel, 1, wsub, kBannerRed);
+        MultiByteToWideChar(CP_UTF8, 0, subject, -1, wl[1], 320);
         // Line 2: how to clear it - the hint names the menu's own Reset row.
         char hint[320] = {};
         _snprintf_s(hint, sizeof(hint), _TRUNCATE,
                     goblin::i18n::tr(goblin::i18n::TextId::ProgressFocusResetHint),
                     goblin::i18n::tr(goblin::i18n::TextId::ProgressFocusClear));
-        wchar_t w1[320] = {};
-        MultiByteToWideChar(CP_UTF8, 0, hint, -1, w1, 320);
-        tip_line(base, root, kBannerPanel, 2, w1, kBannerRed);
-        for (int i = 3; i < kTipLines; ++i)
-            tip_line(base, root, kBannerPanel, i, nullptr, 0);
+        MultiByteToWideChar(CP_UTF8, 0, hint, -1, wl[2], 320);
         // Top-left corner: the map's own left bound, and far enough down that the first line
         // (authored at ty -39.3) is on screen.
         float left = 0.0f, right = 0.0f;
         map_x_bounds(map_area, &left, &right);
-        tip_root(base, root, kBannerPanel, true,
-                 static_cast<int>(left + kPanelLeftInset), kBannerTopY);
+        const float bx = left + kPanelLeftInset;
+        const float by = static_cast<float>(kBannerTopY);
+        if (!g_have_own_tip)
+        {
+            // Borrowed lines, placed against the game's popup the same way the height line is.
+            void *ppanel = g_popup_panel.load(std::memory_order_relaxed);
+            float px = 0.0f, py = 0.0f;
+            if (!popup_pos(ppanel, &px, &py))
+            {
+                // The popup has no position of its own yet (nothing hovered since the map opened).
+                // The banner does not depend on a hover, so it cannot wait for one: place the popup
+                // ourselves, through the game's own placer so its next hover still moves it.
+                const float at[2] = {bx, by};
+                if (!popup_place(base, ppanel, at))
+                    return;
+                px = bx;
+                py = by;
+            }
+            if (popup_hidden)
+            {
+                // Nothing was named this frame, so the lines the game owns go off with it - it left
+                // them as the last name found them, and an empty line still draws its backdrop strip.
+                // Only on such a frame: doing it when the game DID name something would blank a name
+                // the player is reading. Through the game's own setter, so it can show them again.
+                for (int i = 0; i < kBorrowBannerFirst; ++i)
+                    game_line_hide(base, ppanel, i);
+            }
+            // Unconditional: the game hides its popup on every frame it has nothing to name, and our
+            // lines live inside it. Showing one that is already visible costs a single property write.
+            popup_show(base, ppanel, true);
+            for (int i = 0; i < kBorrowBannerLines; ++i)
+            {
+                const float at[2] = {bx + kLineInsetX - px,
+                                     by + kLineInsetY + kLinePitch * static_cast<float>(i) - py};
+                tip_line(base, root, kGamePanel, kBorrowBannerFirst + i, wl[i], kBannerRed, at);
+            }
+            return;
+        }
+        for (int i = 0; i < kBorrowBannerLines; ++i)
+            tip_line(base, root, kBannerPanel, i, wl[i], kBannerRed);
+        for (int i = kBorrowBannerLines; i < kTipLines; ++i)
+            tip_line(base, root, kBannerPanel, i, nullptr, 0);
+        tip_root(base, root, kBannerPanel, true, static_cast<int>(bx), kBannerTopY);
     }
 
     void *placename_detour(void *panel, void *item, void *map_area)
@@ -605,16 +1006,41 @@ namespace
                 pos[1] = orig_pos1;
                 *vis = orig_vis;
                 drive_own_tip(map_area, ours, true, ours_mx, ours_mz);
-                drive_own_banner(map_area);
+                // The game was handed a pin, so its popup is up: the banner only has to add its own
+                // lines to it.
+                drive_own_banner(map_area, false);
                 return ret;
             }
         }
+        // The game hovered one of ITS pins: that pin's map position is where the reticle is, which
+        // is the one measurement that says whether this build's reticle is centred or follows the
+        // cursor. Read-only, and only when the engine handed us a pin.
+        if (item)
+        {
+            __try
+            {
+                const float *pp = reinterpret_cast<const float *>(
+                    reinterpret_cast<uint8_t *>(item) + PIN_POS_OFF);
+                g_reticle_mx.store(pp[0], std::memory_order_relaxed);
+                g_reticle_mz.store(pp[1], std::memory_order_relaxed);
+                g_reticle_ms.store(GetTickCount64(), std::memory_order_relaxed);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
         g_hovered_row.store(row, std::memory_order_relaxed);
+        // AFTER the game's own pass, not before: on a build whose movie was replaced, our lines live
+        // inside the game's popup, and the game rewrites those lines (and hides the popup) every
+        // frame. Running first meant writing text the same frame then wiped.
+        void *ret = o_placename(panel, item, map_area);
         // Only the native reticle gives us MAP coordinates, and only our own rows ever match
         // hovered_marker() anyway - so that is the row the panel follows here.
         drive_own_tip(map_area, ours, ours != nullptr, ours_mx, ours_mz);
-        drive_own_banner(map_area);
-        return o_placename(panel, item, map_area);
+        // No pin of ours went in, so the game's popup is hidden unless the engine focused one of its
+        // own pins - which is exactly what `item` says.
+        drive_own_banner(map_area, item == nullptr);
+        return ret;
     }
 }  // namespace
 
@@ -686,6 +1112,55 @@ void goblin::maphover::setup()
     {
         spdlog::error("[maphover] buildMarkers hook failed (layer pin list disabled): {}", e.what());
     }
+}
+
+// The last position the GAME's own hover reported, in map space, with the time it arrived. That
+// position is the reticle: the engine only reports a pin the reticle is on. Used to work out which
+// anchor the build's map uses - see the calibration in goblin_overlay.cpp.
+bool goblin::maphover::reticle_map(float *mx, float *mz, uint64_t max_age_ms)
+{
+    const uint64_t at = g_reticle_ms.load(std::memory_order_relaxed);
+    if (!at || GetTickCount64() - at > max_age_ms)
+        return false;
+    *mx = g_reticle_mx.load(std::memory_order_relaxed);
+    *mz = g_reticle_mz.load(std::memory_order_relaxed);
+    return true;
+}
+
+bool goblin::maphover::reticle_live(float *mx, float *mz, bool *pointer_mode)
+{
+    if (GetTickCount64() - g_last_hook_ms.load(std::memory_order_relaxed) > 300)
+        return false;  // map closed - the dialog's fields are last frame's at best
+    void *area = g_dialog.load(std::memory_order_relaxed);
+    bool ptr_mode = false;
+    if (!read_reticle_pair(area, mx, mz, &ptr_mode))
+        return false;
+    if (pointer_mode)
+        *pointer_mode = ptr_mode;
+    // Said once per session, and only once there is something to say it AGAINST: the game's own hover
+    // reports a pin the reticle was ON, so the two being close is what says this is the field it
+    // searches around - on a build nobody has run this on. Waiting for the sample matters; done on the
+    // first read it fired on the frame the map opened, before anything had ever been focused, and
+    // printed a comparison with nothing.
+    static std::atomic<int> s_said{0};
+    if (!s_said.load(std::memory_order_relaxed))
+    {
+        float rmx = 0.0f, rmz = 0.0f;
+        if (goblin::maphover::reticle_map(&rmx, &rmz, 400) &&
+            s_said.exchange(1, std::memory_order_relaxed) == 0)
+        {
+            const float d = (rmx - *mx) * (rmx - *mx) + (rmz - *mz) * (rmz - *mz);
+            // The sample is a PIN, not the reticle itself, so it is only ever as close as the engine's
+            // own focus radius. Well beyond that means a different field is being read.
+            const bool agree = d < 300.0f * 300.0f;
+            spdlog::info("[maphover] reticle from the dialog: ({:.0f},{:.0f}) via the {} pair; the "
+                         "game's own focused pin: ({:.0f},{:.0f}) - {}",
+                         *mx, *mz, ptr_mode ? "pointer" : "reticle", rmx, rmz,
+                         agree ? "they agree, so this is the position it searches around"
+                               : "THEY DISAGREE, so this is not that position");
+        }
+    }
+    return true;
 }
 
 void *goblin::maphover::hovered_row()

@@ -1112,10 +1112,10 @@ void goblin::setup_messages()
     // bank. Fresh id above the live max never collides with an overhaul's own menu text. Sanity-check
     // the slot by resolving id 110000 (the "System" tab label) before touching it.
     //
-    // Keyed on native_menu, NOT on debug_logging: this WRITES a rebuilt FMG into the game's
+    // Keyed on the menu mode, NOT on debug_logging: this WRITES a rebuilt FMG into the game's
     // MsgRepository and publishes the ids the menu resolves through, so a log key must not decide it -
     // and with the log key off the menu silently fell back to unlocalized labels.
-    if (goblin::config::nativeMenu)
+    if (goblin::config::native_menu_enabled())
     {
         constexpr int kMenuTextSlot = 200;
         if (count2 > kMenuTextSlot && sub[kMenuTextSlot] &&

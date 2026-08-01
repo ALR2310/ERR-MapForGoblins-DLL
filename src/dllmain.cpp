@@ -13,6 +13,7 @@
 
 #include "goblin_collected.hpp"
 #include "goblin_config.hpp"
+#include "goblin_guarded.hpp"  // "we asked for this fault": what the crash logger must not record
 #include "goblin_inject.hpp"
 #include "goblin_kindling.hpp"
 #include "goblin_logic.hpp"
@@ -257,6 +258,33 @@ namespace goblin::watch
     }
 }
 
+// One record: a header line with the label, the code and the faulting address, then the stack.
+static void crash_write_record(const char *label, DWORD code, uintptr_t fault)
+{
+    if (g_crash_file == INVALID_HANDLE_VALUE)
+        return;
+    char line[1024];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    int len = wsprintfA(line, "\n[%04d-%02d-%02d %02d:%02d:%02d] [%s] code=0x%08X fault=", st.wYear,
+                        st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, label,
+                        static_cast<unsigned>(code));
+    len += crash_fmt_addr(line + len, fault);
+    line[len++] = '\n';
+    DWORD wr = 0;
+    WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+    void *frames[20];
+    const USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
+    for (USHORT i = 0; i < n; ++i)
+    {
+        len = wsprintfA(line, "  #%02d ", i);
+        len += crash_fmt_addr(line + len, reinterpret_cast<uintptr_t>(frames[i]));
+        line[len++] = '\n';
+        WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+    }
+    FlushFileBuffers(g_crash_file);
+}
+
 static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
 {
     // The watch fires as a single-step with the DR6 hit bit set. Log who wrote, then carry on.
@@ -335,34 +363,35 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
     // raise it. Latch after a handful so a fault loop cannot fill the disk.
     if (code == 0xC0000005 && fault >= g_self_base && fault < g_self_base + g_self_size)
         return EXCEPTION_CONTINUE_SEARCH;
+    // Same thing one step out: a fault inside an ENGINE function we called on purpose, from a frame
+    // that handles it. The faulting address is the engine's, so the test above cannot see it - the
+    // caller says so instead (goblin_guarded.hpp). Twelve such records in one ERR session, with the
+    // game alive throughout, are what this removes.
+    if (code == 0xC0000005 && goblin::guarded::inside())
+        return EXCEPTION_CONTINUE_SEARCH;
     static volatile LONG s_logged = 0;
     if (InterlockedIncrement(&s_logged) > 12)
         return EXCEPTION_CONTINUE_SEARCH;
     if (g_crash_file == INVALID_HANDLE_VALUE)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    char line[1024];
-    int len = 0;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    len += wsprintfA(line + len, "\n[%04d-%02d-%02d %02d:%02d:%02d] [CRASH] code=0x%08X fault=",
-                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                     static_cast<unsigned>(code));
-    len += crash_fmt_addr(line + len, fault);
-    line[len++] = '\n';
-    DWORD wr = 0;
-    WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+    crash_write_record("EXCEPTION", code, fault);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
-    void *frames[20];
-    const USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
-    for (USHORT i = 0; i < n; ++i)
-    {
-        len = wsprintfA(line, "  #%02d ", i);
-        len += crash_fmt_addr(line + len, reinterpret_cast<uintptr_t>(frames[i]));
-        line[len++] = '\n';
-        WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
-    }
-    FlushFileBuffers(g_crash_file);
+// [EXCEPTION] vs [CRASH]. A vectored handler runs on EVERY fault, long before anything decides whether
+// it is fatal, so it cannot honestly call one a crash - and while it did, a session with a live game
+// carried a dozen "CRASH" lines and the one real crash looked no different. So the vectored handler
+// says what it knows ("this fault happened"), and the record below is written only from the
+// unhandled-exception filter, i.e. when nothing handled it and the process IS going down.
+//
+// Both are kept because either can be missing: a game that installs its own filter after ours shadows
+// the second, and then the first-chance line is all there is.
+static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
+{
+    crash_write_record("CRASH", ep->ExceptionRecord->ExceptionCode,
+                       reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress));
+    // Hand it on: whatever wrote the process dumps before still does.
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -378,6 +407,7 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
     AddVectoredExceptionHandler(1, crash_veh);
+    SetUnhandledExceptionFilter(crash_ueh);
 }
 
 static void setup_logger(std::filesystem::path log_file)
@@ -520,7 +550,7 @@ static void setup_mod()
     // applies the master-off flag (set by the toggle hotkey OR the overlay's
     // "Show map icons" checkbox). Run it whenever EITHER path can set that flag,
     // so the overlay's master switch works even if the toggle hotkey is disabled.
-    if (goblin::config::enableToggleHotkey || goblin::config::enableOverlay)
+    if (goblin::config::enableToggleHotkey || goblin::config::menuEnabled)
     {
         std::thread(goblin::menu_auto_toggle_loop).detach();
         spdlog::info("Icon-state watcher started (icons EXPANDED always; master show/hide via hotkey or overlay)");

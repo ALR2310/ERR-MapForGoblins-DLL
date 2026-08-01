@@ -721,28 +721,12 @@ def generate_legacy_conv_cpp(conv_json, output_path):
     if not conv_json.exists():
         print(f"  WARNING: {conv_json} missing, skipping")
         return
-    rows = json.load(open(conv_json, encoding='utf-8'))
-    # Keep first row per (srcArea, srcGridX) that lands in 60/61
-    by_key = {}
-    for r in rows:
-        if not isinstance(r, dict): continue
-        src_area = int(r.get('srcAreaNo', 0))
-        src_gx = int(r.get('srcGridXNo', 0))
-        dst_area = int(r.get('dstAreaNo', 0))
-        if dst_area not in (60, 61): continue
-        key = (src_area, src_gx)
-        if key in by_key: continue
-        by_key[key] = {
-            'src_area': src_area, 'src_gx': src_gx,
-            'src_pos_x': float(r.get('srcPosX', 0)),
-            'src_pos_z': float(r.get('srcPosZ', 0)),
-            'dst_area': dst_area,
-            'dst_gx': int(r.get('dstGridXNo', 0)),
-            'dst_gz': int(r.get('dstGridZNo', 0)),
-            'dst_pos_x': float(r.get('dstPosX', 0)),
-            'dst_pos_z': float(r.get('dstPosZ', 0)),
-        }
-    entries = sorted(by_key.values(), key=lambda e: (e['src_area'], e['src_gx']))
+    # Chain resolution lives in tools/legacy_conv.py - the offline marker tool reads the same param and
+    # had the same single-hop bug, and two copies of this is how they diverge.
+    import legacy_conv
+    resolved, chains, unresolved = legacy_conv.resolve(conv_json)
+    legacy_conv.report(chains, unresolved)
+    entries = sorted(resolved.values(), key=lambda e: (e['src_area'], e['src_gx']))
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("#pragma once\n// AUTO-GENERATED - do not edit.\n")
         f.write("// Dungeon-area → overworld-tile conversion table (first base-point per src key).\n\n")

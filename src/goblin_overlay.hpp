@@ -13,7 +13,7 @@ namespace goblin::overlay
 {
     // Spawn the dedicated overlay thread (creates the window + D3D11 + DComp +
     // ImGui and runs the render loop). Returns immediately. Safe no-op (logs) if
-    // enable_overlay is false or window/D3D creation fails. Call from setup_mod.
+    // menu_enabled is false or window/D3D creation fails. Call from setup_mod.
     void setup();
 
     // True while Win32 virtual-key `vk` is currently held. Reads GetAsyncKeyState
@@ -23,7 +23,8 @@ namespace goblin::overlay
 
     // True while ALL buttons in `mask` (an XINPUT_GAMEPAD_* bitmask) are held on the
     // active pad. Reads the overlay's polled pad state (updated each render frame), so it
-    // needs the overlay thread running (enable_overlay). Used by the manual marker-hide loop.
+    // needs the pad poll running, which setup() starts in every mode. Used by the manual
+    // marker-hide loop.
     bool gamepad_mask_down(uint16_t mask);
 
     // Live WorldMapPointParam row of the V3 native marker projecting nearest the

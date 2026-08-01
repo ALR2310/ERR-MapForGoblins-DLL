@@ -68,9 +68,7 @@
     "MegaShadow": "Land of Shadow",
     "ProgressFocusResetHint": "To reset, press '%s' in the menu",
     "MenuBack": "Back",
-    "MenuTools": "Tools",
     "MenuTotal": "Total",
-    "MenuSaveNow": "Save settings now",
     "MenuUnavailable": "This page is unavailable",
     "MenuPressKey": "Press a key...",
     "MenuKeepCurrent": "Keep current"
@@ -82,6 +80,8 @@
     "MarkerDumpFailed": "Marker dump failed - press again"
   },
   "section_labels": {
+    "Categories": "Categories",
+    "Menu settings": "Mod settings",
     "Goblin": "Goblin",
     "Equipment": "Equipment",
     "Key Items": "Key Items",
@@ -92,18 +92,19 @@
     "World": "World",
     "ERR Markers": "ERR Markers",
     "Compatibility": "Compatibility",
-    "Overlay & Hotkeys": "Overlay & Hotkeys",
+    "Menu & Hotkeys": "Menu & Hotkeys",
     "Debug": "Debug"
   },
   "section_comments": {
     "Reforged": "Elden Ring Reforged-only content. Absent from the vanilla build.",
     "ERR Markers": "This section applies this mod's display rules to ERR's OWN pre-placed map\nmarkers (camps, merchants, bosses, dungeon entrances) - NOT the icons this\nmod injects - so both icon sets follow the same visibility logic\n(map-fragment discovery, hide on clear). Disable a toggle to leave that\nmarker group exactly as ERR ships it. Our own boss markers are\n[World] show_bosses and independent of this section.",
     "Compatibility": "Options for running alongside other mods that change item placement.",
-    "Overlay & Hotkeys": "The in-game config overlay and the key/button that opens it. toggle_key\n(keyboard) / toggle_gamepad_combo (gamepad) OPEN the overlay when enable_overlay\nis on, or toggle ALL map icons on/off when it's off. Key names: F1-F24, A-Z,\n0-9, Space, Escape, Tab, Enter, Backspace, Home, End, PageUp, PageDown, Insert,\nDelete, arrows.",
+    "Menu & Hotkeys": "The mod's MENU and the key/button that opens it. toggle_key (keyboard) /\ntoggle_gamepad_combo (gamepad) OPEN the menu when menu_enabled is on, or toggle\nALL map icons on/off when it is off. Which menu opens is menu_render_mode.\nKey names: F1-F24, A-Z, 0-9, Space, Escape, Tab, Enter, Backspace, Home, End,\nPageUp, PageDown, Insert, Delete, arrows.",
     "Debug": "Diagnostics, shown on the overlay's Debug tab."
   },
   "entry_labels": {
     "require_map_fragments": "Require map fragments",
+    "location_emphasis": "Location emphasis",
     "fast_map_open": "Fast map open",
     "show_armaments": "Armaments",
     "show_armour": "Armour",
@@ -179,8 +180,8 @@
     "live_loot_icons": "Live loot icons",
     "anonymous_loot": "Anonymous loot",
     "rebind": "Rebind",
-    "ui_language": "Language",
-    "enable_overlay": "Enable overlay",
+    "overlay_ui_language": "Overlay language",
+    "menu_enabled": "Enable menu",
     "enable_toggle_hotkey": "Enable toggle hotkey",
     "toggle_key": "Toggle key",
     "toggle_gamepad_combo": "Toggle gamepad combo",
@@ -191,11 +192,12 @@
     "enable_manual_hide": "Manual marker hide",
     "hide_marker_key": "Hide-marker key",
     "hover_info": "Marker hover info",
-    "overlay_render_mode": "Overlay render mode",
+    "menu_render_mode": "Menu type",
     "hide_marker_gamepad": "Hide-marker button"
   },
   "entry_comments": {
     "require_map_fragments": "Require map fragment discovery before showing icons in that area",
+    "location_emphasis": "Markers of the map you are actually IN draw bigger; markers that only look nearby (a dungeon under your feet, or the surface above it) draw smaller. Nothing is ever hidden.",
     "fast_map_open": "BETA: makes the world map open faster when many icons are shown.\nTurn off if the map glitches or crashes.",
     "show_armaments": "Weapons, shields, bows, staves, etc.",
     "show_armour": "Armor pieces (helms, chest, gauntlets, legs)",
@@ -270,19 +272,19 @@
     "live_loot_labels": "Relabel each loot marker with the item its lot currently gives, so names match\nthe randomizer. Uses more memory (copies item names into the map's name table).",
     "live_loot_icons": "Give each loot marker the icon and category of the item its lot currently\ngives, so icons and show_* toggles match the randomizer.",
     "anonymous_loot": "Spoiler-free: every loot marker shows a gray \"?\" and a generic label instead\nof the real item. Overrides live_loot_labels/icons; markers still hide on pickup.",
-    "ui_language": "Overlay language. auto follows the Steam game language; unrecognized languages\nfall back to English.",
-    "enable_overlay": "In-game config overlay (Dear ImGui) opened with the toggle key below.\nSet false if a DX-hook conflict (Steam overlay/RTSS/GeForce Experience) or a\nGPU driver issue makes the game unstable.",
+    "overlay_ui_language": "Language of the OVERLAY menu. auto follows the Steam game language;\nunrecognized languages fall back to English. The in-game menu ignores this and\nalways follows the game's own language.",
+    "menu_enabled": "The mod's menu on the toggle key below. With this off those controls switch ALL\nmap icons on/off instead and no menu opens - which is also what to reach for if a\nDX-hook conflict (Steam overlay/RTSS/GeForce Experience) or a GPU driver issue\nmakes the game unstable with the overlay menu.",
     "enable_toggle_hotkey": "Enable toggle_key / toggle_gamepad_combo to switch ALL map icons on/off when\nthe overlay is DISABLED. (When the overlay is enabled, they open it instead.)",
-    "toggle_key": "Keyboard toggle: OPENS the config overlay when enable_overlay is on, or\ntoggles ALL map icons on/off when the overlay is disabled. Default: F10.",
-    "toggle_gamepad_combo": "Gamepad toggle, same role as toggle_key (opens the overlay, or toggles all\nicons if the overlay is disabled). Tokens joined with '+': A,B,X,Y,LB,RB,\nL3/LSTICK,R3/RSTICK,BACK/SELECT/VIEW,START/MENU,UP/DOWN/LEFT/RIGHT. Default: Y+R3.",
+    "toggle_key": "Keyboard toggle: OPENS the config overlay when menu_enabled is on, or\ntoggles ALL map icons on/off when the overlay is disabled. Default: F10.",
+    "toggle_gamepad_combo": "Gamepad toggle, same role as toggle_key: opens the overlay, or switches ALL map\nicons on/off when the overlay is disabled. In the menu you simply press the buttons\nyou want. Editing this file by hand takes names joined with '+' (A, B, X, Y, LB, RB,\nL3, R3, BACK, START, UP, DOWN, LEFT, RIGHT). Default: Y+R3.",
     "debug_logging": "Enable verbose debug logging (memory addresses, param details, FMG internals)",
     "enable_marker_dump": "Master switch for the marker dump hotkey",
     "marker_dump_key": "Key to dump decoded markers to logs/MapForGoblins_markers.log. Default: F9.",
-    "overlay_render_mode": "How the overlay is drawn: surface (default), layered (max compatibility), or swapchain (lightest). Needs a game restart.",
+    "menu_render_mode": "WHICH menu the toggle key opens: native (the in-game menu the game draws itself) or\nimgui (the separate overlay window). Editable here only - a menu cannot host the\nswitch that decides whether it exists. Needs a game restart.",
     "show_world_maps_ignore_fragments": "Always show World Map fragment markers, even when map-fragment gating is on (so you can find a fragment before you own it).",
     "enable_manual_hide": "Hover a marker on the world map and press the hide key to hide it. Hidden markers persist and can be restored on the Hidden tab.",
     "hide_marker_key": "Key that hides the map marker currently under the cursor.",
-    "hover_info": "While the map is open, show a small panel (top-left) with the hovered marker's name and its height relative to you.",
+    "hover_info": "While the map is open, show a small panel on the LEFT telling you how far above or\nbelow you the marker under the cursor sits. Its name is not repeated there - the\ngame's own popup already shows it.",
     "hide_marker_gamepad": "Gamepad button that hides the map marker under the cursor (same as the hide-marker key)."
   }
 }

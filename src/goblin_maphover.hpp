@@ -36,6 +36,22 @@ namespace goblin::maphover
     // -1 when the map is closed / not yet known.
     int map_layer();
 
+    // The reticle in MAP space, as last reported by the game's own hover (it only reports a pin the
+    // reticle is on), or false if no sample is that recent. Kept as the cross-check for the field
+    // below; the hover pick no longer has to infer an anchor from it.
+    bool reticle_map(float *mx, float *mz, uint64_t max_age_ms);
+
+    // Where the GAME looks for a pin this frame, in MAP space, read from the dialog it uses itself -
+    // including which of its two position pairs is live (`pointer_mode` = the one that follows the
+    // pointer). false = the map is closed or the field did not read as a position, and the caller must
+    // fall back to whatever it did before.
+    //
+    // This replaces guessing the anchor per build. "The reticle is the centre of the view" holds only
+    // while the map can still pan: at full zoom-out it cannot, WASD moves the reticle across a fixed
+    // view, and the pick then described whatever was in the middle of the screen.
+    bool reticle_live(float *mx, float *mz, bool *pointer_mode);
+
+
     // GetTickCount64() of the last time the map dialog's per-frame Update ran (this hook fires
     // every frame the world map is open, independent of any marker build). 0 if it has never
     // fired. A value that has advanced PAST a recorded close time is proof the map genuinely

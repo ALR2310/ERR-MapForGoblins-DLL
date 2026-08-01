@@ -1,6 +1,9 @@
 #include "goblin_own_movie.hpp"
 
+#include "generated_shared/goblin_logo.hpp" // LOGO_TAG: the same bitmap the map registers
+
 #include "goblin_config.hpp"
+#include "goblin_gfx_probe.hpp"  // movie_name(): which movie a parse belongs to
 #include "modutils.hpp"
 
 #include "generated_shared/goblin_menu_icon_tags.hpp"
@@ -17,13 +20,6 @@
 
 namespace
 {
-    // ── engine entry points (anchored in tools/rva_anchors.py) ───────────────────────
-    // CS::CSScaleformFileOpener::OpenFile(this, const char* name, int flags, int mode)
-    // returns a Scaleform File*. The name is NARROW here (the CS layer converts the wide
-    // screen name), which the tail of the function makes plain: it tests `cmp byte [rbx], 0`
-    // on the second argument.
-    constexpr uintptr_t kOpenFile = 0xD6B4D0;
-
     // The vtable of the engine's memory-backed File. Movies come out of the archives as one
     // blob and are handed to Scaleform through this class, whose layout the constructor at
     // 0xCE7BB0 spells out:
@@ -37,13 +33,8 @@ namespace
     constexpr size_t kMemFileSize = 0x20;
     constexpr size_t kMemFilePos = 0x24;
 
-    // The screen's movie. Matched as a case-insensitive substring on the SHORT id, because
-    // the opener is handed a path built around it and we do not want to guess at the casing
-    // or the extension the CS layer settles on.
+    // The screen's movie, matched as a case-insensitive substring of the movie's own name.
     constexpr const char *kMovieName = "02_160";
-    // The world map, transformed for a second reason: it gets ONE extra named placement so the
-    // mod has a hover panel of its own (see kTipName below).
-    constexpr const char *kMapMovieName = "02_120";
 
     bool contains_ci(const char *name, const char *needle)
     {
@@ -61,70 +52,15 @@ namespace
         return false;
     }
 
-    bool name_matches(const char *name) { return contains_ci(name, kMovieName); }
-    bool map_name_matches(const char *name) { return contains_ci(name, kMapMovieName); }
 
-    // ── our own hover panel in the world map ─────────────────────────────────────────
-    // The game's tooltip is Body/PlaceName (sprite cid 225: State_0 / State_1, eight lines each,
-    // one line = cid 220 with a backdrop and a plain-text EditText). We want OUR OWN panel with
-    // our own position and line count, and the game's left completely alone - so nothing is
-    // copied or redefined: a SECOND named placement of the very same cid 225 goes into Body at a
-    // depth above everything it holds. One tag, no new characters, no art duplication.
-    constexpr uint16_t kMapBodyCid = 241;    // Body
-    constexpr uint16_t kTipCid = 225;        // the tooltip sprite (State_0 + State_1)
-    constexpr uint16_t kTipDepth = 106;      // Body's own children top out at 104
-    constexpr const char *kTipName = "MfgTip";
-    // A second panel of ours, for the focus banner in the corner. Same sprite, own depth+name,
-    // so the two are independent of each other and of the game's.
-    constexpr uint16_t kBannerDepth = 108;
-    constexpr const char *kBannerName = "MfgBanner";
-    int g_tip_placed = 0;
-
-    // PlaceObject2: flags, depth u16, char u16, MATRIX, name. Flags 0x26 = HasCharacter |
-    // HasMatrix | HasName. The matrix is the minimal identity one (no scale, no rotate, a
-    // 1-bit zero translate) because the runtime sets the position anyway.
-    size_t build_place(uint8_t *out, uint16_t depth, const char *name)
-    {
-        // Parked FAR off-screen (translate -20000, -20000 px), not at the origin: a placement
-        // has no visibility flag, so an origin-placed panel renders for the frames between the
-        // map opening and our first update - in game that was a red block flashing in the
-        // corner. The runtime sets the position before showing it, which overwrites this.
-        // MATRIX: HasScale 0, HasRotate 0, NTranslateBits 20, tx = ty = -400000 twips.
-        static const uint8_t kParkedMatrix[6] = {0x29, 0x3C, 0xB0, 0x13, 0xCB, 0x00};
-        size_t n = 0;
-        out[n++] = 0x26;
-        out[n++] = static_cast<uint8_t>(depth & 0xFF);
-        out[n++] = static_cast<uint8_t>(depth >> 8);
-        out[n++] = static_cast<uint8_t>(kTipCid & 0xFF);
-        out[n++] = static_cast<uint8_t>(kTipCid >> 8);
-        for (unsigned char b : kParkedMatrix)
-            out[n++] = b;
-        for (const char *c = name; *c; ++c)
-            out[n++] = static_cast<uint8_t>(*c);
-        out[n++] = 0;
-        return n;
-    }
-
-    // One tagged PlaceObject2 appended to `dst`. The size is always short-form here.
-    size_t append_place_tag(uint8_t *dst, uint16_t depth, const char *name)
-    {
-        uint8_t body[40];
-        const size_t len = build_place(body, depth, name);
-        const uint16_t th = static_cast<uint16_t>((26u << 6) | (len & 0x3F));
-        dst[0] = static_cast<uint8_t>(th & 0xFF);
-        dst[1] = static_cast<uint8_t>(th >> 8);
-        std::memcpy(dst + 2, body, len);
-        return len + 2;
-    }
-
-    using OpenFileFn = void *(void *self, const char *name, int flags, int mode);
-    OpenFileFn *o_open_file = nullptr;
+    // The world map's two panels used to be added here as well, by the same byte transform. They now
+    // go into the PARSED movie instead (goblin_gfx_probe inject_map_panels), which reads the host
+    // sprite, the character it places and a free depth out of the movie rather than knowing them as
+    // constants - so this file is the MENU screen's transform and nothing else.
 
     std::atomic<int> g_armed{0};
     std::atomic<bool> g_ready{false};
 
-    // Our bytes must outlive the load: the File does not copy them, it points at them.
-    std::vector<uint8_t> g_served;
     const char *g_status = "not tried";
 
     uintptr_t base() { return reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)); }
@@ -341,20 +277,166 @@ namespace
     // Neither uses frames: a timeline cannot be stopped from a tag stream, so a multi-frame
     // sprite animates in every instance we do not reach. Variant 1 previously faulted inside
     // Scaleform when its mask was an image character - it now gets a genuine shape.
+    // Defined further down with the rest of the header-icon work; used here because the logo bitmap
+    // goes in at the same place as the icon defines.
+    uint16_t logo_cid();
+    bool build_logo_define(std::vector<uint8_t> &tag);
+    extern bool g_logo_spliced;
+    // ── row density: a tighter pitch, and more row clips ─────────────────────────────
+    // The screen shows as many rows as the row pool (sprite 190) has clips - eleven in the left
+    // column (Item_0_0 .. Item_10_0), pitched 63.75 px apart between y = 35.3 and y = 673.2 px. The
+    // gap is far larger than the 24 pt text needs, so the pitch comes down and the freed space pays
+    // for extra clips. Both halves are needed: a tighter pitch alone would just leave a hole at the
+    // bottom, and extra clips alone would not fit.
+    //
+    // The clips are OUR placements of the game's own row character, so they carry the icon child the
+    // rebuilt row clip has. Whether the engine ever ASKS for slots 11..13 is not assumed - the row
+    // path hook logs the highest slot it is called with, so one run in game settles it.
+    constexpr uint16_t kRowPoolCid = 190;       // KeySetting/ItemList
+    constexpr int32_t kRowPitchPx = 49;         // authored 63.75; 14 rows then end where 11 did
+    // Measured chain: KeySetting sits at y = 480 px, ItemList at -369.65 px inside it, so row 0
+    // was drawn at 145.65 px absolute while the title's text ends around 77 px. 25 px of that gap
+    // pays for the fifteenth row: the last one then ends at 806.65 px, and the help block below
+    // starts at 863 px.
+    constexpr int32_t kRowFirstYTwips = 706 - 25 * 20; // authored 706, lifted 25 px
+    constexpr int32_t kRowXTwips = 155;         // Item_0_0's x, for the clips we add
+    constexpr uint16_t kRowFirstDepth = 304;    // Item_0_0; each next row sits 16 lower
+    constexpr uint16_t kRowDepthStep = 16;
+    constexpr int kRowAuthored = 11;            // clips the movie ships in the left column
+    constexpr int kRowExtra = goblin::own_movie::kRowSlots - kRowAuthored;
+
+    int32_t row_y_twips(int index) { return kRowFirstYTwips + kRowPitchPx * 20 * index; }
+
+    // A PlaceObject2 for one row clip: flags 0x26 (HasCharacter|HasMatrix|HasName), then the matrix
+    // packed as {HasScale 0, HasRotate 0, nTranslateBits 16, tx, ty} - the same shape the authored
+    // rows use, with a fixed 16 bits so our own numbers always fit.
+    size_t build_row_place(uint8_t *out, uint16_t depth, const char *name, int32_t tx, int32_t ty)
+    {
+        size_t n = 0;
+        out[n++] = 0x26;
+        out[n++] = static_cast<uint8_t>(depth & 0xFF);
+        out[n++] = static_cast<uint8_t>(depth >> 8);
+        out[n++] = static_cast<uint8_t>(goblin::menu_icon_tags::ROW_CID & 0xFF);
+        out[n++] = static_cast<uint8_t>(goblin::menu_icon_tags::ROW_CID >> 8);
+        uint8_t mx[5] = {};
+        uint32_t bit = 0;
+        auto put = [&](uint32_t value, uint32_t bits) {
+            for (uint32_t k = 0; k < bits; ++k, ++bit)
+                if ((value >> (bits - 1 - k)) & 1)
+                    mx[bit >> 3] |= static_cast<uint8_t>(1u << (7 - (bit & 7)));
+        };
+        put(0, 1);  // HasScale
+        put(0, 1);  // HasRotate
+        put(16, 5); // nTranslateBits
+        put(static_cast<uint32_t>(tx) & 0xFFFF, 16);
+        put(static_cast<uint32_t>(ty) & 0xFFFF, 16);
+        for (uint8_t b : mx)
+            out[n++] = b;
+        for (const char *c = name; *c; ++c)
+            out[n++] = static_cast<uint8_t>(*c);
+        out[n++] = 0;
+        return n;
+    }
+
+    size_t append_extra_rows(uint8_t *dst, size_t cap)
+    {
+        size_t len = 0;
+        for (int k = 0; k < kRowExtra; ++k)
+        {
+            const int index = kRowAuthored + k;
+            char name[16];
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_0", index);
+            uint8_t body[48];
+            const size_t blen = build_row_place(body, static_cast<uint16_t>(kRowFirstDepth -
+                                                                           kRowDepthStep * index),
+                                                name, kRowXTwips, row_y_twips(index));
+            const uint16_t th = static_cast<uint16_t>((26u << 6) | (blen & 0x3F));
+            if (len + 2 + blen > cap)
+                return len;
+            dst[len++] = static_cast<uint8_t>(th & 0xFF);
+            dst[len++] = static_cast<uint8_t>(th >> 8);
+            std::memcpy(dst + len, body, blen);
+            len += blen;
+        }
+        return len;
+    }
+
+    // Re-space the rows the movie already has. Same-length in-place edit: only the translate bits of
+    // each placement's matrix change, and every new value is smaller than the authored one, so it
+    // still fits the field width that value was encoded with.
+    int retune_row_pitch(std::vector<uint8_t> &buf)
+    {
+        int done = 0;
+        for (int col = 0; col <= 1; ++col)
+        {
+            // Column 1 is our right-hand preview panel; it keeps the same pitch so the two columns
+            // stay level with each other.
+            for (int i = 0; i < kRowAuthored; ++i)
+            {
+                char name[16];
+                _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_%d", i, col);
+                const size_t nlen = std::strlen(name);
+                const int32_t want = row_y_twips(i);
+                bool patched = false;
+                for (size_t at = 0; at + nlen + 1 <= buf.size() && !patched; ++at)
+                {
+                    if (std::memcmp(buf.data() + at, name, nlen + 1) != 0)
+                        continue;
+                    // The matrix length varies with how wide the authored numbers needed to be, so the
+                    // body start is found by checking the three possibilities against known fields.
+                    for (size_t mlen = 4; mlen <= 6 && !patched; ++mlen)
+                    {
+                        if (at < 5 + mlen)
+                            continue;
+                        const size_t body = at - 5 - mlen;
+                        if (buf[body] != 0x26)
+                            continue;
+                        uint8_t *mx = buf.data() + body + 5;
+                        auto read_bit = [&](uint32_t b) { return (mx[b >> 3] >> (7 - (b & 7))) & 1; };
+                        auto write_bit = [&](uint32_t b, int v) {
+                            const uint8_t m = static_cast<uint8_t>(1u << (7 - (b & 7)));
+                            if (v) mx[b >> 3] |= m;
+                            else   mx[b >> 3] &= static_cast<uint8_t>(~m);
+                        };
+                        if (read_bit(0) || read_bit(1)) // no scale, no rotation, as authored
+                            continue;
+                        uint32_t nt = 0;
+                        for (uint32_t k = 0; k < 5; ++k)
+                            nt = (nt << 1) | static_cast<uint32_t>(read_bit(2 + k));
+                        if (nt < 8 || 7 + 2 * nt > mlen * 8)
+                            continue; // not the shape we parsed - leave this one alone
+                        const int32_t hi = (1 << (nt - 1)) - 1;
+                        if (want > hi)
+                            continue;
+                        const uint32_t ty_at = 7 + nt;
+                        for (uint32_t k = 0; k < nt; ++k)
+                            write_bit(ty_at + k, (static_cast<uint32_t>(want) >> (nt - 1 - k)) & 1);
+                        patched = true;
+                        ++done;
+                    }
+                }
+            }
+        }
+        spdlog::info("[ownmovie] row pitch set to {} px: {} of {} placements re-spaced", kRowPitchPx,
+                     done, kRowAuthored * 2);
+        return done;
+    }
+
+    // emit_sprite_with is defined further down; the row pool needs it here.
+    bool emit_sprite_with(std::vector<uint8_t> &out, const Tag &t, const uint8_t *src,
+                          const uint8_t *extra, size_t extra_len);
+
     bool add_menu_icons(const uint8_t *src, const std::vector<Tag> &tags,
                         std::vector<uint8_t> &out, const char **why)
     {
         namespace mi = goblin::menu_icon_tags;
-        const uint8_t variant = goblin::config::nativeMenuIcons;
-        if (variant != 1 && variant != 2)
-        {
-            *why = "icons off (native_menu_icons)";
-            return false;
-        }
-        const unsigned char *blob = variant == 1 ? mi::ICON_BLOB_A : mi::ICON_BLOB_B;
-        const size_t blob_len = variant == 1 ? mi::ICON_BLOB_A_LEN : mi::ICON_BLOB_B_LEN;
-        const unsigned char *rowtag = variant == 1 ? mi::ROW_TAG_A : mi::ROW_TAG_B;
-        const size_t rowtag_len = variant == 1 ? mi::ROW_TAG_A_LEN : mi::ROW_TAG_B_LEN;
+        // ONE construction: a named child per icon (the former native_menu_icons = 2). The strip
+        // variant needed its position re-applied every frame, because the engine re-applies the
+        // authored matrix whenever the timeline places an object again.
+        const unsigned char *blob = mi::ICON_BLOB_B;
+        const size_t blob_len = mi::ICON_BLOB_B_LEN;
+        const unsigned char *rowtag = mi::ROW_TAG_B;
+        const size_t rowtag_len = mi::ROW_TAG_B_LEN;
         const Tag *row = nullptr;
         for (const Tag &t : tags)
         {
@@ -378,7 +460,9 @@ namespace
             *why = "row clip differs from the one the icons were built against";
             return false;
         }
-        if (!cid_range_free(src, tags, mi::FIRST_CID, mi::LAST_CID))
+        // Through logo_cid(), not just LAST_CID: the logo takes the id one past the icon strip, and a
+        // window is only "checked" if the check covers every id we are about to define.
+        if (!cid_range_free(src, tags, mi::FIRST_CID, logo_cid()))
         {
             *why = "our character ids are already taken in this movie";
             return false;
@@ -393,12 +477,34 @@ namespace
             {
                 out.insert(out.end(), blob, blob + blob_len);
                 out.insert(out.end(), rowtag, rowtag + rowtag_len);
+                // The logo bitmap joins the icons here: same kind of tag, same guaranteed-valid spot
+                // before the movie's first frame, so the character exists by the time the header
+                // places it.
+                std::vector<uint8_t> logo;
+                g_logo_spliced = build_logo_define(logo);
+                if (g_logo_spliced)
+                {
+                    out.insert(out.end(), logo.begin(), logo.end());
+                    spdlog::info("[ownmovie] logo bitmap added as charId {} ({} bytes)", logo_cid(),
+                                 goblin::generated::LOGO_TAG_LEN);
+                }
                 continue;
             }
             if (t.code == 39 && t.length >= 2)
             {
                 uint16_t cid = 0;
                 std::memcpy(&cid, src + t.offset, 2);
+                if (cid == kRowPoolCid && kRowExtra > 0)
+                {
+                    uint8_t extra[256];
+                    const size_t elen = append_extra_rows(extra, sizeof(extra));
+                    if (elen && emit_sprite_with(out, t, src, extra, elen))
+                    {
+                        spdlog::info("[ownmovie] row pool: {} extra row clips added (slots {}..{})",
+                                     kRowExtra, kRowAuthored, goblin::own_movie::kRowSlots - 1);
+                        continue;
+                    }
+                }
                 if (cid == kBgSpriteCid && emit_sprite_without(out, t, src, kCaptionSpriteCid))
                 {
                     ++g_caption_block_dropped;
@@ -452,6 +558,228 @@ namespace
     constexpr uint16_t kRowSectionDepth = 344;
     constexpr uint16_t kRowSectionCid = 198;
     constexpr const char *kRowSectionName = "KeySetting";
+
+    // ── the header icon: our logo instead of MENU_FL_Sysytem ─────────────────────────
+    // sprite 201 (MenuTitle) -> sprite 199 -> character 23 (an external image). We re-point that
+    // innermost placement, so the game keeps its own position and scale for the corner.
+    constexpr uint16_t kTitleIconSpriteCid = 199; // the sprite that holds the icon image
+    constexpr uint16_t kTitleIconImageCid = 23;   // MENU_FL_Sysytem.tga
+    // One past the range the icon strip reserves, so both live in the same checked window.
+    uint16_t logo_cid() { return static_cast<uint16_t>(goblin::menu_icon_tags::LAST_CID + 1); }
+
+    // Re-point sprite 199's PlaceObject3 (code 70: flags1, flags2, depth u16, char u16) from the
+    // game's icon to our logo. Same-length edit, applied to the finished buffer.
+    // Append our logo bitmap as a define tag. DefineBitsLossless2 is tag 36; the body starts with the
+    // charId, which LOGO_TAG carries as a placeholder for exactly this reason.
+    // ── row text size ────────────────────────────────────────────────────────────────
+    // The row's fields are 24 px as authored: Text_0 (the label) is cid 186 on the value frames and
+    // cid 188 on the wide category frame, Text_1 (the value) is cid 185. Taking them to 22 px buys
+    // about a sixth more characters per row - which the progress bars in the value column need more
+    // than the labels do, and the labels lose nothing at this size.
+    constexpr uint16_t kRowFontTwips = 22 * 20;
+    const uint16_t kRowTextCids[] = {185, 186, 188};
+
+    int retune_row_font(std::vector<uint8_t> &buf)
+    {
+        int done = 0;
+        for (size_t i = 0; i + 8 < buf.size(); ++i)
+        {
+            const uint16_t head = static_cast<uint16_t>(buf[i] | (buf[i + 1] << 8));
+            if ((head >> 6) != 37) // DefineEditText
+                continue;
+            uint32_t len = head & 0x3F;
+            size_t body = i + 2;
+            if (len == 0x3F)
+            {
+                std::memcpy(&len, buf.data() + body, 4);
+                body += 4;
+            }
+            if (body + len > buf.size() || len < 8)
+                continue;
+            uint16_t cid = 0;
+            std::memcpy(&cid, buf.data() + body, 2);
+            bool wanted = false;
+            for (uint16_t want : kRowTextCids)
+                wanted = wanted || cid == want;
+            if (!wanted)
+                continue;
+            // Same walk as the help field: RECT, flags, then the font id / class before the height.
+            const uint32_t nbits = static_cast<uint32_t>(buf[body + 2] >> 3);
+            size_t q = body + 2 + (5 + nbits * 4 + 7) / 8;
+            const uint8_t f1 = buf[q], f2 = buf[q + 1];
+            q += 2;
+            if (f1 & 0x01)
+                q += 2; // fontId
+            if (f2 & 0x80)
+            {
+                while (q < body + len && buf[q] != 0)
+                    ++q;
+                ++q; // past the fontClass string
+            }
+            if (!((f1 & 0x01) || (f2 & 0x80)) || q + 2 > body + len)
+                continue;
+            uint16_t was = 0;
+            std::memcpy(&was, buf.data() + q, 2);
+            if (was == kRowFontTwips)
+                continue;
+            std::memcpy(buf.data() + q, &kRowFontTwips, 2);
+            spdlog::info("[ownmovie] row text {}: font {} -> {} px", cid, was / 20,
+                         kRowFontTwips / 20);
+            ++done;
+        }
+        return done;
+    }
+
+    // ── nudging the header icon ──────────────────────────────────────────────────────
+    // The icon's OWN placement (char 23 inside sprite 199) cannot be moved in place: its matrix carries
+    // nTranslateBits = 0, i.e. no translation field at all, so writing one would change the tag length.
+    // The level above can: sprite 201 (MenuTitle) places sprite 199 with a 14-bit translate, and sprite
+    // 201 itself sits at root scale 1.0 - so 20 twips there is exactly one screen pixel, and sprite 199
+    // holds nothing but the icon, so moving it moves the icon and not the title text beside it.
+    // These two numbers are the whole adjustment. Negative = left / up.
+    constexpr int32_t kTitleIconDxPx = -36;
+    constexpr int32_t kTitleIconDyPx = -22;
+
+    int nudge_title_icon(std::vector<uint8_t> &buf)
+    {
+        if (kTitleIconDxPx == 0 && kTitleIconDyPx == 0)
+            return 0;
+        // PlaceObject2 body: flags 0x06 (HasCharacter|HasMatrix), depth 1, cid 199. That five-byte
+        // signature occurs exactly once in the movie.
+        const uint8_t sig[5] = {0x06, 0x01, 0x00, static_cast<uint8_t>(kTitleIconSpriteCid & 0xFF),
+                                static_cast<uint8_t>(kTitleIconSpriteCid >> 8)};
+        for (size_t i = 0; i + 5 + 10 <= buf.size(); ++i)
+        {
+            if (std::memcmp(buf.data() + i, sig, 5) != 0)
+                continue;
+            uint8_t *mx = buf.data() + i + 5;
+            auto read_bit = [&](uint32_t b) { return (mx[b >> 3] >> (7 - (b & 7))) & 1; };
+            auto write_bit = [&](uint32_t b, int v) {
+                const uint8_t mask = static_cast<uint8_t>(1u << (7 - (b & 7)));
+                if (v) mx[b >> 3] |= mask;
+                else   mx[b >> 3] &= static_cast<uint8_t>(~mask);
+            };
+            auto read_bits = [&](uint32_t at, uint32_t n) {
+                uint32_t v = 0;
+                for (uint32_t k = 0; k < n; ++k)
+                    v = (v << 1) | static_cast<uint32_t>(read_bit(at + k));
+                return v;
+            };
+            // Verify the shape before touching it, the same way the row-section shift does: scale
+            // present with 17 bits per field, no rotation, 14 bits per translate.
+            if (!read_bit(0))
+                continue;
+            const uint32_t nscale = read_bits(1, 5);
+            const uint32_t rot_at = 6 + 2 * nscale;
+            if (nscale != 17 || read_bit(rot_at))
+                continue;
+            const uint32_t nt = read_bits(rot_at + 1, 5);
+            if (nt != 14)
+                continue;
+            const uint32_t tx_at = rot_at + 6;
+            const uint32_t ty_at = tx_at + nt;
+            auto sign_extend = [nt](uint32_t v) {
+                const uint32_t sign = 1u << (nt - 1);
+                return static_cast<int32_t>((v & sign) ? (v | ~(sign * 2 - 1)) : v);
+            };
+            const int32_t tx = sign_extend(read_bits(tx_at, nt));
+            const int32_t ty = sign_extend(read_bits(ty_at, nt));
+            const int32_t want_x = tx + kTitleIconDxPx * 20; // 20 twips = 1 px at this level
+            const int32_t want_y = ty + kTitleIconDyPx * 20;
+            const int32_t lo = -(1 << (nt - 1)), hi = (1 << (nt - 1)) - 1;
+            if (want_x < lo || want_x > hi || want_y < lo || want_y > hi)
+            {
+                spdlog::info("[ownmovie] header icon: {},{} twips does not fit {} signed bits - left "
+                             "where it was", want_x, want_y, nt);
+                return 0;
+            }
+            for (uint32_t k = 0; k < nt; ++k)
+            {
+                write_bit(tx_at + k, (static_cast<uint32_t>(want_x) >> (nt - 1 - k)) & 1);
+                write_bit(ty_at + k, (static_cast<uint32_t>(want_y) >> (nt - 1 - k)) & 1);
+            }
+            spdlog::info("[ownmovie] header icon moved: {},{} -> {},{} twips ({},{} -> {},{} px)", tx,
+                         ty, want_x, want_y, tx / 20, ty / 20, want_x / 20, want_y / 20);
+            return 1;
+        }
+        spdlog::info("[ownmovie] header icon: the sprite {} placement was not found - position left as "
+                     "authored", kTitleIconSpriteCid);
+        return 0;
+    }
+
+    // Build the tag, do not place it: WHERE it goes is decided by add_menu_icons, which is walking the
+    // parsed tag list and knows a real tag boundary. Scanning the finished buffer for a ShowFrame byte
+    // pattern (the first attempt) could just as easily land inside another tag's payload and corrupt
+    // the movie, and a define inserted at a bogus offset is not something the game reports - it just
+    // stops working.
+    bool build_logo_define(std::vector<uint8_t> &tag)
+    {
+        const size_t body_len = goblin::generated::LOGO_TAG_LEN;
+        if (body_len < 2)
+            return false;
+        const uint32_t code_len = static_cast<uint32_t>(body_len);
+        const uint16_t head = static_cast<uint16_t>((36u << 6) | 0x3F); // DefineBitsLossless2, long form
+        tag.insert(tag.end(), reinterpret_cast<const uint8_t *>(&head),
+                   reinterpret_cast<const uint8_t *>(&head) + 2);
+        tag.insert(tag.end(), reinterpret_cast<const uint8_t *>(&code_len),
+                   reinterpret_cast<const uint8_t *>(&code_len) + 4);
+        tag.insert(tag.end(), goblin::generated::LOGO_TAG,
+                   goblin::generated::LOGO_TAG + body_len);
+        const uint16_t cid = logo_cid();
+        std::memcpy(tag.data() + 6, &cid, 2); // the body starts with the charId placeholder
+        return true;
+    }
+
+    bool g_logo_spliced = false;
+
+    int swap_title_icon(std::vector<uint8_t> &buf)
+    {
+        const uint16_t want_from = kTitleIconImageCid;
+        const uint16_t want_to = logo_cid();
+        int patched = 0;
+        for (size_t i = 0; i + 16 <= buf.size(); ++i)
+        {
+            // DefineSprite body for cid 199: charId, frameCount, then the sprite's own tag list. We
+            // anchor on that rather than walking the whole tree again, and verify the placement below
+            // before touching anything.
+            uint16_t cid = 0;
+            std::memcpy(&cid, buf.data() + i, 2);
+            if (cid != kTitleIconSpriteCid)
+                continue;
+            const size_t inner = i + 4; // past charId + frameCount
+            const uint16_t head = static_cast<uint16_t>(buf[inner] | (buf[inner + 1] << 8));
+            const uint16_t code = static_cast<uint16_t>(head >> 6);
+            if (code != 26 && code != 70) // PlaceObject2 / PlaceObject3
+                continue;
+            // A length field of 0x3F means the real length follows as a u32. The shipped movie uses
+            // that LONG FORM here even though its 12-byte body would fit the short one, and assuming
+            // the short form is why the first attempt reported "not found" while the placement was
+            // sitting right there.
+            const size_t body = inner + 2 + (((head & 0x3F) == 0x3F) ? 4u : 0u);
+            if (body + 8 > buf.size())
+                continue;
+            if (!(buf[body] & 0x02)) // HasCharacter
+                continue;
+            // PlaceObject3 carries a second flag byte; a class name (flags2 bit 3) would push a string
+            // in front of the character id, so leave that shape alone instead of guessing at it.
+            if (code == 70 && (buf[body + 1] & 0x08))
+                continue;
+            const size_t at = body + (code == 70 ? 2u : 1u) + 2u; // past the flags and the depth
+            uint16_t placed = 0;
+            std::memcpy(&placed, buf.data() + at, 2);
+            if (placed != want_from)
+                continue;
+            std::memcpy(buf.data() + at, &want_to, 2);
+            ++patched;
+            spdlog::info("[ownmovie] title icon re-pointed: sprite {} child {} -> our logo {}",
+                         kTitleIconSpriteCid, want_from, want_to);
+            break;
+        }
+        if (!patched)
+            spdlog::info("[ownmovie] title icon left as authored (sprite {} child {} not found - the "
+                         "movie is not the one we parsed)", kTitleIconSpriteCid, want_from);
+        return patched;
+    }
 
     int shift_row_section(std::vector<uint8_t> &buf)
     {
@@ -660,52 +988,6 @@ namespace
         return true;
     }
 
-    // The world map's transform: add our own hover panel and change nothing else.
-    bool rebuild_map(const uint8_t *src, size_t n, std::vector<uint8_t> &out)
-    {
-        if (n < 16 || std::memcmp(src, "GFX", 3) != 0)
-            return false;
-        const size_t hdr = header_size(src, n);
-        if (!hdr)
-            return false;
-        std::vector<Tag> tags;
-        g_tail_offset = 0;
-        if (!parse_tags(src, n, hdr, tags) || tags.empty())
-            return false;
-        uint8_t tagged[96];
-        size_t tagged_len = append_place_tag(tagged, kTipDepth, kTipName);
-        tagged_len += append_place_tag(tagged + tagged_len, kBannerDepth, kBannerName);
-
-        out.clear();
-        out.reserve(n + 64);
-        out.insert(out.end(), src, src + hdr);
-        g_tip_placed = 0;
-        for (const Tag &t : tags)
-        {
-            if (t.code == 39 && t.length >= 2 && !g_tip_placed)
-            {
-                uint16_t cid = 0;
-                std::memcpy(&cid, src + t.offset, 2);
-                if (cid == kMapBodyCid && emit_sprite_with(out, t, src, tagged, tagged_len))
-                {
-                    g_tip_placed = 1;
-                    continue;
-                }
-            }
-            emit_tag(out, t, src);
-        }
-        if (g_tail_offset && g_tail_offset < n)
-            out.insert(out.end(), src + g_tail_offset, src + n);
-        if (!g_tip_placed)
-            return false; // nothing of ours went in - serve the game's bytes untouched
-        uint32_t stored = 0;
-        std::memcpy(&stored, src + 4, 4);
-        const int64_t delta = static_cast<int64_t>(out.size()) - static_cast<int64_t>(n);
-        const uint32_t adjusted = static_cast<uint32_t>(static_cast<int64_t>(stored) + delta);
-        std::memcpy(out.data() + 4, &adjusted, 4);
-        return true;
-    }
-
     // Rebuild the movie from its parsed tags, adding our own pieces on the way. The full
     // parse and re-emit is what makes that safe: it was proven byte-for-byte identical
     // against the untouched file before any edit rode on it. Returns false to say "serve the
@@ -734,6 +1016,7 @@ namespace
         out.reserve(n + 4096);
         out.insert(out.end(), src, src + hdr);
         g_tag_count = tags.size();
+        g_logo_spliced = false; // per rebuild, so a failed one cannot leave the flag set
         const char *why = nullptr;
         g_icons_added = add_menu_icons(src, tags, out, &why);
         if (!g_icons_added)
@@ -750,6 +1033,17 @@ namespace
         g_captions_renamed = rename_column_captions(out);
         shift_row_section(out); // menu centring, same-length in-place edit
         retune_help_text(out);  // the description block under the rows
+        retune_row_pitch(out);  // tighter rows, to pay for the clips added above
+        retune_row_font(out);   // 21 px, so more of a bar fits in the value column
+        // Only re-point the header icon if the bitmap actually went in - a placement pointing at a
+        // character that does not exist draws nothing at all, which is worse than the game's own icon.
+        if (g_logo_spliced)
+        {
+            swap_title_icon(out);
+            nudge_title_icon(out); // our art is not framed like the icon it replaces
+        }
+        else
+            spdlog::warn("[ownmovie] logo bitmap not added - header icon left as authored");
         // The header's length field is the only thing we author, and writing our absolute size
         // into it is what kept the round trip "DIFFERENT" at an identical size: the file does
         // not necessarily count the same bytes we do (its own value is 8 short here, matching
@@ -762,34 +1056,156 @@ namespace
         return true;
     }
 
-    // POD-only (MSVC forbids objects with destructors in an SEH frame): pull the buffer and
-    // size out of the File the engine just handed us.
-    bool read_memory_file(void *f, const uint8_t **src, uint32_t *size)
+    // ══ the parse route: the bytes reach the PARSER whoever served the file ══════════
+    // This used to run on the engine's own movie OPENER, and being asked at all was then the loader's
+    // decision: ModEngine2 substitutes an overridden file underneath that call, so it still happens and
+    // the bytes are the modded ones, while ModEngine3 answers for the files it overrides before the
+    // engine ever gets there (its `MakeEblObject` returns None for a mapped path, and the engine goes
+    // down its disk route instead). Measured on Convergence: of the 22 movies it overrides, the opener
+    // saw 0; of the 90 it does not, all 90. Taking the opener's vtable slot to get above that changed
+    // nothing - the slot still named the engine's own function - because the call is not intercepted,
+    // it simply never happens. See docs/research_runtime_map_panels.md.
+    //
+    // Being asked to PARSE a movie is not the loader's decision: whatever produced the bytes, they end
+    // up in the tag loop - which is also where the mod's icons already reach the world map.
+    //
+    // FUN_141169590(movieData, ctx, arg3) IS that loop: it takes the reader from ctx+0x418 (or the
+    // inline one at ctx+0x50), announces the header it has just read ("Note: SWF Frame Rate = %f,
+    // Frames = %d"), and only then starts reading tags - so on entry the header is done and NOT ONE TAG
+    // has been read. That is what makes this the right place: our bytes are handed over before the first
+    // one, so nothing about the file's own content has to line up with ours.
+    //
+    // The loop's own end-of-stream bound is ctx+0x2c4 (its condition is `position < that`), so a longer
+    // movie needs that raised or the tags we add past the original length are never reached.
+    using TagLoopFn = void(void *movieData, void *ctx, void *arg3);
+    TagLoopFn *o_tag_loop = nullptr;
+    constexpr size_t kCtxReader = 0x418;
+    constexpr size_t kCtxReaderInline = 0x50;
+    constexpr size_t kCtxTotalLen = 0x2C4;
+    constexpr size_t kReaderSource = 0x20;
+    // The Scaleform File interface, read off the engine's own memory-file implementation (the class
+    // whose layout kMemFile* describes): GetLength at vtable+0x38, Read(buf, n) at +0x50, Seek(offset,
+    // whence) at +0x70 with whence 0 = from the start. Every File the parser can be given implements
+    // it, which is what lets the bytes be read whether the movie arrived as one blob from an archive or
+    // as a stream from disk.
+    constexpr size_t kFileGetLength = 0x38;
+    constexpr size_t kFileRead = 0x50;
+    constexpr size_t kFileSeek = 0x70;
+    // Refcount field of that class. A source of ours is handed to the engine, and if it is ever
+    // released we must not be freed out from under the parse - so the count starts far from zero.
+    constexpr size_t kMemFileRefs = 0x08;
+    constexpr uint32_t kNeverFree = 0x4000'0000u;
+
+    // Every movie the parser is given, counted. Unlike the opener this route sees the ones a loader
+    // overrides too, so the count is the honest total.
+    std::atomic<uint32_t> g_movies_seen{0};
+    std::vector<uint8_t> g_parse_bytes;       // the movie we serve to the parser (must outlive it)
+    alignas(16) uint8_t g_parse_source[0x48]; // our File, cloned from one of the engine's own
+    bool g_source_template = false;           // a memory-file object has been seen and copied
+    std::atomic<uint32_t> g_parsed_seen{0};
+
+    // `outPos` comes back with the position the parser is AT - the reader has already taken the header
+    // out of this source and reads ahead of itself, so that position is what the swap has to preserve.
+    bool read_whole_movie(void *file, uint32_t *outLen, uint32_t *outPos, std::vector<uint8_t> &out)
     {
+        uintptr_t vt = 0;
+        int32_t len = 0, pos = 0;
+        // POD-only reads first; the vector work happens outside any __try.
         __try
         {
-            if (*reinterpret_cast<uintptr_t *>(f) != base() + kMemFileVtable)
-                return false;
-            uint8_t *o = reinterpret_cast<uint8_t *>(f);
-            *src = *reinterpret_cast<const uint8_t **>(o + kMemFileBuffer);
-            *size = *reinterpret_cast<uint32_t *>(o + kMemFileSize);
-            return *src != nullptr && *size >= 16;
+            vt = *reinterpret_cast<uintptr_t *>(file);
+            len = reinterpret_cast<int32_t (*)(void *)>(*reinterpret_cast<void **>(vt + kFileGetLength))(
+                file);
+            pos = reinterpret_cast<int32_t (*)(void *, int32_t, int32_t)>(
+                *reinterpret_cast<void **>(vt + kFileSeek))(file, 0, 1);  // whence 1, 0 bytes = tell
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
         }
-    }
-
-    // POD-only: point the File at our bytes and rewind it.
-    bool repoint_memory_file(void *f, const uint8_t *buf, uint32_t size)
-    {
+        if (len < 16 || len > 64 * 1024 * 1024)
+            return false;
+        out.assign(static_cast<size_t>(len), 0);
+        int32_t got = 0;
         __try
         {
-            uint8_t *o = reinterpret_cast<uint8_t *>(f);
-            *reinterpret_cast<const uint8_t **>(o + kMemFileBuffer) = buf;
-            *reinterpret_cast<uint32_t *>(o + kMemFileSize) = size;
-            *reinterpret_cast<uint32_t *>(o + kMemFilePos) = 0;
+            auto seek = reinterpret_cast<int32_t (*)(void *, int32_t, int32_t)>(
+                *reinterpret_cast<void **>(vt + kFileSeek));
+            auto read = reinterpret_cast<int32_t (*)(void *, void *, int32_t)>(
+                *reinterpret_cast<void **>(vt + kFileRead));
+            seek(file, 0, 0);
+            while (got < len)
+            {
+                const int32_t n = read(file, out.data() + got, len - got);
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            seek(file, pos, 0);  // leave the source exactly where the parser had it
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        if (got != len)
+            return false;
+        *outLen = static_cast<uint32_t>(len);
+        *outPos = static_cast<uint32_t>(pos < 0 ? 0 : pos);
+        return true;
+    }
+
+    // Keep a copy of the first of the engine's own memory-backed Files we see, to use as the shape of
+    // the source we hand back. Building one field by field would mean inventing the parts of the class
+    // that are not plain data; copying one the engine made avoids that entirely.
+    void note_source_template(void *file)
+    {
+        if (g_source_template)
+            return;
+        __try
+        {
+            if (*reinterpret_cast<uintptr_t *>(file) != base() + kMemFileVtable)
+                return;
+            std::memcpy(g_parse_source, file, sizeof(g_parse_source));
+            g_source_template = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    // Point the parse at our bytes: in place when the source is the engine's own memory file (no
+    // ownership changes hands), otherwise through a copy of one, which the reader then reads instead.
+    //
+    // `pos` is the position the source was at and MUST stay at. Rewinding it to 0 is what broke this:
+    // the reader had already taken the header out of this source and buffers ahead of itself, so the
+    // moment its window ran out it went on reading from byte 0 and parsed the movie's own header as a
+    // tag. Everything downstream followed from that - the screen built from this movie never got a
+    // display object, and the engine's walk over its children read through null. The file route could
+    // not have this problem: there the buffer is replaced before a reader exists at all.
+    //
+    // Bytes the reader has already buffered stay the ORIGINAL movie's. That costs nothing: every edit
+    // that early in the stream is a same-length one (a caption, a matrix, a font size), so at worst one
+    // of those is missed, while the insertions - which are what would shift a tag boundary - all sit
+    // deep inside the sprite defines, far past anything a 16KB window has reached.
+    bool serve_to_parser(uint64_t reader, void *source, const uint8_t *bytes, uint32_t len, uint32_t pos)
+    {
+        if (pos > len)
+            return false;
+        __try
+        {
+            uint8_t *dst = reinterpret_cast<uint8_t *>(source);
+            if (*reinterpret_cast<uintptr_t *>(source) != base() + kMemFileVtable)
+            {
+                if (!g_source_template)
+                    return false;
+                dst = g_parse_source;
+                *reinterpret_cast<uint32_t *>(dst + kMemFileRefs) = kNeverFree;
+            }
+            *reinterpret_cast<const uint8_t **>(dst + kMemFileBuffer) = bytes;
+            *reinterpret_cast<uint32_t *>(dst + kMemFileSize) = len;
+            *reinterpret_cast<uint32_t *>(dst + kMemFilePos) = pos;
+            if (dst != source)
+                *reinterpret_cast<void **>(reader + kReaderSource) = dst;
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -798,93 +1214,180 @@ namespace
         }
     }
 
-    std::vector<uint8_t> g_served_map;
-
-    void *open_map_file(void *self, const char *name, int flags, int mode)
+    // Are these bytes already ours? Covers this route being entered more than once for one movie:
+    // rebuilding a rebuilt movie would try to add characters that are in it already.
+    bool source_is_ours(void *source)
     {
-        void *f = o_open_file(self, name, flags, mode);
-        if (!f)
-            return f;
-        const uint8_t *src = nullptr;
-        uint32_t n = 0;
-        if (!read_memory_file(f, &src, &n))
-            return f;
-        std::vector<uint8_t> built;
-        if (!rebuild_map(src, n, built))
+        if (!source || g_parse_bytes.empty())
+            return false;
+        __try
         {
-            spdlog::info("[ownmovie] '{}': hover panel NOT added (Body sprite not found)", name);
-            return f;
+            return *reinterpret_cast<const uint8_t **>(reinterpret_cast<uint8_t *>(source) +
+                                                       kMemFileBuffer) == g_parse_bytes.data();
         }
-        g_served_map.swap(built);
-        if (!repoint_memory_file(f, g_served_map.data(),
-                                 static_cast<uint32_t>(g_served_map.size())))
-            return f;
-        spdlog::info("[ownmovie] '{}': {} bytes in, {} out - own panels '{}' + '{}' placed in Body",
-                     name, n, g_served_map.size(), kTipName, kBannerName);
-        return f;
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
-    void *open_file_detour(void *self, const char *name, int flags, int mode)
+    bool read_ctx(void *ctx, uint64_t *reader, void **source, uint32_t *total)
     {
-        if (map_name_matches(name))
-            return open_map_file(self, name, flags, mode);
-        // The menu movies are all loaded once at game start (the opener is asked for
-        // 'data0:/menu/02_160_keyconfiguration.gfx' seconds into the run, lowercase), so there
-        // is no per-open load to scope this to: the interception has to be live from the
-        // start. That is fine for an ADDITIVE transform - extra characters plus a child clip
-        // that stays invisible until we draw into it - which the real key-binding screen never
-        // shows. arm()/disarm() therefore only annotate the log.
-        if (!name_matches(name))
-            return o_open_file(self, name, flags, mode);
-
-        void *f = o_open_file(self, name, flags, mode);
-        if (!f)
-            return f;
-        const uint8_t *src = nullptr;
-        uint32_t n = 0;
-        if (!read_memory_file(f, &src, &n))
+        __try
         {
-            g_status = "movie did not arrive as a readable memory file";
-            return f;
+            const uintptr_t c = reinterpret_cast<uintptr_t>(ctx);
+            uint64_t r = *reinterpret_cast<uint64_t *>(c + kCtxReader);
+            if (!r)
+                r = c + kCtxReaderInline;
+            *reader = r;
+            *source = *reinterpret_cast<void **>(r + kReaderSource);
+            *total = *reinterpret_cast<uint32_t *>(c + kCtxTotalLen);
+            return *source != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    // Move the loop's end-of-stream bound by the SAME amount the movie grew, instead of setting it to
+    // our buffer's size. The engine derived that bound from the header it had already read, and its own
+    // value is not the file's size - for the menu movie a 55600-byte file gives 55584, the length field's
+    // convention less the trailer. Setting the raw size instead handed the parser 16 bytes it should
+    // never see and it read the movie's trailer as a tag; the file route never had that problem because
+    // the engine computed the bound from OUR header. Keeping the delta keeps whatever convention the
+    // engine used, whatever the movie is.
+    bool move_ctx_total(void *ctx, int64_t delta)
+    {
+        __try
+        {
+            auto *p = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(ctx) + kCtxTotalLen);
+            const int64_t want = static_cast<int64_t>(*p) + delta;
+            if (want <= 0 || want > 0x7FFFFFFF)
+                return false;
+            *p = static_cast<uint32_t>(want);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    // Which movie is this? The name from its definition answers it for a movie the game itself served,
+    // but NOT for one a loader overrode: measured on Convergence, the movie ME3 serves in place of
+    // 02_122 comes back with a name of unreadable bytes. So a name only ever RULES A MOVIE IN, and when
+    // there is none the movie's own CONTENT decides - the authoring class name the menu screen's
+    // SymbolClass carries, which no path or loader can distort.
+    //
+    // The MENU screen only. The map's two panels are added to the PARSED movie instead (goblin_gfx_probe
+    // inject_map_panels), which derives the host sprite, the character it places and a free depth from
+    // the movie itself - so rebuilding the map movie's bytes here would be the weaker of the two routes
+    // (the byte transform knows the host sprite as a constant) and would only get in its way.
+    constexpr const char *kMenuClassMark = "02_160_KeyConfiguration";
+
+    bool content_is_menu(const uint8_t *b, uint32_t len)
+    {
+        const size_t mlen = std::strlen(kMenuClassMark);
+        if (len < mlen)
+            return false;
+        for (uint32_t i = 0; i + mlen <= len; ++i)
+            if (b[i] == '0' && std::memcmp(b + i, kMenuClassMark, mlen) == 0)
+                return true;
+        return false;
+    }
+
+    void tag_loop_detour(void *movieData, void *ctx, void *arg3)
+    {
+        uint64_t reader = 0;
+        void *source = nullptr;
+        uint32_t total = 0;
+        char name[192] = {};
+        bool named_mine = false, nameless = true;
+        if (ctx && read_ctx(ctx, &reader, &source, &total))
+        {
+            note_source_template(source);
+            nameless = !goblin::gfx_probe::movie_name(ctx, name, sizeof(name));
+            named_mine = !nameless && contains_ci(name, kMovieName);
+            // Under debug logging, every movie the PARSER is given, with a running count. This is the
+            // measure that matters now: unlike the opener, this route sees the ones a loader overrides
+            // too, so the count includes them.
+            if (goblin::config::debugLogging)
+                spdlog::info("[ownmovie] parsing '{}' (#{})", nameless ? "(no name)" : name,
+                             g_movies_seen.fetch_add(1, std::memory_order_relaxed) + 1);
+        }
+        // A named movie that is not ours needs no bytes read at all. One without a name has to be looked
+        // at, because that is exactly what an overridden movie looks like from here.
+        if ((!named_mine && !nameless) || !goblin::config::native_menu_enabled())
+        {
+            o_tag_loop(movieData, ctx, arg3);
+            return;
+        }
+        std::vector<uint8_t> src;
+        uint32_t len = 0, at = 0;
+        if (source_is_ours(source) || !read_whole_movie(source, &len, &at, src))
+        {
+            o_tag_loop(movieData, ctx, arg3);
+            return;
+        }
+        if (!named_mine && !content_is_menu(src.data(), len))
+        {
+            o_tag_loop(movieData, ctx, arg3);
+            return;
         }
         std::vector<uint8_t> built;
-        if (!rebuild(src, n, built))
-            return f; // status already says why; the game's own bytes are served
-        const bool identical = built.size() == n && std::memcmp(built.data(), src, n) == 0;
-        // The previous buffer is only dropped here, once the next load starts: the File does
-        // not copy, it points, and the parse happens inside this load.
-        g_served.swap(built);
-        if (!repoint_memory_file(f, g_served.data(), static_cast<uint32_t>(g_served.size())))
+        if (!rebuild(src.data(), len, built) || built.empty())
         {
-            g_status = "could not re-point the movie file";
-            return f;
+            o_tag_loop(movieData, ctx, arg3);
+            return;
         }
-        g_status = g_icons_added ? "icons spliced into the movie"
-                   : identical    ? "rebuilt, no icons added"
-                                  : "rebuilt (size changed), no icons";
-        spdlog::info("[ownmovie] '{}': {} bytes in, {} out, {} tags, {} trailing, {} captions "
-                     "renamed, unchanged {}",
-                     name, n, g_served.size(), g_tag_count,
-                     g_tail_offset && g_tail_offset < n ? n - g_tail_offset : 0,
-                     g_captions_renamed, identical ? "exact" : "DIFFERENT");
+        g_parse_bytes.swap(built);
+        const int64_t delta = static_cast<int64_t>(g_parse_bytes.size()) - static_cast<int64_t>(len);
+        if (!serve_to_parser(reader, source, g_parse_bytes.data(),
+                             static_cast<uint32_t>(g_parse_bytes.size()), at) ||
+            !move_ctx_total(ctx, delta))
+        {
+            o_tag_loop(movieData, ctx, arg3);
+            return;
+        }
+        g_status = g_icons_added ? "icons spliced into the movie" : "rebuilt, no icons added";
+        // `read ahead` is the position the source was at: everything before it the parser already has
+        // buffered from the original movie, so it wants to be a long way short of where our first
+        // insertion lands. If it ever is not, a tag boundary would move under the parser and this line
+        // is where that shows.
+        spdlog::info("[ownmovie] '{}' transformed on the way into the parser: {} bytes in, {} out, "
+                     "{} tags, {} trailing, {} captions renamed (read ahead {}, stream bound {})",
+                     name, len, g_parse_bytes.size(), g_tag_count,
+                     g_tail_offset && g_tail_offset < len ? len - g_tail_offset : 0,
+                     g_captions_renamed, at, total);
         spdlog::info("[ownmovie] caption block dropped from the panel: {}",
                      g_caption_block_dropped ? "yes" : "no");
-        return f;
+        o_tag_loop(movieData, ctx, arg3);
     }
+
 }
 
 void goblin::own_movie::install()
 {
     try
     {
-        modutils::hook<OpenFileFn>({.address = reinterpret_cast<void *>(base() + kOpenFile)},
-                                   open_file_detour, o_open_file);
+        // The parse route. AOB rather than an RVA, and the pattern is the loop's own prologue: it saves
+        // arg3, takes the reader from ctx+0x418 and falls back to the inline one at ctx+0x50 - the three
+        // facts this route is built on, so a game update that changes them breaks the pattern instead of
+        // silently pointing us at something else.
+        auto *fn = modutils::hook<TagLoopFn>(
+            {.aob = "4C 89 44 24 18 53 55 56 57 41 55 41 56 48 83 EC 68 48 8B AA 18 04 00 00 "
+                    "49 8B F8 4C 8B EA 4C 8B F1 48 85 ED"},
+            tag_loop_detour, o_tag_loop);
         g_ready.store(true, std::memory_order_release);
-        spdlog::info("[ownmovie] movie load interception armed");
+        spdlog::info("[ownmovie] movie parse route ready @ 0x{:X}", reinterpret_cast<uintptr_t>(fn));
     }
     catch (const std::exception &e)
     {
-        spdlog::warn("[ownmovie] load interception unavailable: {}", e.what());
+        g_status = "the movie tag loop could not be found";
+        spdlog::warn("[ownmovie] parse route unavailable ({}) - the menu screen keeps the movie the "
+                     "game shipped",
+                     e.what());
     }
 }
 

@@ -189,7 +189,8 @@ static int crash_fmt_addr(char *buf, uintptr_t addr)
 namespace goblin::watch
 {
     std::atomic<uintptr_t> g_addr{0};
-    std::atomic<int> g_hits{0};
+    // A g_hits counter was incremented in the handler and read by nobody; the watch is one-shot
+    // (g_addr is exchanged to 0 on the first hit), so it could only ever have held 0 or 1.
 
     // A request is QUEUED by the game thread and carried out by another thread. Setting debug registers
     // means SuspendThread + Get/SetThreadContext, and doing that to your OWN thread suspends you with
@@ -235,7 +236,6 @@ namespace goblin::watch
         if (ok)
         {
             g_addr.store(address, std::memory_order_release);
-            g_hits.store(0, std::memory_order_release);
             spdlog::info("[watch] armed a write watch on 0x{:X} (thread {})", address, thread_id);
         }
         else
@@ -340,7 +340,6 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
             {
             }
         }
-        goblin::watch::g_hits.fetch_add(1, std::memory_order_relaxed);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     const DWORD code = ep->ExceptionRecord->ExceptionCode;

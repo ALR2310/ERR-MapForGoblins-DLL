@@ -2,9 +2,14 @@
 
 // Runtime icon-frame injector + (dev-only) RE probe. setup() ALWAYS arms the injection hooks
 // (register our DefineBitsLossless2 bitmaps, append a frame per icon to worldmap SpriteDef-171,
-// remap markers to the injected frames) so icons render without a shipped/modified gfx. When
-// config::debugLogging is on it additionally dumps the live SpriteDef/resource-dict + arms a
-// read-only RM2::Execute trace (never changes injection behavior).
+// remap markers to the injected frames) so icons render without a shipped/modified gfx.
+//
+// What debug_logging does and does NOT do (the .cpp has carried the correct version since
+// 2026-07-30; this header still claimed the old one): it is LOGGING ONLY. It does not arm the
+// RM2::Execute hook - that hook is armed by the kNativeMarkers build variant and carries the
+// marker-factory pulse, so it is live in every shipping build and is not a trace. The live
+// SpriteDef / resource-dict dumps additionally require the compile key MFG_DUMP_FRAMES, which
+// is not defined anywhere in the tree.
 // See docs/research_no_gfx_icons.md.
 #include <cstdint>
 
@@ -12,10 +17,9 @@ namespace goblin::gfx_probe
 {
     void setup();
 
-    // True once the in-game menu's movie has been extended with our category icons
-    // (bitmaps + an icon sprite spliced in while that movie was loading). When false the
-    // menu rows simply draw no icon.
-    bool menu_icons_ready();
+    // menu_icons_ready() was declared here and returned a flag nothing ever set, so it answered
+    // "no icons" forever - while the menu icons were in fact working, spliced by goblin_own_movie
+    // on the parse. It had no callers, which is the only reason the false answer went unnoticed.
 
     /// The GAME's own CRT malloc (resolved by AOB), for buffers the ENGINE may later free: it uses the
     /// same heap the game's own free() does, so nothing rests on our allocator matching by luck.

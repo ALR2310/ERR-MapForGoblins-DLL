@@ -22,12 +22,13 @@ namespace
     ConvertFn *o_convert = nullptr;
 
     std::atomic<void *> g_vm{nullptr};
-    std::atomic<uint64_t> g_last_ms{0};
+    // A g_last_ms timestamp was stamped here on every converter call and never read. If a
+    // freshness gate is ever wanted (project() currently trusts a captured VM with no staleness
+    // check, unlike goblin_maphover's 300 ms window), add the reader in the same change.
 
     char convert_detour(void *vm, Vec2 *out, uint32_t *packed, Vec3 *world_local)
     {
         g_vm.store(vm, std::memory_order_relaxed);
-        g_last_ms.store(GetTickCount64(), std::memory_order_relaxed);
         return o_convert(vm, out, packed, world_local);
     }
 

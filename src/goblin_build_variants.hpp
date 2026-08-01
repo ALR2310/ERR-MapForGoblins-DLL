@@ -78,12 +78,30 @@ namespace goblin::variants
 // problems that having no window of our own removes rather than works around. Keeping all four also
 // meant three of them were never exercised while the fourth was the one under development.
 //
-// ALTERNATIVE (MFG_OVERLAY_OWN_WINDOW=1): build the three own-window backends back in, with
-// the ini key choosing between them exactly as it used to (including the Wine override that
-// forces `layered`). With the variant at 0 the key is not consulted at all - its migration to the new
-// meaning is a separate change, so nothing about the key itself is touched here.
+// ALTERNATIVE (MFG_OVERLAY_OWN_WINDOW=1): build the three own-window backends back in. Which of
+// the three is chosen is NOT an ini key any more - it is MFG_OWN_WINDOW_MODE below, because the key
+// that used to pick was repurposed as `menu_render_mode` and load_config() rewrites anything outside
+// {native, imgui, dev}. (This paragraph claimed the ini key still chose "exactly as it used to",
+// directly above the block that says it does not; corrected 2026-07-31.) The Wine/Proton override
+// that forces `layered` does still apply at runtime - that is a property of the machine, not of the
+// build.
+// VERIFIED 2026-07-30: this variant compiles again (it had silently stopped, reading a config
+// field that was renamed away). Checked by building with the default flipped to 1 - the DLL grew
+// 51200 bytes and gained the own-window-only literals (D3D11CreateDevice failed, Wine/Proton
+// detected, forcing layered), so the code really was compiled in and not skipped.
 #ifndef MFG_OVERLAY_OWN_WINDOW
 #define MFG_OVERLAY_OWN_WINDOW 0
+#endif
+
+// Which own-window backend the variant above builds: 0 = layered, 1 = surface, 2 = swapchain
+// (the values of overlay.cpp's RenderMode, in that order). This used to be an ini string, which
+// stopped working when that key was repurposed as `menu_render_mode` - load_config() rewrites
+// anything outside {native, imgui, dev}, so the drawing modes became unreachable and the backend
+// was silently always layered. It is a build choice now, like every other variant here. Ignored
+// entirely when MFG_OVERLAY_OWN_WINDOW is 0. (Wine/Proton still forces layered at runtime: DComp
+// misbehaves under gamescope, and that is a property of the machine, not of the build.)
+#ifndef MFG_OWN_WINDOW_MODE
+#define MFG_OWN_WINDOW_MODE 1
 #endif
 
 namespace goblin::variants
@@ -93,6 +111,35 @@ namespace goblin::variants
     inline constexpr bool kOverlayOwnWindow = MFG_OVERLAY_OWN_WINDOW != 0;
     inline constexpr bool kOverlayInSwapchainOnly = !kOverlayOwnWindow;
 }
+
+// ── Add-on SDK host: NOT BUILT into this DLL ─────────────────────────────────────────────────────
+// The MCM-style add-on SDK (sdk/mfg_menu_api.h + src/goblin_menu_addons.*) lets another mod add its
+// own page to our native menu. The HOST side of it - walking every module loaded in the process and
+// asking each for an exported MfgMenuAddonInit, then listing and routing the pages it gets back -
+// is being released as a SEPARATE mod, so it has no place in the map mod's binary.
+//
+// With this at 0 the sources are still in the tree (and still maintained for that separate mod) but
+// goblin_menu_addons.cpp is not in CMakeLists.txt and every call site in the menu is compiled out,
+// so nothing of it reaches the DLL: no module walk, no "MfgMenuAddonInit" string, no page rows.
+// Set to 1 (and put goblin_menu_addons.cpp back in CMakeLists.txt) to build the host in again.
+#ifndef MFG_MENU_ADDON_HOST
+#define MFG_MENU_ADDON_HOST 0
+#endif
+
+namespace goblin::variants
+{
+    inline constexpr bool kMenuAddonHost = MFG_MENU_ADDON_HOST != 0;
+}
+
+// ── CommandList child prototype: kept as reference, not built ────────────────────────────────────
+// The RE prototype that opens the game's own CommandList screen as a child of a MenuWindow, with
+// hand-made game-ABI std::function objects for the command entries. It has no callers: the native
+// menu went a different way (one screen per page off the key-binding movie). It stays in the tree
+// because scratch/endgame_research/cmdlist_notes.md points at it as the entry point for the
+// unfinished part of that work - but reference material does not need to be in the shipped binary.
+#ifndef MFG_CMDLIST_PROTO
+#define MFG_CMDLIST_PROTO 0
+#endif
 
 // ── Stall profiler: OFF in every normal build ────────────────────────────────────────────────────
 // The map-open/close stall sampler SUSPENDS the map UI thread and reads its context in a loop for the

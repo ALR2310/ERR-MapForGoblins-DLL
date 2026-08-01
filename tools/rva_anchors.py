@@ -121,7 +121,14 @@ ANCHORS = [
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE",
      "used": "own_movie: source of the memory-file field offsets"},
 
-    # ---- independent icon path (goblin_sfimage.cpp): our own pixels, our own clip ----
+    # ---- independent icon path (goblin_sfimage.cpp): NOT COMPILED as of 2026-07-31 ----
+    # goblin_sfimage.cpp is out of CMakeLists.txt (its last external caller went with the own-draw
+    # icon routes), so the four anchors below no longer guard code that ships. They are KEPT rather
+    # than deleted, unlike the stale entries pruned from aob_signatures.py, because an anchor is a
+    # byte-identity check against the exe, not a scan for one of OUR call sites: it costs nothing at
+    # build time and it is exactly what a future patch-break investigation would want if that module
+    # is ever built back in. The `used` fields below therefore describe the module's INTENDED
+    # consumers, not live call sites.
     {"name": "rawimage_create", "rva": 0x11489B0,
      "bytes": "89 54 24 10 89 4C 24 08 56 57 41 54 41 55 41 57",
      "used": "sfimage::create_resource (Render::RawImage::Create)"},

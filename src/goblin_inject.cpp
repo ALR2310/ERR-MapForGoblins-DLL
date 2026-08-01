@@ -18,7 +18,6 @@
 #include "goblin_mapproject.hpp" // read_view/to_map for the native reticle-hover proxy
 #include "goblin_overlay.hpp"
 #include "goblin_progress.hpp"   // region_place_id (tag each CategoryRow for focus)
-#include "goblin_diag.hpp"
 #include "goblin/goblin_map_flags.hpp"
 #include "from/params.hpp"
 #include "from/paramdef/WORLD_MAP_POINT_PARAM_ST.hpp"
@@ -497,9 +496,11 @@ void goblin::set_focus_category(int category_or_negative, int32_t region_place_i
 int goblin::focus_category() { return g_focus_category; }
 int32_t goblin::focus_region() { return g_focus_region; }
 
-// Focus label pass. The on-map highlight itself is drawn by the overlay as a projected
-// ring (goblin::mapproject / focus_highlight_points); this pass only keeps the focused
-// markers' on-map ICONS present so a ring has something under it. For the focused
+// Focus label pass. The on-map highlight itself is a NATIVE pooled child - a marker child
+// carrying HIGHLIGHT_ICON_ID, emitted from native_marker_snapshot (NATIVE_RING_POOL, see the
+// pool block further down this file). The overlay draws no ring and no map geometry at all
+// since 2026-07-28; goblin::mapproject has no overlay consumer left either. This pass only
+// keeps the focused markers' on-map ICONS present so a ring has something under it. For the focused
 // (category, region) UNCOLLECTED rows it gives TEXTLESS markers a "?" label +
 // isEnableNoText and forces the line on (a point with no text is dropped by the game),
 // then restores the baked text when the row leaves focus. Only touches rows it labelled,
@@ -645,19 +646,14 @@ std::unordered_set<uint64_t> goblin::hidden_marker_original_ids()
     return out;
 }
 
-// True only if this row is MANUALLY hidden. Used to suppress our hover tooltip: after a
-// manual hide the engine keeps reporting the (now icon-less) pin as hovered until the
-// cursor moves, so the tooltip would linger. We must NOT use the broader row_is_hidden
-// here - a killed boss/done NPC/hawk sets clearedEventFlagId yet its icon is still drawn
-// (hideKilledBosses defaults off), and suppressing those tooltips is the regression we hit.
-// Collected/flag-hidden icons aren't drawn at all, so the engine never reports them hovered.
-bool goblin::is_row_ptr_hidden(void *rowptr)
-{
-    if (!rowptr) return false;
-    for (const auto &cr : g_category_rows)
-        if (cr.p == rowptr) return is_manually_hidden(cr.p);
-    return false;  // not one of ours
-}
+// A goblin::is_row_ptr_hidden(void*) stood here - true only if a row is MANUALLY hidden. Ten lines
+// of rationale described the consumer in the present tense: the hover tooltip was to call it so a
+// just-hidden pin, which the engine keeps reporting as hovered until the cursor moves, stops being
+// described. That consumer does not exist - the live tooltip (maphover::drive_own_tip) asks
+// hovered_marker() and makes no hidden test at all. The distinction the rationale drew is still
+// TRUE and worth keeping if the check is ever wired up: it must NOT use the broader row_is_hidden,
+// because a killed boss / done NPC / hawk sets clearedEventFlagId while its icon is still drawn
+// (hideKilledBosses defaults off), and suppressing those tooltips was a real regression.
 
 bool goblin::prune_focus_if_empty()
 {
@@ -701,14 +697,14 @@ void goblin::inject_map_entries()
         lot_reader.init();
     std::unordered_map<uint64_t, uint16_t> live_icon_override;
     size_t live_recat = 0;
-    size_t ll_dbg_lot = 0, ll_dbg_rowfound = 0, ll_dbg_item_gt0 = 0, ll_dbg_item_le0 = 0,
-           ll_dbg_hit = 0, ll_dbg_sample = 0;
 
-    // Filter: only include enabled categories (disabled ones are simply not injected)
+    // EVERY category's rows are injected; per-category visibility is a live text-flag gate
+    // applied later (goblin::apply_category_visibility), not a filter here. See the block at
+    // the bottom of this loop. (Until 2026-07-30 this said the opposite and was paired with a
+    // `skipped_by_config` counter that nothing ever incremented, so the startup log reported
+    // "0 skipped by config" as though the filter had run and found nothing to drop.)
     std::vector<InjectedEntry> entries;
     entries.reserve(generated::MAP_ENTRY_COUNT);
-
-    size_t skipped_by_config = 0;
     for (size_t i = 0; i < generated::MAP_ENTRY_COUNT; i++)
     {
         const auto &e = generated::MAP_ENTRIES[i];
@@ -763,10 +759,8 @@ void goblin::inject_map_entries()
                            e.real_posX, e.real_posZ});
     }
 
-    spdlog::info("Adding {} map entries ({} skipped by config, {} live-recategorized)",
-                 entries.size(), skipped_by_config, live_recat);
-    spdlog::info("[ll-diag] lot-backed processed={} rowFound={} item>0={} item<=0={} tableHit={} (lot_reader.ok={})",
-                 ll_dbg_lot, ll_dbg_rowfound, ll_dbg_item_gt0, ll_dbg_item_le0, ll_dbg_hit, lot_reader.ok());
+    spdlog::info("Adding {} map entries ({} live-recategorized, live-loot table ready={})",
+                 entries.size(), live_recat, lot_reader.ok());
 
     auto param_res_cap = find_world_map_point_param_res_cap();
     if (!param_res_cap)
@@ -1387,10 +1381,8 @@ void goblin::set_param_injection_active(bool active)
     spdlog::info("[TOGGLE] WorldMapPointParam -> {}", active ? "EXPANDED" : "VANILLA");
 }
 
-bool goblin::is_param_injection_active()
-{
-    return g_param_injection_active;
-}
+// (A goblin::is_param_injection_active() accessor stood here. It had no callers -
+//  menu_auto_toggle_loop reads g_param_injection_active directly, in this same file.)
 
 // Combo is configurable via toggle_gamepad_combo in the ini. Default is
 // Y + R3 (right stick click), which is uncommon during normal play. Polled
@@ -1770,6 +1762,113 @@ namespace
         zoom = v.zoom;
         return true;
     }
+
+    // ── the anchor: where the reticle is, not where we assumed it is ──────────────
+    // ONE definition, because two of them disagreed. native_reticle_row() picks the nearest marker
+    // to this anchor, and row_reticle_dist2() measures the GAME's candidate for the same contest
+    // (goblin_maphover.cpp: `use_ours = row_reticle_dist2(row, item_d2) && ours_d2 < item_d2`).
+    // Until 2026-07-31 the second one measured from the view centre while the first had already
+    // moved to the live reticle, so the arbitration compared two distances taken from DIFFERENT
+    // points - and picked the wrong marker exactly where the anchors diverge: at full zoom-out,
+    // where the map stops panning and the reticle leaves the centre of the view.
+    //
+    // (cU, cV) is the centre of the view, which IS the reticle on vanilla and ERR. On a build whose
+    // map reticle follows the mouse (Convergence) it is not, and the popup then described the icon in
+    // the middle of the screen while the player pointed at another one.
+    //
+    // Which of the two this build does is measured, not assumed: while the game hovers one of its own
+    // pins it tells us where its reticle is (maphover::reticle_map, map space), and that either sits on
+    // the view centre or on the cursor. One sample settles it for the session; with no sample the
+    // centre stands, i.e. the old behaviour.
+    enum class Anchor
+    {
+        Centre,
+        Cursor,
+    };
+    // ATOMIC, not a plain static: this runs on the map dialog's frame AND on the overlay thread
+    // (see the cache note in native_reticle_row), and since row_reticle_dist2 calls it too there is
+    // no single lock covering both entries any more.
+    // The STARTING value comes from the build, because a profile's DLL only ever runs on the mod it was
+    // built from: Convergence is the one measured to follow the cursor. It is a starting value, not a
+    // belief - the measurement below still decides, and this only fixes the first few seconds before a
+    // sample arrives (until then the popup used to sit at the centre).
+    std::atomic<int> g_anchor{static_cast<int>(std::strstr(BUILD_NAME, "convergence") != nullptr
+                                                   ? Anchor::Cursor
+                                                   : Anchor::Centre)};
+    std::atomic<bool> g_anchor_measured{false};
+
+    void reticle_anchor(float cU, float cV, float zoom, float &ax, float &ay)
+    {
+        ax = cU;
+        ay = cV;
+        // FIRST CHOICE: the position the GAME searches around this frame, read from its own dialog
+        // (maphover::reticle_live). It needs no anchor guess at all, and it is the only one that is
+        // right at full zoom-out, where the map stops panning and the reticle leaves the centre of
+        // the view - the regime in which the two-anchor guess below quietly described the icon in
+        // the middle of the screen.
+        {
+            float lmx = 0.0f, lmz = 0.0f;
+            bool ptr_mode = false;
+            if (goblin::maphover::reticle_live(&lmx, &lmz, &ptr_mode))
+            {
+                ax = lmx;
+                ay = lmz;
+                return;
+            }
+        }
+        // Fallback: infer it. Kept because it is what shipped and it is still right in the common
+        // case, but it is now only reached when that field could not be read at all.
+        //
+        // Cursor -> map space: the inverse of the projection the markers use.
+        auto cursor_map = [&](float &out_mx, float &out_mz) -> bool {
+            POINT pt{};
+            if (!GetCursorPos(&pt))
+                return false;
+            HWND hw = GetForegroundWindow();
+            RECT rc{};
+            if (!hw || !ScreenToClient(hw, &pt) || !GetClientRect(hw, &rc))
+                return false;
+            const float cw = static_cast<float>(rc.right - rc.left);
+            const float ch = static_cast<float>(rc.bottom - rc.top);
+            if (cw < 100.0f || ch < 100.0f || zoom <= 0.0f)
+                return false;
+            if (pt.x < 0 || pt.y < 0 || pt.x > rc.right || pt.y > rc.bottom)
+                return false;
+            out_mx = (static_cast<float>(pt.x) - cw * 0.5f) / (zoom * (cw / 1920.0f)) + cU;
+            out_mz = (static_cast<float>(pt.y) - ch * 0.5f) / (zoom * (ch / 1080.0f)) + cV;
+            return true;
+        };
+        float rmx = 0.0f, rmz = 0.0f;
+        const bool have_sample = goblin::maphover::reticle_map(&rmx, &rmz, 400);
+        if (!g_anchor_measured.load(std::memory_order_acquire) && have_sample)
+        {
+            float kmx = 0.0f, kmz = 0.0f;
+            const bool have_cursor = cursor_map(kmx, kmz);
+            const float d_centre = (rmx - cU) * (rmx - cU) + (rmz - cV) * (rmz - cV);
+            const float d_cursor = have_cursor ? (rmx - kmx) * (rmx - kmx) + (rmz - kmz) * (rmz - kmz)
+                                               : 1e18f;
+            const Anchor was = static_cast<Anchor>(g_anchor.load(std::memory_order_acquire));
+            const Anchor now = d_cursor < d_centre ? Anchor::Cursor : Anchor::Centre;
+            g_anchor.store(static_cast<int>(now), std::memory_order_release);
+            g_anchor_measured.store(true, std::memory_order_release);
+            if (was != now)
+                spdlog::info("[hover] the build's starting anchor was wrong - corrected by measurement");
+            spdlog::info("[hover] reticle anchor measured: {} (sample {:.0f},{:.0f}; centre "
+                         "{:.0f},{:.0f} d2={:.0f}; cursor {:.0f},{:.0f} d2={:.0f})",
+                         now == Anchor::Cursor ? "THE CURSOR" : "the view centre", rmx, rmz, cU,
+                         cV, d_centre, kmx, kmz, have_cursor ? d_cursor : -1.0f);
+        }
+        if (static_cast<Anchor>(g_anchor.load(std::memory_order_acquire)) == Anchor::Cursor)
+        {
+            float kmx = 0.0f, kmz = 0.0f;
+            if (cursor_map(kmx, kmz))
+            {
+                ax = kmx;
+                ay = kmz;
+            }
+        }
+        // Centred build: the sample and the centre agree, so nothing to do.
+    }
 }
 
 void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_map_z)
@@ -1804,100 +1903,8 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         cache_layer = layer;
         cache_at = now;
     }
-    // ── the anchor: where the reticle is, not where we assumed it is ──────────────
-    // (cU, cV) is the centre of the view, which IS the reticle on vanilla and ERR. On a build whose
-    // map reticle follows the mouse (Convergence) it is not, and the popup then described the icon in
-    // the middle of the screen while the player pointed at another one.
-    //
-    // Which of the two this build does is measured, not assumed: while the game hovers one of its own
-    // pins it tells us where its reticle is (maphover::reticle_map, map space), and that either sits on
-    // the view centre or on the cursor. One sample settles it for the session; with no sample the
-    // centre stands, i.e. the old behaviour.
-    enum class Anchor
-    {
-        Unknown,
-        Centre,
-        Cursor,
-    };
-    // The STARTING value comes from the build, because a profile's DLL only ever runs on the mod it was
-    // built from: Convergence is the one measured to follow the cursor. It is a starting value, not a
-    // belief - the measurement below still decides, and this only fixes the first few seconds before a
-    // sample arrives (until then the popup used to sit at the centre).
-    static Anchor s_anchor =
-        std::strstr(BUILD_NAME, "convergence") != nullptr ? Anchor::Cursor : Anchor::Centre;
-    static bool s_measured = false;
-    // Cursor -> map space: the inverse of the projection the markers use.
-    auto cursor_map = [&](float &out_mx, float &out_mz) -> bool {
-        POINT pt{};
-        if (!GetCursorPos(&pt))
-            return false;
-        HWND hw = GetForegroundWindow();
-        RECT rc{};
-        if (!hw || !ScreenToClient(hw, &pt) || !GetClientRect(hw, &rc))
-            return false;
-        const float cw = static_cast<float>(rc.right - rc.left);
-        const float ch = static_cast<float>(rc.bottom - rc.top);
-        if (cw < 100.0f || ch < 100.0f || zoom <= 0.0f)
-            return false;
-        if (pt.x < 0 || pt.y < 0 || pt.x > rc.right || pt.y > rc.bottom)
-            return false;
-        out_mx = (static_cast<float>(pt.x) - cw * 0.5f) / (zoom * (cw / 1920.0f)) + cU;
-        out_mz = (static_cast<float>(pt.y) - ch * 0.5f) / (zoom * (ch / 1080.0f)) + cV;
-        return true;
-    };
-    float ax = cU, ay = cV;
-    // FIRST CHOICE: the position the GAME searches around this frame, read from its own dialog
-    // (maphover::reticle_live). It needs no anchor guess at all, and it is the only one that is right
-    // at full zoom-out, where the map stops panning and the reticle leaves the centre of the view - the
-    // regime in which the two-anchor guess below quietly described the icon in the middle of the screen.
-    bool live_anchor = false;
-    {
-        float lmx = 0.0f, lmz = 0.0f;
-        bool ptr_mode = false;
-        if (goblin::maphover::reticle_live(&lmx, &lmz, &ptr_mode))
-        {
-            ax = lmx;
-            ay = lmz;
-            live_anchor = true;
-        }
-    }
-    if (!live_anchor)
-    {
-        // Fallback: infer it. Kept because it is what shipped and it is still right in the common case,
-        // but it is now only reached when that field could not be read at all.
-        float rmx = 0.0f, rmz = 0.0f;
-        const bool have_sample = goblin::maphover::reticle_map(&rmx, &rmz, 400);
-        if (!s_measured && have_sample)
-        {
-            float kmx = 0.0f, kmz = 0.0f;
-            const bool have_cursor = cursor_map(kmx, kmz);
-            const float d_centre = (rmx - cU) * (rmx - cU) + (rmz - cV) * (rmz - cV);
-            const float d_cursor = have_cursor ? (rmx - kmx) * (rmx - kmx) + (rmz - kmz) * (rmz - kmz)
-                                               : 1e18f;
-            const Anchor was = s_anchor;
-            s_anchor = d_cursor < d_centre ? Anchor::Cursor : Anchor::Centre;
-            s_measured = true;
-            if (was != s_anchor)
-                spdlog::info("[hover] the build's starting anchor was wrong - corrected by measurement");
-            spdlog::info("[hover] reticle anchor measured: {} (sample {:.0f},{:.0f}; centre "
-                         "{:.0f},{:.0f} d2={:.0f}; cursor {:.0f},{:.0f} d2={:.0f})",
-                         s_anchor == Anchor::Cursor ? "THE CURSOR" : "the view centre", rmx, rmz, cU,
-                         cV, d_centre, kmx, kmz, have_cursor ? d_cursor : -1.0f);
-        }
-        if (s_anchor == Anchor::Cursor)
-        {
-            float kmx = 0.0f, kmz = 0.0f;
-            if (cursor_map(kmx, kmz))
-            {
-                ax = kmx;
-                ay = kmz;
-            }
-        }
-        else if (have_sample && s_anchor == Anchor::Centre)
-        {
-            // Centred build: the sample and the centre agree, so nothing to do.
-        }
-    }
+    float ax = 0.0f, ay = 0.0f;
+    reticle_anchor(cU, cV, zoom, ax, ay); // the SAME anchor row_reticle_dist2 measures from
     constexpr float PICK_CANVAS_PX = 40.0f; // ~engine pin focus radius
     float best = PICK_CANVAS_PX * PICK_CANVAS_PX;
     void *best_row = nullptr;
@@ -1938,8 +1945,13 @@ bool goblin::row_reticle_dist2(const void *rowptr, float &out_dist2)
     if (!goblin::mapproject::to_map(wp->areaNo, wp->gridXNo, wp->gridZNo,
                                     wp->posX, wp->posZ, mx, mz))
         return false;
-    const float dx = (mx - cU) * zoom;
-    const float dy = (mz - cV) * zoom;
+    // From the SAME anchor native_reticle_row picks against - the caller compares the two numbers
+    // directly, so measuring this one from the view centre made the comparison meaningless wherever
+    // the reticle is not at the centre.
+    float ax = 0.0f, ay = 0.0f;
+    reticle_anchor(cU, cV, zoom, ax, ay);
+    const float dx = (mx - ax) * zoom;
+    const float dy = (mz - ay) * zoom;
     out_dist2 = dx * dx + dy * dy;
     return true;
 }
@@ -2338,35 +2350,24 @@ static void show_tutorial_popup_trampoline(uintptr_t /*er*/, int tutorial_id)
     if (fn) fn(tutorial_id);
 }
 
-// SEH-guarded codex-toast fire (POD-only locals, no C++ unwinding).
-static void seh_dispatch_toast(uintptr_t er, bool icons_on)
+// SEH-guarded trampoline fire (POD-only locals - no C++ unwinding). ONE of these, not two: there
+// used to be a seh_dispatch_toast and a seh_fire_trampoline with byte-identical bodies, differing
+// only in how the caller obtained the tutorial id.
+//
+// Both callers also computed a module handle first - GetModuleHandleA(nullptr), checked against 0
+// (which cannot happen for one's own process) and passed as `er` - and the trampoline's `er`
+// parameter has been commented out for as long as it has existed. That whole dance is gone.
+static void seh_fire_toast(int tutorial_id)
 {
-    int tutorial_id = goblin::g_toast_param_row_id[icons_on ? goblin::TOAST_ON : goblin::TOAST_OFF];
-    __try
-    {
-        show_tutorial_popup_trampoline(er, tutorial_id);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
+    __try { show_tutorial_popup_trampoline(0, tutorial_id); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
-// Fire the upper-left codex toast for the icons ON/OFF toggle. Resolves the
-// module base once.
+// Fire the upper-left codex toast for the icons ON/OFF toggle.
 static void show_toggle_banner(bool icons_on)
 {
-    static uintptr_t er = 0;
-    if (!er) er = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr) /* main module = the game exe */);
-    if (!er) return;
     spdlog::info("[TOAST] fire (icons {})", icons_on ? "ON" : "OFF");
-    seh_dispatch_toast(er, icons_on);
-}
-
-// SEH-guarded trampoline fire (POD-only locals - no C++ unwinding).
-static void seh_fire_trampoline(uintptr_t er, int tutorial_id)
-{
-    __try { show_tutorial_popup_trampoline(er, tutorial_id); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { }
+    seh_fire_toast(goblin::g_toast_param_row_id[icons_on ? goblin::TOAST_ON : goblin::TOAST_OFF]);
 }
 
 // Fire an upper-left codex toast for one of the injected TutorialParam rows
@@ -2374,26 +2375,14 @@ static void seh_fire_trampoline(uintptr_t er, int tutorial_id)
 // path as the F10 banner - no FMG rewrite. Used by the F9 marker-dump banner.
 void goblin::show_codex_toast(int tutorial_id)
 {
-    static uintptr_t er = 0;
-    if (!er) er = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr) /* main module = the game exe */);
-    if (!er) return;
-    seh_fire_trampoline(er, tutorial_id);
+    seh_fire_toast(tutorial_id);
 }
 
 
-// WorldMapPointParam state owner. Since the 16-align fix in inject_map_entries
-// (see docs/ersc_hosting_and_map_autohide.md), the expanded table is safe during
-// ERSC hosting - the old "expand only while the map is open" auto-hide is no
-// longer needed and has been removed. The table now stays EXPANDED always; the
-// hotkey is a pure personal show/hide toggle.
-//
-// Desired table state:
-//   userDisabled (F10/gamepad master-off) -> VANILLA  (user hid the icons)
-//   else                                  -> EXPANDED  (icons everywhere)
-//
-// (The retired map-state auto-hide read CSMenuMan+0xCD with inverse logic;
-// it's fully documented in docs/ersc_hosting_and_map_autohide.md should a
-// future patch ever need it back.)
+// The live rows we injected, for whoever needs to walk them. (A thirteen-line header describing the
+// WorldMapPointParam STATE MACHINE - who owns the vanilla/expanded decision and what the desired
+// state is per user toggle - stood over this accessor, which owns none of it. That machine is
+// menu_auto_toggle_loop; the header moved there.)
 const std::vector<uint8_t *> &goblin::injected_row_ptrs()
 {
     return g_injected_row_ptrs;
@@ -2471,11 +2460,6 @@ void goblin::apply_flag_or_pairs()
     }
 }
 
-// ── Live-loot: hide loot markers on the LIVE item-lot pickup flag ──────
-// Reads each lot-backed marker's source ItemLotParam row from memory and sets
-// textDisableFlagId1 to the lot's current getItemFlagId. Because we read the
-// LOADED regulation (vanilla, Randomizer, any file mod), the marker hides on
-// the actual light-point pickup regardless of which item the lot now gives.
 // Point every marker whose (baked/live) iconId is a custom icon we injected at the runtime-injected
 // frame for it. Called from the worldmap-load hook after the icon frames are appended, before pins are
 // built. gfx_probe::injected_iconid(src) returns the appended frame's iconId for source icon `src`, or
@@ -2506,9 +2490,16 @@ void goblin::remap_injected_icons()
                      "possibly two copies active).", already, iid_lo, iid_hi);
     spdlog::info("[icons] mapped {} markers to new frame ids.", n);
     apply_focus_highlight();  // re-apply any active focus glow after the frames are (re)mapped
-    goblin::diag::set_remap(n);
 }
 
+// ── Live-loot: hide loot markers on the LIVE item-lot pickup flag ──────
+// Reads each lot-backed marker's source ItemLotParam row from memory and sets
+// textDisableFlagId1 to the lot's current getItemFlagId. Because we read the
+// LOADED regulation (vanilla, Randomizer, any file mod), the marker hides on
+// the actual light-point pickup regardless of which item the lot now gives.
+// (This header sat above remap_injected_icons() until 2026-07-30, separated from its own function
+// by a missing blank line - and that function does not read ItemLotParam at all.)
+//
 // One-shot at init: the flag VALUE in a row is static post-load; the engine
 // then evaluates textDisableFlagId1 live every frame. See reference_cleared_badge
 // / the randomizer-compat research. Gated by config::liveLootFlags/Labels.
@@ -2607,6 +2598,17 @@ void goblin::refresh_loot_from_itemlot()
                  updated, relabeled, not_found, no_flag, g_lot_backed_rows.size());
 }
 
+// WorldMapPointParam state owner. Since the 16-align fix in inject_map_entries
+// (see docs/ersc_hosting_and_map_autohide.md), the expanded table is safe during ERSC hosting -
+// the old "expand only while the map is open" auto-hide is no longer needed and has been removed.
+// The table now stays EXPANDED always; the hotkey is a pure personal show/hide toggle.
+//
+// Desired table state:
+//   userDisabled (F10/gamepad master-off) -> VANILLA  (user hid the icons)
+//   else                                  -> EXPANDED  (icons everywhere)
+//
+// (The retired map-state auto-hide read CSMenuMan+0xCD with inverse logic; it is fully documented
+// in docs/ersc_hosting_and_map_autohide.md should a future patch ever need it back.)
 void goblin::menu_auto_toggle_loop()
 {
     bool prev_user_disabled = g_icons_user_disabled.load();

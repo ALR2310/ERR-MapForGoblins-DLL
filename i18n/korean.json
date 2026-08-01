@@ -4,7 +4,6 @@
     "AllOn": "모두 켜기",
     "AllOff": "모두 끄기",
     "RandomizerHint": "랜덤마이저(Randomizer)를 사용 중이신가요? live_loot_flags + live_loot_labels + live_loot_icons 옵션을 활성화하여 마커가 무작위로 배치된 아이템 위치와 일치하도록 설정하세요.",
-    "FastMapOpenWarning": "베타: 지도 오픈 속도를 빠르게 만듭니다. 지도가 비정상적으로 작동하거나 게임이 충돌할 경우 이 옵션을 비활성화하세요.",
     "IniOnly": "(.ini 전용)",
     "PressAKey": "아무 키나 누르세요",
     "PressComboRelease": "콤보 입력 후 떼기",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "지도 조각 필요",
     "location_emphasis": "현재 위치 강조",
-    "fast_map_open": "지도 빨리 열기",
     "show_armaments": "무기",
     "show_armour": "방어구",
     "show_ashes_of_war": "전회",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "해당 지역의 지도 조각을 발견하기 전까지 아이콘 표시 안 함",
     "location_emphasis": "현재 머물러 있는 맵의 마커는 크게, 가까워 보일 뿐인 마커(발 아래 던전이나 그 위 지상)는 작게 표시됩니다. 숨기는 것은 없습니다.",
-    "fast_map_open": "베타: 많은 아이콘이 표시될 때 세계 지도를 더 빨리 엽니다.\n지도가 오작동하거나 게임이 충돌하는 경우 비활성화하세요.",
     "show_armaments": "무기, 방패, 활, 지팡이 등",
     "show_armour": "방어구 (투구, 갑옷, 장갑, 각반)",
     "show_ashes_of_war": "전회 (무기 기술)",

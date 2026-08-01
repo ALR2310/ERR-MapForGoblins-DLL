@@ -1,17 +1,20 @@
 #pragma once
-// World-map overlay projection. Turns a marker's world X/Z into a screen pixel on the
-// open world map, so the overlay can draw a highlight ring on top of the game-rendered
-// icon (no baked glow variants, no map reopen). Uses the live WorldMapDialog view
-// transform (center/zoom/logical-viewport) published by goblin::maphover, plus a small
-// calibration (logical->device px) that is tuned once against the rendered frame.
+// World-map coordinates. Two things live here now:
+//   read_view()  the live view transform (pan / snapMid / zoom) off the map dialog
+//   to_map()     a raw WorldMapPointParam position -> the map canvas coordinate that native
+//                Scaleform display objects use
 //
 // Coordinate chain (overworld / underground / DLC - one shared affine):
 //   world = gridNo*256 + pos      (from WORLD_MAP_POINT_PARAM_ST)
 //   mapX  = worldX - CONST_X ; mapZ = CONST_Z - worldZ
-//   logical = (map - center)/zoom + viewport/2
-//   screen  = origin + logical*scale
-// Legacy dungeons use a per-area fold (WorldMapLegacyConvParam) and are handled
-// separately once the overworld path is pixel-verified.
+// Legacy dungeons use a per-area fold (WorldMapLegacyConvParam), resolved in tools/legacy_conv.py
+// at bake time rather than here.
+//
+// THIS IS NO LONGER A world->SCREEN PROJECTOR. It was: project() turned a marker into a screen
+// pixel so the overlay could draw a highlight ring over the game-rendered icon, and calib() tuned
+// the logical->device scale against the rendered frame. Both went with the overlay's on-map
+// drawing on 2026-07-28 (the rings are native display children now), and with them the last
+// consumer of the screen half of the chain.
 #include <cstdint>
 
 namespace goblin::mapproject
@@ -27,43 +30,24 @@ namespace goblin::mapproject
         float panX, panZ;
         float zoom;
         float snapMidX, snapMidZ;
-        float fullMidX, fullMidZ; // fixed midpoint of the complete map canvas
+        // (fullMidX / fullMidZ - the fixed midpoint of the complete map canvas - were members
+        //  here. Filled every read_view(), read by nothing.)
         bool valid;
     };
 
-    // Live calibration. Pan/zoom/scale are already tracked by the two live rects, so the
-    // only residual is a MAP-SPACE nudge (a constant offset in the world->map-space
-    // affine): applied before projection it tracks zoom correctly, unlike a screen-space
-    // offset which drifts as the map scales. scale is a rarely-needed multiplier override.
-    struct Calib
-    {
-        float scale;      // 0 = auto (client/visSize); >0 overrides the device scale
-        float dmap_x;     // map-space X nudge (+ moves rings right)
-        float dmap_z;     // map-space Z nudge (+ moves rings down, before flip)
-        float map_scale;  // map-space spread multiplier about the map centre (1 = none):
-                          // corrects a mismatch between our world->map-space unit and the
-                          // range the full-map rect spans (fixes corner-vs-corner drift)
-        bool flip_y;      // invert the vertical axis if north/south comes out flipped
-    };
+    // A Calib struct (a map-space nudge tuned live from overlay sliders) lived here alongside
+    // project() below. Both went with the overlay's on-map drawing on 2026-07-28: nothing
+    // projects to screen pixels any more, because the rings and the hover marker are native
+    // display children positioned in map space.
 
     // Read the live view transform from the map dialog. false if the map is closed or
     // the dialog is not resolvable this frame.
     bool read_view(MapView &out);
 
     // Convert a raw WorldMapPointParam position to the map canvas coordinate
-    // used by native Scaleform display objects. Unlike project(), this does not
-    // depend on the current pan/zoom or the client size.
+    // used by native Scaleform display objects. It does NOT depend on the current
+    // pan/zoom or on the client size - that is what makes it safe to bake against.
     bool to_map(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
                 float &map_x, float &map_z);
 
-    // Project a marker to a screen pixel. area 60/61 use the plain overworld affine on
-    // (grid*256+pos); every other area is folded to map-space by the game's converter
-    // (goblin::worldmap_probe). Returns false if a folded area cannot be placed yet
-    // (view-model not captured / map not opened this session).
-    bool project(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
-                 const MapView &v, const Calib &c, float client_w, float client_h,
-                 float &screen_x, float &screen_y);
-
-    // Live calibration accessors (overlay sliders write these; defaults below).
-    Calib &calib();
 }

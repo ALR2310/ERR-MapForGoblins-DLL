@@ -12,6 +12,11 @@
 // and those are covered by tools/rva_anchors.py).
 //
 // Threading: menu/UI thread only - the repository and drawing contexts have no locks.
+//
+// NOT COMPILED as of 2026-07-31 (goblin_sfimage.cpp is commented out of CMakeLists.txt): the last
+// external caller of create_resource() went with the own-draw icon routes. To build it back in,
+// restore the two source lines in CMakeLists.txt and re-add `#include "goblin_sfimage.hpp"` to
+// whichever file starts calling it.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,34 +32,11 @@ namespace goblin::sfimage
     // per frame would leak.
     void *create_resource(const wchar_t *name, int width, int height, const uint8_t *rgba);
 
-    // Draw a previously created resource into a resolved clip proxy, scaled to fit
-    // width x height pixels at (x, y) in the clip's OWN coordinates. Returns false if the
-    // clip cannot host a drawing. A zero width or height clears the clip's drawing context
-    // without putting anything in it, which is how a row with no icon is blanked.
-    bool draw_into(void *clip_proxy, void *resource, float x, float y, float width,
-                   float height);
-
-    // How far the row-icon path got the last time a row with an icon was drawn. Reported on
-    // the Tools page so a broken step is visible in game without reading the log.
-    enum class IconState
-    {
-        Untried,  // no icon row drawn yet
-        NoImage,  // the pixels could not be turned into a resource
-        NoClip,   // no clip to draw into (child creation refused and no spare clip)
-        NoDraw,   // the clip exists but the engine refused the drawing
-        Drawn,    // pixels are on screen
-    };
-    // Which step refused the last drawing, and the value type word the clip reported.
-    const char *draw_failure();
-    uint32_t last_value_type();
-
-    IconState icon_state();
-    void set_icon_state(IconState state);
-    const char *icon_state_name();
-
-    // Create an empty child clip (a flash.display.Sprite) named `name` at `depth` under the
-    // given parent clip proxy, so we have something of our own to draw into. Safe to call
-    // repeatedly - it does nothing if the child already exists. Returns false if the engine
-    // refused (e.g. the parent is not a display-object container).
-    bool ensure_child_clip(void *parent_proxy, const char *name, int32_t depth);
+    // REMOVED 2026-07-30, with the drawing half of the .cpp: draw_into(), ensure_child_clip(),
+    // the IconState enum and its accessors (draw_failure / last_value_type / icon_state /
+    // set_icon_state / icon_state_name). They served the own-icon path, which was permanently
+    // disabled (kEnableOwnIconPath = false) when the row icons moved to being spliced into the
+    // menu movie, and they reported their state to an overlay Tools page retired on 2026-07-28.
+    // The hard-won details about the engine's addref, the CreateEmptyMovieClip out-buffer and
+    // the vtable-slot lookup are kept as comments at their old sites in the .cpp.
 }

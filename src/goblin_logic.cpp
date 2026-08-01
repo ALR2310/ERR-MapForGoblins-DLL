@@ -97,22 +97,21 @@ static int GetMapFragment(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &r
             if (t == 12011) { requiredMapFragment = flag::LakeOfRot; break; }
     }
 
-    if (config::requireMapFragments)
+    // Post-event areas. (This block used to re-test config::requireMapFragments. It could not be
+    // false here: the only caller is GetIconFlag below, which calls this function ONLY from inside
+    // that same test.)
+    if (chunk == MapTile(11, 5) || chunk == MapTile(19))
     {
-        // Post-event areas
-        if (chunk == MapTile(11, 5) || chunk == MapTile(19))
-        {
-            SetSecondaryFlags(row, flag::StoryErdtreeOnFire);
-        }
-        else if (chunk == MapTile(21) || chunk == MapTile(21, 1) ||
-                 chunk == MapTile(21, 2) || chunk == MapTile(22))
-        {
-            SetSecondaryFlags(row, flag::StoryCharmBroken);
-        }
-        else if (chunk == MapTile(20, 1))
-        {
-            SetSecondaryFlags(row, flag::StorySealingTreeBurnt);
-        }
+        SetSecondaryFlags(row, flag::StoryErdtreeOnFire);
+    }
+    else if (chunk == MapTile(21) || chunk == MapTile(21, 1) ||
+             chunk == MapTile(21, 2) || chunk == MapTile(22))
+    {
+        SetSecondaryFlags(row, flag::StoryCharmBroken);
+    }
+    else if (chunk == MapTile(20, 1))
+    {
+        SetSecondaryFlags(row, flag::StorySealingTreeBurnt);
     }
 
     return requiredMapFragment;
@@ -126,25 +125,18 @@ static int GetIconFlag(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &row)
         return flag::AlwaysOn;
 }
 
-static void HideOnCompletion(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &row)
+// DUNGEON rows only. The one caller is SetupDungeonERR, which is itself only reached from the
+// `else` of `if (row.textId2 == 5100)` and never writes textId2 before calling - so the overworld
+// branch this used to carry (disable flags taken from textEnableFlagId4 when textId2 == 5100) could
+// not be reached, and is gone. Overworld bosses go through SetupOverworldERR, which does not hide.
+static void HideOnCompletion(from::paramdef::WORLD_MAP_POINT_PARAM_ST &row)
 {
-    if (row.textId2 == 5100)
-    {
-        auto disableFlag = row.textEnableFlagId4;
-        row.textDisableFlagId1 = disableFlag;
-        row.textDisableFlagId2 = disableFlag;
-        row.textDisableFlagId3 = disableFlag;
-        row.textDisableFlagId4 = disableFlag;
-    }
-    else
-    {
-        auto disableFlag = row.textEnableFlagId5;
-        row.textDisableFlagId1 = disableFlag;
-        row.textDisableFlagId2 = disableFlag;
-        row.textDisableFlagId3 = disableFlag;
-        row.textDisableFlagId4 = disableFlag;
-        row.textDisableFlagId5 = disableFlag;
-    }
+    auto disableFlag = row.textEnableFlagId5;
+    row.textDisableFlagId1 = disableFlag;
+    row.textDisableFlagId2 = disableFlag;
+    row.textDisableFlagId3 = disableFlag;
+    row.textDisableFlagId4 = disableFlag;
+    row.textDisableFlagId5 = disableFlag;
 }
 
 static void SetupOverworldERR(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &row)
@@ -163,7 +155,7 @@ static void SetupDungeonERR(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST 
 
     if (config::hideDungeonIconsOnClear)
     {
-        HideOnCompletion(rowId, row);
+        HideOnCompletion(row);
     }
 }
 
@@ -175,10 +167,9 @@ static void SetupCampsERR(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &r
 
 static void SetupMerchants(int rowId, from::paramdef::WORLD_MAP_POINT_PARAM_ST &row)
 {
-    if (config::requireMapFragments)
-        row.textEnableFlagId3 = GetIconFlag(rowId, row);
-    else
-        row.textEnableFlagId3 = flag::AlwaysOn;
+    // One assignment, not two branches: GetIconFlag already returns flag::AlwaysOn when
+    // config::requireMapFragments is false, so the else arm computed the same value by hand.
+    row.textEnableFlagId3 = GetIconFlag(rowId, row);
 }
 
 void goblin::apply_map_logic()

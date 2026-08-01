@@ -17,7 +17,8 @@
 #include "goblin_i18n.hpp"    // the localized hover sentences
 #include "goblin_progress.hpp" // region names for the focus banner    // the localized hover sentences
 #include "goblin_inject.hpp"
-#include "goblin_messages.hpp" // lookup_text() for the marker name     // native_reticle_row() - the native-tooltip proxy
+// (goblin_messages.hpp was included here "for lookup_text()"; no export of that header is used
+//  in this file. The trailing note about native_reticle_row belongs to goblin_inject.hpp above.)
 #include "goblin_map_timing.hpp"
 #include "goblin_stall_probe.hpp"
 #include "modutils.hpp"
@@ -48,6 +49,9 @@ namespace
     //   line  = base + i * 0x180,  slot count = *(int64*)(base + 0xC08)
     //   FUN_140735A60(line, visible) / FUN_1407353B0(line + 0x70, DLString)
     std::atomic<void *> g_popup_panel{nullptr};
+    // One-shot latch for the line-slot log below. It is an int32 because it used to publish the
+    // popup's line-slot count for popup_line_slots(), which was removed with the overlay's on-map
+    // panel; the only thing left that reads it is its own "have I logged this yet" test.
     std::atomic<int32_t> g_popup_lines{-1};
     std::atomic<bool> g_root_probed{false};
 
@@ -66,7 +70,6 @@ namespace
     using BuildFn = void *(void *, void *, void *, void *);
     BuildFn *o_build = nullptr;
 
-    std::atomic<void *> g_dialog_data{nullptr};  // buildMarkers param_2 (dialogData)
 
     // Native-tooltip proxy: the last REAL pin the engine focused this map
     // session. When the engine focuses nothing but one of OUR native markers
@@ -114,10 +117,9 @@ namespace
     {
         g_map_owner.store(owner, std::memory_order_relaxed);
         g_proxy_pin.store(nullptr, std::memory_order_relaxed);
-        // ctx = dialogData. The displayed map id lives at *(int*)(dialogData+8) and its top
-        // byte is the area (60=overworld, 12=underground, 61=DLC) - it updates live on layer
-        // switch (FUN_1401b9390). We keep the pointer and read it live in map_layer().
-        g_dialog_data.store(ctx, std::memory_order_relaxed);
+        // (A g_dialog_data pointer was stored here with a note saying map_layer() reads the
+        //  displayed map id live from *(int*)(dialogData+8). It does not: map_layer() reads
+        //  MapArea+0x904 off g_dialog. Nothing ever loaded g_dialog_data.)
         goblin::stall_probe::v3_pin_build_begin(owner, ctx);
         void *result = o_build(owner, ctx, a, b);
         goblin::stall_probe::v3_pin_build_end();
@@ -192,12 +194,15 @@ namespace
 
     // ── our own hover panel ──────────────────────────────────────────────────────────
     // Body/MfgTip is a second named placement of the tooltip sprite, added by the load-time
-    // transform. It is OURS: own position, own line count, own text. The game's Body/PlaceName is
-    // never read or written here.
+    // transform. It is OURS: own position, own line count, own text.
     //
-    // Coordinates: the pin's world position (item->vt[0x20]) is converted by the game's own
-    // FUN_1409CC470(mapArea, &out2f, v). Reusing that converter is deliberate - re-deriving the
-    // projection would drift from the map's view transform on every zoom/pan change.
+    // The game's own Body/PlaceName IS read and written in this file (kGamePanel below, and the
+    // show/hide of the game popup) - an earlier version of this note claimed otherwise.
+    //
+    // Coordinates: map space -> the space Body's children live in. FUN_1409CC470 does it for the
+    // game, but it needs a pin, and our markers have none - so the same formula is applied inline
+    // (`out = zoom * v - pan` over WorldMapArea +0x380 / +0x378 / +0x37C). The converter's address
+    // is therefore NOT called from here; only its arithmetic is reused.
     constexpr uintptr_t kSetVisible = 0x733340;
     constexpr uintptr_t kSetPosI = 0x7331A0;
     // ── the game's own wrappers are a different type from a resolved proxy ───────────
@@ -214,7 +219,6 @@ namespace
     constexpr uintptr_t kResolve = 0x74A2F0;
     constexpr uintptr_t kProxyValid = 0x733150;
     constexpr uintptr_t kProxyDtor = 0xD7F850;
-    constexpr uintptr_t kWorldToScreen = 0x9CC470;
     // Text colour. These fields are html=0, so markup is not an option here - unlike the menu,
     // where the same job is done with a <font> tag.
     constexpr uintptr_t kSetTextColor = 0x74A1D0;
@@ -531,36 +535,11 @@ namespace
         --goblin::guarded::depth;
     }
 
-    // ── where is the reticle? (measurement, not assumption) ─────────────────────────
-    // Offset of the position pair inside a display object, discovered once by writing a known
-    // position and looking for it. -1 until found. The proxy holds the display object at +0x50 (the
-    // same pdata the icon work identified), and Scaleform keeps the transform in twips, so the pair
-    // we look for is (x*20, y*20) as floats.
-
-    uintptr_t proxy_object(void *proxy)
-    {
-        __try
-        {
-            return *reinterpret_cast<uintptr_t *>(reinterpret_cast<uint8_t *>(proxy) + 0x50);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return 0;
-        }
-    }
-
-    bool read_float(uintptr_t at, float *out)
-    {
-        __try
-        {
-            *out = *reinterpret_cast<float *>(at);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
-    }
+    // Two SEH readers (proxy_object / read_float) lived here for a one-off measurement: find the
+    // offset of a display object's position pair by writing a known position and searching for
+    // (x*20, y*20) in twips. The measurement is long done - the reticle field is documented and
+    // popup_pos() reads it directly - and neither helper had a caller left. The comment that
+    // introduced them described a "-1 until found" variable that no longer existed either.
 
     // POD-only: show/hide our panel root and place it.
     void tip_root(uintptr_t base, void *root, const char *panel, bool show, int x, int y)
@@ -600,32 +579,11 @@ namespace
         --goblin::guarded::depth;
     }
 
-    // Map space -> the space Body's children live in. The game's converter (FUN_1409CC470) is
-    // just `out = zoom * v - pan` over WorldMapArea +0x380 (zoom) / +0x378,+0x37C (pan), and its
-    // `v` is a plain float[2] in MAP space - so ANY point of ours can be placed, with no pin
-    // involved. That matters: our markers are drawn by the native path and have no game pin, so
-    // the first attempt (which needed one) never showed anything on hover.
-    bool tip_pos_from_map(void *map_area, float map_x, float map_z, float *out2)
-    {
-        bool ok = false;
-        ++goblin::guarded::depth;
-        __try
-        {
-            const uintptr_t a = reinterpret_cast<uintptr_t>(map_area);
-            const float pan_x = *reinterpret_cast<float *>(a + 0x378);
-            const float pan_z = *reinterpret_cast<float *>(a + 0x37C);
-            const float zoom = *reinterpret_cast<float *>(a + 0x380);
-            out2[0] = zoom * map_x - pan_x;
-            out2[1] = zoom * map_z - pan_z;
-            ok = true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            ok = false;
-        }
-        --goblin::guarded::depth;
-        return ok;
-    }
+    // A tip_pos_from_map(map_area, map_x, map_z, out2) stood here - the map-space to Body-space
+    // conversion, `out = zoom * v - pan`. It had no callers: the live tooltip is laid out by
+    // map_x_bounds() / map_middle_y() / popup_pos() instead, which place it against the panel
+    // rather than against the marker. The constant it was written for, kWorldToScreen
+    // (FUN_1409CC470), had a single occurrence in the tree - its own declaration - and went too.
 
     // Does this movie carry our own panels? Answered once, from the movie itself: a mod that ships
     // its own 02_120_worldmap is served by a route the load-time transform never sees, and then our
@@ -852,9 +810,11 @@ namespace
 
     void *placename_detour(void *panel, void *item, void *map_area)
     {
-        // This hook fires once per frame on the game UI thread while the world map
-        // is open (the dialog's per-frame Update calls it, item may be null) - it is
-        // the per-frame driver for fast_map_open's deferred-relayout replay.
+        // This hook fires once per frame on the game UI thread while the world map is open (the
+        // dialog's per-frame Update calls it, item may be null). It drives the map's per-frame
+        // work: today that is stall_probe::on_map_frame() (marker viewport reconcile + the
+        // location-emphasis pass). It is NOT a replay driver - the deferred-relayout replay queue
+        // this comment used to name was removed for good, and `fast_map_open` is a retired ini key.
         goblin::map_timing::on_map_frame();
 
         // Publish the popup panel and how many line slots its current variant has, so the
@@ -974,9 +934,16 @@ namespace
             void *pin = nullptr;
             if (use_ours)
             {
-                // Preferred: our own engine-constructed pin. Fallback when the
-                // ctor AOB missed: borrow the live item (or the cached pin).
-                if (g_pin_ctor)
+                // The engine renders this frame's popup FROM THE PIN OBJECT IT IS HOLDING. So when
+                // it has one, re-point THAT object - which is what the note above always said
+                // ("borrow a real pin - the live item when there is one"). The code used to prefer
+                // our own constructed pin instead, and because g_own_pin_ready latches on first
+                // success it then took that branch forever: we wrote our row into an object the
+                // engine was not drawing, reported success, and the player saw the engine's own
+                // popup or nothing at all. Diagnosed 2026-07-31 from a live log where
+                // `item=yes ... pin=own -> SHOWN` coincided with no popup on screen.
+                pin = item;
+                if (!pin && g_pin_ctor)
                 {
                     if (!g_own_pin_ready && seh_construct_own_pin(ours, ours_mx, ours_mz))
                         g_own_pin_ready = true;
@@ -984,7 +951,7 @@ namespace
                         pin = g_own_pin;
                 }
                 if (!pin)
-                    pin = item ? item : g_proxy_pin.load(std::memory_order_relaxed);
+                    pin = g_proxy_pin.load(std::memory_order_relaxed);
             }
             if (pin)
             {
@@ -1173,11 +1140,8 @@ void *goblin::maphover::hovered_row()
     return g_hovered_row.load(std::memory_order_relaxed);
 }
 
-void *goblin::maphover::popup_panel() { return g_popup_panel.load(std::memory_order_relaxed); }
-int32_t goblin::maphover::popup_line_slots()
-{
-    return g_popup_lines.load(std::memory_order_relaxed);
-}
+// popup_panel() / popup_line_slots() were exported here and never called: the code inside this
+// file that needs the panel reads g_popup_panel directly.
 
 uint64_t goblin::maphover::last_activity_ms()
 {

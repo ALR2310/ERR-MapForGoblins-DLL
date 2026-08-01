@@ -1,27 +1,26 @@
-// In-game config overlay: Dear ImGui drawn in a SEPARATE, INDEPENDENT transparent
-// top-most window with its own D3D11 + DirectComposition device, on its own thread.
+// In-game config overlay: Dear ImGui, drawn INTO THE GAME'S OWN FRAME.
 //
-// Why a separate window (not a swapchain hook): we no longer touch the game's DXGI
-// swapchain at all. That makes the overlay compatible with tools that wrap the
-// game's swapchain (Special K, NVIDIA Smooth Motion / driver frame-gen, ReShade) -
-// the old Present/ExecuteCommandLists hook fought those wrappers and crashed.
+// WHAT SHIPS (MFG_OVERLAY_OWN_WINDOW = 0, the default): the sc2 in-swapchain backend. We publish
+// ImGui draw data and the game's own D3D12 renderer paints it - no window of ours, no second
+// swapchain, no D3D11 device, no DirectComposition. setup() builds the ImGui context and fonts
+// WITHOUT a platform/renderer backend and runs sc2_frontend_loop() on its own thread.
+//   - Custom images DO draw: the category icons, the logo and the highlight are packed into the
+//     FONT ATLAS (AddCustomRectRegular + a blit per rect), because the packet carries one texture.
+//   - Only an OPEN menu is published. The overlay draws nothing else: the on-map hover panel, the
+//     focus banner and the highlight rings were retired on 2026-07-28 in favour of native
+//     equivalents, which is why nothing here projects world coordinates to screen any more.
+//   - Whether this overlay is created at all depends on menu_render_mode: at the shipping default
+//     (`native`) the in-game menu owns the hotkey and the overlay is never created.
 //
-// Architecture:
-//   - setup() spawns a detached overlay thread that creates the window + D3D11 +
-//     DComp + ImGui DX11 backend and runs the render loop. setup() returns fast.
-//   - The window is WS_POPUP + WS_EX_LAYERED|TRANSPARENT|TOPMOST|NOACTIVATE|
-//     TOOLWINDOW; transparency comes from DirectComposition (premultiplied alpha),
-//     NOT UpdateLayeredWindow.
-//   - Each loop iteration the overlay window is moved to exactly cover the game's
-//     client area, so it sits over the game like a HUD.
-//   - F10 (toggle key) + ESC are polled with GetAsyncKeyState (rising edge) to
-//     open/close the menu. While CLOSED the window is click-through (WS_EX_TRANSPARENT)
-//     and renders nothing; while OPEN it is interactive and ImGui draws the panel.
-//   - Input is our OWN WndProc -> ImGui_ImplWin32_WndProcHandler (mouse + keyboard).
-//     Optional gamepad nav is polled directly via XInputGetState (no hook).
+// THE ALTERNATIVE (MFG_OVERLAY_OWN_WINDOW = 1): a separate transparent top-most window with its
+// own D3D11 + DirectComposition device, in three flavours picked by MFG_OWN_WINDOW_MODE (layered /
+// surface / swapchain; Wine/Proton is forced to layered at runtime because DComp misbehaves under
+// gamescope). It exists because a window of our own cannot be fought over by tools that wrap the
+// game's swapchain, and because that was the shape the overlay had first. Everything specific to it
+// lives under `#if MFG_OVERLAY_OWN_WINDOW` blocks further down, including the dev Icon Preview,
+// which needs a texture of its own and therefore only works there.
 //
-// All UI drawing code (draw_settings_window / tabs / rebind / preview) is backend
-// -agnostic and reused verbatim; only the texture path is now D3D11 SRVs.
+// All UI drawing code (draw_settings_window and the tabs) is backend-agnostic and shared by both.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -48,12 +47,11 @@
 #include "goblin_inject.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_build_variants.hpp" // which overlay backend is in this build
-#include "goblin_maphover.hpp"   // hovered_row() for the passive hover-info panel
-#include "goblin_mapproject.hpp" // world->screen projection for the highlight rings
-#include "goblin_messages.hpp"   // lookup_text() for the hovered marker's name
-#include "goblin_collected.hpp"  // read_player_pos() for the height readout
+// goblin_maphover.hpp / goblin_mapproject.hpp / goblin_collected.hpp were included here for the
+// hover panel, the highlight-ring projection and the height readout. All three went away with the
+// on-map overlay drawing (2026-07-28) and no symbol from them is referenced in this file any more.
+#include "goblin_messages.hpp"   // lookup_text() for marker names in the menu
 #include "goblin_progress.hpp"
-#include "goblin_diag.hpp"
 #include "modutils.hpp" // hook GetRawInputData (menu input-leak block)
 
 #include <spdlog/spdlog.h>
@@ -100,7 +98,13 @@ XInputGetState_t o_XInputGetState = nullptr; // trampoline: OUR poll reads the r
                                              // disconnected pad while the menu is open.
 
 // ── Our own window + D3D11 + DirectComposition state (overlay thread only) ──
+// Own-window only: every use of this is inside MFG_OVERLAY_OWN_WINDOW (the class registration and
+// the two CreateWindowExW calls). Unguarded it put a readable literal in a shipping DLL that has no
+// window of its own - and readable strings with no code path are precisely what the AV heuristics
+// weigh. Guarded 2026-07-31.
+#if MFG_OVERLAY_OWN_WINDOW
 const wchar_t *OVERLAY_CLASS = L"MFG_OverlayWindow";
+#endif
 HWND g_hwnd = nullptr;          // our overlay window
 HWND g_game_hwnd = nullptr;     // tracked game main window (for cover + focus return)
 
@@ -167,8 +171,11 @@ ImVec2 g_logo_uv0{0.0f, 0.0f}, g_logo_uv1{1.0f, 1.0f};
 ImTextureID g_highlight_texid = nullptr;
 ImVec2 g_highlight_uv0{0.0f, 0.0f}, g_highlight_uv1{1.0f, 1.0f};
 
-// The window modes: draw straight from the SRVs, identity transform.
+// The window modes: draw straight from the SRVs, identity transform. Own-window only, like its
+// definition - the in-swapchain backend points these ids at ImGui's font atlas instead.
+#if MFG_OVERLAY_OWN_WINDOW
 void point_images_at_srvs();
+#endif
 
 // Dev "Icon Preview" (Debug tab): pick a PNG off disk, show it floating + centered with a transparent
 // background at a chosen on-map size, so icon art can be eyeballed against the live map without a rebuild.
@@ -182,7 +189,9 @@ std::mutex g_preview_mx;
 std::wstring g_preview_path;                    // picked path (set by the dialog thread)
 std::atomic<bool> g_preview_dirty{false};      // a new path is waiting to be decoded (render thread)
 std::atomic<bool> g_preview_dialog_open{false}; // a file dialog is already up (avoid stacking)
+#if MFG_OVERLAY_OWN_WINDOW
 static void open_preview_dialog(); // defined below (opens the file dialog on a worker thread)
+#endif
 
 std::atomic<bool> g_running{false}; // overlay thread alive (teardown guard)
 std::atomic<bool> g_menu_open{false};
@@ -446,12 +455,10 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                 std::strcmp(e.key, "hide_marker_gamepad") == 0)
                 continue; // rendered at the TOP of the Hidden tab instead
             ImGui::PushID(e.key);
-            if (std::strcmp(e.key, "fast_map_open") == 0)
-            {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.84f, 0.0f, 1.0f)); // yellow
-                ImGui::TextWrapped("%s", tr::tr(tr::TextId::FastMapOpenWarning, lang));
-                ImGui::PopStyleColor();
-            }
+            // A yellow BETA warning was painted here for the key `fast_map_open`. build_schema() has
+            // not emitted that key since it became a build variant (it is only in ini_retired_keys()
+            // now), so this loop over ini_schema() could never see it: the branch was unreachable and
+            // its TextId::FastMapOpenWarning was dead weight in the binary and in all eight locales.
             draw_row_icon(e.key);
             const char *label = tr::entry_label(e.key, lang);
             bool hovered = false; // mouse hover OR keyboard/gamepad nav focus on this row
@@ -686,10 +693,12 @@ void draw_debug_tab()
     namespace tr = goblin::i18n;
     const tr::Language lang = tr::current_language();
 
-    // The inject-status readout (goblin::diag::report() plus a Copy button) lived at the top of this
-    // tab until 2026-07-29: a live summary of every load step with a reason for anything that failed,
-    // meant to be screenshotted into a bug report. It went unused, and every state it summarised is
-    // already logged where it is set, so the log file is the single source now.
+    // The inject-status readout (a diag::report() summary plus a Copy button) lived at the top of
+    // this tab until 2026-07-29: every load step with a reason for anything that failed, meant to be
+    // screenshotted into a bug report. Nobody ever sent one - players send LOGS - so on 2026-07-31
+    // the registry behind it left the build too (src/goblin_diag.*, see CMakeLists). Two things it
+    // held were NOT logged anywhere and were moved into the log before it went: the logo plaque
+    // re-point outcome, and the live worldmap sprite pointer that reveals the heap region.
     bool changed = false;
     for (const auto &sec : goblin::ini_schema())
         if (std::strcmp(sec.name, "Debug") == 0)
@@ -726,6 +735,11 @@ void draw_debug_tab()
     else
         ImGui::TextDisabled("%s", tr::tr(tr::TextId::NoDumpYet, lang));
 
+    // Icon Preview needs a texture of its own, which only the own-window backend can create
+    // (upload_rgba goes through g_d3d_device, and maybe_load_preview/draw_preview_window are
+    // pumped from that backend's loop). Built into the in-swapchain build, the button opened a
+    // modal file dialog and then nothing could ever appear - so it is offered only where it works.
+#if MFG_OVERLAY_OWN_WINDOW
     ImGui::Separator();
     ImGui::TextWrapped("%s", tr::tr(tr::TextId::IconPreviewHint, lang));
     if (ImGui::Button(tr::tr(tr::TextId::IconPreviewOpen, lang)))
@@ -741,7 +755,7 @@ void draw_debug_tab()
         ImGui::SliderFloat(tr::tr(tr::TextId::IconPreviewSize, lang), &g_preview_px, 8.0f, 256.0f, "%.0f");
         ImGui::TextDisabled(tr::tr(tr::TextId::IconPreviewSource, lang), g_preview_w, g_preview_h);
     }
-
+#endif // MFG_OVERLAY_OWN_WINDOW
 }
 
 // ── About tab: version + links ──
@@ -1290,6 +1304,10 @@ void draw_settings_window()
 }
 
 // ── Our own window proc: feed ImGui (mouse/keyboard/char), nothing else ──
+// OWN-WINDOW ONLY: it is installed as wc.lpfnWndProc when that backend registers its window class,
+// and the in-swapchain build has no window of its own to give it. Guarded from 2026-07-31; before
+// that it compiled into every shipping DLL with no caller.
+#if MFG_OVERLAY_OWN_WINDOW
 LRESULT CALLBACK overlay_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
@@ -1307,7 +1325,10 @@ LRESULT CALLBACK overlay_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (o_SetCursor) o_SetCursor(nullptr);
                 return TRUE;
             }
-            // Menu closed but the window is still shown (hover tooltip / highlight image).
+            // Menu closed while the window is still shown. The two things that used to keep it up
+            // with the menu closed - the on-map hover tooltip and the highlight image - were retired
+            // on 2026-07-28, and the loop now shows the window only while `open && game_focused`, so
+            // this is a defensive arm rather than a reachable state.
             // We must NOT fall through to DefWindowProc: with our window's class cursor null
             // it paints the OS "background app" busy ring (blue spinner) over the map. Assert
             // the game's real cursor instead - or a plain arrow until we've captured it, which
@@ -1324,6 +1345,10 @@ LRESULT CALLBACK overlay_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 }
 
+// (Same guard continues from overlay_wndproc above - the two regions were adjacent and are now
+// one.) Built only with the own-window backend: every one of these needs g_d3d_device (created
+// by init_d3d, which lives in that backend) and they are pumped from its loop. In the
+// in-swapchain build they had no caller and no way to show anything.
 // ── Dev Icon Preview helpers ──────────────────────────────────────────────
 // Open the native file dialog on a WORKER thread so the modal dialog never blocks the render/present
 // thread. On success, stash the path and flag the render thread to decode it next frame.
@@ -1382,8 +1407,15 @@ static std::vector<unsigned char> to_map_icon(const unsigned char *src, int w, i
     return out;
 }
 
+// (guard continues)
+
 // Upload one RGBA8 image to an immutable D3D11 texture + create its SRV. Returns
 // false on a hard allocation failure. ImGui ImTextureID = the returned SRV ptr.
+// It needs g_d3d_device, which only the own-window backend creates, and both of its callers
+// (maybe_load_preview and try_upload_atlas) are own-window too - so it is inside the guard as of
+// 2026-07-31. The note that used to sit on the old #endif here ("shared with the icon atlas", i.e.
+// needed by every backend) stopped being true when the in-swapchain backend started blitting the
+// atlas into ImGui's own font atlas instead - see sc2_build_context_fonts.
 static bool upload_rgba(const unsigned char *rgba, int w, int h,
                         ID3D11Texture2D **out_tex, ID3D11ShaderResourceView **out_srv)
 {
@@ -1419,6 +1451,7 @@ static bool upload_rgba(const unsigned char *rgba, int w, int h,
     return true;
 }
 
+// (guard continues)
 // Render-thread: if a path was picked, read (wide path) + decode the PNG and (re)upload it.
 static void maybe_load_preview()
 {
@@ -1503,6 +1536,7 @@ static void draw_preview_window()
     }
     ImGui::End();
 }
+#endif // MFG_OVERLAY_OWN_WINDOW
 
 // Build the overlay's category-icon atlas RGBA AT RUNTIME by decoding the SHARED DefineBitsLossless2
 // icon tags (goblin::generated::MAP_ICON_TAGS - the same source the map injects) into each cell. This
@@ -1565,6 +1599,12 @@ static std::vector<unsigned char> build_atlas_rgba()
 // One-time upload of the category-icon atlas + the mod logo to D3D11 textures/SRVs.
 // The atlas is built at runtime from the shared lossless tags (build_atlas_rgba),
 // so map + menu share one embedded icon source.
+//
+// OWN-WINDOW ONLY, both of these. The in-swapchain backend has no D3D11 device to upload to: it
+// blits the same atlas into ImGui's font atlas instead (sc2_build_context_fonts) and points
+// g_icon_texid / g_logo_texid / g_highlight_texid at that one texture. build_atlas_rgba above stays
+// OUTSIDE the guard - it is the shared source both backends decode.
+#if MFG_OVERLAY_OWN_WINDOW
 void try_upload_atlas()
 {
     if (g_atlas_ready || !g_d3d_inited || !g_d3d_device)
@@ -1596,6 +1636,7 @@ void point_images_at_srvs()
     g_highlight_uv0 = ImVec2(0.0f, 0.0f);
     g_highlight_uv1 = ImVec2(1.0f, 1.0f);
 }
+#endif // MFG_OVERLAY_OWN_WINDOW
 
 const goblin::overlay_icons::IconCell *find_icon_cell(const char *key)
 {
@@ -1713,6 +1754,9 @@ HWND find_game_window()
 
 // Move/resize our overlay to exactly cover the game's client area. Returns the
 // client size so the caller can resize the swapchain on change.
+// Own-window only: it moves g_hwnd, and the in-swapchain build never creates one. (find_game_window
+// above stays outside the guard - the focus test uses it in every backend.)
+#if MFG_OVERLAY_OWN_WINDOW
 void cover_game_window(int &out_w, int &out_h)
 {
     out_w = out_h = 0;
@@ -1731,6 +1775,7 @@ void cover_game_window(int &out_w, int &out_h)
     out_w = w;
     out_h = h;
 }
+#endif // MFG_OVERLAY_OWN_WINDOW
 
 // ── Our own window's three backends: NOT BUILT unless MFG_OVERLAY_OWN_WINDOW=1 ──────────────────
 // Everything from here to the raw-input hook exists only to get our ImGui onto the screen through a
@@ -1837,13 +1882,13 @@ static bool init_d3d()
         return false;
     }
 
-    // 2) Render mode from ini: surface (default) / swapchain / else layered (see notes above).
-    {
-        const std::string &mstr = goblin::config::overlayRenderMode;
-        g_render_mode = (mstr == "swapchain") ? RenderMode::Swapchain
-                      : (mstr == "surface")   ? RenderMode::Surface
-                                              : RenderMode::Layered;
-    }
+    // 2) Render mode: a BUILD choice, not an ini one. It used to read the ini key that is
+    // now `menu_render_mode` (native/imgui/dev), and load_config() rewrites anything else
+    // to `native`, so "surface"/"swapchain" could never arrive here again - the own-window
+    // backend would silently always be Layered. One key cannot carry two meanings; pick the
+    // backend with MFG_OWN_WINDOW_MODE at compile time (goblin_build_variants.hpp), which is
+    // also what makes this variant's switch a rebuild rather than a hidden string compare.
+    g_render_mode = static_cast<RenderMode>(MFG_OWN_WINDOW_MODE);
     // Proton/Wine (Steam Deck): DirectComposition is unreliable - instead of a clean E_NOTIMPL
     // it can partially "work" then misbehave: the DComp surface's size/placement desyncs from
     // the gamescope-composited game window, so the menu opens shifted and DRAGGING it churns the
@@ -2043,7 +2088,6 @@ static bool init_d3d()
         return false;
     }
     g_d3d_inited = true;
-    goblin::diag::set_overlay(goblin::diag::OverlayState::Active, "");
     return true;
 }
 
@@ -2341,12 +2385,13 @@ void update_menu_toggle()
 // fix) and no second swapchain. Under ERR + a mod loader we always load after the
 // game is already presenting, so discovery goes through late adoption.
 //
-// Custom images (category icons, logo, dev preview) are NOT drawn in this mode:
-// the packet protocol carries only the font atlas, and our D3D11 icon atlas is
-// never created here, so those calls degrade to blank space via their existing
-// g_atlas_ready/g_*_srv guards. Text/shapes (the whole functional menu + hover
-// tooltip) render normally. A future phase can extend the packet with our icon
-// atlas as a second texture.
+// Custom images DO draw in this mode. The packet still carries a single texture, so
+// rather than add a second one the category icons, the logo and the highlight are
+// PACKED INTO THE FONT ATLAS itself (AddCustomRectRegular + a blit per rect, below),
+// and g_icon_texid/g_logo_texid/g_highlight_texid all point at that one atlas. That is
+// why g_atlas_ready is set here too - the existing icon guards are meant to pass.
+// The one exception is the dev-only Icon Preview, which needs a texture of its own and
+// is built with the own-window backend.
 
 // Build the ImGui context + fonts WITHOUT a platform/renderer backend (the sc2
 // D3D12 renderer consumes the packet). Mirrors init_d3d's context/font setup so
@@ -2508,7 +2553,6 @@ static void sc2_frontend_loop()
         cte::g_hinst = reinterpret_cast<HINSTANCE>(self);
     }
     spdlog::info("[OVERLAY] render mode = swapchain_2 (in-swapchain D3D12 backend)");
-    goblin::diag::set_overlay(goblin::diag::OverlayState::Active, "swapchain_2");
 
     if (!cte::hooks::init())
         spdlog::warn("[SC2] MinHook init reported failure (may already be initialized)");
@@ -2584,13 +2628,11 @@ static void sc2_frontend_loop()
 
         ImGuiIO &io = ImGui::GetIO();
         io.DisplaySize = ImVec2(static_cast<float>(canvas.width), static_cast<float>(canvas.height));
-        // sc2 has no DComp swapchain, so g_back_w/g_back_h are never set - yet
-        // draw_map_highlights (and other world->screen projection) use them as the
-        // canvas size. Feed the real backbuffer dims so the focus-highlight rings
-        // land on the correct map positions (else they projected against a 1920x1080
-        // fallback and scattered to wrong spots).
-        g_back_w = canvas.width;
-        g_back_h = canvas.height;
+        // g_back_w/g_back_h are NOT written here any more. They existed for the world->screen
+        // projection that draw_map_highlights used to do, and that function went away with the
+        // rest of the on-map overlay drawing (2026-07-28). Every remaining reader of the pair
+        // lives inside the own-window backend, which writes them itself; feeding them from the
+        // sc2 loop only meant the two backends could disagree about who owns the value.
         const float dt = (now - last_tick) / 1000.0f;
         last_tick = now;
         io.DeltaTime = dt > 0.0f ? dt : (1.0f / 60.0f);
@@ -2606,31 +2648,16 @@ static void sc2_frontend_loop()
             const float fs = goblin::config::fontScale;
             io.FontGlobalScale = fs < 0.8f ? 0.8f : (fs > 3.0f ? 3.0f : fs);
         }
-        if (open)
-        {
-            io.MouseDrawCursor = true;
-            draw_settings_window();
-        }
-        else
-        {
-            io.MouseDrawCursor = false;
-        }
+        // Only an OPEN menu reaches this point - a closed one took the `!want` continue above,
+        // and `open` cannot change in between. The `else` that cleared MouseDrawCursor and the
+        // later "closed and empty" guard were both left over from when the overlay also painted
+        // focus rings and the hover tooltip with the menu closed (retired 2026-07-28); neither
+        // could be taken any more.
+        io.MouseDrawCursor = true;
+        draw_settings_window();
+
         ImGui::Render();
         const ImDrawData *draw_data = ImGui::GetDrawData();
-        const bool has_geometry =
-            draw_data && draw_data->CmdListsCount > 0 && draw_data->TotalVtxCount > 0;
-        // The backend treats "published while visible but with no draw commands" as proof that the
-        // frontend is broken, and answers by marking the renderer unhealthy - which is right for a menu
-        // (a menu that cannot draw must not hold input) but wrong for us: with the menu closed we are
-        // visible only to paint focus rings and the hover tooltip, and a frame where the rings are
-        // off-screen or the tooltip is empty is perfectly normal. Publishing those made `healthy` flap
-        // about once every three seconds in the player's log. Stay hidden for such a frame instead.
-        if (!open && !has_geometry)
-        {
-            cte::overlay::present::set_visible(false);
-            Sleep(16);
-            continue;
-        }
         cte::overlay::present::publish_draw_data(draw_data);
         cte::overlay::present::set_visible(true);
 
@@ -2710,14 +2737,12 @@ void overlay_thread()
     if (!g_hwnd)
     {
         spdlog::error("[OVERLAY] CreateWindowExW failed; overlay disabled");
-        goblin::diag::set_overlay(goblin::diag::OverlayState::Failed, "window creation failed");
         return;
     }
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
 
     if (!seh_init_d3d())
     {
-        goblin::diag::set_overlay(goblin::diag::OverlayState::Failed, "D3D11/DComp init failed");
         DestroyWindow(g_hwnd);
         g_hwnd = nullptr;
         return;
@@ -2877,7 +2902,6 @@ void goblin::overlay::setup()
     if (!goblin::config::menuEnabled)
     {
         spdlog::info("[OVERLAY] disabled via ini (menu_enabled = false)");
-        goblin::diag::set_overlay(goblin::diag::OverlayState::OffByConfig, "");
         return;
     }
     if (!goblin::config::overlay_menu_enabled())
@@ -2889,7 +2913,6 @@ void goblin::overlay::setup()
         // overlay thread - it touches nothing but XInput.
         spdlog::info("[OVERLAY] not created: menu_render_mode = native (the in-game menu is the "
                      "one on the hotkey). Polling the pad only.");
-        goblin::diag::set_overlay(goblin::diag::OverlayState::OffByConfig, "native menu mode");
         if (g_running.exchange(true))
             return;
         std::thread([] {

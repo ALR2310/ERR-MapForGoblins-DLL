@@ -50,10 +50,9 @@ int32_t goblin::remap_textid(int32_t encoded)
     return it != g_textid_remap.end() ? it->second : encoded;
 }
 
-// Toggle state for PlaceName FMG (slot 19). Only this slot is a pointer
-// swap - other slots get surgical in-place additions we don't try to undo.
-static uint8_t **g_placename_slot_ptr = nullptr;
-static uint8_t *g_vanilla_placename_fmg = nullptr;
+// (Toggle state for the PlaceName FMG slot lived here - g_placename_slot_ptr and
+//  g_vanilla_placename_fmg. Only slot 19 was ever a pointer swap; the other slots get surgical
+//  in-place additions that are not undone. Both went with the toggle API that never had a caller.)
 
 // Every MsgRepository slot we overwrote, with what it held before. See check_patched_slots().
 struct PatchedSlot
@@ -70,7 +69,6 @@ static uint8_t *g_expanded_placename_fmg = nullptr;
 // only in a DLC layer aren't in our expanded base buffer. Captured at setup so
 // the marker dump can resolve location names the way the game does.
 static uint8_t *g_placename_dlc_slots[2] = {nullptr, nullptr};
-static bool g_fmg_injection_active = false;
 
 // ── SEH-guarded slot access ──
 // Some runtimes keep STALE pointers in MsgRepository slots the game never
@@ -230,11 +228,6 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
     }
 
 
-    for (size_t i = 0; i < (std::min)(all_entries.size(), (size_t)5); i++)
-    {
-        auto &e = all_entries[i];
-    }
-
     // Injected entries OVERRIDE pre-existing ids. Overhaul mods can pre-seed
     // rows at ids our offset encoding also uses (The Convergence ships
     // boss-text PlaceName rows in the 9xxM band, some with EMPTY text -
@@ -274,34 +267,41 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
     for (auto &e : all_entries)
         merged.push_back({e.id, e.str_offset});
 
-    struct PendingStr
-    {
-        size_t merged_idx;
-        size_t data_offset; // offset within new_str_data
-    };
-    std::vector<PendingStr> pending;
-
+    // A `pending` vector of (merged_idx, data_offset) was built here and never read: merged_idx is
+    // stale the moment the entries are sorted, which is exactly why the offsets are re-derived from
+    // the ids further down. Only the re-derivation was ever used.
+    //
+    // EVERY added entry gets a string appended, unconditionally. That is the invariant this loop and
+    // the re-derivation at "Rebuild pending map" below must SHARE: they walk `new_entries` in the
+    // same order, and the second one advances `data_pos` for exactly the entries the first one
+    // appended. When the two disagreed by even one entry, every later string offset shifted and
+    // labels after it drew truncated or foreign text (the duplicate-id case at the top of this
+    // function, reported in game under The Convergence).
+    //
+    // There used to be a guard here that SKIPPED an added entry whose id was already in `merged`,
+    // with a note saying it was kept on purpose to catch an overhaul shipping a row at an id our
+    // offset encoding also uses. Two things were wrong with that (2026-07-31). It cannot fire:
+    // `merged` is built only from `all_entries`, and the block above has just erased from
+    // `all_entries` every id that appears in `new_entries`, so the override is already done by the
+    // time we get here. And if it ever HAD fired it would have done the opposite of what it claimed:
+    // `continue` skipped both the string append and the push, dropping OUR row and leaving the
+    // pre-existing one - possibly the empty Convergence row that the erase above exists to displace.
+    //
+    // It is not replaced by a "defensive" version of itself either. A scan of `merged` per added
+    // entry is O(added x merged) - tens of millions of comparisons at PlaceName scale - to test a
+    // condition that is provably false, and it would have to carry a log line, which is dead text in
+    // a binary that is judged on its readable strings. The override rule is enforced ONCE, where it
+    // belongs: in the erase above. If that block is ever changed, this loop's precondition changes
+    // with it, and that is the place to look.
     for (auto &ne : new_entries)
     {
-        bool exists = false;
-        for (auto &m : merged)
-        {
-            if (m.id == ne.id)
-            {
-                exists = true;
-                break;
-            }
-        }
-        if (exists) continue;
-
         size_t str_start = new_str_data.size();
         size_t wlen = wcslen(ne.text);
         size_t byte_len = (wlen + 1) * sizeof(wchar_t);
         new_str_data.resize(new_str_data.size() + byte_len);
         memcpy(new_str_data.data() + str_start, ne.text, byte_len);
 
-        pending.push_back({merged.size(), str_start});
-        merged.push_back({ne.id, 0}); // offset TBD
+        merged.push_back({ne.id, 0}); // offset TBD, filled by the id-keyed re-derivation below
     }
 
     std::sort(merged.begin(), merged.end(),
@@ -362,19 +362,21 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
     // Game expects fixed-up absolute pointer, not relative offset
     *reinterpret_cast<uint64_t *>(nfmg + 0x18) = (uint64_t)(nfmg + new_str_off_pos);
 
-    // Rebuild pending map: merged_idx is stale after sort, so re-derive from IDs
+    // Where each added string landed in new_str_data, keyed by id. The append loop's own indices
+    // into `merged` are stale after the sort above, so this walks `new_entries` again and re-derives
+    // the positions from the ids.
+    //
+    // UNCONDITIONAL, and it has to be: this loop advances `data_pos` by one string per entry, and
+    // the append loop wrote one string per entry, so the two only agree if neither skips. It used to
+    // carry its own skip test (`exists_in_orig`, over `all_entries`) mirroring the append loop's
+    // skip test (over `merged`). Two separately-written predicates for one shared invariant is how a
+    // desync gets introduced silently - and the two were NOT the same test. Both are gone; the
+    // invariant is now "one string per added entry" on both sides, with nothing to disagree about.
     std::unordered_map<int32_t, size_t> new_entry_data_offset;
     {
         size_t data_pos = orig_str_data_len; // where new strings start in new_str_data
         for (auto &ne : new_entries)
         {
-            bool exists_in_orig = false;
-            for (auto &e : all_entries)
-            {
-                if (e.id == ne.id) { exists_in_orig = true; break; }
-            }
-            if (exists_in_orig) continue;
-
             new_entry_data_offset[ne.id] = new_str_data_start + data_pos;
             size_t wlen = wcslen(ne.text);
             data_pos += (wlen + 1) * sizeof(wchar_t);
@@ -457,7 +459,6 @@ void goblin::check_patched_slots()
     }
 }
 
-static const wchar_t *fmg_lookup_in(uint8_t *fmg, int32_t id);  // defined below
 
 void goblin::setup_messages()
 {
@@ -1002,14 +1003,13 @@ void goblin::setup_messages()
     if (patch_fmg_in_memory(fmg_ptr, &sub[19], new_entries, /*capture_valid_ids=*/true))
     {
         spdlog::info("PlaceName FMG merged ({} entries)", new_entries.size());
-        // Capture toggle state. fmg_ptr was the original buffer; sub[19] now
-        // points at our expanded buffer (set inside patch_fmg_in_memory).
-        g_placename_slot_ptr = &sub[19];
-        g_vanilla_placename_fmg = fmg_ptr;
+        // sub[19] now points at our expanded buffer (set inside patch_fmg_in_memory). The DLC
+        // layers are captured because the game resolves PlaceName through them FIRST.
+        // (Two more captures stood here, plus an "injection is active" flag, for the runtime
+        //  vanilla/expanded toggle that never had a caller.)
         g_expanded_placename_fmg = sub[19];
         g_placename_dlc_slots[0] = (329 < count2) ? sub[329] : nullptr;
         g_placename_dlc_slots[1] = (429 < count2) ? sub[429] : nullptr;
-        g_fmg_injection_active = true;
 
 #ifdef MFG_VANILLA
         // The game resolves PlaceName through the DLC layers FIRST (slots 429,
@@ -1240,15 +1240,15 @@ void goblin::setup_messages()
                     goblin::g_menutext_row_ids[i] = mt_base + 1 + static_cast<int32_t>(i);
                 goblin::g_menutext_on_id = mt_base + static_cast<int32_t>(mt_value_first);
                 goblin::g_menutext_off_id = goblin::g_menutext_on_id + 1;
-                spdlog::info("[optmenu] GR_MenuText.fmg expanded: tab label id {} + {} row labels "
+                spdlog::info("[nmenu] GR_MenuText.fmg expanded: tab label id {} + {} row labels "
                              "+ on/off {}/{} (above live max {})", mt_base, row_count,
                              goblin::g_menutext_on_id, goblin::g_menutext_off_id, mt_base - 1);
             }
             else
-                spdlog::warn("[optmenu] GR_MenuText merge failed - native tab keeps the duplicate label");
+                spdlog::warn("[nmenu] GR_MenuText merge failed - native tab keeps the duplicate label");
         }
         else
-            spdlog::warn("[optmenu] GR_MenuText slot {} unavailable / id 110000 missing - "
+            spdlog::warn("[nmenu] GR_MenuText slot {} unavailable / id 110000 missing - "
                          "native tab keeps the duplicate label", kMenuTextSlot);
     }
 
@@ -1327,26 +1327,19 @@ void goblin::sanitize_injected_textids()
                  "(missing from PlaceName FMG → would null-deref on load)", scanned, cleared);
 }
 
-void goblin::set_fmg_injection_active(bool active)
-{
-    if (!g_placename_slot_ptr)
-    {
-        spdlog::warn("[TOGGLE] FMG not ready - setup_messages didn't run");
-        return;
-    }
-    if (active == g_fmg_injection_active)
-        return;
-    *g_placename_slot_ptr = active ? g_expanded_placename_fmg : g_vanilla_placename_fmg;
-    g_fmg_injection_active = active;
-    spdlog::info("[TOGGLE] PlaceName FMG -> {}", active ? "EXPANDED" : "VANILLA");
-}
+// set_fmg_injection_active(bool) and is_fmg_injection_active() stood here. They swapped the
+// PlaceName MsgRepository slot between our expanded FMG and the vanilla one, so the injection could
+// be toggled at runtime - and nothing ever called either of them. With no caller, the three statics
+// they were built on (g_placename_slot_ptr, g_vanilla_placename_fmg and g_fmg_injection_active)
+// were write-only: filled at install time and never consulted again.
+//
+// They looked live because goblin_inject exports a matching pair for the PARAM injection, and that
+// one IS driven (menu_auto_toggle_loop). The FMG buffer is different: it is installed once and
+// stays for the session, which is also why check_patched_slots() exists to notice when the engine
+// replaces the slot under us.
 
-bool goblin::is_fmg_injection_active()
-{
-    return g_fmg_injection_active;
-}
-
-// Look an id up in ONE FMG-v2 buffer (same layout fixup as patch_fmg_in_memory).
+// Look an id up in ONE FMG-v2 buffer (same layout fixup as patch_fmg_in_memory: the game turns
+// the relative string-offset table into an absolute pointer at runtime, so both forms are handled).
 static const wchar_t *fmg_lookup_in(uint8_t *fmg, int32_t id)
 {
     if (!fmg || id <= 0)

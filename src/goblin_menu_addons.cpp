@@ -29,6 +29,23 @@ namespace
     constexpr int kMaxStrikes = 3;
     constexpr uint32_t kMaxRowsPerPage = 128;
 
+    // The owner module's name, narrowed for the log. Page::owner is filled for every add-on page
+    // and was never printed anywhere, which left "an add-on page failed" unactionable with more
+    // than one add-on loaded.
+    std::string owner_utf8(const std::wstring &w)
+    {
+        if (w.empty())
+            return "(unnamed)";
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                          nullptr, 0, nullptr, nullptr);
+        if (n <= 0)
+            return "(unnamed)";
+        std::string out(static_cast<size_t>(n), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), n,
+                            nullptr, nullptr);
+        return out;
+    }
+
     AddonPage *page_at(size_t index)
     {
         return index < g_pages.size() ? &g_pages[index] : nullptr;
@@ -274,7 +291,8 @@ const goblin::addons::Page *goblin::addons::build_page(size_t index)
         if (faulted && ++p->strikes >= kMaxStrikes)
         {
             p->alive = false;
-            spdlog::warn("[menu] add-on page disabled after repeated errors");
+            spdlog::warn("[menu] add-on page from '{}' disabled after repeated errors",
+                         owner_utf8(p->data.owner));
             return nullptr;
         }
     }
@@ -291,7 +309,8 @@ bool goblin::addons::activate(size_t page_index, uint32_t row_id)
     if (faulted && ++p->strikes >= kMaxStrikes)
     {
         p->alive = false;
-        spdlog::warn("[menu] add-on page disabled after repeated errors");
+        spdlog::warn("[menu] add-on page from '{}' disabled after repeated errors",
+                     owner_utf8(p->data.owner));
     }
     return changed != 0;
 }

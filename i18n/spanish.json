@@ -4,7 +4,6 @@
     "AllOn": "todo activado",
     "AllOff": "todo desactivado",
     "RandomizerHint": "¿Usas un Randomizer? Activa live_loot_flags + live_loot_labels + live_loot_icons para que los marcadores coincidan con la colocación barajada de objetos.",
-    "FastMapOpenWarning": "BETA: hace que el mapa se abra más rápido. Si el mapa falla o se cierra, desactiva esto.",
     "IniOnly": "(solo .ini)",
     "PressAKey": "pulsa una tecla",
     "PressComboRelease": "pulsa la combinación y suelta",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "Requerir fragmentos de mapa",
     "location_emphasis": "Énfasis de ubicación",
-    "fast_map_open": "Apertura rápida del mapa",
     "show_armaments": "Armamento",
     "show_armour": "Armadura",
     "show_ashes_of_war": "Cenizas de Guerra",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "Requerir el descubrimiento del fragmento de mapa antes de mostrar iconos en esa zona",
     "location_emphasis": "Los marcadores del mapa en el que estás se dibujan más grandes; los que solo parecen cercanos (una mazmorra bajo tus pies, o la superficie sobre ella) más pequeños. Nunca se oculta nada.",
-    "fast_map_open": "BETA: hace que el mapa del mundo se abra más rápido cuando se muestran muchos iconos.\nDesactívalo si el mapa falla o se cierra.",
     "show_armaments": "Armas, escudos, arcos, báculos, etc.",
     "show_armour": "Piezas de armadura (yelmos, pecho, guanteletes, piernas)",
     "show_ashes_of_war": "Cenizas de Guerra (habilidades de arma)",

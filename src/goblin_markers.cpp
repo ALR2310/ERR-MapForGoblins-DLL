@@ -6,7 +6,9 @@
 //   - Stamps: follow beacons (type 0x0600/0x080A/0x0900/0x0901/0x090A)
 //   - Empty slot: idx=-1, x=z=0, type=0x0100, pad=0
 //
-// Strategy: AOB-scan all committed memory for the beacon-array signature.
+// Strategy: follow a STATIC POINTER CHAIN to the arrays (marker_chain_slot() -> object -> +0x68,
+// with the destination vtable checked before anything is read). It replaced a full-process scan of
+// committed memory for the beacon signature - see the note at find_beacon_arrays().
 
 #include "goblin_markers.hpp"
 #include "goblin_collected.hpp"
@@ -313,7 +315,6 @@ struct NearbyEntry
 {
     uint64_t row_id;
     const from::paramdef::WORLD_MAP_POINT_PARAM_ST *data;  // baked row (all 8 textId slots)
-    generated::Category category;
     int32_t item_tid;         // loot item-name textId  (0 = none)
     int32_t loc_tid;          // location (PlaceName) textId
     int32_t enemy_tid;        // drop-source enemy/npc textId (enemy drops, bosses)
@@ -323,10 +324,12 @@ struct NearbyEntry
     uint8_t gx;
     uint8_t gz;
     float posX, posY, posZ;   // marker's own local map coords
-    uint32_t lot_id;          // source ItemLotParam row (0 = none)
-    const char *object_name;  // MSB object e.g. AEG099_610_9007, nullptr if none
-    float entry_worldX;
-    float entry_worldZ;
+    // Five more members stood here and none was ever read: `category` (a
+    // generated::Category, above), lot_id, object_name, entry_worldX and entry_worldZ.
+    // Three of them were not even filled with data - the aggregate below passed
+    // generated::Category{}, 0u and nullptr literally - so "print them instead of
+    // deleting them" would have printed three blanks. The two real values, the entry's
+    // world X/Z, are the inputs to `dist` on the very next line, which IS printed.
     float dist;
     bool is_ours;             // true = a marker this mod injected (vs vanilla/overhaul)
 };
@@ -367,21 +370,13 @@ static std::string wide_to_utf8(const wchar_t *w)
     return out;
 }
 
-// Resolve a marker textId to its in-game string (player's language), the way the
-// game does: offset-encoded ids were relocated to fresh ids (remap_textid), and
-// DLC-layer-only PlaceName ids aren't in our expanded base buffer (probe layers).
-// "" if it resolves to nothing.
-static std::string resolve_text(int32_t text_id)
-{
-    if (text_id <= 0)
-        return {};
-    int32_t mapped = goblin::remap_textid(text_id);
-    if (const wchar_t *s = goblin::lookup_text(mapped))
-        return wide_to_utf8(s);
-    if (const wchar_t *s = goblin::lookup_text_dlc(text_id))
-        return wide_to_utf8(s);
-    return {};
-}
+// A resolve_text(int32_t) helper stood here with no callers. It resolved a marker textId to its
+// in-game string the way the game does (offset-encoded ids relocated by remap_textid, with a probe
+// across layers for DLC-only PlaceName ids that are absent from our expanded base buffer), and
+// returned "" when nothing resolved. The dump loop further down does the
+// same remap-then-lookup-then-DLC-fallback inline, but it also reports WHICH source answered and
+// prints the remapped id when it differs - information this helper's plain string return could
+// not carry. Extend that loop rather than reviving this if a second caller ever appears.
 
 // Map a marker's (area, grid, local pos) to overworld world coords. Overworld tiles
 // (m60/m61) are direct; dungeon areas go through WorldMapLegacyConvParam (our baked
@@ -452,12 +447,10 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
             int32_t item_tid, loc_tid, enemy_tid;
             classify_textids(row, item_tid, loc_tid, enemy_tid);
             out.push_back({
-                row_id, &row, generated::Category{}, item_tid, loc_tid, enemy_tid,
+                row_id, &row, item_tid, loc_tid, enemy_tid,
                 row.textDisableFlagId1,
                 row.iconId, row.areaNo, row.gridXNo, row.gridZNo,
-                row.posX, row.posY, row.posZ, 0u,
-                nullptr,
-                ewx, ewz, std::sqrt(d2),
+                row.posX, row.posY, row.posZ, std::sqrt(d2),
                 ourset.count(&row) != 0
             });
         }
@@ -487,12 +480,13 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
 
 // ── The actual dump ──
 
-// Plain (POD-only) SEH-guarded memcpy: copies a found beacon array out of live
-// game memory into a local buffer before we read it field-by-field. The array
-// is located by a full process-memory scan, but the game's allocator can free
-// or move the region between the scan and the read (a TOCTOU race) - reading it
-// directly then access-violates and the whole dump aborts. Copying through this
-// guard means a stale array is skipped, not fatal.
+// Plain (POD-only) SEH-guarded memcpy: copies a found beacon array out of live game memory into a
+// local buffer before we read it field-by-field. The guard is REQUIRED and stays - but not for the
+// reason it used to give (a TOCTOU race against a full-process scan; there is no such scan any
+// more). The real reason: the address comes from a pointer chain through the game's own objects,
+// and the game may free or move that region between the moment the chain is resolved and the
+// moment we read it. Reading directly then access-violates and the whole dump aborts; copying
+// through this guard means a stale array is skipped, not fatal.
 static bool seh_copy(const void *src, void *dst, size_t n)
 {
     __try { memcpy(dst, src, n); return true; }
@@ -574,6 +568,17 @@ static int dump_impl(std::ostream &f, DumpSel sel)
                 if (n.is_ours && n.data && goblin::display_position(n.data, dpx, dpz) &&
                     (std::fabs(dpx - n.posX) > 0.01f || std::fabs(dpz - n.posZ) > 0.01f))
                     f << "  drawn=(" << dpx << "," << dpz << ")";
+            }
+            // The taxonomy classify_textids() derives (which slot is the item, which is the place,
+            // which is the drop source). It was computed for every nearby marker and then thrown
+            // away - the struct carried the three ids and nothing printed them, so the comment
+            // above the classifier described an output that did not exist.
+            if (n.item_tid || n.loc_tid || n.enemy_tid)
+            {
+                f << "  tid:";
+                if (n.item_tid)  f << " item=" << n.item_tid;
+                if (n.loc_tid)   f << " loc=" << n.loc_tid;
+                if (n.enemy_tid) f << " src=" << n.enemy_tid;
             }
             f << "\n";
 

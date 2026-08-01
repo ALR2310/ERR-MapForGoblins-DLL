@@ -28,13 +28,13 @@ This is a pure DLL: the only files are [b]MapForGoblins.dll[/b] and [b]MapForGob
 
 [size=5][color=#ff8c00][b]In-game mod menu[/b][/color][/size]
 [img]https://staticdelivery.nexusmods.com/mods/4333/images/10062/10062-1783098972-301371669.png[/img]
-Press [b][color=#ff8c00]F10[/color][/b] (keyboard) or [b][color=#ff8c00]Y+R3[/color][/b] (controller) to open a settings panel right inside the game - no more alt-tabbing to edit the ini. From it you can:
+Press [b][color=#ff8c00]F10[/color][/b] (keyboard) or [b][color=#ff8c00]Y+R3[/color][/b] (controller) to open a settings panel right inside the game. From it you can:
 [list]
 [*]Turn any icon category on or off, or use [b]Show all[/b] / [b]Hide all[/b] at once[/*]
 [*]Track your completion on the [b]Progress[/b] tab: collected/total per region (grouped into The Lands Between, the Underground and Shadow of the Erdtree), and click a category to highlight only its uncollected markers right on the map[/*]
 [*]Hide individual markers you don't care about, and bring them back, from the [b]Hidden[/b] tab[/*]
 [*]Flip the master "Show map icons" switch[/*]
-[*]Adjust the [b]overlay text size[/b] and [b]opacity[/b] with sliders - handy on 4K / high-DPI screens[/*]
+[*]Change the mod's settings from the [b]Settings[/b] page - map fragment requirement, killed-boss handling, spoiler-free mode and the rest[/*]
 [*]Copy a marker dump for bug reports[/*]
 [/list]
 [b]Toggling a category takes effect right away on the open map[/b] - its icons appear or disappear without closing the map. (Some other options, such as spoiler-free mode, apply the next time you open the map.) Mouse, keyboard and controller supported.
@@ -48,9 +48,11 @@ Press [b][color=#ff8c00]F10[/color][/b] (keyboard) or [b][color=#ff8c00]Y+R3[/co
 [*][b]Progress tracking[/b]: the [b]Progress[/b] tab shows how much of each category you've collected per region (grouped into The Lands Between, the Underground and Shadow of the Erdtree, with small caves/catacombs folded into their region). Click a category to light up only its uncollected markers on the open map.[/*]
 [*][b]Hide markers you don't want[/b]: hover a marker on the world map and press [b]Delete[/b] (or [b]RB[/b] on a controller) to hide just that one; the [b]Hidden[/b] tab lists your hidden markers so you can restore them. Hidden markers persist and are saved per character.[/*]
 [*]Hovering a marker on the map shows a small tooltip with its name and how far above or below you it is.[/*]
+[*][b]Focus for markers at your current location[/b]: markers of the map you are on are drawn bigger and brighter, markers of another map smaller and dimmer. Nothing is hidden. Can be turned off in the menu.[/*]
+[*][b]Live marker deoverlapping[/b]: overlapping icons are spread apart using only the markers visible at that moment, so a category you turn off frees its space.[/*]
 [*]Every marker shows its location name, down to sub-areas (like Siofra Aqueduct/Siofra River etc). The mod uses original game strings, everything should be localised out of the box.[/*]
 [*]The INI maintains itself. If there's no file - it gets created. If there are new options after an update - they will be added automatically.[/*]
-[*]Master on/off for all icons: the "Show map icons" switch in the overlay, or [b]F10[/b] / [b]Y+R3[/b] directly when the overlay is turned off in the ini.[/*]
+[*]Master on/off for all icons: the "All icon categories" row at the top of the menu, or [b]F10[/b] / [b]Y+R3[/b] directly when the menu is turned off in the ini.[/*]
 [*][b]Item & Enemy Randomizer support[/b] (vanilla build, on by default): loot markers read the loaded regulation at startup, so each one shows the item that's [i]actually[/i] there - right name, right icon - and disappears when you pick up the real light point. Works with any seed, no per-seed setup. Turn it off in the ini if you play vanilla without the randomizer.[/*]
 [*][b]Spoiler-free mode[/b] (optional, set anonymous_loot in the ini): every loot marker shows a plain "?" icon and a generic label instead of the real item, so you can find loot without knowing what it is - made for blind / randomizer runs.[/*]
 [*]The ERR version can optionally tie ERR's own pre-placed markers (camps, merchants, bosses, dungeon entrances) to the same display rules as this mod's icons, so everything on the map follows one logic: show after map discovery, hide once cleared. If you prefer ERR's markers as they are, turn these options off in the ini.[/*]

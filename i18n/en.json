@@ -4,7 +4,6 @@
     "AllOn": "all on",
     "AllOff": "all off",
     "RandomizerHint": "Using a Randomizer? Enable live_loot_flags + live_loot_labels + live_loot_icons so markers match the shuffled item placements.",
-    "FastMapOpenWarning": "BETA: makes the map open faster. If the map glitches or crashes, turn this off.",
     "IniOnly": "(.ini only)",
     "PressAKey": "press a key",
     "PressComboRelease": "press combo, release",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "Require map fragments",
     "location_emphasis": "Location emphasis",
-    "fast_map_open": "Fast map open",
     "show_armaments": "Armaments",
     "show_armour": "Armour",
     "show_ashes_of_war": "Ashes of War",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "Require map fragment discovery before showing icons in that area",
     "location_emphasis": "Markers of the map you are actually IN draw bigger; markers that only look nearby (a dungeon under your feet, or the surface above it) draw smaller. Nothing is ever hidden.",
-    "fast_map_open": "BETA: makes the world map open faster when many icons are shown.\nTurn off if the map glitches or crashes.",
     "show_armaments": "Weapons, shields, bows, staves, etc.",
     "show_armour": "Armor pieces (helms, chest, gauntlets, legs)",
     "show_ashes_of_war": "Ashes of War (weapon skills)",

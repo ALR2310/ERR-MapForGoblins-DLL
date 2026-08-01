@@ -20,6 +20,12 @@ namespace goblin::nmenu
         Back,        // "< Back" - go up one level
         SubPage,     // opens another page in place
         Toggle,      // bool config value, decide flips it
+        // NOT CURRENTLY REACHABLE (checked 2026-07-31): Number, Enum and ValueOption - with them
+        // kPageValue, build_value(), kRanges and kLanguages. kind_of() only ever runs on keys that
+        // a page lists, the page table kLayout contains no Float or Language key, and the three
+        // that exist (overlay_font_scale, overlay_opacity, ui_language) sit in the schema's
+        // "Menu & Hotkeys" section which no page enters. The machinery works - it is a page short.
+        // Either list those keys on a page or delete the branches; do not assume it is live.
         Number,      // numeric config value, decide opens its value page
         Enum,        // value from a fixed list, decide opens its value page
         ValueOption, // one choice ON a value page; decide applies it and returns
@@ -91,22 +97,17 @@ namespace goblin::nmenu
     // engine instead of being emulated. The host tells the model which page a screen shows, and
     // asks what a row would open without activating it.
     void set_page(int32_t page);
-    int32_t subpage_target(size_t row_index);
 
     // SCREEN-PER-PAGE mode. With it on the model never navigates on its own: activate() only
     // PREPARES a transition (remembering which entry a value/rebind page will edit) and reports
     // it, so the host can open or close a real native screen and keep the engine's own Back,
     // Esc and scroll restore. The page a screen shows is set by the host through set_page().
     void set_nested(bool on);
-    bool nested();
     // The page the last activate() wants opened as its OWN screen, or -1. Reading it clears it.
     int32_t take_child_page();
     // The last activate() finished an edit (a value was chosen, a key was bound, a "Back" row
     // was confirmed): the host should close the screen showing it. Reading it clears it.
     bool take_close_request();
-
-    // Enter the screen at the root page (called when our screen opens).
-    void reset_to_root();
 
     // Handle "decide" on a row: navigates, toggles, steps or runs the action. Returns
     // true if the row list changed (the caller must rebuild the native view).
@@ -116,10 +117,10 @@ namespace goblin::nmenu
     // let the screen close normally).
     bool navigate_back();
 
-    // How many levels down we are (0 = root). The host uses it to tell "went deeper" from
-    // "came back", so it can park the list at the top of a new page and restore the previous
-    // position on the way out.
-    size_t depth();
+    // REMOVED 2026-07-30, all four with no callers: subpage_target() (what a row would open,
+    // without activating it), nested(), reset_to_root() and depth(). The host drives this model
+    // through set_page / take_child_page / take_close_request, and it tracks its own screen stack
+    // in g_screens rather than asking the model how deep it is.
 
     // Rows are handed to the engine in PAIRS (left column, right column). This returns the
     // right-column row for pair `index`, or nullptr when that half should stay empty.

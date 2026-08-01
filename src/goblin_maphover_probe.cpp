@@ -1,5 +1,13 @@
 // Temporary investigation probe (test builds only, not shipped).
 //
+// STATUS 2026-07-30: this whole translation unit is an ORPHAN, and deliberately so. It is not in
+// CMakeLists.txt, so it never compiles; setup() has no callers; and its AOB duplicates the shipping
+// one in goblin_maphover.cpp. It is kept as reverse-engineering notes in compilable form - the
+// struct offsets below are the record of what CS::WorldMapPointPinData looks like. Two things to
+// know before reviving it: add the file to CMakeLists AND give it a call site (adding it to the
+// build alone changes nothing), and treat the hardcoded PIN_VT_RVA as stale - the shipping code
+// resolves that vtable by AOB because the RVA moves on every game update.
+//
 // Hooks FUN_14087a8e0 (v2.6.2.0) = the world-map dialog's per-frame "update the
 // PlaceName panel for the currently-focused pin" routine. The dialog picks the pin
 // NEAREST the reticle within a radius each frame (FUN_1409dbf80) and passes it here

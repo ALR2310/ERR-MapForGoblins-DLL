@@ -16,7 +16,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-// World-map open optimization (config::fastMapOpen). With ~7000 markers the game's
+// World-map open optimization (variants::kFastMapOpen - a build variant, not an ini
+// key: `fast_map_open` was retired 2026-07-27 and lives in ini_retired_keys()).
+// With ~7000 markers the game's
 // per-marker widget relayout on every map open takes a long time (~0.7-1.2s of the
 // open stall). We wrap that relayout (refresh fn) at the map's per-marker dispatcher
 // call site, gated by return address so other UI is left as-is, and SKIP it there
@@ -92,9 +94,10 @@ namespace
 
 void goblin::map_timing::on_map_frame()
 {
-    // The shipping fast-map path has no deferred per-frame work. The debug V3 native
-    // marker experiment uses this stable UI-thread callback to counter-scale its one
-    // transplanted child during zoom; it is a single atomic gate otherwise.
+    // The shipping fast-map path has no deferred per-frame work of its own, but this is
+    // NOT an idle callback: stall_probe::on_map_frame() drives the native-marker rollout
+    // (v3_native_tick) and Lever B's viewport reconcile on every frame the map is open.
+    // Both are shipping behaviour, not a debug experiment.
     goblin::stall_probe::on_map_frame();
 }
 
@@ -128,7 +131,12 @@ void goblin::map_timing::setup()
             {.aob = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 20 "
                     "48 8B D9 48 8B 50 10 48 8B"},
             refresh_detour, o_refresh);
-        // Map-close probe trigger (diagnostics only; the hook changes no behavior).
+        // Map-close hook. NOT diagnostics: wmd_dtor_detour carries three load-bearing
+        // duties before the engine's dtor runs - stall_probe::on_map_close() (drops every
+        // cached V3 pointer), v3_detach_all_children() (Lever C, the bulk detach that
+        // removes the ~75ms close freeze) and gfx_probe::v3_on_map_close() (re-arms
+        // creation for the next dialog). Only the capture() call is diagnostics. Do not
+        // remove this hook while trimming logs.
         modutils::hook<DtorFn>(
             {.aob = "48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 30 "
                     "48 C7 45 F0 FE FF FF FF 48 89 9C 24 88 00 00 00 48 8B F1 48 8D 05 "

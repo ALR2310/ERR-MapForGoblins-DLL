@@ -83,7 +83,15 @@ extern "C"
         void (*set_on_activate)(mfg_page page, mfg_on_activate cb);
         void (*set_on_build)(mfg_page page, mfg_on_build cb);
 
-        /* Ask the menu to rebuild + redraw (safe to call from the UI thread). */
+        /* RESERVED - DO NOT CALL. Accepted and ignored.
+           This slot was published as "ask the menu to rebuild + redraw". The host records the
+           request and nothing polls it: the only place a poll could go is the per-frame dialog
+           update, and rebuilding the model from there would bump the row-pool generation while the
+           live screen still points at the previous one - the defect that made a returning page come
+           back with dead rows. Rows pushed with set_rows() already appear on the next build, so an
+           add-on does not need this. The slot stays so the struct layout is stable for anything
+           compiled against an earlier copy of this header; it will be repurposed or removed only
+           with a version bump. */
         void (*request_redraw)(void);
     } mfg_menu_api;
 

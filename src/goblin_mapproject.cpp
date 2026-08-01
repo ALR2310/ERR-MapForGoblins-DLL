@@ -1,4 +1,4 @@
-// World-map overlay projection. See goblin_mapproject.hpp.
+// World-map coordinates (see the header - this is NOT a world->screen projector any more). See goblin_mapproject.hpp.
 #include "goblin_mapproject.hpp"
 #include "goblin_maphover.hpp"       // map_dialog() -> the live CS::WorldMapArea
 #include "goblin_worldmap_probe.hpp" // fold non-overworld areas via the game's converter
@@ -24,7 +24,8 @@ namespace
 
     // The engine renders the map in a fixed virtual 1920x1080 GFx canvas then scales to
     // the backbuffer, so the canvas factor (realW/1920, realH/1080) is mandatory.
-    constexpr float CANVAS_W = 1920.0f, CANVAS_H = 1080.0f;
+    // (CANVAS_W / CANVAS_H, the 1920x1080 GFx canvas, stood here. They were the projector's
+    //  units; the projector left on 2026-07-28 and took both consumers with it.)
 
     bool seh_read(const void *addr, void *out, size_t n)
     {
@@ -38,8 +39,6 @@ namespace
         return v;
     }
 
-    // Baked defaults - overwritten live from the overlay sliders during calibration.
-    goblin::mapproject::Calib g_calib{0.0f, 0.0f, 0.0f, 1.0f, false};  // scale,dmap_x,dmap_z,map_scale,flip_y
 }
 
 bool goblin::mapproject::read_view(MapView &out)
@@ -57,8 +56,10 @@ bool goblin::mapproject::read_view(MapView &out)
     const float fmaxX = rf(b, OFF_FULLRECT + 8), fmaxZ = rf(b, OFF_FULLRECT + 12);
     out.snapMidX = (vminX + vmaxX) * 0.5f;
     out.snapMidZ = (vminZ + vmaxZ) * 0.5f;
-    out.fullMidX = (fminX + fmaxX) * 0.5f;
-    out.fullMidZ = (fminZ + fmaxZ) * 0.5f;
+    // (out.fullMidX / fullMidZ were filled here and read by nobody: both live consumers of
+    //  MapView - goblin_inject's reticle_view and stall_probe's zoom/pan reader - take only
+    //  pan, snapMid and zoom. The OFF_FULLRECT reads above STAY: the validity test below is
+    //  built on them.)
     if (!(out.zoom > 0.01f)) return false;
     if (!((vmaxX - vminX) > 1.0f) || !((vmaxZ - vminZ) > 1.0f)) return false;
     if (!((fmaxX - fminX) > 1.0f) || !((fmaxZ - fminZ) > 1.0f)) return false;
@@ -78,28 +79,8 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
     return goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z);
 }
 
-bool goblin::mapproject::project(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
-                                 const MapView &v, const Calib &c, float client_w, float client_h,
-                                 float &screen_x, float &screen_y)
-{
-    if (!v.valid) return false;
-
-    float mapX, mapZ;
-    if (!to_map(area, gx, gz, px, pz, mapX, mapZ)) return false;
-    mapX += c.dmap_x;
-    mapZ += c.dmap_z;
-
-    // Engine projection (cursor- and layer-independent):
-    //   viewCentre = (pan + snapMid) / zoom
-    //   screen     = (marker - viewCentre) * zoom * (real/virtual) + real/2
-    // pan is already screen-local px; the canvas factor (real/1920, real/1080) accounts
-    // for the fixed 1920x1080 GFx canvas being scaled to the backbuffer.
-    const float cU = (v.panX + v.snapMidX) / v.zoom;
-    const float cV = (v.panZ + v.snapMidZ) / v.zoom;
-    const float kx = client_w / CANVAS_W, ky = client_h / CANVAS_H;
-    screen_x = (mapX - cU) * v.zoom * kx + client_w * 0.5f;
-    screen_y = (mapZ - cV) * v.zoom * ky + client_h * 0.5f;
-    return true;
-}
-
-goblin::mapproject::Calib &goblin::mapproject::calib() { return g_calib; }
+// project() (world -> screen) and calib() lived here. Their only consumer was the overlay's
+// on-map drawing - the focus rings and the hover marker - which was retired 2026-07-28 when the
+// native equivalents took over. read_view() and to_map() below them stay: those ARE live, called
+// from goblin_inject and goblin_stall_probe, and to_map still routes non-overworld tiles through
+// goblin::worldmap_probe::project.

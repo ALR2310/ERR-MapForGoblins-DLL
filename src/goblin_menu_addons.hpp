@@ -50,5 +50,16 @@ namespace goblin::addons
     bool activate(size_t page_index, uint32_t row_id);
 
     // Set when an add-on asked for a redraw outside of a callback.
+    //
+    // NOT POLLED BY ANYTHING (verified 2026-07-30): the flag is set and never taken, so
+    // api_request_redraw() in the published API table is a call the host accepts and ignores. That
+    // stopped being a live problem the same day - this whole host is out of the map mod's build
+    // (MFG_MENU_ADDON_HOST = 0), so the DLL no longer offers the table to anyone - but it is the
+    // first thing to settle in the separate SDK mod, BEFORE any add-on author sees the header.
+    //
+    // Wiring it up is not a one-line change. The poll has to sit somewhere that may rebuild the
+    // row pool, and the obvious candidate - the per-frame form_update_detour - runs inside the
+    // engine's own dialog update, where rebuilding pools underneath it is exactly the shape of
+    // crash this codebase has hit before. An attempt on 2026-07-30 was reverted for that reason.
     bool take_redraw_request();
 }

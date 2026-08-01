@@ -25,15 +25,22 @@ namespace goblin::own_movie
     // stays off and the screen loads the stock movie.
     void install();
 
-    // Is the interception armed and usable?
+    // Is the interception armed and usable? NO CONSUMER at present, like status() below. It reports
+    // whether install() found the parse route - NOT whether a transform is armed for some particular
+    // open, because there is no such thing; see the next paragraph.
     bool available();
 
-    // Bracket our own screen's open, so a movie load started by anything else (the player
-    // opening the real key-binding screen) is never touched.
-    void arm();
-    void disarm();
+    // THERE IS NO PER-OPEN BRACKET, and one cannot exist at this layer. An arm()/disarm() pair
+    // was added on 2026-07-30 to keep the player's own key-binding screen on the stock movie; in
+    // game it turned the transform off entirely, because the engine parses 02_160 ONCE during the
+    // startup preload and every screen - ours and the player's - instances that single parse. The
+    // transform is therefore all-or-nothing per launch. Telling the two screens apart is a
+    // per-INSTANCE decision (the live display list), not a per-parse one.
 
-    // One-line state for the Tools page and the log: what happened on the last load.
+    // One-line state: what happened on the last load. NO CONSUMER at present - the overlay
+    // Tools page that read it was retired with the rest of the on-map overlay UI (2026-07-28),
+    // and the native menu never picked it up. Kept because g_status is maintained anyway and
+    // this is the only way to read it; wire it to a Debug row rather than re-deriving it.
     const char *status();
 
     // How many row clips the LEFT column of the row pool has once we are done with the movie.

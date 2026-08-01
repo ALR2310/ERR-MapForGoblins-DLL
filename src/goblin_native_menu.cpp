@@ -8,10 +8,11 @@
 #include "goblin_config_schema.hpp"
 #include "goblin_i18n.hpp"
 #include "goblin_inject.hpp"
+#include "goblin_build_variants.hpp" // MFG_MENU_ADDON_HOST - do not rely on an undefined macro
+#if MFG_MENU_ADDON_HOST
 #include "goblin_menu_addons.hpp"
+#endif
 #include "goblin_gfx_probe.hpp"
-#include "goblin_diag.hpp"     // report() for the copy-status row
-#include "goblin_sfimage.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp" // lookup_text() names the hidden markers
 #include "goblin_progress.hpp"
@@ -123,9 +124,9 @@ namespace
     // The row's text fields are html=1 EditText, and the setter the mod already uses
     // (RVA 0x74A000 -> FUN_140D842A0) passes isHtml=1 unconditionally - so <font>, <b>
     // and friends work with no extra plumbing (recon_draw_primitives.md section 2).
-    // Kept behind a switch so a single in-game run can compare markup on vs off.
-    // Row colour is unconditional: the toggle that used to gate it was a comparison row and
-    // colour won. The fields are html=1, so a <font> tag is the only way to paint text here.
+    // Row colour is UNCONDITIONAL - there is no switch. The toggle that used to gate it existed so
+    // one in-game run could compare markup on vs off; the run happened, colour won, and the toggle
+    // went. The fields are html=1, so a <font> tag is the only way to paint text here.
     std::wstring colored(const std::wstring &text, uint32_t rgb)
     {
         wchar_t open[32];
@@ -136,7 +137,8 @@ namespace
     constexpr uint32_t kColOn = 0x7FD97F;    // green - enabled
     constexpr uint32_t kColOff = 0x9A9A9A;   // grey - disabled
     constexpr uint32_t kColValue = 0xE8D9A0; // parchment - neutral value
-    constexpr uint32_t kColBarOn = 0x7FD97F;
+    // (a kColBarOn sat here, identical to kColOn and never used - bar_render draws with
+    // kColBarDone / kColBarPart)
     constexpr uint32_t kColBarOff = 0x50504A;
     // The mod's name as it should read on screen, in one place.
     const wchar_t *const kProductName = L"Map for Goblins";
@@ -150,6 +152,13 @@ namespace
     // categories stay distinguishable. Only code points VERIFIED present in the menu font
     // (font/eu_std/font.gfx, "Agmena W1G", 910 glyphs) are used: U+25A0 SQUARE,
     // U+25CF CIRCLE, U+25C6 DIAMOND, U+2605 STAR, U+25B2 TRIANGLE, U+2022 BULLET.
+    // ONE declaration of the glyph, used everywhere it is needed. A hand-repeated escape is
+    // how the bullet once shipped as a bare " 22" - the backslash was lost in an edit and every
+    // icon-less hidden-marker row drew " 22" in front of its name. An escape that exists in
+    // exactly one place cannot lose its backslash in nine others.
+    constexpr wchar_t kBulletCh = L'\x2022';
+    constexpr const wchar_t *kBullet = L"\x2022";
+
     struct SectionMark
     {
         const char *section;
@@ -160,11 +169,11 @@ namespace
     // BULLET but NOT the geometric shapes (U+25A0/25C6/25CF/25B2/2605 all rendered as
     // tofu boxes). So every section uses the bullet and is distinguished by COLOUR.
     constexpr SectionMark kMarks[] = {
-        {"Goblin", L'\x2022', 0xE8D9A0},    {"Equipment", L'\x2022', 0x9FC6E8},
-        {"Key Items", L'\x2022', 0xE8C86A}, {"Loot", L'\x2022', 0xC8E89A},
-        {"Magic", L'\x2022', 0xC9A0E8},     {"Quest", L'\x2022', 0xE8A0A0},
-        {"Reforged", L'\x2022', 0xE8B080},  {"World", L'\x2022', 0x9AD8C0},
-        {"ERR Markers", L'\x2022', 0xD0A0E8},
+        {"Goblin", kBulletCh, 0xE8D9A0},    {"Equipment", kBulletCh, 0x9FC6E8},
+        {"Key Items", kBulletCh, 0xE8C86A}, {"Loot", kBulletCh, 0xC8E89A},
+        {"Magic", kBulletCh, 0xC9A0E8},     {"Quest", kBulletCh, 0xE8A0A0},
+        {"Reforged", kBulletCh, 0xE8B080},  {"World", kBulletCh, 0x9AD8C0},
+        {"ERR Markers", kBulletCh, 0xD0A0E8},
     };
     // ini key -> source icon id, via the same atlas mapping the overlay draws from
     // (generated_shared/goblin_overlay_icons: ICON_CELLS gives the cell, CELL_SRC_ICON the
@@ -186,20 +195,14 @@ namespace
         return -1;
     }
 
-    // A representative icon for a whole section: the first entry in it that has one. Makes
-    // the icons visible on the very first screen instead of only inside a category page.
-    const goblin::IniEntry *section_icon_entry(const goblin::IniSection &sec)
-    {
-        for (const auto &e : sec.entries)
-            if (icon_for_key(e.key) >= 0)
-                return &e;
-        return nullptr;
-    }
+    // section_icon_entry() lived here: it picked a representative icon for a whole section (the
+    // first entry that had one). It lost its caller when the page rows stopped borrowing an icon
+    // from their first entry - a loot icon standing for dozens of settings said the wrong thing.
 
-    // The glyph is a STAND-IN for a picture. Where a real icon draws, showing both put a
-    // coloured dot right next to the image that replaced it; where there is no icon, the row
-    // still needs its marker. So the caller passes whether this row has one.
-
+    // The glyph is a STAND-IN for a picture. Where a real icon draws, showing both put a coloured
+    // dot right next to the image that replaced it; where there is no icon, the row still needs its
+    // marker. That decision is the CALLER's - mark_for only maps a section to its glyph and colour;
+    // the "does this row have an icon" test lives at the call site (push_entry_row, r.icon_id < 0).
     const SectionMark *mark_for(const char *section)
     {
         if (!section)
@@ -211,11 +214,13 @@ namespace
     }
 
     // ── value formatting ─────────────────────────────────────────────────────────────
-    // The value field (Text_1, cid 185) is 260 px wide and the row font is now 21 px, so roughly a
-    // quarter more characters fit than when the eight-cell bar was chosen. How many EXACTLY is a
-    // question for the eye, not for arithmetic - the font is proportional, so a digit, a '#' and a '.'
-    // are all different widths. Hence the styles below and the rulers on the Debug page: pick what
-    // reads best in game, then set kBarStyle to it.
+    // The value field (Text_1, cid 185) is 260 px wide and the row font is 22 px (kRowFontTwips in
+    // goblin_own_movie.cpp - THE definition of that number; this comment carried a stale 21 that was
+    // already corrected at the other copy). Roughly a quarter more characters fit than when the
+    // eight-cell bar was chosen. How many EXACTLY is a question for the eye, not for arithmetic - the
+    // font is proportional, so a digit, a '#' and a '.' are all different widths. Hence the styles
+    // below; pick what reads best in game, then set kBarStyle to it. (The comparison rulers this note
+    // used to send you to were removed from the Debug page on 2026-07-29.)
     constexpr uint32_t kColBarDone = 0x8CE68C; // a finished zone reads green, numbers and all
     // Anything short of finished is yellow. Green used to mean "some of it is done", which is the one
     // thing a colour should not say when green also means finished two rows below.
@@ -488,28 +493,11 @@ namespace
     }
 
     // ── actions ──────────────────────────────────────────────────────────────────────
-    // Bulk switches operate on the section that is currently open, so one pair of
-    // actions serves every section (including the ~60 icon-category toggles).
-    void set_section_bools(bool on)
-    {
-        const auto &schema = goblin::ini_schema();
-        const size_t ix = static_cast<size_t>(g_page - goblin::nmenu::kPageSectionBase);
-        if (ix >= schema.size())
-            return;
-        size_t n = 0;
-        for (const auto &e : schema[ix].entries)
-            if (e.type == goblin::IniType::Bool && e.target && entry_visible(e))
-            {
-                *static_cast<bool *>(e.target) = on;
-                ++n;
-            }
-        g_dirty = true;
-        goblin::reapply_live_settings();
-        spdlog::info("[nmenu] section '{}': {} bools -> {}", schema[ix].name, n, on ? "on" : "off");
-    }
-    void action_all_on() { set_section_bools(true); }
-    void action_all_off() { set_section_bools(false); }
-
+    // A set_section_bools(bool) with all-on / all-off wrappers lived here and had no callers and
+    // no Action rows pointing at it. Its index arithmetic had also gone stale: it indexed
+    // ini_schema() by (g_page - kPageSectionBase), which was true when a page WAS a schema
+    // section, but pages index kLayout now (4 entries against 12 schema sections), so a bulk
+    // toggle would have applied to whichever section happened to sit at that index.
     void action_unhide_all()
     {
         const size_t n = goblin::manual_hidden_count();
@@ -526,7 +514,7 @@ namespace
     // valueless Info row, which is what makes the row clip draw it on the PadCategory frame) or an
     // explicit ordered KEY list, which is how a page shows only some of a section's entries.
     // Page id = kPageSectionBase + index into this table, so all the existing id arithmetic and the
-    // host's set_page/subpage_target keep working unchanged.
+    // host's set_page arithmetic keeps working unchanged.
     //
     // Keys deliberately absent from every page: `native_menu` (it gates the menu itself - switching
     // it off from inside would be a trap) and the overlay-only settings (window geometry, opacity,
@@ -569,19 +557,19 @@ namespace
     // row, which the host draws on the Grayout frame - so "disabled" needs no new row kind.
     bool key_is_readonly(const char *key)
     {
-        // enable_toggle_hotkey decides whether the key that OPENS this menu does that at all;
-        // flipping it from inside is how a player locks themselves out.
+        // enable_toggle_hotkey does NOT gate the key that opens this menu - that path reads
+        // toggleInjectionKey / toggleGamepadMask directly (goblin_stall_probe, the native-mode
+        // poll). The flag is the master switch of the ICON toggle hotkey, read by dllmain and by
+        // toggle_hotkey_loop in goblin_inject. It is read-only here for the same reason the
+        // overlay greys it (goblin_overlay.cpp, the `locked` pair): a master switch that turns
+        // off the very input surface you would need to turn it back on does not belong on a row
+        // the player can flip in passing.
         return std::strcmp(key, "enable_toggle_hotkey") == 0;
     }
 
-    const goblin::IniEntry *entry_by_key(const char *key)
-    {
-        for (const auto &sec : goblin::ini_schema())
-            for (const auto &e : sec.entries)
-                if (std::strcmp(e.key, key) == 0)
-                    return &e;
-        return nullptr;
-    }
+    // (entry_for_key() stood here with a body identical to entry_for_key() above, minus the null
+    //  guard. Two wrappers over one double loop, with the call sites split between them purely by
+    //  which one happened to be in scope when each was written. Folded into entry_for_key.)
 
     // One schema entry -> one row. Shared by every page so the pages cannot disagree about how an
     // entry looks; `section` only decides the colour of the fallback bullet.
@@ -621,14 +609,46 @@ namespace
         push(h);
     }
 
+    // A "show_" PREFIX is not the same thing as an icon category, and treating it as one was a bug
+    // with two symptoms. show_world_maps_ignore_fragments is a MODIFIER - it clears the map-fragment
+    // gate on the World Maps rows - yet it matched the prefix, so the aggregate toggle at the top of
+    // the Categories page switched it along with everything else while turning the very same
+    // categories off by hand never touched it. That is exactly how the two paths came to disagree:
+    // "disable all" also silently dropped the fragment bypass, and re-enabling categories one by one
+    // never brought it back. It also made the aggregate miscount its own state (57 keys where there
+    // are 56 categories), so "are they all on?" could answer wrongly.
+    //
+    // Answer from the REAL category list instead. category_config_key() is the one place that maps a
+    // Category to its ini key and returns nullptr for everything else, so a future non-category
+    // show_* key cannot reintroduce this. Category is a uint8_t enum, so 0..255 covers it whole.
+    bool is_category_key(const char *key)
+    {
+        if (!key)
+            return false;
+        static const std::vector<std::string> keys = [] {
+            std::vector<std::string> out;
+            for (int i = 0; i < 256; ++i)
+                if (const char *k = goblin::category_config_key(
+                        static_cast<goblin::generated::Category>(i)))
+                    out.emplace_back(k);
+            return out;
+        }();
+        for (const auto &k : keys)
+            if (k == key)
+                return true;
+        return false;
+    }
+
     // Every icon category across the whole schema, not just one section - the same thing the
-    // overlay's "show all / hide all" pair does.
+    // overlay's "show all / hide all" pair does. Membership comes from is_category_key(), NOT from
+    // the "show_" prefix: see the note there for what the prefix swept in and why the aggregate and
+    // the per-row toggles behaved differently because of it.
     void set_all_categories(bool on)
     {
         for (const auto &sec : goblin::ini_schema())
             for (const auto &e : sec.entries)
                 if (e.type == goblin::IniType::Bool && e.target && entry_visible(e) &&
-                    std::strncmp(e.key, "show_", 5) == 0)
+                    is_category_key(e.key))
                     *static_cast<bool *>(e.target) = on;
         g_dirty = true;
         goblin::reapply_live_settings();
@@ -674,7 +694,7 @@ namespace
         for (const auto &sec : goblin::ini_schema())
             for (const auto &e : sec.entries)
                 if (e.type == goblin::IniType::Bool && e.target && entry_visible(e) &&
-                    std::strncmp(e.key, "show_", 5) == 0)
+                    is_category_key(e.key))
                 {
                     ++*total;
                     if (*static_cast<bool *>(e.target))
@@ -682,9 +702,6 @@ namespace
                 }
     }
 
-    // ONE row, not a pair: everything on -> turn everything off, anything else -> turn everything
-    // on. A Toggle row is not usable here because there is no single bool to point at - the state
-    // is an aggregate, and the row shows it as a count.
     // The dump the player can copy out. Held here so the "copy" row has something to copy and can
     // report its size, exactly like the overlay's byte counter.
     std::string g_dump_text;
@@ -845,7 +862,7 @@ namespace
                     push_entry_row(e, name);
         }
         for (size_t ki = 0; ki < lp.key_count; ++ki)
-            if (const goblin::IniEntry *e = entry_by_key(lp.keys[ki]))
+            if (const goblin::IniEntry *e = entry_for_key(lp.keys[ki]))
                 if (entry_visible(*e))
                     push_entry_row(*e, nullptr);
         if (lp.dump_rows)
@@ -895,9 +912,9 @@ namespace
         // Two settings are important enough to sit at the top level rather than inside a
         // page: what the map is allowed to show at all, and how it tells the place you are
         // in from the places that merely sit under (or over) it.
-        if (const goblin::IniEntry *rmf = entry_by_key("require_map_fragments"))
+        if (const goblin::IniEntry *rmf = entry_for_key("require_map_fragments"))
             push_entry_row(*rmf, nullptr);
-        if (const goblin::IniEntry *le = entry_by_key("location_emphasis"))
+        if (const goblin::IniEntry *le = entry_for_key("location_emphasis"))
             push_entry_row(*le, nullptr);
         for (size_t i = 0; i < kLayoutCount; ++i)
         {
@@ -916,7 +933,7 @@ namespace
                             if (entry_visible(e))
                                 ++shown;
             for (size_t ki = 0; ki < lp.key_count; ++ki)
-                if (const goblin::IniEntry *e = entry_by_key(lp.keys[ki]))
+                if (const goblin::IniEntry *e = entry_for_key(lp.keys[ki]))
                     if (entry_visible(*e))
                         ++shown;
             if (!shown)
@@ -971,7 +988,9 @@ namespace
         push(ab);
 
         // Pages contributed by other mods (sdk/mfg_menu_api.h). They appear as ordinary
-        // rows, so a player sees one menu for everything.
+        // rows, so a player sees one menu for everything. Not built into this DLL - the SDK host
+        // ships as a separate mod (goblin_build_variants.hpp, MFG_MENU_ADDON_HOST).
+#if MFG_MENU_ADDON_HOST
         goblin::addons::scan();
         for (size_t i = 0; i < goblin::addons::page_count(); ++i)
         {
@@ -985,8 +1004,10 @@ namespace
             r.value = hold(L">");
             push(r);
         }
+#endif // MFG_MENU_ADDON_HOST
     }
 
+#if MFG_MENU_ADDON_HOST
     void build_addon(size_t index)
     {
         const auto *ap = goblin::addons::build_page(index);
@@ -1034,6 +1055,7 @@ namespace
             push(r);
         }
     }
+#endif // MFG_MENU_ADDON_HOST
 
     // build_section() lived here until 2026-07-29: it built one page per ini section. Pages now
     // come from the layout table above, so a page can merge several sections or list keys by hand.
@@ -1238,7 +1260,7 @@ namespace
                 r.help = hold(wide(tr::entry_label(ckey, mlang())));
             }
             if (r.icon_id < 0)
-                r.label = hold(colored(L" 22", kColValue) + L"  " +
+                r.label = hold(colored(kBullet, kColValue) + L"  " +
                                std::wstring(r.label ? r.label : L""));
             push(r);
         }
@@ -1267,7 +1289,7 @@ namespace
             // clean list and the marker reads the same on every row width.
             r.label = hold(option_label(*e, i));
             if (live)
-                r.value = hold(colored(L"\x2022", kColOn));
+                r.value = hold(colored(kBullet, kColOn));
             push(r);
         }
     }
@@ -1361,8 +1383,10 @@ namespace
             build_rebind();
         else if (g_page >= goblin::nmenu::kPageRegionBase)
             build_region(static_cast<size_t>(g_page - goblin::nmenu::kPageRegionBase));
+#if MFG_MENU_ADDON_HOST
         else if (g_page >= goblin::nmenu::kPageAddonBase)
             build_addon(static_cast<size_t>(g_page - goblin::nmenu::kPageAddonBase));
+#endif
         else if (g_page >= goblin::nmenu::kPageSectionBase)
             build_layout_page(static_cast<size_t>(g_page - goblin::nmenu::kPageSectionBase));
         else
@@ -1407,8 +1431,6 @@ void goblin::nmenu::set_nested(bool on)
     g_want_close = false;
 }
 
-bool goblin::nmenu::nested() { return g_nested; }
-
 int32_t goblin::nmenu::take_child_page()
 {
     const int32_t p = g_child_page;
@@ -1423,20 +1445,8 @@ bool goblin::nmenu::take_close_request()
     return c;
 }
 
-int32_t goblin::nmenu::subpage_target(size_t row_index)
-{
-    if (row_index >= g_rows.size())
-        return -1;
-    const Row &r = g_rows[row_index];
-    return r.kind == RowKind::SubPage ? r.page_id : -1;
-}
-
-void goblin::nmenu::reset_to_root()
-{
-    g_page = kPageRoot;
-    g_stack.clear();
-    build_current();
-}
+// nested(), subpage_target(), reset_to_root() and depth() were exported here and had no callers:
+// the host drives the model through set_page / take_child_page / take_close_request only.
 
 bool goblin::nmenu::activate(size_t row_index)
 {
@@ -1473,6 +1483,16 @@ bool goblin::nmenu::activate(size_t row_index)
             *v = !*v;
             g_dirty = true;
             spdlog::info("[nmenu] {} -> {}", row.ini_key ? row.ini_key : "?", *v ? "on" : "off");
+            // The flag alone is not the whole setting. Our own icons follow it live (the per-frame
+            // visibility asks is_category_enabled directly), which is why flipping a category here
+            // LOOKED complete - but the param row also carries the enable flags the GAME gates on,
+            // and only apply_category_visibility writes those. The aggregate "all categories" row
+            // does call this; a single toggle did not, so after "turn everything off" the rows kept
+            // textEnableFlagId = AlwaysOff while the config said the category was back on: our icons
+            // returned, the engine still considered those rows disabled, built no pin for them, and
+            // the marker popups stayed dead until some OTHER setting happened to trigger a reapply.
+            // That is the asymmetry between the button and the per-row switches. Found 2026-07-31.
+            goblin::reapply_live_settings();
         }
         build_current();
         return true;
@@ -1555,6 +1575,7 @@ bool goblin::nmenu::activate(size_t row_index)
         }
         [[fallthrough]];
     case RowKind::Info:
+#if MFG_MENU_ADDON_HOST
         // An add-on row: let the owning add-on handle it and rebuild if it changed.
         if (row.type_tag == 0xFF)
         {
@@ -1564,6 +1585,7 @@ bool goblin::nmenu::activate(size_t row_index)
                 build_current();
             return changed;
         }
+#endif
         return false;
     }
     return false;
@@ -1628,8 +1650,6 @@ void goblin::nmenu::rebind_apply(uint32_t vk)
     }
     navigate_back();
 }
-
-size_t goblin::nmenu::depth() { return g_stack.size(); }
 
 bool goblin::nmenu::dirty() { return g_dirty; }
 void goblin::nmenu::clear_dirty() { g_dirty = false; }

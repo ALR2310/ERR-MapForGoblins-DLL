@@ -23,7 +23,6 @@ namespace goblin::i18n
         AllOn,
         AllOff,
         RandomizerHint,
-        FastMapOpenWarning,
         IniOnly,
         PressAKey,
         PressComboRelease,

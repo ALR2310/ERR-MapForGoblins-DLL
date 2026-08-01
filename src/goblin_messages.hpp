@@ -12,9 +12,12 @@ namespace goblin
     /// at the end of setup_messages(), after the FMG bank is built.
     void sanitize_injected_textids();
 
-    /// Toggle the PlaceName FMG slot between vanilla and expanded states.
-    void set_fmg_injection_active(bool active);
-    bool is_fmg_injection_active();
+    // (set_fmg_injection_active(bool) / is_fmg_injection_active(), which toggled the PlaceName FMG
+    //  slot between the vanilla and the expanded buffer, were exported here and had no
+    //  callers anywhere. They read as live because their twin in goblin_inject - the PARAM
+    //  injection on/off pair - really is driven, from menu_auto_toggle_loop. The FMG side has no
+    //  such driver: the expanded PlaceName buffer is installed once and stays. See the note at
+    //  their former definitions.)
 
     /// Resolve a marker textId (item-name offset-encoded id, or raw PlaceName
     /// location id) to its string in the player's language, by reading the

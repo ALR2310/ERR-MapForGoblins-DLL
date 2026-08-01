@@ -4,7 +4,6 @@
     "AllOn": "alle an",
     "AllOff": "alle aus",
     "RandomizerHint": "Du nutzt einen Randomizer? Aktiviere live_loot_flags + live_loot_labels + live_loot_icons, damit die Markierungen zu den gemischten Gegenstandspositionen passen.",
-    "FastMapOpenWarning": "BETA: lässt die Karte schneller öffnen. Wenn die Karte fehlerhaft ist oder abstürzt, schalte dies ab.",
     "IniOnly": "(nur .ini)",
     "PressAKey": "Taste drücken",
     "PressComboRelease": "Kombination drücken, loslassen",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "Kartenfragmente erforderlich",
     "location_emphasis": "Ortshervorhebung",
-    "fast_map_open": "Karte schneller öffnen",
     "show_armaments": "Waffen",
     "show_armour": "Rüstung",
     "show_ashes_of_war": "Kriegsaschen",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "Erfordert das Entdecken des Kartenfragments, bevor Symbole in diesem Gebiet angezeigt werden",
     "location_emphasis": "Marker der Karte, auf der du dich befindest, werden größer gezeichnet; Marker, die nur nahe wirken (ein Verlies unter dir oder die Oberfläche darüber), kleiner. Es wird nie etwas ausgeblendet.",
-    "fast_map_open": "BETA: lässt die Weltkarte schneller öffnen, wenn viele Symbole angezeigt werden.\nAusschalten, wenn die Karte fehlerhaft ist oder abstürzt.",
     "show_armaments": "Waffen, Schilde, Bögen, Stecken usw.",
     "show_armour": "Rüstungsteile (Helme, Brust, Armschienen, Beinschienen)",
     "show_ashes_of_war": "Kriegsaschen (Waffenfertigkeiten)",

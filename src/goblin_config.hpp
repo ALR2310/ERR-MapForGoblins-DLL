@@ -163,10 +163,11 @@ namespace goblin
         // or a GPU driver issue makes the game unstable.
         extern std::string overlayUiLanguage; // OVERLAY menu language (ini overlay_ui_language);
                                               // the in-game menu follows the GAME language
-    // key native_menu_icons: how the in-game menu draws category icons - 0 off,
-    // 1 masked strip, 2 one child per icon (both need the movie rebuilt at load),
-    // 3 drawn straight from our own pixels into a clip the row already has.
-    extern float fontScale;        // overlay text size multiplier (live io.FontGlobalScale)
+        // (Three lines describing an ini key `native_menu_icons` - how the in-game menu draws
+        //  category icons - stood here, in the present tense, directly above an unrelated field, so
+        //  they read as ITS documentation. That key was removed on 2026-07-29 along with the second
+        //  icon construction; one construction is spliced now. goblin_own_movie.cpp already says so.)
+        extern float fontScale;    // overlay text size multiplier (live io.FontGlobalScale)
         extern bool menuEnabled; // ini menu_enabled (was enable_menu, was enable_overlay)
         extern std::string menuRenderMode; // native | imgui | dev (ini menu_render_mode)
 

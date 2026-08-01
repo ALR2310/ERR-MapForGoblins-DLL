@@ -12,11 +12,13 @@ namespace goblin::watch { void pump(); }
 #include "generated_shared/goblin_logo.hpp"       // runtime-injectable MapForGoblins logo (bitmap + matrix)
 #include "generated/goblin_item_icons.hpp"       // goblin::generated::ANON_ICON_ID
 #include "goblin_inject.hpp"   // goblin::remap_injected_icons (point markers at our injected frames)
-#include "goblin_diag.hpp"     // goblin::diag inject-status registry (overlay Debug readout)
 #include "goblin_maphover.hpp" // map_dialog() - the V3 spike only fires while the map is open
 #include "goblin_stall_probe.hpp"
-#include "goblin_settings_textures_dev.hpp" // DEV: 40 settings textures as lossless bitmaps (300..339)
-#include "goblin_settings_insert_dev.hpp"   // DEV: Path B native-parse insert blob (defs + root PO2)
+// goblin_settings_textures_dev.hpp (5,260,706 bytes) and goblin_settings_insert_dev.hpp (113,808)
+// were included here unconditionally for the retired re-host experiment. No symbol from either
+// namespace is referenced anywhere in src/ or tools/, and neither reaches the DLL (both blobs are
+// `inline const unsigned char` arrays, so their COMDATs are discarded) - but the file still parsed
+// 5.4 MB of them on every profile build. The headers stay in the tree as the experiment's data.
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -46,8 +48,11 @@ namespace goblin::watch { void pump(); }
 // Icon injection is UNCONDITIONAL: we register our DefineBitsLossless2 bitmaps in the live worldmap
 // movie, append a frame per icon to SpriteDef-171, and remap markers to the injected frames - so icons
 // render without a modified/shipped gfx. This is the mod's normal icon path (no ini toggle).
-//   debug_logging (ini, default off) - DEV ONLY: additionally dumps the live SpriteDef/dict and arms the
-//                              read-only RM2::Execute trace. Never changes injection behavior.
+//   debug_logging (ini, default off) - logging only. It does NOT arm the RM2::Execute hook: that one
+//                              is armed by the kNativeMarkers build variant and carries the marker
+//                              factory pulse, so it is live in every shipping build. The SpriteDef/dict
+//                              dumps additionally require the compile key MFG_DUMP_FRAMES, which is not
+//                              defined anywhere in the tree. Never changes injection behavior.
 // See docs/research_no_gfx_icons.md.
 namespace
 {
@@ -62,21 +67,16 @@ namespace
     // CharacterCreateInfo* createOverride, InteractiveObject* origChar). The last five arrive on the
     // stack and the callee both READS and WRITES those slots, so a short detour hands it our own frame.
     std::atomic<uint64_t> g_moviedef{0};
-    std::atomic<unsigned> g_adddisp_calls{0};
 
     // Resource-dict lookup 0x14113fd90: rcx = container (= movieDef+0xd8), edx = charId. The most
     // reliable movieDef source - every charId resolution funnels here (both AddDisplayObject and the
     // 2nd caller). movieDef = rcx - 0xd8.
     using LookupFn = void *(void *, uint32_t, void *);
     LookupFn *o_lookup = nullptr;
-    std::atomic<unsigned> g_lookup_calls{0};
 
     // R2 diagnostics: lossless image loader 0x1411e2670 (rcx = movieContext, rdx = tagInfo).
     using LosslessFn = void *(void *, void *);
     LosslessFn *o_lossless = nullptr;
-    std::atomic<unsigned> g_lossless_calls{0};
-    std::atomic<uint64_t> g_lossless_ctx{0};
-    std::atomic<bool> g_r2_dumped{false};
 
     // DefineSprite loader 0x1411e2bc0 (rcx = movieContext). We hook it to inject our embedded "?"
     // bitmap by calling the NATIVE lossless loader during the worldmap load (when the load context +
@@ -85,7 +85,9 @@ namespace
     using SpriteLoaderFn = void *(void *, void *);
     SpriteLoaderFn *o_spriteloader = nullptr;
     std::atomic<bool> g_qmark_injected{false}; // frames appended (per worldmap load)
-    std::atomic<bool> g_img_registered{false}; // our bitmaps registered (at native-13507 load)
+    // A g_img_registered flag stood here ("our bitmaps registered (at native-13507 load)"). It had a
+    // single occurrence - this declaration - and its own trailing note had gone stale besides:
+    // registration runs at sprite-171 load now, not at 13507 (see lossless_detour).
 
     // srcIconId (the gfx iconId a category's markers are baked with) -> our injected iconId. Filled at
     // worldmap load; read by remap_injected_icons. srcIconIds are small (369..441) so a flat array is fine.
@@ -102,7 +104,9 @@ namespace
     ExecFn *o_rm2exec = nullptr;
     std::atomic<uint64_t> g_my_rm2_d1{0}, g_my_rm2_d2{0};
     std::atomic<unsigned> g_rmhook_logs{0};
-    std::atomic<bool> g_in_inject{false};
+    // A g_in_inject re-entrancy flag lived here. It guarded a PO2-loader detour against recursing
+    // while we drove that loader ourselves - and that detour was never installed (it went with the
+    // re-host cluster). Nothing ever LOADED the flag; it was only stored to.
 
     // ── Runtime injected-charId base (no build-time / per-profile guess) ───────────────────────────
     // The common resource-dict registrar 0x1411cf250 runs for EVERY native charId as a movie streams in
@@ -111,7 +115,8 @@ namespace
     // We hook it to track each movie's real max NATIVE charId at runtime, SCOPED BY ctx (not global), so
     // our injected bitmaps sit above every native id no matter which/whose gfx actually loaded. This is
     // why no per-profile bake is needed and external gfx edits can't break us.
-    constexpr uint64_t RVA_FN_DICT_REGISTRAR = 0x11CF250;
+    // (The registrar is reached by AOB, not by this RVA - a constexpr RVA_FN_DICT_REGISTRAR = 0x11CF250
+    //  sat here and no expression read it. The address is already in the prose above and at the scan.)
     using RegistrarFn = void *(void *, void *, void *, void *);
     RegistrarFn *o_registrar = nullptr;
     constexpr int REGN = 16;                    // a few movies can be loading/resident at once
@@ -280,59 +285,24 @@ namespace
     std::atomic<uint32_t> g_sprite171_rm2_count{0};
     uint32_t logo_charid() { return inject_base() + (uint32_t)goblin::generated::MAP_ICON_TAG_COUNT; }
 
-    // Path A milestone: watch the registrar for OUR injected charId, to CONFIRM the loader
-    // actually inserted it into the dict (definitive, independent of g_moviedef timing) and
-    // to capture the TRUE dict-owner rcx the registrar was called with.
-    std::atomic<uint32_t> g_ms_charid{0};   // charId we are watching for (0 = off)
-    std::atomic<int> g_ms_reg_seen{0};      // set when the registrar fired for g_ms_charid
-    std::atomic<uint64_t> g_ms_reg_rcx{0};  // the rcx (dict owner/movieDef) at that call
-    std::atomic<int> g_ms_dictchecked{0};    // one-shot post-load char-dict verification latch
-    std::atomic<uint32_t> g_ms_watch_cid{0}; // lookup_detour logs resolves of this charId (0=off)
-    std::atomic<int> g_ms_watch_hits{0};     // rate-limit the watch log
+    // The Path-A milestone watches (g_ms_charid / g_ms_reg_seen / g_ms_reg_rcx / g_ms_dictchecked /
+    // g_ms_watch_cid / g_ms_watch_hits) lived here. They existed to confirm that our injected charIds
+    // reached the char dict during the settings re-host experiment. None of them was ever assigned a
+    // watch target, so every branch reading them was unreachable.
 
-    // MASTER OFF-SWITCH for the Path-A settings re-host experiment. FALSE = the DLL does NOT touch the
-    // settings clips (icons-only, known-stable shipping behavior) - the safe checkpoint. TRUE = register
-    // the 149-def closure AND place + verify the 5 roots (Task #4). A transient sprite fault can crash
-    // startup with it on, so it ships OFF; flip to true only for a dev experiment run.
-    //
-    // BACK TO OFF 2026-07-27 - the documented ship state, and the current experiment. With it on (plus
-    // debug_logging, which also gates the splice) every worldmap load has 40149 bytes of settings defs
-    // spliced into the movie buffer the engine parses: `[movieswap] SPLICED blob 40149 bytes at
-    // ShowFrame@68865 -> new movie len 109888 (was 69739)`. That is by far the most invasive thing we do
-    // to that movie, and map TILES have been going transparent and back during scroll/zoom. Everything
-    // else was ruled out first: charIds never collided (measured, see the worldmap charId memory), the
-    // V3 detach path was excluded by three player runs (viewport window off, self-detach off) plus two
-    // probes that logged nothing at all, and the sc2 backend cannot produce terrain-shaped holes.
-    constexpr bool ENABLE_SETTINGS_REHOST = false;
-    // Path B: splice the settings def+root blob into the worldmap movie buffer at load so the GAME'S
-    // native parser registers + instantiates them (correct dicts). Supersedes the runtime per-tag def
-    // inject (which lands defs in the wrong dict -> instantiation crash).
-    constexpr bool NATIVE_SPLICE = true;
-
-    // Task #4 (settings-root placement) runtime state - see the "place the 5 settings roots" section.
-    std::atomic<uint64_t> g_map_root{0};   // live map _root sprite (adddisp rcx when it places a root cid)
-    std::atomic<uint64_t> g_root_ctx{0};   // the DisplayObjContext of that root-frame PO2::Execute (Route P)
-    std::atomic<uint32_t> g_root_frame{0}; // frame arg of that Execute
-    std::atomic<uint64_t> g_map_scene{0};  // the movie scene resolved against (from the 14074a2f0 hook)
-    std::atomic<int> g_roots_placed{0};    // one-shot placement guard
-    std::atomic<uint64_t> g_settings_owner{0}; // char-def registrar owner (rcx) our settings defs land in
-    std::atomic<uint32_t> g_root_reg_mask{0};  // bit k set = ROOTS[k].newCid def registered this load
-    std::atomic<int> g_stream_complete{0};     // 1 = the whole settings def stream registered (no fault)
-    std::atomic<int> g_settings_verified{0};   // 1 = ran the Task#5 TabList-resolves-under-map-scene check
-    // Live per-frame DisplayObjContexts seen flowing through PlaceObject2::Execute during map build.
-    // These are the ONLY placeable contexts (list@+0x28); the probe tries them against the binding scene.
-    uint64_t g_live_ctx[96] = {};
-    uint32_t g_live_ctx_frame[96] = {};
-    std::atomic<int> g_live_ctx_n{0};
-    alignas(16) uint8_t g_pos_tmpl[0x100]; // cloned CharPosInfo template (Route A')
-    std::atomic<uint64_t> g_tmpl_name{0};  // a captured GASString name arg (Route A' mechanical reuse)
-    std::atomic<int> g_pos_tmpl_ready{0};
-    // TLS: ctx/frame of the PlaceObject2::Execute running on this thread (AddDisplayObject is called
-    // synchronously from inside it, so adddisp_detour can read the owning root ctx here).
-    thread_local uint64_t tls_po2_ctx = 0;
-    thread_local uint32_t tls_po2_frame = 0;
-    // Re-entrancy guard: our own o_resolve probe calls must NOT recurse back into resolve_detour.
-    thread_local bool tls_in_probe = false;
+    // HISTORY. The Path-A settings re-host experiment kept its state here: a "MASTER OFF-SWITCH"
+    // (ENABLE_SETTINGS_REHOST), a route selector (NATIVE_SPLICE), and ~15 globals holding the map root,
+    // the placement contexts, the registrar owner and the Task #4 placement guards. None of it was
+    // wired to anything by the end - the off-switch was read by NO expression, so it did not switch
+    // anything either. The experiment is documented (and its hazard recorded) in
+    // docs/research_retired_native_ui_experiments.md: with the splice on, every worldmap load had
+    // 40149 bytes of settings defs pushed into the buffer the engine parses, and map TILES went
+    // transparent during scroll/zoom. The resolver/PO2-loader detours that caused it are gone, and
+    // so is the rest of the cluster (see the Path A/Path B tombstone further down - that removal is
+    // what finally emptied this). Three thread_locals stood here with it: tls_po2_ctx and
+    // tls_po2_frame (the ctx/frame of the PlaceObject2::Execute running on this thread) and
+    // tls_in_probe (a re-entrancy guard for the resolver probe). Each had exactly one occurrence in
+    // the file - its own declaration.
 
     void *registrar_detour(void *rcx, void *rdx, void *r8, void *r9)
     {
@@ -340,21 +310,17 @@ namespace
         {
             uint32_t cid = *reinterpret_cast<const uint32_t *>(r8); // registrar itself derefs [r8]
             reg_note(dict_owner((uint64_t)rcx), cid); // key on the dict owner, not the outer pointer
-            uint32_t watch = g_ms_charid.load(std::memory_order_relaxed);
-            if (watch && cid == watch)
-            {
-                g_ms_reg_rcx.store((uint64_t)rcx, std::memory_order_relaxed);
-                g_ms_reg_seen.store(1, std::memory_order_relaxed);
-            }
+            // A milestone-watch branch stood here: when the registrar fired for a charId held in
+            // g_ms_charid it recorded the owner. Nothing ever wrote that charId, so the branch was
+            // unreachable, and the two atomics it set had no readers either.
         }
         return o_registrar(rcx, rdx, r8, r9);
     }
 
-    // Path A diagnostic: the CHAR-DEF registrar 0x11169D90 (rcx=char registry owner, rdx=&charId,
-    // r8=CharacterDef). Logs which owner object native worldmap char defs (charId 171 etc.) AND our
-    // injected shape (13831) land in - to settle whether we share the movie's real char registry.
-    using CharDefRegFn = void *(void *, void *, void *, void *);
-    CharDefRegFn *o_chardef_reg = nullptr;
+    // A Path A diagnostic on the CHAR-DEF registrar 0x11169D90 stood here (which owner object native
+    // worldmap char defs and our injected shape land in). Its typedef and trampoline were declared and
+    // never assigned - no hook was installed - and the question it asked was answered: we do share the
+    // movie's real char registry, which is why the icon injection works at all.
 
     // XInput gamepad injection: hook XInputGetState (game reads XINPUT1_4) and OR in the buttons we
     // want, driven by sentinel file scratch\pad.cmd ("<hexmask> <frames>"). Bypasses ER's injected-
@@ -504,34 +470,20 @@ namespace
         // moment, but a stock/overhaul gfx may carry ZERO embedded bitmaps (confirmed: this loader fired
         // 0 times on a pure-DLL run). Registration now runs at sprite-171 load instead (the image manager
         // is already warm there from the worldmap's external-image loads), which is gfx-content-independent.
-        g_lossless_calls.fetch_add(1, std::memory_order_relaxed);
-        if (!g_lossless_ctx.load(std::memory_order_relaxed) && rcx)
-            g_lossless_ctx.store((uint64_t)rcx, std::memory_order_relaxed);
+        // (a call counter and a captured context were recorded here for dump_r2, which never
+        // printed them; the detour itself stays because o_lossless is the pass-through)
         return o_lossless(rcx, rdx);
     }
 
-    // R2 read-only: dump the global image service [0x144593250] + its vtable, and whether any movie
-    // loaded a lossless image (captured movieContext template for Route A).
-    void dump_r2()
-    {
-        uint64_t exe = (uint64_t)GetModuleHandleW(nullptr);
-        uint64_t svcptr = exe + (0x144593250ull - 0x140000000ull);
-        uint64_t svc = rq(svcptr);
-        uint64_t vt = rq(svc);
-        unsigned lc = g_lossless_calls.load(std::memory_order_relaxed);
-        uint64_t ctx = g_lossless_ctx.load(std::memory_order_relaxed);
-        if (ctx)
-        {
-            uint64_t mgr = rq(ctx + 0x18);
-        }
-    }
+    // dump_r2() stood here. Its comment promised a dump of the global image service and the
+    // lossless-image state, but the body only read six values into locals and dropped them -
+    // there was no spdlog call, no store and no return. It ran once per session for nothing.
 
     uint64_t build_clean_place_tag(uint16_t cid, uint16_t dp, const unsigned char *mtx, unsigned mlen); // below
-    uint64_t build_clean_sprite_place_tag(uint16_t cid, uint16_t dp, const unsigned char *mtx, unsigned mlen); // below
     uint64_t build_remove_tag(uint16_t depth);                                // defined below
     void capture_tag_vtables(uint64_t sd);                                    // defined below
     void capture_sprite171_rm2_tags(uint64_t sd);                              // defined below
-    uint32_t append_icon_frame(uint64_t sd, uint16_t newCharId, const unsigned char *mat, unsigned matLen, bool asSprite = false); // defined below
+    uint32_t append_icon_frame(uint64_t sd, uint16_t newCharId, const unsigned char *mat, unsigned matLen); // defined below
     uint32_t compute_safe_base(uint64_t movieDef, uint32_t count);            // defined below (self-healing)
 #ifdef MFG_DUMP_FRAMES
     void dump_frames(uint64_t sd);                                 // defined below
@@ -626,9 +578,7 @@ namespace
         wr32(reader + 0x4c, 0); wr32(reader + 0x50, 0); wr32(reader + 0x54, 0);
         uint32_t taginfo[8] = {36u, 0, len, 0, 0, 0, 0, 0}; // [+0]=type36 (DefineBitsLossless2), [+8]=length
 
-        g_in_inject.store(true, std::memory_order_relaxed);
         void *lret = seh_call_lossless((void *)ctx, taginfo);
-        g_in_inject.store(false, std::memory_order_relaxed);
 
         wr64(reader + 0x20, s20);
         wr32(reader + 0x4c, s4c); wr32(reader + 0x50, s50); wr32(reader + 0x54, s54);
@@ -637,217 +587,27 @@ namespace
         return lret != nullptr;
     }
 
-    // ============================================================================
-    // Path A (re-host settings menu IN the map movie) - FIRST MILESTONE (dev-only).
-    // Prove we can register a FOREIGN (settings-movie) DEFINE tag - not just a bitmap -
-    // into the LIVE worldmap movie's resource dictionary. This is the core new capability
-    // the full re-host builds on. Here we register ONE self-contained DefineShape (a
-    // 400x28px gray bar, cid 123 of 02_040_optionsetting.gfx) and confirm via the game's
-    // own dict lookup that it landed. Rendering/instancing is the NEXT step (Task #4).
-    // ============================================================================
-    // Native SWF tag-loader TABLE: module_base + 0x3b7fd10, indexed by tag code, stride 8
-    // (0 = no loader). RE-verified: [tag 2/22/32/83]=shape, [37]=edittext, [39]=sprite.
-    void *resolve_tag_loader(uint32_t tagCode)
-    {
-        uint64_t base = (uint64_t)GetModuleHandleW(nullptr);
-        if (!base) return nullptr;
-        // The native dispatch (0x141169590) indexes TWO tables: SWF tags [0,92) via the primary
-        // table 0x3b7fd10, and GFX tags [1000,1009] via the secondary table 0x3b7fff0 (index
-        // tag-1000). Any other tag has no loader. Indexing the primary table with a 1000+ tag is
-        // an OUT-OF-BOUNDS read -> garbage fn ptr -> crash (this crashed the 149-def stream on the
-        // DefineExternalImage2 (1009) tags).
-        uint64_t slot;
-        if (tagCode < 92) slot = base + 0x3b7fd10 + (uint64_t)tagCode * 8;
-        else if (tagCode >= 1000 && tagCode <= 1009) slot = base + 0x3b7fff0 + (uint64_t)(tagCode - 1000) * 8;
-        else return nullptr;
-        uint64_t fn = 0;
-        if (!safe_copy(&fn, (void *)slot, 8)) return nullptr;
-        if (fn < base + 0x1000 || fn >= base + 0x3000000) return nullptr; // must be in .text-ish
-        return (void *)fn;
-    }
-
-    // Native per-tag core helpers (rcx = READER for BOTH): ReadTagInfo fills the taginfo
-    // struct {tagCode@0, streamStartPos@+4, tagLen@+8, bodyStartPos@+0xc} from the record
-    // header AND pushes the tag's END bound onto the reader nesting stack (reader+0x40[]/+0x48),
-    // advancing the reader to the tag body. align pops that bound. A leaf loader reads
-    // taginfo[+0xc] (body stream pos) to size the body - so a HAND-BUILT taginfo is wrong;
-    // we MUST call ReadTagInfo (this was why the manual {type,0,len,0} shape inject silently
-    // failed to register: bodyStartPos was 0). Signatures verified in the disasm.
-    using ReadTagInfoFn = void(void *reader, void *tagInfoOut);
-    using TagAlignFn = void(void *reader);
-    ReadTagInfoFn *g_readtaginfo = nullptr;
-    TagAlignFn *g_tagalign = nullptr;
-    bool g_stream_fns_tried = false;
-
-    void ensure_stream_fns()
-    {
-        if (g_stream_fns_tried) return;
-        g_stream_fns_tried = true;
-        try {
-            g_readtaginfo = (ReadTagInfoFn *)modutils::scan<void>(
-                {.aob = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 30 44 8B 41 50 4C 8B"});
-        } catch (...) { g_readtaginfo = nullptr; }
-        try {
-            g_tagalign = (TagAlignFn *)modutils::scan<void>(
-                {.aob = "40 53 48 83 EC 20 FF 49 48 48 8B D9 8B 41 48 8B 54 81 40 E8"});
-        } catch (...) { g_tagalign = nullptr; }
-        spdlog::info("[rehost] stream fns: ReadTagInfo=0x{:X} align=0x{:X}",
-                     (uint64_t)g_readtaginfo, (uint64_t)g_tagalign);
-    }
-
-    // SEH filter: capture the faulting instruction + data address (for AV) so a failing tag/sprite
-    // can be diagnosed (fault RVA -> which struct access; fault data addr -> what was bad).
-    std::atomic<uint64_t> g_seh_at{0}, g_seh_data{0};
-    std::atomic<uint32_t> g_seh_code{0};
-    int capture_seh(EXCEPTION_POINTERS *ep)
-    {
-        auto *r = ep->ExceptionRecord;
-        g_seh_code.store((uint32_t)r->ExceptionCode, std::memory_order_relaxed);
-        g_seh_at.store((uint64_t)r->ExceptionAddress, std::memory_order_relaxed);
-        g_seh_data.store(r->NumberParameters >= 2 ? (uint64_t)r->ExceptionInformation[1] : 0, std::memory_order_relaxed);
-        return EXCEPTION_EXECUTE_HANDLER;
-    }
-
-    // Drive the native per-tag core over ONE complete SWF tag (record header + body):
-    // borrowed reader -> ReadTagInfo (fills taginfo + pushes end bound + advances to body)
-    // -> table[tagCode] loader(ctx, &taginfo) -> align (pops bound). The loader self-registers
-    // the CharacterDef into the movie dict. `fullTag` includes the record header; the charId
-    // (first u16 of the body, at offset hdrLen) is patched to `charId`. Same reader save/restore
-    // discipline as inject_lossless_tag (window bytes + the nesting count are MANDATORY).
-    bool inject_full_tag(uint64_t ctx, const unsigned char *fullTag, unsigned len,
-                         uint16_t charId, unsigned hdrLen, uint32_t &tagCodeOut, bool patchCid = true)
-    {
-        tagCodeOut = 0;
-        ensure_stream_fns();
-        if (!ctx || !fullTag || !len || !g_readtaginfo || !g_tagalign) return false;
-        // Allocate the tag buffer with a ZEROED tail margin: the sprite inner-loop's reader window
-        // refills up to wincap (~0x200) at a time, so a large DefineSprite whose inner stream ends near
-        // our buffer's end makes the refill read PAST it into adjacent heap -> garbage inner tags -> the
-        // transient AV at exe+0x251BEE7 (the fault's dataAddr is always adjacent heap). The margin means
-        // any over-read hits our zeros (a benign End/0 tag) instead. VirtualAlloc zero-inits the tail.
-        static unsigned char *fbuf = nullptr; static unsigned fcap = 0;
-        const unsigned FBUF_MARGIN = 0x1000;
-        if (fcap < len)
-        {
-            if (fbuf) VirtualFree(fbuf, 0, MEM_RELEASE);
-            fbuf = (unsigned char *)VirtualAlloc(nullptr, (SIZE_T)len + FBUF_MARGIN, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            fcap = fbuf ? len : 0;
-        }
-        if (!fbuf) return false;
-        memset(fbuf, 0, (size_t)len + FBUF_MARGIN); // clear stale bytes + the over-read margin
-        memcpy(fbuf, fullTag, len);
-        if (patchCid && hdrLen + 2 <= len) memcpy(fbuf + hdrLen, &charId, 2); // charId = first u16 of the body
-
-        uint64_t reader = rq(ctx + 0x418);
-        if (!reader) reader = ctx + 0x50;
-        uint64_t srcMF = rq(reader + 0x20);
-        if (!looks_heap(srcMF)) return false;
-        static uint64_t myMF3 = 0;
-        if (!myMF3)
-        {
-            void *mf = VirtualAlloc(nullptr, 0x48, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!mf || !safe_copy(mf, (void *)srcMF, 0x48)) return false;
-            myMF3 = (uint64_t)mf;
-        }
-        wr64(myMF3 + 0x18, (uint64_t)fbuf);
-        wr32(myMF3 + 0x20, len);
-        wr32(myMF3 + 0x24, 0);
-
-        uint64_t winbuf = rq(reader + 0x60);
-        uint32_t wincap = rd32(reader + 0x68);
-        static unsigned char winsave3[0x4000];
-        if (wincap > sizeof(winsave3)) wincap = sizeof(winsave3);
-        bool havewin = winbuf && wincap && safe_copy(winsave3, (void *)winbuf, wincap);
-        uint64_t s20 = rq(reader + 0x20);
-        uint32_t s48 = rd32(reader + 0x48), s4c = rd32(reader + 0x4c),
-                 s50 = rd32(reader + 0x50), s54 = rd32(reader + 0x54);
-        uint8_t s58 = (uint8_t)rd32(reader + 0x58);
-
-        // ctx+0x3b8 is the load MODE flag: the DefineSprite inner-loop (FUN_1411be310) sets it to
-        // 1 while populating a sprite and resets to 0 when done. If that inner-loop FAULTS, it is
-        // left = 1, and every SUBSEQUENT tag inject then takes the wrong (nested-child) branch ->
-        // cascade failure. Save + restore it around this tag so a faulting sprite is isolated.
-        uint32_t s3b8 = rd32(ctx + 0x3b8);
-        wr64(reader + 0x20, myMF3);
-        wr32(reader + 0x4c, 0); wr32(reader + 0x50, 0); wr32(reader + 0x54, 0);
-        uint32_t taginfo[8] = {0};
-        void *lret = nullptr;
-        g_in_inject.store(true, std::memory_order_relaxed);
-        __try
-        {
-            g_readtaginfo((void *)reader, taginfo);         // header -> taginfo, push end bound, advance to body
-            tagCodeOut = taginfo[0];
-            void *loader = resolve_tag_loader(taginfo[0]);
-            if (loader) lret = ((LosslessFn *)loader)((void *)ctx, taginfo);
-            g_tagalign((void *)reader);                     // pop the nesting bound
-        }
-        __except (capture_seh(GetExceptionInformation())) { lret = (void *)~0ull; }
-        g_in_inject.store(false, std::memory_order_relaxed);
-
-        wr32(ctx + 0x3b8, s3b8);                            // restore the load-mode flag (isolate sprite faults)
-        wr64(reader + 0x20, s20);
-        wr32(reader + 0x48, s48); wr32(reader + 0x4c, s4c);
-        wr32(reader + 0x50, s50); wr32(reader + 0x54, s54);
-        safe_copy((void *)(reader + 0x58), &s58, 1);
-        if (havewin) safe_copy((void *)winbuf, winsave3, wincap);
-        return lret != nullptr && lret != (void *)~0ull;
-    }
-
-    // Drive the native per-tag core over a WHOLE tag stream (concatenated full tags + a final
-    // End tag): borrowed reader -> loop { ReadTagInfo -> table[tag] loader(ctx,&taginfo) -> align }
-    // until the End tag. DefineSprite loaders auto-recurse their inner tag stream from the same
-    // reader (self-terminating at the sprite length bound), so nested clips register correctly.
-    // charIds are ALREADY remapped in the bytes (no patching). Returns #tags processed (<0 = fail).
-
-    // ===== PATH B (in-memory): let the GAME instantiate the roots =====
-    // Instead of runtime-placing the 5 settings roots (the CS<->GFx execution-ctx wall), APPEND their
-    // PlaceObject2 tags to the map ROOT's frame-1 tag stream DURING PARSE (driven through the same
-    // native loader). The game's OWN timeline executor then instantiates them as named instances - no
-    // manual ctx, no manual naming, bound by the normal map scene. Called from the PO2-loader hook the
-    // moment the root frame-1 is being parsed (ctx+0x3b8 == 0 = top-level/root, not a nested sprite).
-    std::atomic<int> g_root_tags_injected{0};
-    // How many roots to inject (crash-isolation): 0 = OFF (safe), 1 = only the first root, 5 = all.
-    // Instantiating the full settings sprites crashed (garbage vtable) - isolate content vs pipeline.
-    constexpr int ROOT_INJECT_COUNT = 0; // OFF: runtime-injected defs land in load-registry(+0x180) not
-                                          // the runtime dict(+0xd8), so instantiation crashes (garbage
-                                          // vtable). Only native full-movie parse populates both. See memory.
-
-    // Hook of the PlaceObject2 LOADER (0x1411e23b0, a LOAD-time tag parser - NOT the hot render Execute).
-    // Fires once per PlaceObject2 tag during movie parse. When the map ROOT's frame-1 is being parsed
-    // (ctx+0x3b8 == 0 = top-level, not a nested sprite), append our 5 root tags into the same frame so
-    // the game instantiates them. g_in_inject guards the re-entry when inject_full_tag drives this loader.
-    using Po2LoaderFn = void *(void *, void *);
-    Po2LoaderFn *o_po2loader = nullptr;
-
-    // One self-contained DefineShape FULL TAG (record header + body) from 02_040 (cid 123:
-    // a ~400x28px gray 0x999999 bar; solid fill, NO internal charId refs -> no remap needed).
-    // Header = 2 bytes (short form, len 33); charId (first body u16) at offset 2, patched at
-    // inject time. Dev milestone data only.
-
-    // Scan a movieDef's read-dict for `charId`; return its binding node (0 if absent).
-    uint64_t dict_node_for(uint64_t movieDef, uint32_t charId, uint32_t &countOut)
-    {
-        countOut = 0;
-        if (!looks_heap(movieDef)) return 0;
-        uint64_t cont = movieDef + OFF_MOVIEDEF_DICT;
-        uint64_t base = rq(cont);
-        uint32_t count = rd32(cont + 8);
-        if (!looks_heap(base) || count == 0 || count > 200000) return 0;
-        countOut = count;
-        for (uint32_t k = 0; k < count; ++k)
-        {
-            uint64_t n = rq(base + (uint64_t)k * 16);
-            if (n && rd32(n + OFF_NODE_CHARID) == charId) return n;
-        }
-        return 0;
-    }
-
-    // Path A milestone (dev): register the FULL remapped 02_040 closure (149 defs, charIds
-    // 300..448, topo order) into the LIVE worldmap movie via the stream driver, then hand the
-    // MenuTitle root (cid 448) to the instantiation step (a SPRITE places/renders normally,
-    // unlike the earlier bare shape). Registration into the worldmap char registry is already
-    // proven (chardef_reg_detour: charId -> owner 0x233AC39E900).
-    std::atomic<int> g_ms_stream_done_once{0}; // register the closure ONCE/process (re-reg = dup charIds = crash)
+    // ── PATH A / PATH B (re-host the settings menu inside the map movie): REMOVED 2026-07-31 ──
+    // The whole tag-injection half of that experiment lived here and had no callers left:
+    //   inject_full_tag()     drove the game's own per-tag loader over one hand-built SWF tag
+    //   resolve_tag_loader()  indexed the two native loader tables (0x3b7fd10 / 0x3b7fff0)
+    //   ensure_stream_fns()   AOB-scanned ReadTagInfo + tag-align at first use
+    //   capture_seh()         SEH filter storing the faulting instruction/data address
+    //   dict_node_for()       scanned a movieDef's read-dict for a charId
+    // plus g_readtaginfo / g_tagalign / g_stream_fns_tried, g_seh_at / g_seh_data / g_seh_code,
+    // g_root_tags_injected and the Po2LoaderFn typedef with o_po2loader (never assigned - that
+    // hook was never installed).
+    //
+    // Proof it was unreachable rather than merely unused: the only literal the cluster could ever
+    // print, "[rehost] stream fns", is absent from the built DLL, and no `#if` or CMake exclusion
+    // covers this region (the file's only preprocessor key is MFG_DUMP_FRAMES). It cost two AOB
+    // scans at first use and carried a VirtualAlloc + PAGE_READWRITE tag buffer.
+    //
+    // What it established is not lost - it is the ancestry of the two routes that DO ship:
+    // inject_lossless_tag above (map-icon bitmaps into the live worldmap movie) and the parse-side
+    // panel injection. The rest is written up in docs/research_retired_native_ui_experiments.md.
+    // The dropped constant ROOT_INJECT_COUNT left two dangling comment lines here as well; they
+    // went with it.
 
     // Register ALL embedded map-icon bitmaps (charId BASE+i) at the proven 13507 moment.
     void inject_all_icons(uint64_t ctx)
@@ -865,7 +625,6 @@ namespace
         spdlog::info("[icons] registered {}/{} bitmaps (charId {}..{}).", ok,
                      goblin::generated::MAP_ICON_TAG_COUNT, base,
                      base + goblin::generated::MAP_ICON_TAG_COUNT - 1);
-        goblin::diag::set_bitmaps(ok, goblin::generated::MAP_ICON_TAG_COUNT);
 
         // Register the MapForGoblins logo bitmap right after the icons (same fresh-manager moment).
         uint32_t lcid = logo_charid();
@@ -932,17 +691,17 @@ namespace
             dump_frames(sd); // DEV-only (compile-time gated): live tag layout of key frames
 #endif
 
-            spdlog::info("[icons] appended {} frames; remapping markers.", placed);
-            goblin::diag::set_sprite171(true, base, placed, goblin::generated::MAP_ICON_TAG_COUNT, "");
-            goblin::diag::set_heap_sample(sd); // live worldmap sprite ptr -> shows the game heap region
+            // The sprite pointer rides along because it reveals which heap region the game handed
+            // us - that is what identified the looks_heap bound bug in 2026-06, and it used to be
+            // carried only by the status registry.
+            spdlog::info("[icons] appended {} frames (base charId {}, sprite 0x{:X}); "
+                         "remapping markers.", placed, base, sd);
             goblin::remap_injected_icons(); // point markers at our added iconIds (before pins built)
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             spdlog::error("[icons] EXCEPTION during sprite-171 icon load - icons may be incomplete this "
                           "load; game kept alive.");
-            goblin::diag::set_sprite171(false, inject_base(), 0, goblin::generated::MAP_ICON_TAG_COUNT,
-                                        "exception during icon load (icons missing this load)");
         }
     }
 
@@ -955,11 +714,9 @@ namespace
 
     uint64_t locate_sprite171();  // fwd decl (defined below): worldmap sprite-171 by charId+frameCount
 
-    // NATIVE-PARSE Path B: swap the reader's source buffer to our own copy so the GAME parses our
-    // spliced settings tags. Step 1 (current): IDENTITY copy (no splice) to validate the mechanism -
-    // if the map loads unchanged, we then splice. reader = ctx+0x418 (or ctx+0x50 inline); source
-    // object @reader+0x20; its data buffer @+0x18, byte length @+0x20.
-    std::atomic<int> g_movie_swapped{0};
+    // A g_movie_swapped counter for the retired Path B buffer swap stood here with a four-line note
+    // about validating that mechanism with an identity copy. Single occurrence, and the mechanism it
+    // belonged to left with the Path A/Path B cluster.
     // ── Category icons for the IN-GAME MENU rows ─────────────────────────────────────
     // The menu row clip (DefineSprite cid 189 of 02_160_KeyConfiguration) has no image
     // child, and an image registered into another movie is not reachable from this one -
@@ -970,58 +727,12 @@ namespace
     // ROW_TAG is the row clip rebuilt with our icon sprite placed as a named child
     // ("MfgIcon"), so the row keeps its charId and everything else about it.
     // Generated offline by scratch/gen_menu_icons_insert.py.
-    std::atomic<int> g_menu_icons_spliced{0};
-    std::atomic<uint64_t> g_menu_icons_ctx{0};
+    // The splice state (g_menu_icons_spliced / g_menu_icons_ctx) and buffer_is_menu_movie() lived
+    // here. The movie test survives as content_is_menu() in goblin_own_movie.cpp - the same search
+    // for the "02_160_KeyConfiguration" marker - and that copy is the one with a caller.
 
-    // Does this buffer belong to the keybinding movie? Its SymbolClass carries the
-    // authoring class name as plain ASCII, which is a far more reliable marker than a
-    // charId (charIds repeat across movies).
-    bool buffer_is_menu_movie(const unsigned char *buf, uint32_t len)
-    {
-        static const char kMark[] = "02_160_KeyConfiguration";
-        const size_t mlen = sizeof(kMark) - 1;
-        if (len < mlen)
-            return false;
-        for (uint32_t i = 0; i + mlen <= len; ++i)
-            if (buf[i] == '0' && std::memcmp(buf + i, kMark, mlen) == 0)
-                return true;
-        return false;
-    }
-
-    // Byte range of the top-level DefineSprite tag whose charId is `cid` (0 = not found).
-    bool find_top_level_sprite_tag(const unsigned char *b, uint32_t len, uint16_t cid,
-                                   uint32_t *outStart, uint32_t *outEnd)
-    {
-        uint32_t p = 8;
-        p += (5 + (b[8] >> 3) * 4 + 7) / 8; // RECT
-        p += 4;                             // frameRate + frameCount
-        while (p + 2 <= len)
-        {
-            const uint32_t rh = b[p] | (b[p + 1] << 8);
-            uint32_t tag = rh >> 6, tl = rh & 0x3f, hdr = 2;
-            if (tl == 0x3f)
-            {
-                if (p + 6 > len)
-                    return false;
-                tl = b[p + 2] | (b[p + 3] << 8) | (b[p + 4] << 16) | (b[p + 5] << 24);
-                hdr = 6;
-            }
-            if (tag == 0)
-                return false;
-            if (tag == 39 && p + hdr + 2 <= len)
-            {
-                const uint16_t got = static_cast<uint16_t>(b[p + hdr] | (b[p + hdr + 1] << 8));
-                if (got == cid)
-                {
-                    *outStart = p;
-                    *outEnd = p + hdr + tl;
-                    return *outEnd <= len;
-                }
-            }
-            p += hdr + tl;
-        }
-        return false;
-    }
+    // find_top_level_sprite_tag() lived here: it walked a movie buffer to the byte range of a
+    // top-level DefineSprite with a given charId, for the retired icon splice below.
 
     // The first version of this crashed the game (2026-07-25 17:56 dump): it re-pointed the
     // row's existing CursorLock placement at our icon sprite, but CursorLock has a child of
@@ -1037,10 +748,14 @@ namespace
     // not the particular edit. The extended buffer parses cleanly offline, so the damage is
     // semantic: our natively-parsed DefineBitsLossless2 characters are not fully usable in
     // this movie, and the row clip's instantiation trips over them.
-    // We no longer need this route: goblin_sfimage.cpp draws our own pixels into our own
-    // runtime-created clip and touches no movie at all. Kept (with its offline self-check in
-    // scratch/gen_menu_icons_insert.py) purely as documented fallback material.
-    constexpr bool kEnableMenuIconSplice = false;
+    // What actually ships instead: goblin_own_movie.cpp rebuilds the menu movie ON THE PARSE and
+    // splices the icon characters in there. Unconditionally - there is no per-open bracket and
+    // there cannot be one: 02_160 is parsed ONCE, in the startup preload, and every screen after
+    // that instances that single parse (goblin_own_movie.hpp says why at length).
+    // (An earlier note here said goblin_sfimage.cpp draws our pixels into a runtime-created clip -
+    // that route was disabled too, and its code has since been removed.) The generator and its
+    // offline self-check remain in scratch/gen_menu_icons_insert.py as fallback material.
+    // The kEnableMenuIconSplice flag that used to sit here gated nothing: no code read it.
 
 
 
@@ -1567,30 +1282,25 @@ namespace
             uint32_t scid = sd ? rd32(sd + OFF_CHARID) : 0;
             if (sd && scid == LOGO_PLAQUE_SPRITE)
             {
-                if (seh_inject_logo(sd))
-                {
+                const bool logo_ok = seh_inject_logo(sd);
+                if (logo_ok)
                     g_logo_placed.store(true, std::memory_order_relaxed);
-                    goblin::diag::set_logo(true, "");
-                }
-                else
-                    goblin::diag::set_logo(false, "plaque re-point failed");
+                // Logged because it was logged NOWHERE: the only record of this was the status
+                // status registry, which had no reader and has since been taken out of the build.
+                spdlog::info("[icons] logo plaque: {}", logo_ok ? "re-pointed" : "re-point FAILED");
             }
         }
         return ret;
     }
 
-    // ── V3 native-marker SPIKE (stage 0) ────────────────────────────────────
-    // One-shot, debug_logging-gated. Piggybacks on the FIRST native RemoveObject2
-    // executed on a live display context while the world map is open (a sprite
-    // playing a composite frame = a live, engine-driven display list on the right
-    // thread): we execute OUR synthesized PlaceObject3 (first injected icon,
-    // unused depth) on the SAME ctx via the tag's own vtable Execute (slot 6).
-    // Proves the v3 mechanism end to end: place-into-live-list, native render,
-    // parent-transform inheritance, teardown tolerance (the parent destroys our
-    // node at close - watch for crashes). One-shot per process: re-test needs a
-    // game restart. See scratch/v3_native_markers_plan.md.
-    constexpr uint16_t SPIKE_DEPTH = 24; // composite icon frames use depths 1-2
-    constexpr uint16_t SPIKE_SLOTS = 8;
+    // ── V3 native markers: how the RM2 hook below earned its keep (HISTORY) ──
+    // A one-shot spike used to ride here: on the first native RemoveObject2 executed on a live
+    // display context with the world map open, it executed OUR synthesized PlaceObject3 on the same
+    // ctx through the tag's own vtable Execute. It proved the v3 mechanism end to end -
+    // place-into-live-list, native render, parent-transform inheritance, teardown tolerance - and
+    // that is why native markers ship. The spike itself is long gone; what the detour below does
+    // TODAY is log the display list for our injected RM2 tags and drive the marker-factory pulse.
+    // Written up in scratch/v3_native_markers_plan.md.
 
 
     // DIAGNOSTIC detour on RemoveObject2::Execute. For OUR injected RM2 tags, inspect the display list
@@ -1714,7 +1424,7 @@ namespace
     // 1-based iconId (= the new frameCount). Frame = RemoveObject2(d1)+RemoveObject2(d2)+PlaceObject(@d1)
     // - exactly what a gfx-authored composite frame does, so it clears the predecessor and shows only our
     // icon. Returns 0 on failure. Called once per embedded icon at worldmap load.
-    uint32_t append_icon_frame(uint64_t sd, uint16_t newCharId, const unsigned char *mat, unsigned matLen, bool asSprite)
+    uint32_t append_icon_frame(uint64_t sd, uint16_t newCharId, const unsigned char *mat, unsigned matLen)
     {
         uint64_t fdata = rq(sd + OFF_FRAMEARR_DATA);
         uint32_t fcnt = rd32(sd + OFF_FRAMEARR_COUNT);
@@ -1737,8 +1447,7 @@ namespace
         g_my_rm2_d2.store(rm2_d2, std::memory_order_relaxed);
         // The placement matrix is PER-ICON (passed in): each icon's bitmap is cropped tight, so its
         // centering depends on its own W x H. Computed at build time by generate_map_icons.icon_matrix().
-        uint64_t placeTag = asSprite ? build_clean_sprite_place_tag(newCharId, 1, mat, matLen)  // shape/clip (no HasImage)
-                                     : build_clean_place_tag(newCharId, 1, mat, matLen);        // bitmap (HasImage)
+        uint64_t placeTag = build_clean_place_tag(newCharId, 1, mat, matLen); // bitmap (HasImage)
         if (!placeTag)
         {
             spdlog::warn("[icons] build_clean_place_tag failed; abort.");
@@ -1789,7 +1498,6 @@ namespace
 
     void *lookup_detour(void *rcx, uint32_t charId, void *r8)
     {
-        g_lookup_calls.fetch_add(1, std::memory_order_relaxed);
         // Capture ONLY when resolving charId 171 (the worldmap icon sprite) so movieDef is the
         // worldmap movie, not some other tiny menu movie that happens to resolve first.
         if (charId == 171 && !g_moviedef.load(std::memory_order_relaxed) && rcx)
@@ -1799,20 +1507,9 @@ namespace
                 g_moviedef.store(md, std::memory_order_relaxed);
         }
         void *res = o_lookup(rcx, charId, r8);
-        // Path A milestone: log every DISTINCT charId in our injected range that the char-dict
-        // lookup resolves (dedup). Tells us which of our ids (bitmaps 13764.., logo, shape 13831)
-        // actually go through this char-dict path + whether they resolve.
-        if (g_ms_watch_cid.load(std::memory_order_relaxed) && charId >= 13700 && charId <= 13900)
-        {
-            static uint8_t seen[256] = {0};
-            uint32_t idx = charId - 13700;
-            if (idx < 256 && !seen[idx])
-            {
-                seen[idx] = 1;
-                spdlog::info("[rehost] LOOKUP charId={} cont=0x{:X} -> 0x{:X} ({})",
-                             charId, (uint64_t)rcx, (uint64_t)res, res ? "RESOLVED" : "unknown");
-            }
-        }
+        // A Path-A milestone log stood here: for each distinct charId in our injected range, print
+        // whether the char-dict lookup resolved it. It was gated on g_ms_watch_cid, which nothing
+        // ever set, so it never printed a line.
         return res;
     }
 
@@ -1926,25 +1623,12 @@ namespace
         return (uint64_t)t;
     }
 
-    // Same as build_clean_place_tag but flags1@+9 = 0x00 (NO HasImage): the engine
-    // instantiates `charId` as a MovieClip (a DefineSprite) instead of a bitmap-image
-    // leaf. A MovieClip child exposes the DrawingContext getter (vtbl+0x2a0) that the
-    // solid-fill spike needs; a bitmap leaf does not. Used only by create_native_sprite_child.
-    uint64_t build_clean_sprite_place_tag(uint16_t charId, uint16_t depth, const unsigned char *matrix, unsigned matLen)
-    {
-        void *t = gfx_alloc(0x40);
-        if (!t)
-            return 0;
-        uint64_t vt = po3_vtable();
-        uint8_t flags0 = 0x06, flags1 = 0x00;                  // HasCharacter|HasMatrix, no HasImage
-        safe_copy(t, &vt, 8);                                   // vtable @+0
-        safe_copy((void *)((uint64_t)t + 8), &flags0, 1);      // flags0 @+8
-        safe_copy((void *)((uint64_t)t + 9), &flags1, 1);      // flags1 @+9  (sprite, not image)
-        safe_copy((void *)((uint64_t)t + 0xa), &depth, 2);     // depth  u16 @+0xa
-        safe_copy((void *)((uint64_t)t + 0xc), &charId, 2);    // charId u16 @+0xc
-        safe_copy((void *)((uint64_t)t + 0xe), (void *)matrix, matLen); // matrix @+0xe
-        return (uint64_t)t;
-    }
+    // build_clean_sprite_place_tag() stood here: the same placement tag with the HasImage flag
+    // cleared, so the engine instantiates the charId as a MovieClip (which exposes the
+    // DrawingContext getter) instead of a bitmap leaf. It existed for the solid-fill spike, and
+    // its "used only by create_native_sprite_child" note named a function that never existed in
+    // this tree. Its one call site was the asSprite branch of append_icon_frame, and asSprite
+    // defaulted to false at the single call - so the branch was never taken.
 
     // ============================ TASK #4: place the 5 settings roots ============================
     // Make the 5 settings MainTimeline roots (registered by the def stream at charIds 342..448) LIVE,
@@ -1955,53 +1639,16 @@ namespace
     // directly with a cloned CharPosInfo (mechanical; the name arg needs a GASString we cannot yet build,
     // so it reuses a captured name = misnamed, for placement-mechanism comparison only).
     // ALL dev-gated (ENABLE_SETTINGS_REHOST + debugLogging), one-shot, SEH-guarded, map-live only.
-    constexpr int SETTINGS_ROUTE = 0; // 0 = Route P (named-tag Execute), 1 = Route A' (AddDisplayObject)
 
-    using ExecTagFn = void *(void *thisTag, void *ctx, uint32_t frame);
-    ExecTagFn *o_po2exec = nullptr;
-
-    // Name-resolver FUN_14074a2f0(scene, out, path): capture the MAP scene (when scene+0x20 == our
-    // captured root) + log resolutions, so we (a) learn the map-scene ptr, (b) watch the ctor bind names.
-    using ResolveFn = void *(void *scene, void *out, const char *path, void *d);
-    ResolveFn *o_resolve = nullptr;
-    std::atomic<int> g_resolve_logs{0};
-    bool safe_resolve(void *scene, void *out, const char *name); // fwd (defined just below)
-
-    // POD-only SEH wrappers: MSVC forbids C++ object unwinding (spdlog temporaries) in a __try frame, so
-    // the raw game-function calls live here (no C++ objects) and callers log outside the try.
-    //
-    // Each raises goblin::guarded::depth around the call so the crash logger does not record a fault we
-    // asked for and handle. The result goes through a variable rather than a `return` inside the __try:
-    // a return from in there would skip the decrement and leave the counter up for the life of the
-    // thread, which would silence the log for a REAL crash.
-    bool safe_resolve(void *scene, void *out, const char *name)
-    {
-        bool ok = false;
-        ++goblin::guarded::depth;
-        __try { o_resolve(scene, out, name, nullptr); ok = true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
-        --goblin::guarded::depth;
-        return ok;
-    }
-    bool safe_exec_tag(uint64_t execFn, uint64_t tag, uint64_t ctx, uint32_t frame)
-    {
-        bool ok = false;
-        ++goblin::guarded::depth;
-        __try { reinterpret_cast<ExecTagFn *>(execFn)((void *)tag, (void *)ctx, frame); ok = true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
-        --goblin::guarded::depth;
-        return ok;
-    }
-    void *safe_add_disp(uint64_t add, uint64_t root, void *pos, void *name)
-    {
-        using AddDisp9 = void *(void *, void *, void *, void *, void *, int, unsigned, void *, void *);
-        void *res = nullptr;
-        ++goblin::guarded::depth;
-        __try { res = reinterpret_cast<AddDisp9 *>(add)((void *)root, pos, name, nullptr, nullptr, -1, 1u, nullptr, nullptr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { res = (void *)~0ull; } // sentinel = faulted
-        --goblin::guarded::depth;
-        return res;
-    }
+    // The settings re-host probes lived here: o_po2exec / o_resolve (never assigned, so safe_resolve
+    // would have called through a null pointer had anything reached it), their SEH wrappers
+    // safe_resolve / safe_exec_tag / safe_add_disp, and the verify_roots / exec_named_child pair below.
+    // Six functions that referenced only each other, with no live entry point - which is why counting
+    // occurrences made them look used. Removed 2026-07-30 with the rest of the re-host residue.
+    // The SEH-wrapper PATTERN they demonstrated is still in force everywhere else in this file: raise
+    // goblin::guarded::depth around a raw game call so the crash logger does not record a fault we asked
+    // for, and carry the result out in a variable - a `return` inside the __try would skip the decrement
+    // and silence the log for a REAL crash for the life of the thread.
 
     // A NAMED PlaceObject3 ExecuteTag: same synth as build_clean_place_tag but flags0 adds HasName (0x20)
     // and the asciiz instance name follows the matrix (SWF PlaceObject3 field order). The engine's Execute
@@ -2024,45 +1671,9 @@ namespace
         return (uint64_t)t;
     }
 
-    // Probe: ask the game's own resolver whether each name is live under the map scene. Logs the result.
-    void verify_roots()
-    {
-        uint64_t scene = g_map_scene.load(std::memory_order_relaxed);
-        if (!scene) { spdlog::info("[rehost] verify: no map scene captured yet"); return; }
-        if (!o_resolve) return;
-        const char *names[] = {"TabList", "BackTabList", "MenuTitle", "MenuTitle/Text_0", "StatusBar"};
-        for (const char *nm : names)
-        {
-            alignas(16) uint8_t out[0x80]; memset(out, 0, sizeof(out));
-            bool ok = safe_resolve((void *)scene, out, nm);
-            if (!ok) { spdlog::warn("[rehost] verify '{}' SEH", nm); continue; }
-            uint64_t vt = 0, obj = 0;
-            memcpy(&vt, out, 8); memcpy(&obj, out + 0x20, 8); // SceneObjProxy: vftable@0, target@+0x20
-            spdlog::info("[rehost] verify '{}' -> proxyVt=0x{:X} target=0x{:X}", nm, vt, obj);
-        }
-    }
-
-    // Build a NAMED sprite child (charId, name) into ctx via the ExecuteTag Execute (slot vtable+0x30 -
-    // slot +0x30 (see the naming note above; slot 0 is NOT it). Returns the
-    // materialized display child (matched by depth in ctx+0x28 list), or 0. SEH-guarded through
-    // safe_exec_tag, so a bad ctx / unregistered charId faults into 0, not a crash.
-    uintptr_t exec_named_child(uint16_t charId, uint16_t depth, const unsigned char *mtx, unsigned mlen,
-                               const char *name, uint64_t ctx, uint32_t frame)
-    {
-        uint64_t tag = build_named_place_tag(charId, depth, mtx, mlen, name);
-        uint64_t vt = tag ? rq(tag) : 0;
-        uint64_t execFn = vt ? rq(vt + 0x30) : 0; // ExecuteTag::Execute
-        if (!execFn) return 0;
-        if (!safe_exec_tag(execFn, tag, ctx, frame)) return 0;
-        uint64_t list = rq(ctx + 0x28), count = rq(ctx + 0x30);
-        if (looks_heap(list) && count > 0 && count < 8192)
-            for (uint64_t i = 0; i < count; ++i)
-            {
-                uint64_t node = rq(list + i * 8);
-                if (looks_heap(node) && rd32(node + 0x14) == depth) return (uintptr_t)node;
-            }
-        return 0;
-    }
+    // verify_roots() and exec_named_child() stood here - the other half of the dead re-host web
+    // described above. Note that build_named_place_tag(), which exec_named_child called, is LIVE and
+    // stays: the composite icon frames build their placements with it.
 
     // Does "TabList" resolve to a live target under `scene`? (guarded so it doesn't re-enter us)
 
@@ -2538,17 +2149,9 @@ void goblin::gfx_probe::tick()
     // Once a lookup has handed us movieDef: the collision SELF-HEAL below is functional (always runs);
     // the resource-dict dumps are dev-only (gated by `probe`). One-shot, never writes.
     {
-        if (probe)
-        {
-            static unsigned last_ad = 0xFFFFFFFF, last_lk = 0xFFFFFFFF;
-            unsigned ad = g_adddisp_calls.load(std::memory_order_relaxed);
-            unsigned lk = g_lookup_calls.load(std::memory_order_relaxed);
-            if (ad != last_ad || lk != last_lk)
-            {
-                last_ad = ad;
-                last_lk = lk;
-            }
-        }
+        // A diagnostic block here loaded two call counters into statics and, when they changed,
+        // updated the statics - no log, no state, nothing else. One of the two (g_adddisp_calls)
+        // had also stopped being incremented when the AddDisplayObject hook was removed.
         uint64_t md = g_moviedef.load(std::memory_order_relaxed);
         if (md && !g_dict_dumped.exchange(true, std::memory_order_relaxed))
         {
@@ -2589,7 +2192,6 @@ void goblin::gfx_probe::tick()
                     g_qmark_injected.store(false, std::memory_order_relaxed); // allow re-inject at sprite-171
                     g_logo_placed.store(false, std::memory_order_relaxed);
                     g_dict_dumped.store(false, std::memory_order_relaxed);
-                    goblin::diag::note_selfheal(newbase);
                     spdlog::warn("[icons] charId COLLISION: {} native ids in [{}, {}) -> bumped base to {}; "
                                  "will re-add on next worldmap open (reopen the map).",
                                  in_window, base, base + cnt, newbase);
@@ -2598,39 +2200,18 @@ void goblin::gfx_probe::tick()
         }
     }
 
-    if (probe && !g_r2_dumped.exchange(true, std::memory_order_relaxed))
-        dump_r2();
 }
 
 
 
-// Release the AddRef'd ref the resolver stores in an out SceneObjProxy's inner
-// CSScaleformValue (out+0x28). Layout: inner objIface @out+0x40, flags @out+0x48,
-// handle @out+0x50; if flags bit6 set, Release = objIface->vt[0x10](objIface,&scratch,
-// handle) - exactly the game's own cleanup (FUN_140d7f9d0). Without this the leaked ref
-// corrupts refcounts and crashes at map teardown. SEH-guarded.
-static void release_resolver_out(void *out)
-{
-    __try
-    {
-        uint8_t *o = reinterpret_cast<uint8_t *>(out);
-        uint32_t flags = *reinterpret_cast<uint32_t *>(o + 0x48);
-        if ((flags >> 6) & 1)
-        {
-            void *oif = *reinterpret_cast<void **>(o + 0x40);
-            uint64_t handle = *reinterpret_cast<uint64_t *>(o + 0x50);
-            if (oif)
-            {
-                uint8_t scratch[0x20] = {0};
-                uint64_t ovt = *reinterpret_cast<uint64_t *>(oif);
-                using RelFn = void(__fastcall *)(void *, void *, uint64_t);
-                RelFn rel = reinterpret_cast<RelFn>(*reinterpret_cast<uint64_t *>(ovt + 0x10));
-                rel(oif, scratch, handle);
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
+// A release_resolver_out() stood here: it dropped the AddRef'd ref the name resolver leaves in an out
+// SceneObjProxy's inner CSScaleformValue (objIface @out+0x40, flags @out+0x48, handle @out+0x50;
+// Release = objIface->vt[0x10] when flags bit6 is set - the game's own FUN_140d7f9d0). Its comment
+// read as a live requirement ("without this the leaked ref corrupts refcounts and crashes at map
+// teardown") and that requirement IS real - but nothing in this file called this function, and this
+// file resolves no proxies. The obligation is discharged where the resolving actually happens: every
+// call site there passes the out buffer to the engine's own proxy destructor at 0xD7F850 straight
+// after reading it. If a resolver call is ever added HERE, do the same - do not re-add a private copy.
 
 
 
@@ -2641,7 +2222,11 @@ static void release_resolver_out(void *out)
 void goblin::gfx_probe::setup()
 {
     // Icon/resource injection is UNCONDITIONAL (it's how icons render without a gfx), so the load-time
-    // hooks below are ALWAYS armed. Only the read-only RM2::Execute trace is dev-only (debug_logging).
+    // hooks below are ALWAYS armed. The RM2::Execute hook is NOT a dev-only trace: it is armed with
+    // kNativeMarkers (1 in every shipping build) and carries v3_native_factory_pulse - our marker
+    // instances are materialized from inside that callback. What debug_logging gates is only the
+    // logging inside it; the SpriteDef/dict dumps need the compile key MFG_DUMP_FRAMES on top, and
+    // that macro is not defined anywhere in the tree.
     try
     {
         // Resolve the game's own CRT allocator FIRST: every buffer we hand to Scaleform (frame array,
@@ -2679,7 +2264,6 @@ void goblin::gfx_probe::setup()
             spriteloader_detour, o_spriteloader);
         spdlog::info("[gfxprobe] icon handlers ready (ctor + movieDef read + registrar + lossless + "
                      "DefineSprite-loader)");
-        goblin::diag::set_hooks(true, "");
 
         // The V3 native-marker factory needs the RemoveObject2::Execute hook below, so it is installed
         // with that feature rather than with logging. Two more detours used to live here (the Scaleform
@@ -2701,11 +2285,8 @@ void goblin::gfx_probe::setup()
     catch (const std::exception &e)
     {
         spdlog::warn("[gfxprobe] setup failed: {}", e.what());
-        goblin::diag::set_hooks(false, e.what());
     }
 }
 
-bool goblin::gfx_probe::menu_icons_ready()
-{
-    return g_menu_icons_spliced.load(std::memory_order_relaxed) != 0;
-}
+// menu_icons_ready() lived here (see the note in the header): a readiness signal whose flag was
+// never raised, with no caller to be misled by it.

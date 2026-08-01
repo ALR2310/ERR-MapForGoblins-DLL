@@ -1,10 +1,13 @@
 #pragma once
 // World-map hover detection. Hooks the game's per-frame "name the focused pin" routine
 // (FUN_14087a8e0) so we always know which map pin the cursor is over - exactly the icon
-// the game highlights + shows a popup for. Used by manual marker-hide (hover + hotkey)
-// and (later) the passive hover-info overlay. The hovered pin's underlying
-// WorldMapPointParam row pointer is published; goblin::inject matches it to one of our
-// injected rows. Native + exact (no compute-nearest approximation).
+// the game highlights + shows a popup for. The hovered pin's underlying WorldMapPointParam row
+// pointer is published; goblin::inject matches it to one of our injected rows. Native + exact
+// (no compute-nearest approximation).
+//
+// Consumers: manual marker-hide (hover + hotkey) and the NATIVE hover panel, which is built in
+// the .cpp of this file. The "passive hover-info overlay" this header used to promise was retired
+// on 2026-07-28 along with the rest of the on-map overlay drawing.
 #include <cstdint>
 
 namespace goblin::maphover
@@ -19,16 +22,15 @@ namespace goblin::maphover
 
     // The live CS::WorldMapArea object (r8 of the hook, vtable RVA 0x2B2CB08), or nullptr
     // when the map is not open. Carries the view transform (pan @+0x378/+0x37C, zoom
-    // @+0x380, full-map side @+0x358) that drives the overlay world->screen projection.
+    // @+0x380, full-map side @+0x358), which is what places the native tooltip and what
+    // mapproject::read_view() reads. (It no longer drives a world->screen projection - that
+    // projection had one consumer, the overlay's on-map drawing, and both are gone.)
     // Thread-safe; nullptr when stale (map closed). (Named map_dialog for API stability.)
     void *map_dialog();
 
-    // The game's hover POPUP panel (the one that names the focused pin), or nullptr when the
-    // map is not open. Everything FUN_14087A8E0 does to it is reachable through small
-    // primitives, so this handle is enough to place it and fill its lines ourselves.
-    void *popup_panel();
-    // How many text-line slots the panel's current variant has (-1 = not measured yet).
-    int32_t popup_line_slots();
+    // popup_panel() and popup_line_slots() were declared here. They exposed the game's hover
+    // panel handle and its line-slot count to callers outside this file; there were none, and
+    // the code that needs the panel lives in goblin_maphover.cpp and reads the atomic directly.
 
     // The currently displayed map layer, decoded live from the WorldMapDialog field at
     // MapArea+0x904 (value = world*10 + sublayer). Matches WorldMapPointParam dispMask

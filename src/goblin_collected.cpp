@@ -76,10 +76,9 @@ struct ParamRef {
 static std::map<uint64_t, ParamRef> g_param_ptrs;
 
 static std::map<uint32_t, std::vector<uint64_t>> g_tile_to_rows;                // tile → ordered row_ids
-// tile → object_name → row_ids. A VECTOR because ERR duplicates part names when it
-// copy-pastes assets (two AEG099_931_9006 in m12_02) - duplicate-named rows need
-// per-position classification instead of the name-keyed fast path.
-static std::map<uint32_t, std::map<std::string, std::vector<uint64_t>>> g_tile_name_to_row;
+// A g_tile_name_to_row (tile -> object_name -> row_ids) was built, cleared and remapped here and
+// never read once. It served the name-keyed fast path, which the rewrite to slot-and-position
+// classification replaced - the comment above it still described that path as current.
 // 3D slot map: tile → prefix → geom_slot → row_ids (duplicate-named parts share the
 // suffix-derived slot: the game writes one GEOF entry PER instance with the SAME slot
 // value - verified live: two collected AEG099_931_9006 produced GEOF slots [6, 6]).
@@ -359,28 +358,36 @@ static void read_singleton_entries(uintptr_t slot,
         }
     }
 
+    // tiles_found / tiles_skipped were counted per table row and then dropped on the floor. They
+    // are the answer to "did the walk actually see the table, or did it reject everything", which
+    // is the first question when collected-tracking goes quiet.
+    //
+    // Edge-triggered ON PURPOSE. This runs on every refresh - 10 Hz while a map is open - and the
+    // interesting information is entirely in the TRANSITIONS: the walk starting to see the table,
+    // or going quiet. Printing the same pair on every pass buries the rest of the log (a 53 s
+    // Graceborne session on 2026-07-31 was 650 identical lines out of 716) without adding a fact.
+    static std::atomic<uint64_t> last_reported{UINT64_MAX};
+    const uint64_t now = (static_cast<uint64_t>(static_cast<uint32_t>(tiles_found)) << 32) |
+                         static_cast<uint32_t>(tiles_skipped);
+    if (goblin::config::debugLogging &&
+        last_reported.exchange(now, std::memory_order_relaxed) != now)
+        spdlog::debug("[GEOF] table walk: {} tile(s) read, {} rejected by the area/pointer sanity "
+                      "tests", tiles_found, tiles_skipped);
 }
 
 // ─── Read geom state from CSWorldGeomMan (loaded tiles) ─────────────
 //
-// Returns per-tile:
-//   alive_names: set of ALIVE tracked-model names (for direct-name match)
-//   occupied_positions: all AEG099_* instances at MSB-local coords, regardless
-//     of name. Used to detect ERR-style "replacement" - e.g. a collected
-//     AEG099_860 slot gets replaced by a respawning AEG099_780 at the same
-//     position, so the original slot is effectively gone/collected.
+// Returns per-tile the live instances keyed by (model prefix -> geom slot), which is what
+// refresh() consumes. The name-set and the two position lists this used to also return
+// (alive_names / occupied / alive_occupied) were removed 2026-07-30: the classifier stopped
+// reading them when it moved to the position match, but they were still being filled for
+// EVERY instance on EVERY refresh - a std::string copy plus a tuple each.
 //
-// Name-based detection alone is not enough: the game spawns gathering-node
-// CSWorldGeomIns lazily, so a truly-alive instance may simply not be loaded
-// yet (and would be wrongly treated as dead by "not in alive list" logic).
+// Name-based detection alone was never enough anyway: the game spawns gathering-node
+// CSWorldGeomIns lazily, so a truly-alive instance may simply not be loaded yet (and would
+// be wrongly treated as dead by "not in alive list" logic).
 struct WGMSnapshot
 {
-    std::set<std::string> alive_names;
-    std::vector<std::tuple<float, float, float, std::string>> occupied;  // (x, y, z, name)
-    // alive instances WITH positions - needed for duplicate-named parts (ERR copy-pastes
-    // keep the part name, e.g. two AEG099_931_9006 in m12_02), where per-name state is
-    // ambiguous and rows must be classified by the instance at THEIR coordinates.
-    std::vector<std::tuple<float, float, std::string>> alive_occupied;  // (x, z, name)
 
     // COORDINATE-FREE identity (engine's own key). Per ACTUAL-model prefix -> geom slot
     // -> live instances. The engine keys collected state on (model_id, geom_idx) only
@@ -397,9 +404,6 @@ struct WGMSnapshot
 static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
 {
     std::map<uint32_t, WGMSnapshot> result;
-
-    uintptr_t game_base = (uintptr_t)GetModuleHandleA(nullptr) /* main module = the game exe */;
-    if (!game_base) return result;
 
     void *wgm = nullptr;
     if (!safe_read((void *)world_geom_man_slot(), &wgm, 8) || !wgm)
@@ -509,10 +513,11 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
                     if (!is_tracked_family)
                         continue;
 
-                    // Runtime position lives in MsbPart +0x20 (3 floats)
-                    float px = 0, py = 0, pz = 0;
+                    // Runtime position lives in MsbPart +0x20 (3 floats). Only X and Z are taken:
+                    // they disambiguate twins at the same slot. Y was read into a `py` that nothing
+                    // used - the Y that reaches g_entry_positions comes from e.data.posY.
+                    float px = 0, pz = 0;
                     safe_read((char *)msb_part_ptr + 0x20 + 0, &px, 4);
-                    safe_read((char *)msb_part_ptr + 0x20 + 4, &py, 4);
                     safe_read((char *)msb_part_ptr + 0x20 + 8, &pz, 4);
 
                     // Normalise the live block key to (area,gx,gz) - drop the 4th map
@@ -520,9 +525,6 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
                     // from a DD!=0 block match their marker keyed via encode_tile (DD=0).
                     // This is why some tiles' collected nodes never hid (NO-ROW-MATCH).
                     auto &snap = result[block_id & 0xFFFFFF00u];
-
-                    // Record occupancy for position-based replacement detection
-                    snap.occupied.emplace_back(px, py, pz, narrow_str);
 
                     // Track alive state only for models we're actually hiding on the map
                     std::string prefix = prefix_from_object_name(narrow);
@@ -535,12 +537,6 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
                         safe_read((char *)geom_ins + 0x26B, &f26B, 1);
 
                         bool alive = (f263 & 0x02) && !(f26B & 0x10);
-                        if (alive)
-                        {
-                            snap.alive_names.insert(narrow_str);
-                            snap.alive_occupied.emplace_back(px, pz, narrow_str);
-                        }
-
                         // Coordinate-free record, keyed by ACTUAL model + geom slot
                         // (the engine's identity). model_id @inst+0x28; geom_idx @
                         // [[inst+0x48]+8]; slot = geom_idx - 0x2328. Keyed by the
@@ -599,10 +595,6 @@ static std::vector<GEOFEntry> read_geof_from_memory()
 {
     std::vector<GEOFEntry> result;
 
-    uintptr_t game_base = (uintptr_t)GetModuleHandleA(nullptr) /* main module = the game exe */;
-    if (!game_base)
-        return result;
-
     read_singleton_entries(geom_flag_slot(), result);
 
     // NOTE: GeomNonActiveBlockManager (RVA_GEOM_NONACTIVE) is intentionally NOT
@@ -640,7 +632,6 @@ void goblin::collected::initialize()
 
     g_tile_to_rows.clear();
     g_tile_slot_to_row.clear();
-    g_tile_name_to_row.clear();
     g_tracked_prefixes.clear();
     g_tracked_model_ids.clear();
     g_entry_positions.clear();
@@ -682,9 +673,6 @@ void goblin::collected::initialize()
         // 3D slot map: tile → ACTUAL-model prefix → geom_slot → row_ids
         if (e.geom_slot >= 0)
             g_tile_slot_to_row[tile][geof_prefix][e.geom_slot].push_back(e.row_id);
-
-        // WGM name tracking: full object name for accurate alive matching
-        g_tile_name_to_row[tile][e.object_name].push_back(e.row_id);
 
         // MSB-local position for replacement detection via WGM occupancy. Use the
         // REAL (pre-de-overlap) X/Z: data.posX/posZ may be spiral-shifted for icon
@@ -750,20 +738,6 @@ void goblin::collected::remap_row_ids(const std::unordered_map<uint64_t, uint64_
         }
     }
 
-    // Remap g_tile_name_to_row
-    for (auto &[tile, name_map] : g_tile_name_to_row)
-    {
-        for (auto &[obj_name, rids] : name_map)
-        {
-            for (auto &rid : rids)
-            {
-                auto it = old_to_new.find(rid);
-                if (it != old_to_new.end())
-                    rid = it->second;
-            }
-        }
-    }
-
     // Remap g_entry_positions (keyed by row_id)
     decltype(g_entry_positions) remapped;
     for (auto &[rid, pos] : g_entry_positions)
@@ -779,13 +753,10 @@ void goblin::collected::remap_row_ids(const std::unordered_map<uint64_t, uint64_
 
 // ─── hide icon in-place ─────────────────────────────────────────────
 
-static void hide_icon(void *param_data)
-{
-    if (!param_data) return;
-    auto *p = reinterpret_cast<uint8_t *>(param_data);
-    // Set areaNo (offset 0x20, uint8) to 99 → non-existent area, icon won't display
-    p[0x20] = 99;
-}
+// A hide_icon(void*) that wrote areaNo = 99 straight through the pointer lived here with no
+// callers. The live path does the same write through safe_write_byte() in refresh(), which is
+// SEH-guarded - the param buffer can be relocated or freed by another mod between our snapshot
+// and the write, and an unguarded twin is exactly the thing that turns that into a crash.
 
 // ─── register param pointer for real-time hiding ────────────────────
 
@@ -799,9 +770,6 @@ void goblin::collected::register_param_ptr(uint64_t row_id, void *param_data)
 
 int goblin::collected::refresh()
 {
-    uintptr_t game_base = (uintptr_t)GetModuleHandleA(nullptr) /* main module = the game exe */;
-    if (!game_base)
-        return 0;
     void *wgm_check = nullptr;
     safe_read((void *)world_geom_man_slot(), &wgm_check, 8);
     void *geof_check = nullptr;
@@ -831,18 +799,14 @@ int goblin::collected::refresh()
     }
 
     // ── WGM: tracking for loaded tiles ──
-    // A row is collected if EITHER:
-    //   (A) Its MSB-part name is NOT present as alive in WGM, AND a different
-    //       AEG099_* instance occupies the same MSB-local position (ERR-style
-    //       replacement: collected smithing stone becomes a respawning
-    //       cracked-crystal of a different model at the same coords).
-    //   (B) No replacement at the position, but we at least KNOW the row's
-    //       own instance is loaded and dead (name directly present but not in
-    //       alive_names).
-    //
-    // We CANNOT simply say "name not in alive_names → collected" because the
-    // game spawns alive gathering-node CSWorldGeomIns lazily - an absent name
-    // may just mean "not yet spawned near the player".
+    // HISTORY, not the current rule: rows used to be classified by an (A)/(B) pair of
+    // name-and-position tests over alive_names/occupied - "the name is not alive AND another
+    // AEG099_* instance sits at the same MSB-local position" or "the name is present but
+    // dead". Both fields and both tests are gone; what ships is the position match inside
+    // (tile, model) described where the loop actually starts, below. The one part of that
+    // reasoning still worth carrying: absence of a name never means collected on its own,
+    // because the game spawns alive gathering-node CSWorldGeomIns lazily, so a name we do
+    // not see may simply not have spawned near the player yet.
     auto wgm = read_wgm_snapshot();
     std::set<uint32_t> wgm_tiles;
 
@@ -851,10 +815,11 @@ int goblin::collected::refresh()
     // live instance, not just because the tile is unloaded.
     std::set<uint64_t> demonstrably_alive_rows;
 
-    // Coordinate-free WGM classification, keyed by the engine's own (model_id, geom_idx)
-    // identity (slot). The previous position-based "occupied/replacement" heuristic was
-    // broken by the de-overlap pass shifting display coords; matching by slot reads each
-    // instance's real collected flag directly, so display coords are irrelevant.
+    // WGM classification. The slot survives only as the shape of the map we walk - the match
+    // itself is by position, for the reason spelled out at the inner loop below. (An earlier
+    // rewrite here WAS coordinate-free and keyed on the engine's (model_id, geom_idx) identity;
+    // it left collected nodes as NO-ROW-MATCH and was replaced. Do not restore that claim
+    // without also changing the loop.)
     for (auto &[tile_id, snap] : wgm)
     {
         wgm_tiles.insert(tile_id);
@@ -1022,10 +987,15 @@ int goblin::collected::refresh()
                                 }
                             }
                             if (rows.empty()) rows = " NO-ROW-MATCH(slot absent in g_tile_slot_to_row)";
-                            spdlog::info("[GEOFDBG] m{:02d}_{:02d}_{:02d} {} slot={} model={} gidx={} "
-                                         "f263=0x{:02X} f26B=0x{:02X} alive {}->{}{}",
-                                         a, gx, gz, prefix, slot, in.model_id, in.gidx,
-                                         (unsigned)in.f263, (unsigned)in.f26B, it->second, cur, rows);
+                            // in.suffix_slot is the slot parsed from the MSB name; `slot` is the
+                            // one derived from the engine's geom_idx. Printing BOTH is the live
+                            // cross-check of that formula the struct comment promises - it was
+                            // computed every refresh and left out of this line.
+                            spdlog::info("[GEOFDBG] m{:02d}_{:02d}_{:02d} {} slot={} name-slot={} "
+                                         "model={} gidx={} f263=0x{:02X} f26B=0x{:02X} alive {}->{}{}",
+                                         a, gx, gz, prefix, slot, in.suffix_slot, in.model_id,
+                                         in.gidx, (unsigned)in.f263, (unsigned)in.f26B,
+                                         it->second, cur, rows);
                         }
                         if (dbg_prev_alive.size() < kDbgAliveCap ||
                             dbg_prev_alive.find(key) != dbg_prev_alive.end())
@@ -1088,6 +1058,9 @@ int goblin::collected::refresh()
         spdlog::warn("[COLLECTED] Dropped {} stale entries; {} remain",
                      stale.size(), g_param_ptrs.size());
     }
+    // Publish it as well as logging it: skipped_count() is a public accessor that returned a
+    // hard 0 for as long as this counter existed, because nothing ever assigned it.
+    g_unmatched_count = missed;
     if (missed > 0)
         spdlog::warn("[COLLECTED] {} row IDs NOT in param_ptrs (out of {} collected)", missed, new_collected.size());
 

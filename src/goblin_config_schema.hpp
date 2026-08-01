@@ -22,7 +22,11 @@ namespace goblin
     enum class IniType : uint8_t
     {
         Bool,        // -> bool*
-        U8,          // -> uint8_t*
+        U8,          // -> uint8_t*. NO schema entry uses this today (build_schema() emits only
+                     // Bool, Float, Text, Language, VkKey and GamepadMask), so the four handlers
+                     // that switch on it - config parse/save, the native menu and the overlay -
+                     // are unreachable. They stay because they keep those switches exhaustive
+                     // for -Wswitch; delete the enumerator and all four together, or not at all.
         VkKey,       // -> uint32_t*  (parsed via parse_vk_code)
         GamepadMask, // -> uint16_t*  (parsed via parse_gamepad_combo)
         Language,    // -> std::string*  (normalized as a language via normalize_language_config)

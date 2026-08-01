@@ -4,7 +4,6 @@
     "AllOn": "全開",
     "AllOff": "全關",
     "RandomizerHint": "使用隨機道具？請啟用 live_loot_flags + live_loot_labels + live_loot_icons，讓標記符合被打亂後的物品位置。",
-    "FastMapOpenWarning": "測試功能：加快地圖開啟速度。如果地圖異常或崩潰，請關閉它。",
     "IniOnly": "（僅限 INI）",
     "PressAKey": "按一個按鍵",
     "PressComboRelease": "按住組合後放開",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "需要地圖碎片",
     "location_emphasis": "當前區域強調",
-    "fast_map_open": "加快地圖開啟",
     "show_armaments": "武器",
     "show_armour": "防具",
     "show_ashes_of_war": "戰灰",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "需要先發現對應區域的地圖碎片，才顯示該區域圖示。",
     "location_emphasis": "你所在地圖的標記會畫得更大；只是看起來在附近的標記（腳下的地下城，或其上方的地表）會畫得更小。不會隱藏任何標記。",
-    "fast_map_open": "測試功能：顯示大量圖示時加快世界地圖開啟速度。\n如果地圖異常或崩潰，請關閉。",
     "show_armaments": "武器、盾牌、弓、杖等。",
     "show_armour": "防具部位（頭盔、胸甲、臂甲、腿甲）。",
     "show_ashes_of_war": "戰灰（武器戰技）。",

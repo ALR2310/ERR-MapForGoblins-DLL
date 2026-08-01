@@ -7,10 +7,9 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "goblin_native_menu.hpp"
 #include "goblin_own_movie.hpp"
 #include "goblin_overlay.hpp" // gamepad_mask_down: the pad state is polled there
-#include "goblin_sfimage.hpp"
-#include "goblin_map_icons.hpp"
+// (goblin_map_icons.hpp was included TWICE here - bare and generated_shared, which resolve to the
+//  same generated header - for MAP_ICON_TAGS, whose last user in this file was icon_resource_for.)
 #include "generated_shared/goblin_menu_icon_tags.hpp"
-#include "generated_shared/goblin_map_icons.hpp"
 #include "goblin_maphover.hpp"
 #include "goblin_mapproject.hpp"
 #include "goblin_gfx_probe.hpp"
@@ -19,7 +18,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
-#include "miniz.h"
+// (miniz.h was included for icon_resource_for's inflate; no mz_ symbol is used here any more.)
 
 #include <algorithm>
 #include <array>
@@ -146,8 +145,15 @@ namespace
     // PlaceObject replace wrapper.
     // Recording the before/after count proves that the 6468-object map layer is
     // built through this API and preserves the arguments needed for a later,
-    // deliberately-scoped native insertion experiment. This one probe runs for
-    // the whole debug-logging session because insertion precedes capture start.
+    // deliberately-scoped native insertion experiment.
+    //
+    // PROFILER-ONLY, all of it: the hook, its detour, the recorder v3_note_add and the report
+    // block that drains these counters. The whole cluster used to sit outside the guard while
+    // only the detour and the hook were inside it, which meant that in a default build the
+    // recorder and the report compiled with no way to run - and their string literals reached
+    // .rdata, which is the one thing the AV heuristics read. That split is what 947216c set out
+    // to close; it stopped one level short.
+#if MFG_STALL_PROFILER
     using V3AddFn = void(void *, void *, void *, void *);
     V3AddFn *o_v3_add = nullptr;
 
@@ -171,50 +177,31 @@ namespace
     std::atomic<uint64_t> g_v3_add_owner_match{0};
     std::atomic<uint64_t> g_v3_add_max_count{0};
     std::atomic_flag g_v3_add_lock = ATOMIC_FLAG_INIT;
+#endif // MFG_STALL_PROFILER
 
-    // PlaceObject add path used by the V3 custom-icon spike. Unlike the generic
-    // insert-core hook above, this level still has the character id. Filter to
-    // our spike's (first injected charId, depth 24) pair and retain the ready
-    // DisplayObject it creates.
+    // PlaceObject insertion path. LOAD-BEARING: v3_place_detour matches the marker factory's
+    // production slots by depth + charId and carries the factory's ready DisplayObjects into
+    // g_v3_native - it is not a spike probe. (The comment here used to describe a retired
+    // one-shot experiment - "filter to our spike's (first injected charId, depth 24) pair" -
+    // which the detour has not done for a long time; the custom path it belonged to was a
+    // compile-time-false constant and is gone.)
     using V3PlaceFn = void(void *, void *, void *, void *, uint64_t);
     V3PlaceFn *o_v3_place = nullptr;
-    struct V3CustomSnapshot
-    {
-        uintptr_t vector = 0;
-        uintptr_t parent = 0;
-        uintptr_t placement = 0;
-        uintptr_t child = 0;
-        uintptr_t ret = 0;
-        uint64_t before_count = 0;
-        uint64_t after_count = 0;
-        uint64_t child_vt = 0;
-        uint64_t child_28 = 0;
-        uint64_t child_30 = 0;
-        uint64_t child_parent = 0;
-        uint32_t depth = 0;
-        uint32_t char_id = 0;
-        uint32_t placement_flags = 0;
-        uint32_t child_flags = 0;
-    };
-    V3CustomSnapshot g_v3_custom;
-    std::atomic<uint64_t> g_v3_custom_hits{0};
-    std::atomic_flag g_v3_custom_lock = ATOMIC_FLAG_INIT;
+    // V3CustomSnapshot, its instance, hit counter and lock lived here.
 
-    // One-shot visual experiment. FUN_1410c8440 is the high-level attach API:
-    // given its display-list wrapper, a child and an index, it removes the child
-    // from any old parent through the engine's own path, inserts it into the new
-    // parent's +0xd8 vector, and fixes parent/depth/flags/transform state.
+    // FUN_1410c8440 is the high-level attach API: given its display-list wrapper, a child and an
+    // index, it removes the child from any old parent through the engine's own path, inserts it
+    // into the new parent's +0xd8 vector, and fixes parent/depth/flags/transform state.
+    // LOAD-BEARING in every shipping build, and the comment here called it a "one-shot visual
+    // experiment" until 2026-07-31: its detour holds v3_note_movie_attach, the ONLY writer of the
+    // native-marker anchor, and the seed, the per-frame tick and the viewport reconcile all bail
+    // out when that anchor is 0. Do not gate it on a diagnostic flag.
     using V3AttachFn = void(void *, void *, uint32_t);
     V3AttachFn *o_v3_attach = nullptr;
     using V3AttachMovieFn = uint32_t(void *, void *, void *, const char *, void *, int, void *);
     V3AttachMovieFn *o_v3_attach_movie = nullptr;
-    constexpr uint32_t V3_MATRIX_SLOTS = 8;
-    constexpr uint32_t V3_CANDIDATE_CAP = 128;
-    std::atomic<uintptr_t> g_v3_matrix_children[V3_MATRIX_SLOTS]{};
-    float g_v3_matrix_base_tx[V3_MATRIX_SLOTS]{};
-    float g_v3_matrix_base_ty[V3_MATRIX_SLOTS]{};
-    std::atomic<uint64_t> g_v3_matrix_started_ms{0};
-    std::atomic<uint32_t> g_v3_matrix_state{0}; // 0 collecting, 1 attached/attempted
+    // The eight matrix slots (children, base translations, state, start time) lived here.
+    constexpr uint32_t V3_CANDIDATE_CAP = 128; // still live: the build-correlation candidate arrays
 
     struct V3BuildParentStat
     {
@@ -274,16 +261,12 @@ namespace
         }
     }
 
-    struct V3Candidate
-    {
-        uintptr_t wrapper = 0;
-        uintptr_t parent = 0;
-        uintptr_t caller = 0;
-        uint64_t count = 0;
-    };
-    V3Candidate g_v3_candidates[V3_CANDIDATE_CAP]{};
-    uint32_t g_v3_candidate_count = 0;
-    std::atomic_flag g_v3_candidate_lock = ATOMIC_FLAG_INIT;
+    // A V3Candidate table stood here (wrapper / parent / caller / count per candidate marker
+    // parent, cap V3_CANDIDATE_CAP) with its count and a spinlock. Its only outside reader was
+    // v3_try_matrix_batch, removed 2026-07-30 with the custom-capture path; after that the
+    // recorder only ever read its OWN entries to dedupe by parent, and `caller` was written twice
+    // and read nowhere. Cost while dead: 4096 bytes of .bss zeroed on every single map close.
+    // V3_CANDIDATE_CAP itself STAYS - it sizes V3BuildParentStat::parents[] further down.
 
     std::atomic<uintptr_t> g_v3_target_wrapper{0};
     std::atomic<uintptr_t> g_v3_target_parent{0};
@@ -303,9 +286,8 @@ namespace
     // parent - heap corruption on fast reopens.
     std::atomic<uint64_t> g_v3_close_ms{0};
 
-    // Lever A recon probe state (declared early so on_map_close can reset it).
-    // Solid-fill route-(c) spike: one-shot per build burst, reset on real map close.
-    std::atomic<int> g_solidfill_spike_done{0};
+    // (a g_solidfill_spike_done one-shot latch lived here and was reset on every map close so the
+    // spike could "re-fire"; the spike it guarded had already been removed)
 
     // Factory BATCH: one pulse queues up to V3_FACTORY_BATCH timeline records
     // on the live ctx, then runs the engine's record-materialization driver on
@@ -362,8 +344,6 @@ namespace
     //               container's reference (freeing the child if it was the last).
     using V3RemoveAtFn = void(void *, uint32_t);
     V3RemoveAtFn *g_v3_remove_at = nullptr;
-    std::atomic<uint32_t> g_v3_last_detached{0};
-    std::atomic<uint64_t> g_v3_last_detach_us{0};
 
     // Scaleform GFx DrawingContext primitives (the C++ backing of AS Graphics),
     // used by the dev-only solid-fill spike. A SOLID color fill needs NO GPU
@@ -377,18 +357,9 @@ namespace
     //   lineTo     FUN_14119d7a0(ctx, int, int)     - twips
     //   endFill    FUN_14119d650(ctx)
     //   shapeReset FUN_14119d0c0(ctx)               - clear accumulator (begin returns 0 on a fresh ctx)
-    using DcBeginFn      = char(void *, char);
-    using DcBeginFillFn  = void(void *, uint32_t);
-    using DcMoveToFn     = void(void *, int, int);
-    using DcLineToFn     = void(void *, int, int);
-    using DcEndFillFn    = void(void *);
-    using DcShapeResetFn = void(void *);
-    DcBeginFn      *g_dc_begin      = nullptr;
-    DcBeginFillFn  *g_dc_beginfill  = nullptr;
-    DcMoveToFn     *g_dc_moveto     = nullptr;
-    DcLineToFn     *g_dc_lineto     = nullptr;
-    DcEndFillFn    *g_dc_endfill    = nullptr;
-    DcShapeResetFn *g_dc_shapereset = nullptr;
+    // (the six matching function pointers were declared here and resolved at startup; no call
+    // site ever existed, so both the pointers and their scans are gone - the signatures above
+    // are kept as the record of what these entry points are)
 
     // Leaf 1: scan the parent's logical child vector (owner+0xd8: base@[0],
     // count@+0xe0, entry stride 0x10 with the child ptr at +0) and record the
@@ -514,8 +485,9 @@ namespace
 
     struct V3NativeObject
     {
-        uint64_t row_id = 0;
-        int source_icon_id = -1;
+        // (row_id and source_icon_id were members here, assigned at creation and read by nothing -
+        //  lookups go through g_v3_native.by_row, and the icon is baked into the child's character.
+        //  12 bytes x ~9500 objects.)
         uintptr_t child = 0;
         float map_x = 0.0f;
         float map_z = 0.0f;
@@ -575,9 +547,11 @@ namespace
         // adaptation curve (incl. clamps), no reference zoom needed.
         float cur_fx = 1.0f;      // last applied basis factor, x row
         float cur_fy = 1.0f;      // last applied basis factor, y row
-        float sample_fx = 0.0f;   // last successfully sampled widget scale
-        float sample_fy = 0.0f;
-        float sample_zoom = 0.0f; // MapView.zoom at that sample (zoom-ratio fallback)
+        // (sample_fx / sample_fy / sample_zoom stood here - "the last successfully sampled widget
+        //  scale" and the MapView.zoom at that sample, kept for a zoom-ratio fallback. One
+        //  occurrence each, their own declaration. The live rule is not a ratio at all, it is the
+        //  power law at the counter-zoom pass: V3_SIZE_TRIM * powf(V3_ZOOM_PIVOT / view.zoom,
+        //  V3_ZOOM_EXP). last_dump_zoom and sample_logged below ARE live.)
         float last_dump_zoom = 0.0f; // last zoom the diagnostic probe logged at
         bool sample_logged = false;
         // Location emphasis: the map the player stands in, resampled while the map is
@@ -612,51 +586,11 @@ namespace
         uint64_t parent_vtable = 0;
     };
     V3NativeManager g_v3_native;
-    std::atomic<uintptr_t> g_v3_custom_child{0};
-    std::atomic<uint32_t> g_v3_visual_state{0}; // 0 waiting, 1 attempted
-    struct V3VisualSnapshot
-    {
-        uintptr_t wrapper = 0;
-        uintptr_t target_parent = 0;
-        uintptr_t old_parent = 0;
-        uintptr_t child = 0;
-        uint64_t target_before = 0;
-        uint64_t target_after = 0;
-        uint64_t old_before = 0;
-        uint64_t old_after = 0;
-        uint64_t child_parent_after = 0;
-        float old_tx = 0.0f;
-        float old_ty = 0.0f;
-        float new_tx = 0.0f;
-        float new_ty = 0.0f;
-        float map_mid_x = 0.0f;
-        float map_mid_y = 0.0f;
-        float reference_zoom = 0.0f;
-        float base_m0 = 0.0f;
-        float base_m1 = 0.0f;
-        float base_m4 = 0.0f;
-        float base_m5 = 0.0f;
-        bool positioned = false;
-    };
-    V3VisualSnapshot g_v3_visual;
-    std::atomic<bool> g_v3_visual_published{false};
+    // g_v3_custom_child, g_v3_visual_state, V3VisualSnapshot and its publish flag lived here.
 
-    struct V3ScaleState
-    {
-        uintptr_t child = 0;
-        uintptr_t target_parent = 0;
-        float reference_zoom = 0.0f;
-        float base_m0 = 0.0f;
-        float base_m1 = 0.0f;
-        float base_m4 = 0.0f;
-        float base_m5 = 0.0f;
-        float target_tx = 0.0f;
-        float target_ty = 0.0f;
-        float pivot_tx = 0.0f;
-        float pivot_ty = 0.0f;
-    };
-    V3ScaleState g_v3_scale;
-    std::atomic<bool> g_v3_scale_ready{false};
+    // A V3ScaleState (the transplanted child's reference zoom, authored basis and pivot) and its
+    // ready flag lived here, for the counter-scale pass in on_map_frame. The flag was never set
+    // true and the state never written; both went with that pass on 2026-07-30.
 
     bool v3_read64(uintptr_t addr, uint64_t &out)
     {
@@ -720,32 +654,11 @@ namespace
         return p >= 0x10000 && p < 0x7fffffffffffULL;
     }
 
-    bool v3_read8(uintptr_t addr, uint8_t &out)
-    {
-        __try
-        {
-            out = *reinterpret_cast<const uint8_t *>(addr);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            out = 0;
-            return false;
-        }
-    }
+    // v3_read8() stood here, unused - the SEH readers that ARE used are v3_read64 / v3_read32 /
+    // v3_read_bytes.
 
-    bool v3_executable_ptr(uint64_t p)
-    {
-        if (!v3_heap_ptr(p))
-            return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(reinterpret_cast<const void *>(p), &mbi, sizeof(mbi)) ||
-            mbi.State != MEM_COMMIT)
-            return false;
-        const DWORD protect = mbi.Protect & 0xff;
-        return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
-               protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
-    }
+    // v3_executable_ptr() (a VirtualQuery-based "does this point at executable memory" test)
+    // stood here with no callers.
 
     bool v3_copy_ascii(uintptr_t addr, char *dst, size_t capacity)
     {
@@ -975,30 +888,10 @@ namespace
         }
     }
 
-    void v3_record_candidate(uintptr_t wrapper, uintptr_t parent, uintptr_t caller,
-                             uint64_t count)
-    {
-        // Every growing list passes these milestones once. Retain its wrapper here
-        // and read the final live count after the build settles; do not take a lock
-        // on all ~50k insertion calls.
-        if (!goblin::maphover::map_dialog() || (count != 20 && count != 1000) ||
-            g_v3_candidate_lock.test_and_set(std::memory_order_acquire))
-            return;
-
-        for (uint32_t i = 0; i < g_v3_candidate_count; ++i)
-        {
-            if (g_v3_candidates[i].parent == parent)
-            {
-                g_v3_candidates[i].wrapper = wrapper;
-                g_v3_candidates[i].caller = caller;
-                g_v3_candidate_lock.clear(std::memory_order_release);
-                return;
-            }
-        }
-        if (g_v3_candidate_count < V3_CANDIDATE_CAP)
-            g_v3_candidates[g_v3_candidate_count++] = {wrapper, parent, caller, count};
-        g_v3_candidate_lock.clear(std::memory_order_release);
-    }
+    // v3_record_candidate() stood here: it retained a growing display list's wrapper the first
+    // time that list passed 20 and 1000 entries, so the real marker parent could be picked out
+    // after the build settled. That question is long answered - the parent arrives through
+    // v3_note_movie_attach - and the table it filled had no reader left. Removed 2026-07-31.
 
     constexpr float V3_HIDDEN_MAP_POS = -100000.0f;
 
@@ -1685,6 +1578,39 @@ namespace
         g_v3_native.build_started_ms = GetTickCount64();
         g_v3_native.next_refresh_ms = g_v3_native.build_started_ms + 200;
         g_v3_native.last_progress_ms = g_v3_native.build_started_ms;
+        // ┌─ REMOVABLE: location-emphasis DRAW ORDER, seed-time player map ──────────────┐
+        // │ Delete this block and nothing else needs touching - the feature reverts to   │
+        // │ what it did before 2026-07-31, which is nothing.                             │
+        // │                                                                              │
+        // │ The seed sort in v3_native_merge_snapshot puts the player's OWN map's        │
+        // │ markers last (= on top). It decides that through v3_is_own_location, which    │
+        // │ is gated on v3_emphasis_possible() = locationEmphasis && player_map != 0.     │
+        // │ player_map has exactly ONE other assignment in this file, in v3_native_tick - │
+        // │ and v3_native_reset() three lines above has just zeroed it. So at sort time   │
+        // │ the test was false for EVERY marker and the ordering half of the emphasis     │
+        // │ had never once applied. Measured 2026-07-31: the seed logged at 10:11:52.976, │
+        // │ the player map first read at 10:11:53.051 - 75 ms too late, every open.       │
+        // │ Size and colour were never affected: the tick re-applies those once it reads  │
+        // │ the map. Depth cannot be re-applied - it is fixed when a child is created.    │
+        // │                                                                              │
+        // │ emph_active is deliberately NOT set here: merge_snapshot computes it from     │
+        // │ the snapshot at the top of the same call, before the sort, and it only needs  │
+        // │ player_map to be non-zero to come out right.                                  │
+        {
+            uint32_t seed_player_map = 0;
+            if (goblin::config::locationEmphasis &&
+                goblin::collected::read_player_map_id(seed_player_map))
+                g_v3_native.player_map = seed_player_map;
+            // Logged BEFORE the sort runs, so the order of the lines in the log is the proof:
+            // this must appear ahead of "item categories", and the tick's own map line after it.
+            // A zero here means the read failed and the ordering is inert again, exactly as before.
+            spdlog::info("[v3native] seed map for draw order: m{:02d}_{:02d}_{:02d}_{:02d}",
+                         (g_v3_native.player_map >> 24) & 0xFF,
+                         (g_v3_native.player_map >> 16) & 0xFF,
+                         (g_v3_native.player_map >> 8) & 0xFF,
+                         g_v3_native.player_map & 0xFF);
+        }
+        // └─ end removable block ────────────────────────────────────────────────────────┘
         v3_native_merge_snapshot(goblin::native_marker_snapshot(layer), true);
         // Initial construction happens across exact sprite-171 ExecuteTag calls
         // in this same stock build burst, before the first map-frame callback.
@@ -1915,7 +1841,10 @@ namespace
 
         // Report the marker children's display-object vtable as an exe RVA, once per
         // generation. The colour transform - the one emphasis lever the matrix call
-        // cannot reach - is a slot of this same vtable, so finding it is a static read
+        // cannot reach - would be reachable from here IF it were virtual. It is not: Get/SetCxform
+        // are non-virtual (goblin_scaleform notes + GFx_DisplayObject.h), which is why no vtable
+        // dump could ever find them and why the colour lever goes through the node data instead
+        // (v3_write_cxform, node data + g_v3_cx_offset). Kept as the record of a dead end.
         // of these bytes offline rather than another live probe.
         if (g_v3_native.child_vtable != 0 && !g_v3_native.child_vtable_logged)
         {
@@ -2202,10 +2131,12 @@ namespace
             {
                 const uint64_t lightweight = g_v3_native.objects.size();
                 const uint64_t heavy = live_count >= lightweight ? live_count - lightweight : 0;
+                // wrongCtx belongs next to failed: both answer "why are markers missing", and the
+                // counter was being incremented on every root-changed child while nothing read it.
                 spdlog::info("[v3native] CATEGORIES READY: layer={} "
-                             "created={} failed={} parentCount={} inferredHeavy={}",
+                             "created={} failed={} wrongCtx={} parentCount={} inferredHeavy={}",
                              g_v3_native.layer, lightweight, g_v3_native.failed,
-                             live_count, heavy);
+                             g_v3_native.wrong_contexts, live_count, heavy);
                 g_v3_native.completion_reported = true;
             }
         }
@@ -2237,26 +2168,30 @@ namespace
     // also the UI-thread beachhead the future native announce/dialogs need.
     using MenuUpdateFn = void(void *menuman, void *dt);
     MenuUpdateFn *o_menu_update = nullptr;
-    std::atomic<uint64_t> g_menu_last_active{0};
+    // (a g_menu_last_active atomic sat here, left from the retired solid-fill spike's MENU-MOVIE
+    //  block; it was declared and never touched again)
 
 
-    // ── STANDALONE settings menu open (F11), Proto 2.0 ──
-    // Opens the game's own settings menu via the SAME job-push machinery as the
-    // MessageBox (mirrors reference impl FUN_14080fbf0): build the settings-open job
-    // (FUN_1408087e0, movie "02_040_OptionSetting" + factory lambda), ref-move
-    // (FUN_1407a7b60), push onto the active menu (FUN_1407edfa0). Must run on the
-    // menu UI thread with a menu active - so we fire it from the updateTask detour.
-    using BuildJobFn = void *(void *out, void *owner, uint8_t flag); // FUN_1408087e0
+    // ── Job-push machinery ──
+    // Push a MenuJob onto a live menu's job stack, the same way the game's own MessageBox does
+    // (reference impl FUN_14080fbf0): ref-move (FUN_1407a7b60) then push (FUN_1407edfa0). Must run
+    // on the menu UI thread with a menu active - so it is driven from the updateTask detour. This
+    // is how open_screen() gets our key-binding screen up over plain gameplay.
+    //
+    // THE F11 SETTINGS-MENU PROTOTYPE THAT LIVED HERE IS GONE (2026-07-31). It opened the game's own
+    // OptionSettingTopDialog with our tab spliced into it, through a third primitive p_build_job
+    // (FUN_1408087e0, movie 02_040_OptionSetting). Nothing triggered it: g_our_f11_open was declared
+    // and read once, never assigned anything but 0, and no F11 poll existed anywhere in the file -
+    // yet setup() still scanned p_build_job and armed five hooks for it on every launch. The whole
+    // chain hung off that one flag: no flag -> no suppress -> our tab never appended -> our category
+    // id never reached the page dispatch -> the populate swap never armed. The native menu went the
+    // other way (one screen per page off the key-binding movie, open_screen below), which is what
+    // ships.
     using RefMoveFn = void *(void *src, void *dst);                  // FUN_1407a7b60
     using PushJobFn = void *(void *menu, void *out2, void *ctxOut, void *jobPtr, void *tmp); // FUN_1407edfa0
-    BuildJobFn *p_build_job = nullptr;
     RefMoveFn *p_refmove = nullptr;
     PushJobFn *p_push_job = nullptr;
-    // Set at F11 push; consumed by the NEXT OptionSettingTopDialog ctor to mean
-    // "this is OUR open - suppress the game tabs, show only ours".
-    std::atomic<int> g_our_f11_open{0};
     void **p_worldchrman_slot = nullptr; // *slot != 0 => a game world is loaded (in-game)
-    std::atomic<uintptr_t> g_our_dialog{0}; // our currently-open F11 dialog (anti-restack; cleared by its dtor)
     // The persistent base/root menu (the in-game HUD menu = *(CSMenuMan+0x80) while NO
     // full-screen menu is up). Pushing settings onto the BASE stacks it as an overlay
     // (like it stacks over gameplay); pushing onto the map instead REPLACES the map view.
@@ -2265,17 +2200,15 @@ namespace
     std::atomic<uintptr_t> g_active_menu{0};
     // CSMenuMan itself, for the read-only window scan when no window host is found.
     std::atomic<uintptr_t> g_menuman{0};
-    // Was the screen PUSHED onto a menu's job stack (no +0xA28 holder to watch) rather than
-    // stored in a child slot? Decides how the close is noticed.
-    std::atomic<bool> g_form_pushed{false};
-    std::atomic<uintptr_t> g_form_job{0}; // the pushed job
+    // g_form_pushed ("was the screen pushed rather than slotted - decides how the close is
+    // noticed") and g_form_job stood here. Both were declared and never touched again: the screen
+    // stack in g_screens carries `pushed` per level, and the close is noticed by heartbeat.
     // Liveness by ACTIVITY, not by inspecting the dialog: while our screen is up its row-draw
     // hook runs every frame, so a gap means it is gone. Reading the dialog's vtable instead
     // reported "closed" on a live screen, which dropped the one-screen guard and let presses
     // stack layers.
-    // The menu our screen was pushed onto. Liveness is read from here, never from the job or the
-    // dialog: those are freed on close, while the host stays.
-    std::atomic<uintptr_t> g_form_pushed_host{0};
+    // A g_form_pushed_host stood here, described as where liveness is read from. Nothing wrote or
+    // read it; liveness is the per-screen heartbeat in g_screens (see beat_fresh).
     // TRUE per-frame liveness: the dialog's own update (FUN_14093F540, its vt+0x10) runs every
     // frame while the dialog exists. Row draws do not - they only happen when the view refreshes,
     // which is why timing them declared a static screen closed half a second after it opened.
@@ -2291,7 +2224,8 @@ namespace
     // which looked exactly like "the host we pushed onto is bad" and was not.
     using FormUpdateFn = void(void *dlg, float dt, void *consumed);
     FormUpdateFn *o_form_update = nullptr;
-    std::atomic<uint64_t> g_form_last_update{0};
+    // (A g_form_last_update timestamp was stamped here every frame and never read - the live
+    //  liveness signal is form_dialog_ticked() below, keyed on g_form_update_watch.)
 
     // Set from the row-build hook once our dialog is known; the heartbeat compares against it
     // rather than the later-declared g_form_dialog.
@@ -2309,8 +2243,6 @@ namespace
     void form_update_detour(void *dlg, float dt, void *consumed)
     {
         const uintptr_t d = reinterpret_cast<uintptr_t>(dlg);
-        if (d == g_form_update_watch.load(std::memory_order_relaxed))
-            g_form_last_update.store(GetTickCount64(), std::memory_order_relaxed);
         form_dialog_ticked(d);
         o_form_update(dlg, dt, consumed);
         // Order inside the frame is what decides whether an icon is visible at all. Writing the
@@ -2402,12 +2334,12 @@ namespace
     // memo/marker involvement. The created 02_040 movie renders over the map on its own (the
     // gfx mgr ticks it); we only need to construct the dialog once its scene root is populated
     // (root!=0), else the ctor faults on a null root (the v2/v3 crash). base+RVA calls (dev).
-    std::atomic<uintptr_t> g_settings_movie{0};  // our created 02_040 movie (async-loading)
-    std::atomic<uintptr_t> g_settings_dialog{0}; // constructed once the movie loaded
-    // Armed while OUR keybinding-form child is the one being built/shown, so the row
-    // swap below never touches the game's own keybinding screen. Declared here because
-    // close_settings() clears it.
-    std::atomic<bool> g_form_rows_armed{false};
+    // g_settings_movie (our own 02_040, async-loading), g_settings_dialog (the
+    // OptionSettingTopDialog built against its scene) and g_form_rows_armed stood here. None was
+    // ever written. g_settings_dialog was READ though, as the third host fallback in open_screen -
+    // a branch that could therefore never be taken, and whose "our settings menu" label could never
+    // be printed. Same defect the audit recorded for g_form_host, fifteen lines below it in the
+    // same function.
     // The form's dialog only exists a few frames after its job is stored, so the page
     // title is stamped by the first row draw rather than at open time.
     std::atomic<bool> g_form_title_pending{false};
@@ -2457,21 +2389,19 @@ namespace
         {
             g_menu_cfg_dirty = true;
             goblin::reapply_live_settings(); // live-apply, same as the overlay's change path
-            spdlog::info("[optmenu] native-menu change applied live");
+            spdlog::info("[nmenu] setting applied live");
         }
     }
-    std::atomic<uintptr_t> g_settings_job{0};    // the F11 build-job (kept; its +0x10 = a pre-built
-                                                  // SceneObjProxy with objIface, the ctor's scene)
-    uint8_t *g_settings_scene = nullptr;          // heap SceneObjProxy buffer (persists for the dialog)
+    // g_settings_job and g_settings_scene stood here (the F11 build-job and its SceneObjProxy
+    // buffer), with prose for a close_settings() and a per-frame dialog builder that are not in
+    // this tree. All of it belonged to the F11 prototype removed above.
 
-
-    // Tear down the settings job (release + stop stepping). Mirrors the game runner's job
-    // release (FUN_141eba200 unref -> vt[0] dtor when refcount hits 0), which closes the
-    // dialog + its 02_040 movie. Used by the job-done detection (Back) AND the F11 toggle.
-
-    // Per-frame builder (body after the opttop/alloc decls below): once our 02_040 movie has
-    // loaded (scene root != 0), construct the dialog against its scene.
-
+// The CommandList child prototype is KEPT but NOT BUILT (MFG_CMDLIST_PROTO, default 0). It is the
+// working half of the CommandList RE session and the entry point cmdlist_notes.md points at for the
+// unfinished native-menu work, so deleting it would throw away the result of that session - but it
+// has no callers, and "do not delete" is not the same as "must ship". Behind the guard the source
+// stays available and the DLL carries none of it: no hand-made game-ABI functors, no registrar call.
+#if MFG_CMDLIST_PROTO
     // ── CommandList child prototype (RE cmdlist_notes.md, session 2026-07-23 night) ──
     // FUN_140747450(win, out, in) = open the native CommandList screen (movie
     // 02_045_PC_CommandList / 01_070_CommandList, dialog CS::CommandSelectDialog) as a
@@ -2555,6 +2485,12 @@ namespace
     // Register our commands on the dialog via FUN_140744540(win, inputSpec,
     // actionFn, predFn); inputSpec = 3 contiguous holders (trigger/pack/extra).
     // Everything is deep-copied by the registrar, so stack lifetime is fine.
+    //
+    // NOT CONNECTED TO ANYTHING (verified 2026-07-30): this function has no callers, and with it the
+    // whole hand-made game-ABI std::function cluster above is unused. It is KEPT DELIBERATELY - it is
+    // the working half of the CommandList RE session and the entry point that
+    // scratch/endgame_research/cmdlist_notes.md points at for the unfinished native-menu work. Do not
+    // remove it as dead code without settling that work first; do not assume it is wired up either.
     void register_our_cmdlist_rows(uintptr_t dlg)
     {
         if (goblin::g_menutext_tab_id <= 0 || goblin::g_menutext_row_ids.empty())
@@ -2609,6 +2545,7 @@ namespace
         }
         spdlog::info("[cmdlist] registered {} of our commands on dlg=0x{:X}", added, dlg);
     }
+#endif // MFG_CMDLIST_PROTO
 
     // ── Our rows ON the native keybinding form (02_160) ──────────────────────────
     // RE (keysetting_*_re.txt): KeyConfigDialog = GenericItemSelectDialog<CSMenuKeySetting>
@@ -3629,9 +3566,10 @@ namespace
 
     // POD-only: remember the dialog if this list really is dlg+0x1268 (the refresh path
     // also builds into temporary stack lists).
-    // Set when the screen's dialog first appears: the movie is parsed by then, so the load
-    // interception can stand down until the next open. Acted on outside the SEH frame below.
-    std::atomic<bool> g_movie_open_settled{false};
+    // A g_movie_open_settled latch stood here. It was raised when the screen's dialog first
+    // appeared and its only job was to disarm the movie interception for the rest of the session.
+    // That bracket is gone (goblin_own_movie.hpp says why: 02_160 is parsed once at startup, so
+    // there is nothing to arm around), and with it the latch.
 
     // The dialog behind a row-item list, or 0 when this list belongs to something else. The
     // class is CHECKED (vtable), never assumed: the refresh path also builds into temporary
@@ -3844,7 +3782,6 @@ namespace
                 log_form_command_table(dlg);
                 spdlog::info("[form] level {} is dialog 0x{:X} (page {})", level, dlg,
                              pending->page);
-                g_movie_open_settled.store(true, std::memory_order_release);
                 hide_row_panel(dlg); // the dark rectangle behind our rows
                 // The page it came from steps aside NOW - the child's movie exists as of this
                 // build, so there is no frame with neither of them on screen.
@@ -3885,8 +3822,6 @@ namespace
             g_form_dialog.store(dlg, std::memory_order_release);
             g_form_update_watch.store(dlg, std::memory_order_release);
         }
-        if (g_movie_open_settled.exchange(false, std::memory_order_acq_rel))
-            goblin::own_movie::disarm();
         if (!temp_list)
         {
             goblin::nmenu::set_page(g_screens[static_cast<size_t>(level)].page);
@@ -3932,7 +3867,11 @@ namespace
         }
     }
 
-    // ── Independent icon path: our own pixels, our own clip, no movie edited ─────────
+    // ── Independent icon path: RETIRED, this is its tombstone ───────────────────────
+    // Three implementations of "draw our own pixels into a clip the row already has" lived below
+    // this banner and all three are gone (icon_resource_for, draw_row_icon_own,
+    // draw_row_icon_direct). The menu icons ship as characters spliced into the movie on the parse
+    // instead - goblin_own_movie.cpp. What is left here is the leftover state of that route.
     // The spliced route below needs the movie's bytes patched at load. This one does not
     // touch any movie: we build a Scaleform image resource from our own RGBA (RawImage +
     // ScaleformImageResource), create our OWN child sprite in the row via
@@ -3950,74 +3889,20 @@ namespace
     constexpr int32_t kOwnIconDepth = -1;
     constexpr float kOwnIconPx = 28.f;
 
-    // iconId -> resource, built once each.
-    std::unordered_map<int32_t, void *> g_icon_resources;
     std::atomic<int> g_own_icon_state{0}; // 0 = untried, 1 = working, -1 = unavailable
     // Direct-draw route (native_menu_icons = 3): whether anything has been drawn yet, and a
     // resource to clear with. Both are UI-thread only, like every other draw here.
     bool g_direct_icon_seen = false;
     void *g_blank_resource = nullptr;
-    // Which grid slot is being drawn right now. Captured from the engine's own row-path
-    // helper (hooked further down as row_path_detour), and needed by every icon route that
-    // addresses a row BY PATH from the movie root.
-    std::atomic<int32_t> g_row_slot{-1};
-    std::atomic<int32_t> g_row_column{0};
+    // A g_row_slot / g_row_column pair was captured here from the engine's row-path helper and
+    // never read: the icon route explicitly rejected that capture ("stale by the time we draw") and
+    // takes the slot from slot_of_row() instead. row_path_detour stays - it still feeds the
+    // row-count log below, which is what tells us how many rows the engine is willing to show.
 
-    void *icon_resource_for(int32_t icon_id)
-    {
-        auto it = g_icon_resources.find(icon_id);
-        if (it != g_icon_resources.end())
-            return it->second;
-        // The pixels are already embedded for the map and the overlay: inflate the shared
-        // lossless tag for this iconId. Tag payload is {charId u16, fmt u8, w u16, h u16,
-        // zlib(ARGB rows)} - premultiplied ARGB, so swizzle to RGBA for the image we build.
-        int w = 0, h = 0;
-        std::vector<uint8_t> rgba;
-        {
-            namespace gen = goblin::generated;
-            const gen::MapIconTag *tag = nullptr;
-            for (int k = 0; k < gen::MAP_ICON_TAG_COUNT; ++k)
-                if (gen::MAP_ICON_TAGS[k].srcIconId == icon_id)
-                {
-                    tag = &gen::MAP_ICON_TAGS[k];
-                    break;
-                }
-            if (tag && tag->tagLen > 8)
-            {
-                const unsigned char *b = tag->tag;
-                w = b[3] | (b[4] << 8);
-                h = b[5] | (b[6] << 8);
-                if (w > 0 && h > 0 && w <= 1024 && h <= 1024)
-                {
-                    std::vector<uint8_t> argb(static_cast<size_t>(w) * h * 4);
-                    mz_ulong destlen = static_cast<mz_ulong>(argb.size());
-                    if (mz_uncompress(argb.data(), &destlen, b + 7,
-                                      static_cast<mz_ulong>(tag->tagLen - 7)) == MZ_OK &&
-                        destlen == argb.size())
-                    {
-                        rgba.resize(argb.size());
-                        for (size_t i = 0; i < argb.size(); i += 4)
-                        {
-                            rgba[i + 0] = argb[i + 1]; // R
-                            rgba[i + 1] = argb[i + 2]; // G
-                            rgba[i + 2] = argb[i + 3]; // B
-                            rgba[i + 3] = argb[i + 0]; // A
-                        }
-                    }
-                }
-            }
-        }
-        if (rgba.empty())
-        {
-            g_icon_resources[icon_id] = nullptr;
-            return nullptr;
-        }
-        wchar_t name[64];
-        _snwprintf_s(name, _TRUNCATE, L"MFG_Icon_%05d", icon_id);
-        void *res = goblin::sfimage::create_resource(name, w, h, rgba.data());
-        g_icon_resources[icon_id] = res;
-        return res;
-    }
+    // icon_resource_for() built (and cached in g_icon_resources) a Scaleform resource per iconId by
+    // inflating the shared lossless tag. Its two consumers were the own-icon draw routes, both
+    // permanently disabled - the row icons are spliced into the menu movie instead - so it and the
+    // cache it owned had no callers left.
 
     // OFF. Creating display objects inside someone else's live movie is a dead end, and this
     // is the third crash from it: after the screen closed, Scaleform faulted on poisoned memory
@@ -4085,65 +3970,11 @@ namespace
         }
     }
 
-    // Compare the two lookups that disagree, in the same instant and on the same movie:
-    // the row handle the renderer gave us, and the explicit path from the movie root. The
-    // walker (0xD7F9D0) hands GetMember the value's pdata at +0x28, so if the two pdata
-    // pointers differ, the handle simply refers to another instance - which is the only
-    // difference left once the type and interface check out.
-    void probe_icon_owner_raw(uintptr_t base, void *rowProxy, uint64_t *out)
-    {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
-        __try
-        {
-            // out[0..2]: row handle type / iface / pdata
-            out[0] = *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(rowProxy) + 0x48);
-            out[1] = *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(rowProxy) + 0x40);
-            out[2] = *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(rowProxy) + 0x50);
-            // out[3]: does MfgIcon resolve from the handle right now
-            uint8_t a[0x60] = {};
-            void *ra = p_resolve(rowProxy, a, "MfgIcon");
-            out[3] = p_valid(ra) ? 1 : 0;
-            p_dtor(a + 0x28);
-            const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
-            if (!dlg)
-                return;
-            void *root = reinterpret_cast<void *>(dlg + 0x120);
-            // out[4..6]: the same row reached by path - type / pdata / does MfgIcon resolve
-            uint8_t b[0x60] = {};
-            void *rb = p_resolve(root, b, "KeySetting/ItemList/Item_0_0");
-            if (p_valid(rb))
-            {
-                out[4] = *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(rb) + 0x48);
-                out[5] = *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(rb) + 0x50);
-                uint8_t c[0x60] = {};
-                void *rc = p_resolve(rb, c, "MfgIcon");
-                out[6] = p_valid(rc) ? 1 : 0;
-                p_dtor(c + 0x28);
-            }
-            p_dtor(b + 0x28);
-            // out[7..10]: grid cursor and its neighbours, to find the visible-window top
-            const uintptr_t grid = *reinterpret_cast<uintptr_t *>(dlg + 0xA38);
-            if (grid)
-                for (int k = 0; k < 4; ++k)
-                    out[7 + k] = *reinterpret_cast<uint32_t *>(grid + 0xD0 + k * 4);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-    }
+    // probe_icon_owner_raw() stood here (SEH-guarded reads of a row proxy by handle and by path,
+    // plus the grid fields). Its only caller was probe_icon_owner, removed just below.
 
-    void probe_icon_owner(uintptr_t base, void *rowProxy)
-    {
-        uint64_t v[11] = {};
-        probe_icon_owner_raw(base, rowProxy, v);
-        spdlog::info("[menuicons] handle: type 0x{:X} iface 0x{:X} pdata 0x{:X} MfgIcon {} | "
-                     "by path: type 0x{:X} pdata 0x{:X} MfgIcon {} | grid +0xD0..0xDC: "
-                     "{} {} {} {}",
-                     v[0], v[1], v[2], v[3] ? "yes" : "no", v[4], v[5], v[6] ? "yes" : "no",
-                     v[7], v[8], v[9], v[10]);
-    }
+    // probe_icon_owner() logged how a row proxy resolves by handle and by path. Removed with its
+    // raw helper: both lost their callers when the own-icon route was retired.
 
     void probe_icon_paths(uintptr_t base)
     {
@@ -4183,8 +4014,6 @@ namespace
     {
         if (pair)
         {
-            g_row_slot.store(pair->slot, std::memory_order_release);
-            g_row_column.store(pair->column, std::memory_order_release);
             // The engine formats the row name itself, so the highest slot it ever asks for IS the
             // number of rows it is willing to show. That is the one fact that decides whether adding
             // clips to the movie buys anything, so it goes in the log the first time it grows.
@@ -4781,7 +4610,9 @@ namespace
     // our rows resolves to the placeholder "GR_LineHelp(...)"), so we overwrite it AFTER the
     // engine's update with the highlighted row's own description - the text the overlay used
     // to show as a tooltip.
-    void paint_right_panel(uintptr_t base, uintptr_t dlg);
+    // (A stray forward declaration of paint_right_panel stood here, 62 lines BELOW the definition
+    //  and wedged between the doc comment of paint_help_line and kPaintRightPanel, so it read as
+    //  documentation of the wrong function. One namespace, so it declared nothing new.)
 
     // Off for now. Painting the preview into the right-hand row clips works, but those clips
     // carry the list's own button plate (an unnamed timeline child, so it cannot be hidden by
@@ -4855,9 +4686,9 @@ namespace
     // style frame, which rebuilds the row's display list and hands the spliced icon child back at
     // its authored position - the blank cell. So our shift is undone on exactly those refreshes
     // that keep the same rows, and comes back the moment the list is scrolled, because a scroll
-    // renders rows through the path where our draw runs last. Fix: repaint the strips on the few
-    // ticks AFTER a refresh, when that render has happened.
-    std::atomic<int> g_icon_repaint_left{0};
+    // renders rows through the path where our draw runs last. That is what happens today, but not
+    // through the counter this note proposed: the repaint moved to the tail of form_update_detour,
+    // and the g_icon_repaint_left it describes was declared here and never read or written.
 
     // POD: the item the view list has bound to a visible slot, or nullptr.
     void *view_item_at(uintptr_t dlg, uint32_t index)
@@ -5296,8 +5127,7 @@ namespace
 
     // A screen asked to be closed from its own handler; done on the next tick.
     std::atomic<uintptr_t> g_close_request{0};
-    // One-shot: log a screen's registered command ids the first time we see them.
-    std::atomic<bool> g_cmd_ids_logged{false};
+    // A g_cmd_ids_logged one-shot latch lived here: reset on teardown, never read, never set true.
 
     void form_decide_detour(void *dlg)
     {
@@ -5368,75 +5198,15 @@ namespace
         refresh_form_view(d);
     }
 
-    // Build a CommandList MenuJob for the window via the game's spec builder
-    // FUN_140745ed0. Disasm truth (r2 @0x140745f61..0x140745ff2): on PC the builder
-    // stages "01_070_CommandList" (gamepad form: big layout, right-side pad panel)
-    // into the spec's movie block, then UNCONDITIONALLY overwrites it with
-    // "02_045_PC_CommandList" (the small popup) - there is no runtime branch. The
-    // float2 from FUN_140d82770 (fed by the builder's param_3) only sets the form
-    // size @spec+0xa80. So: forcePad temporarily repoints the second movie-name lea
-    // (rip-relative disp32 @+0x745fd6, lea end +0x745fda) at the 01_070 literal and
-    // restores it right after - same-thread only (the game reaches this builder
-    // solely from this UI thread's input dispatcher). w > 0 passes a custom size
-    // through param_3; otherwise the game default flow (FUN_140757af0) is used.
-    void *build_cmdlist_job(uintptr_t base, uintptr_t dlg, bool forcePad, float w, float h)
-    {
-        uint8_t inFlag = 0;
-        uint64_t sizeBuf = 0;
-        void *szp = &sizeBuf;
-        if (w > 0.f)
-        {
-            float *f = reinterpret_cast<float *>(&sizeBuf);
-            f[0] = w;
-            f[1] = h;
-        }
-        else
-        {
-            auto p_size = reinterpret_cast<void *(*)(void *, uint64_t *)>(base + 0x757af0);
-            szp = p_size(&inFlag, &sizeBuf);
-        }
-        uint8_t *leaDisp = reinterpret_cast<uint8_t *>(base + 0x745fd6);
-        const uintptr_t leaEnd = base + 0x745fda;
-        static const wchar_t kPadMovie[] = L"01_070_CommandList";
-        int32_t oldDisp = 0;
-        bool patched = false;
-        if (forcePad)
-        {
-            oldDisp = *reinterpret_cast<int32_t *>(leaDisp);
-            if (leaEnd + static_cast<intptr_t>(oldDisp) == base + 0x2A93B38 &&
-                std::memcmp(reinterpret_cast<const void *>(base + 0x2A93B10), kPadMovie,
-                            sizeof(kPadMovie)) == 0)
-            {
-                const int32_t newDisp = static_cast<int32_t>(
-                    static_cast<intptr_t>(base + 0x2A93B10) - static_cast<intptr_t>(leaEnd));
-                DWORD prot = 0;
-                if (VirtualProtect(leaDisp, 4, PAGE_EXECUTE_READWRITE, &prot))
-                {
-                    *reinterpret_cast<int32_t *>(leaDisp) = newDisp;
-                    VirtualProtect(leaDisp, 4, prot, &prot);
-                    patched = true;
-                }
-            }
-            if (!patched)
-            {
-                spdlog::warn("[cmdlist] force-pad movie patch failed (layout mismatch)");
-                return nullptr;
-            }
-        }
-        void *job = nullptr;
-        auto p_build = reinterpret_cast<void (*)(void *, void **, void *)>(base + 0x745ed0);
-        p_build(reinterpret_cast<void *>(dlg), &job, szp);
-        if (patched)
-        {
-            DWORD prot = 0;
-            if (VirtualProtect(leaDisp, 4, PAGE_EXECUTE_READWRITE, &prot))
-            {
-                *reinterpret_cast<int32_t *>(leaDisp) = oldDisp;
-                VirtualProtect(leaDisp, 4, prot, &prot);
-            }
-        }
-        return job;
-    }
+    // build_cmdlist_job() stood here: it opened the game's CommandList popup with a forced
+    // gamepad layout by taking PAGE_EXECUTE_READWRITE on the exe, repointing a rip-relative
+    // lea at the other movie-name literal and putting it back. It had no callers anywhere in
+    // src/, so a dead patcher of the game's own code was compiled into every shipped DLL - the
+    // worst kind of dead weight, since that is also exactly the shape an antivirus heuristic
+    // looks for. The RE it rests on (the builder stages 01_070 and then unconditionally
+    // overwrites it with 02_045, so there is no runtime branch to flip) is in cmdlist_notes.md.
+    // The live analogue that DOES ship is patch_form_desc_kind, which touches one descriptor
+    // byte of our own screen and restores it in the same call.
 
     // Release one DLRefCountObj reference (Unref + vt[0] dtor at rc==1), the pattern
     // used across the job/holder machinery.
@@ -5456,45 +5226,11 @@ namespace
     // dialog (vt+0x28/0x30/0x38/0x40 are the same MenuWindow slots), so it has the same
     // child-job holder at +0xA28 - we can hang the keybinding form straight off the MAP
     // and skip the intermediate F11 menu layer.
-    // Does this look like a MenuWindow we can hang a child screen off? Checked rather than
-    // assumed: the active menu can be any dialog, and writing a job into a slot that is not a
-    // holder would corrupt it. A heap-looking vtable plus an EMPTY child holder is enough - the
-    // holder is a DLRefPtr, so an in-range non-null value there means the slot is already taken.
-    // POD-only: read the two things the check looks at, so a rejection can be explained.
-    bool host_fields(uintptr_t win, uintptr_t *vt, uint64_t *holder)
-    {
-        __try
-        {
-            *vt = *reinterpret_cast<uintptr_t *>(win);
-            *holder = *reinterpret_cast<uint64_t *>(win + 0xA28);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
-    }
-
-    bool usable_host(uintptr_t win)
-    {
-        if (!v3_heap_ptr(win))
-            return false;
-        uintptr_t vt = 0;
-        uint64_t holder = 0;
-        const bool read = host_fields(win, &vt, &holder);
-        const bool vt_ok = read && v3_heap_ptr(vt);
-        const bool holder_free = read && holder == 0;
-        static bool s_logged = false;
-        if (!s_logged)
-        {
-            s_logged = true;
-            const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-            spdlog::info("[form] host check 0x{:X}: read={} vt=0x{:X} (rva 0x{:X}) holder=0x{:X} "
-                         "-> vt_ok={} holder_free={}",
-                         win, read, vt, vt > base ? vt - base : 0, holder, vt_ok, holder_free);
-        }
-        return vt_ok && holder_free;
-    }
+    // host_fields() and usable_host() stood here: a POD-only read of a window's vtable and its
+    // child-job holder at +0xA28, and the check built on it. They formed a closed pair with no
+    // outside caller. open_screen validates a host with window_like() instead, and the +0xA28
+    // route was tried and reverted on 2026-07-28 - that field is not a child holder on the
+    // object we reach, which is exactly what window_like() was right to reject.
 
     uintptr_t map_menu_window()
     {
@@ -5519,7 +5255,7 @@ namespace
     // Set while the form hangs off the MAP (no F11 menu in the stack): nothing steps our
     // own job then, so the per-frame tick must live-apply and the ini must be saved when
     // the form closes (its child-job holder empties).
-    std::atomic<uintptr_t> g_form_host{0};
+    // g_form_host lived here: set nowhere, cleared on teardown, compared once. Removed 2026-07-30.
 
     // F8 (dev): open the game's real keybinding form (movie 02_160_KeyConfiguration,
     // dialog CS::KeyConfigDialog) as a CHILD WINDOW, with our rows swapped in.
@@ -5560,14 +5296,12 @@ namespace
     // very same page factory (FUN_14095EB90) our settings tab already borrows - with clip
     // index 0xD = "GraphicOption" instead of 3 = "CameraSetting", which is exactly why that
     // one caps out at 12 rows with no scrollbar and this one does not.
-    using PopulateGraphicFn = void(void *page, void *ctx);
-    PopulateGraphicFn *o_populate_graphic = nullptr;
-    // Defined with the settings-tab code further down; both screens are populated the same way.
-    void build_our_rows(void *page);
-    std::atomic<int> g_pad_rows_to{0}; // F6 scroll test: pad our page to this many rows (0 = off)
-    std::atomic<bool> g_graphic_armed{false};
-    std::atomic<bool> g_graphic_populated{false};
-    std::atomic<uintptr_t> g_graphic_host{0};
+    // The F6 graphics-screen host's own state (its populate hook type and pointer, plus the armed /
+    // populated / host trio) stood here. The host was removed on 2026-07-28 once it was measured in
+    // game - its list caps at sixteen rows and does not scroll - so nothing assigned or read any of
+    // it. See docs/research_f6_graphics_host_retired.md.
+    // (A build_our_rows() forward declaration stood here for the F11 settings tab's page populate.
+    //  Both it and its definition went with that prototype.)
 
 
 
@@ -5712,12 +5446,8 @@ namespace
             if (host)
                 what = "the map";
         }
-        if (!host)
-        {
-            host = g_settings_dialog.load(std::memory_order_acquire);
-            if (host)
-                what = "our settings menu";
-        }
+        // (A third fallback tried g_settings_dialog here - the F11 prototype's own dialog. It was
+        //  never constructed, so this branch could not be taken; removed with that prototype.)
         if (host && !window_like(host))
         {
             spdlog::info("[form] host 0x{:X} ({}) is not a window - not storing a job in it", host,
@@ -5770,9 +5500,8 @@ namespace
         spdlog::info("[form] opening page {} on {} (0x{:X})", page, what, host);
 
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        // From here until the screen is up, a load of this movie is OURS: the interception
-        // rebuilds it and leaves every other load (the player's own key-binding screen) alone.
-        goblin::own_movie::arm();
+        // (No movie-interception arming here. The movie this screen runs on was parsed - and
+        //  transformed - during the startup preload, long before any open; see goblin_own_movie.hpp.)
         g_own_icon_state.store(0, std::memory_order_release);
         g_icon_diag_done.store(false, std::memory_order_release);
         g_icon_host_logged.store(false, std::memory_order_release);
@@ -5864,10 +5593,7 @@ namespace
         {
             g_screens.pop_back();
             if (g_screens.empty())
-            {
                 goblin::nmenu::set_nested(false);
-                goblin::own_movie::disarm();
-            }
             return;
         }
         g_form_title_pending.store(true, std::memory_order_release);
@@ -5979,29 +5705,19 @@ namespace
     // Guards: not while the rebind page is waiting for a key (there ESC means "leave the binding
     // alone" and poll_rebind owns it), and only on the down-edge so holding ESC cannot close a
     // parent screen right after a child.
-    bool g_esc_was_down = false;
 
-    void poll_escape_close(uintptr_t dlg)
-    {
-        // RETIRED 2026-07-28, kept for the reasoning. Raising a close request on ESC cannot work:
-        // close_screen -> invoke_cancel calls the Back command's ACTION directly, and the engine only
-        // ever runs an action when that command's matcher AND guard agree (see section 2a of
-        // docs/research_native_menu_screens.md), so the call reported success while the screen stayed
-        // up - and the only visible effect was the HUD returning over a still-open menu.
-        // Measured afterwards, and this is the reason it is off rather than fixed: ESC produces NONE
-        // of the nine actions this screen listens for, and in plain gameplay ESC does not reach the
-        // action predicate at all - the system menu it opens is handled by a path OUTSIDE the per-screen
-        // command tables. So ESC-close is not a defect of ours to repair; it is engine integration we
-        // do not have yet, and it belongs with the native-registration work.
-        return;
-        const bool down = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        const bool edge = down && !g_esc_was_down;
-        g_esc_was_down = down;
-        if (!edge || !dlg || goblin::nmenu::rebind_pending())
-            return;
-        spdlog::info("[form] Escape pressed - closing screen 0x{:X} through its own cancel", dlg);
-        g_close_request.store(dlg, std::memory_order_release);
-    }
+    // ESC-CLOSE, RETIRED 2026-07-28. A poll_escape_close(dlg) stood here: it read the physical ESC
+    // key and raised a close request. That cannot work, and the reasoning is worth keeping:
+    // close_screen -> invoke_cancel calls the Back command's ACTION directly, and the engine only
+    // runs an action when that command's matcher AND guard agree (section 2a of
+    // docs/research_native_menu_screens.md), so the call reported success while the screen stayed up -
+    // the only visible effect was the HUD returning over a still-open menu. Measured afterwards: ESC
+    // produces NONE of the nine actions this screen listens for, and in plain gameplay it never
+    // reaches the action predicate at all, because the system menu it opens is handled outside the
+    // per-screen command tables. So ESC-close is not a defect of ours to repair; it is engine
+    // integration we do not have yet, and it belongs with the native-registration work.
+    // The function itself was left in place with an unconditional `return` at the top, which meant a
+    // per-frame call into a body that could never run. Both are gone; the reasoning stays.
 
     // FUN_1407A9230(win + 0x10) - the game's OWN "is the sequence slot free?" test, the one its
     // input dispatcher gates a window's commands on (it stops feeding a window input while the
@@ -6030,13 +5746,10 @@ namespace
         g_form_depth = 0;
         g_form_dialog.store(0, std::memory_order_release);
         g_form_update_watch.store(0, std::memory_order_release);
-        g_form_host.store(0, std::memory_order_release);
-        g_cmd_ids_logged.store(false, std::memory_order_release);
         g_close_request.store(0, std::memory_order_release);
         for (std::vector<FormItem> &p : g_form_pools)
             p.clear();
         goblin::nmenu::set_nested(false);
-        goblin::own_movie::disarm();
         if (goblin::nmenu::dirty())
         {
             goblin::nmenu::clear_dirty();
@@ -6240,7 +5953,6 @@ namespace
         paint_help_line();
         poll_rebind();
         arm_action_log_on_escape();
-        poll_escape_close(top.dlg);
         // ── the strips, EVERY frame ──────────────────────────────────────────────────
         // The SDK says why they cannot be written once: DisplayList::MoveDisplayObject
         // (GFx_DisplayList.cpp:363) re-applies the tag's MATRIX whenever the timeline places an
@@ -6376,8 +6088,10 @@ namespace
             {
                 const uintptr_t a = *reinterpret_cast<uintptr_t *>(
                     reinterpret_cast<uintptr_t>(menuman) + 0x80);
-                if (a && a != g_our_dialog.load(std::memory_order_relaxed) &&
-                    a != g_form_host.load(std::memory_order_relaxed))
+                // (Two further terms excluded nothing and are gone: g_form_host, which open_screen
+                //  never wrote - the map-hosted path stores its job in the window's sequence slot -
+                //  and g_our_dialog, which only the retired F11 prototype ever set.)
+                if (a)
                     g_active_menu.store(a, std::memory_order_release);
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
@@ -6391,9 +6105,9 @@ namespace
             {
                 const uintptr_t a = *reinterpret_cast<uintptr_t *>(
                     reinterpret_cast<uintptr_t>(menuman) + 0x80);
-                // Only cache a base that is NOT our own settings dialog (avoid caching a
-                // menu we opened). Skip while our dialog is alive.
-                if (a && a != g_our_dialog.load(std::memory_order_relaxed))
+                // (This used to skip caching while our own F11 settings dialog was alive. That
+                //  dialog was never constructed - see the F11 note at the top of the file.)
+                if (a)
                     g_base_menu.store(a, std::memory_order_release);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -6452,498 +6166,52 @@ namespace
     }
 
     // ── NATIVE SETTINGS-MENU tab injection, Proto 0 (read-only observe) ──
-    // The options menu (CS::OptionSettingTopDialog) builds its tabs as a DATA list
-    // CS::MenuViewItemList<CS::MenuOptionCategory> (cap 10) - the same list machinery
-    // as the memo dialog we already populate. This detour on its ctor FUN_140966120
-    // (0x966120) runs AFTER the game builds its ~7 tabs and (dev-only) logs the live
-    // tab list: count @dialog+0x1760, entries @dialog+0x1208 stride 0x88, each a
-    // MenuOptionCategory {vtable, label, id@+0x40}. Read-only: confirms the hook fires
-    // on options-open + the offsets are right before we append our own tab.
-    using OptTopCtorFn = void *(void *dialog, void *scene, uint8_t a, void *b);
-    OptTopCtorFn *o_opttop_ctor = nullptr;
-    using OptTopDtorFn = void(void *dialog); // FUN_140966980 - clears our anti-restack tracker
-    OptTopDtorFn *o_opttop_dtor = nullptr;
-    // The game's own category build/destruct primitives + the tab-append (HOOKED).
-    using BuildCatFn = void *(void *out, void *a, void *b, void *c); // FUN_140807d60 (category, label FMG 110000)
-    using DtorCatFn = void(void *category);                          // FUN_1408691a0 (destruct our temp)
-    using AppendTabFn = void(void *listBase, void *category, void *c, void *d); // FUN_140967b50 (copy into vector, cap 10)
-    BuildCatFn *p_build_cat = nullptr;
-    DtorCatFn *p_dtor_cat = nullptr;
-    AppendTabFn *o_append_tab = nullptr; // trampoline to the original append
-    // We inject our tab DURING the options ctor (as one extra append), so the ctor's
-    // OWN view-couple renders it - no need to re-resolve the templated couple fn (it
-    // has ~31 identical instantiations, unresolvable by AOB). Single UI thread.
-    std::atomic<uintptr_t> g_opt_ctor_dialog{0};
-    // Our tab's category id. Game categories use 0..9 (= the page-open dispatch
-    // FUN_14093c590 switch keys); an out-of-range id falls to the switch default
-    // (no page) until our own page hook serves it.
-    constexpr int32_t kOurCategoryId = 64;
-    bool g_opt_tab_added = false; // one inject per ctor
-    bool g_opt_reentrant = false; // guard our own re-entrant append
-    bool g_opt_suppress = false;  // this ctor is OUR F11 open -> game tabs suppressed
+    // ── OUR TAB AND OUR PAGE IN THE GAME'S OWN SETTINGS MENU: REMOVED 2026-07-31 ──
+    // Roughly 220 lines lived here and none of it could run. The chain, in order:
+    //   opttop_ctor_detour   consumed g_our_f11_open to decide "this ctor is OUR open"
+    //   append_tab_detour    on that flag, skipped every game tab and called...
+    //   inject_our_tab       which built a MenuOptionCategory, relabelled it from our injected
+    //                        GR_MenuText id and appended it with category id 64
+    //   show_page_detour     matched that id 64 and borrowed page 3, arming...
+    //   populate_page_detour which swapped the game's populate for...
+    //   build_our_rows       which appended native ON/OFF combo rows bound to our config bools
+    //   opttop_dtor_detour   cleared g_our_dialog so the toggle could open again
+    // g_our_f11_open was never set to anything but 0 and no F11 poll existed, so the first link
+    // was never made and nothing downstream of it ever ran. Five hooks and two AOB scans were
+    // nevertheless armed at every launch for it, and two of its log literals ("our tab added",
+    // "[optmenu] our page populated") sat in the shipped DLL - readable text with no code path,
+    // which is exactly what the AV heuristics weigh.
+    //
+    // The RE it rests on is NOT lost and is worth keeping: the options dialog builds its tabs as
+    // CS::MenuViewItemList<CS::MenuOptionCategory> (cap 10) at dialog+0x1208, count at +0x1760,
+    // stride 0x88 with the category id at +0x40; the page-open dispatch FUN_14093c590 switches on
+    // that id and its page cache is a fixed 10-slot array at pageCtl+0x68 indexed UNCHECKED; the
+    // row primitives are MenuTextCtor 0x760970, help 0x760790, ComboItemList 0x9543B0, append-combo
+    // 0x948FA0 and pack dtor 0x742C90. That is written up with the rest of the native-menu work in
+    // docs/research_native_menu_screens.md.
+    //
+    // What ships instead is open_screen() below: one native screen per page, hosted on the
+    // key-binding movie. It needs none of this.
 
-    // Add our category to the tab list (once), via the trampoline (no recursion).
-    void inject_our_tab(void *listBase)
-    {
-        if (g_opt_tab_added || g_opt_reentrant || !p_build_cat || !p_dtor_cat)
-            return;
-        g_opt_reentrant = true;
-        __try
-        {
-            alignas(16) uint8_t catBuf[0x100];
-            memset(catBuf, 0, sizeof(catBuf));
-            p_build_cat(catBuf, nullptr, nullptr, nullptr); // full valid category (label "System", id 0)
-            // Relabel: the category label is an INLINE 0x38-byte DLString at cat+0x8
-            // (FUN_140807d60 builds it via MenuTextCtor FUN_140760970(out, fmgId), bank
-            // GR_MenuText). Re-run that ctor in place with OUR injected GR_MenuText id
-            // (goblin_messages expands the FMG at startup). Constructing over the copied
-            // "System" string is safe (the ctor initializes, doesn't read old bytes); its
-            // SSO content just gets replaced. Skipped if the FMG merge didn't run.
-            if (goblin::g_menutext_tab_id > 0)
-            {
-                const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-                using MenuTextCtorFn = void *(void *out, uint32_t fmgId);
-                auto p_menu_text = reinterpret_cast<MenuTextCtorFn *>(base + 0x760970);
-                p_menu_text(catBuf + 0x8, static_cast<uint32_t>(goblin::g_menutext_tab_id));
-            }
-            // Unique category id (cat+0x40). The page-open dispatch FUN_14093c590
-            // switches on this id (game pages 0..9; unknown id hits the default case
-            // = NO page opens, harmless). Our own page hook keys on this id later.
-            *reinterpret_cast<int32_t *>(catBuf + 0x40) = kOurCategoryId;
-            o_append_tab(listBase, catBuf, nullptr, nullptr);
-            p_dtor_cat(catBuf);
-            g_opt_tab_added = true;
-            spdlog::info("[optmenu] our tab added (suppress={} labelId={})",
-                         g_opt_suppress, goblin::g_menutext_tab_id);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            spdlog::warn("[optmenu] SEH on tab inject");
-        }
-        g_opt_reentrant = false;
-    }
+    // A diagnostic for the map sub-dialog job runner (FUN_1407ad1c0) lived here: it dumped a live
+    // job's scene/movie/factory/dialog fields so a Path-B settings job could be reproduced on the
+    // map's own runner. It was fully written and NEVER HOOKED - setup() installed nothing for it,
+    // so o_jobstep stayed null and the detour that dereferenced it was unreachable. That is not the
+    // usual AOB-miss degradation; there was no scan at all.
 
-    // Hook of the tab-append FUN_140967b50. In OUR F11 open (g_opt_suppress) we SKIP
-    // every game tab and add only ours. In a normal game-settings open we pass through
-    // untouched (game tabs stay, we do not inject). Only fires for the options tab list.
-    void append_tab_detour(void *listBase, void *category, void *c, void *d)
-    {
-        const uintptr_t dlg = g_opt_ctor_dialog.load(std::memory_order_relaxed);
-        const bool ours_list = dlg && !g_opt_reentrant && p_build_cat &&
-                               reinterpret_cast<uintptr_t>(listBase) == dlg + 0x1208;
-        if (g_opt_suppress && ours_list)
-        {
-            inject_our_tab(listBase); // add ours once; SKIP the game tab (no o_append_tab)
-            return;
-        }
-        o_append_tab(listBase, category, c, d); // normal path (game settings untouched)
-    }
+    // opttop_ctor_detour stood here. Besides consuming g_our_f11_open (see the note above) it
+    // logged the dialog's tab count under debug_logging; with the flag permanently 0 that log was
+    // the only thing it did, on a hook installed for every settings-menu open in the game.
 
-    void opttop_dtor_detour(void *dialog)
-    {
-        if (reinterpret_cast<uintptr_t>(dialog) == g_our_dialog.load(std::memory_order_acquire))
-            g_our_dialog.store(0, std::memory_order_release); // our menu closed -> F11 can open again
-        o_opttop_dtor(dialog);
-    }
+    // The Task #5 "memo dialog" prototype lived here until 2026-07-30. It was never connected:
+    // o_memo_show and o_memo_ctor were declared and never assigned, so no detour existed; the
+    // scan helpers had no callers, and by the end the block was ~50 lines of comments describing
+    // functions that had already been deleted. Its startup cost was real, though - setup() kept
+    // resolving three AOB patterns (memo view-couple, game allocator, allocator global) whose
+    // only use was printing them in one log line. What was learned about WorldMapMemoSelectDialog
+    // is in docs/research_retired_native_ui_experiments.md; the working native path is the
+    // key-binding screen (open_screen), not this one.
 
-    // ── OUR PAGE in the native settings menu (rows = native checkboxes on config bools) ──
-    // Page-open chain (RE 2026-07-23, pagedispatch_re.txt / rowappend_re.txt): tab decide
-    // -> FUN_140967370 -> FUN_14093b760(pageCtl, catId) "show page for category id". The
-    // page cache is a FIXED 10-slot array @pageCtl+0x68 indexed by catId UNCHECKED - our
-    // id 64 would index out of bounds, so the detour must intercept BEFORE the read.
-    // For kOurCategoryId we show the BORROWED page id 3 (page-open switch FUN_14093c590
-    // case 3 -> FUN_14093b810: generic list page, clip #5, populate FUN_140957ef0) with
-    // the populate-swap armed: the game builds a 100% native page (factory + view-couple
-    // + render) whose ROWS are ours. In our F11 menu the game tabs are suppressed, so
-    // cache slot 3 is otherwise unused; in the game's own settings menu our tab doesn't
-    // exist and both detours pass through untouched.
-    using ShowPageFn = void(void *pageCtl, int catId);
-    ShowPageFn *o_show_page = nullptr;
-    using PopulatePageFn = void(void *page, void *ctx);
-    PopulatePageFn *o_populate_page = nullptr;
-    std::atomic<int> g_our_page_mode{0}; // 1 = populate-swap armed (our tab decided)
-    constexpr int kBorrowedPageCat = 3;
-
-    // Append our rows to a freshly-built page. Row primitives (base+RVA, dev):
-    //   0x760970 MenuTextCtor(out, fmgId)        - DLString from GR_MenuText (label)
-    //   0x760790 (out, fmgId)                    - DLString from the help bank
-    //   0x9543B0 (out)                           - build a temp ComboItemList<bool,2>
-    //            (the native ON/OFF item pair; ~0xA8 bytes: vft@0, items@+8 stride
-    //            0x48, count u64 @+0xA0)
-    //   0x948FA0 (page, labelPack, valuePtr, comboItems, defaultPtr, u8 flag=1) -
-    //            build + append one ON/OFF combo row (native checkbox) bound
-    //            DIRECTLY to the byte at valuePtr (list cap 16); reference populate
-    //            is the System page FUN_140958c50.
-    //   0x742C90 label-pack dtor (the game destructs its pack after each append).
-    void build_our_rows(void *page)
-    {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        using TextCtorFn = void *(void *out, uint32_t fmgId);
-        using ComboItemsCtorFn = void *(void *out);
-        using AppendComboFn = void *(void *page, void *labelPack, void *valuePtr,
-                                     void *comboItems, void *defaultPtr, uint8_t flag);
-        using PackDtorFn = void(void *pack);
-        auto p_label = reinterpret_cast<TextCtorFn *>(base + 0x760970);
-        auto p_help = reinterpret_cast<TextCtorFn *>(base + 0x760790);
-        auto p_combo_items = reinterpret_cast<ComboItemsCtorFn *>(base + 0x9543B0);
-        auto p_append_combo = reinterpret_cast<AppendComboFn *>(base + 0x948FA0);
-        auto p_pack_dtor = reinterpret_cast<PackDtorFn *>(base + 0x742C90);
-        size_t n = 0;
-        const goblin::NativeMenuRowDef *rows = goblin::native_menu_rows(&n);
-        int added = 0;
-        for (size_t i = 0; i < n; ++i)
-        {
-            const int label_id = (i < goblin::g_menutext_row_ids.size())
-                                     ? goblin::g_menutext_row_ids[i]
-                                     : 0;
-            if (label_id <= 0)
-                continue;
-            // Label pack = {DLString label @0, DLString help @+0x38} (0x70 bytes),
-            // the shape the game's row builders (e.g. FUN_140956830) produce. Help
-            // id = a valid game one for now (0x22308, the reference populate's);
-            // our own help strings need a help-bank injection later.
-            alignas(16) uint8_t pack[0x70];
-            memset(pack, 0, sizeof(pack));
-            p_label(pack, static_cast<uint32_t>(label_id));
-            p_help(pack + 0x38, 0x22308);
-            // Native ON/OFF combo pair (temp, destructed after the append copies it).
-            alignas(16) uint8_t comboBuf[0x100];
-            memset(comboBuf, 0, sizeof(comboBuf));
-            p_combo_items(comboBuf);
-            // Per-row schema default; static storage - the row may keep the pointer.
-            static uint8_t s_row_defaults[64];
-            if (i < 64)
-                s_row_defaults[i] = rows[i].def ? 1 : 0;
-            p_append_combo(page, pack, rows[i].value, comboBuf,
-                           &s_row_defaults[i < 64 ? i : 0], 1);
-            // Destruct the temp ComboItemList exactly like the game populate does:
-            // per item (stride 0x48, count @+0xA0) call vt[0](item, 0).
-            const uint64_t cnt = *reinterpret_cast<uint64_t *>(comboBuf + 0xA0);
-            for (uint64_t k = 0; k < cnt && k < 2; ++k)
-            {
-                uint8_t *item = comboBuf + 8 + k * 0x48;
-                auto vt = *reinterpret_cast<void ***>(item);
-                if (vt && vt[0])
-                    reinterpret_cast<void (*)(void *, int)>(vt[0])(item, 0);
-            }
-            p_pack_dtor(pack);
-            ++added;
-        }
-        // SCROLL TEST (2026-07-28, F6 host only): the graphics screen shows 13 rows with no scrollbar,
-        // and we do not know whether one appears by itself once the rows outgrow the page. Pad with
-        // recycled labels up to g_pad_rows_to and look. The engine's list may have a fixed capacity, in
-        // which case this overflows it - the user asked for the answer either way. Only the F6 path sets
-        // the target; F8 is untouched.
-        const int pad_to = g_pad_rows_to.load(std::memory_order_relaxed);
-        if (pad_to > added && !goblin::g_menutext_row_ids.empty())
-        {
-            static bool s_filler_value = false;
-            static uint8_t s_filler_default = 0;
-            const int real_rows = added;
-            while (added < pad_to)
-            {
-                const int label_id = goblin::g_menutext_row_ids[added % goblin::g_menutext_row_ids.size()];
-                if (label_id <= 0)
-                    break;
-                alignas(16) uint8_t pack[0x70];
-                memset(pack, 0, sizeof(pack));
-                p_label(pack, static_cast<uint32_t>(label_id));
-                p_help(pack + 0x38, 0x22308);
-                alignas(16) uint8_t comboBuf[0x100];
-                memset(comboBuf, 0, sizeof(comboBuf));
-                p_combo_items(comboBuf);
-                p_append_combo(page, pack, &s_filler_value, comboBuf, &s_filler_default, 1);
-                const uint64_t cnt = *reinterpret_cast<uint64_t *>(comboBuf + 0xA0);
-                for (uint64_t k = 0; k < cnt && k < 2; ++k)
-                {
-                    uint8_t *item = comboBuf + 8 + k * 0x48;
-                    auto vt = *reinterpret_cast<void ***>(item);
-                    if (vt && vt[0])
-                        reinterpret_cast<void (*)(void *, int)>(vt[0])(item, 0);
-                }
-                p_pack_dtor(pack);
-                ++added;
-            }
-            spdlog::info("[optmenu] scroll test: padded {} real rows to {} on the graphics host",
-                         real_rows, added);
-        }
-        spdlog::info("[optmenu] our page populated: {} native rows (of {})", added, n);
-    }
-
-    void show_page_detour(void *pageCtl, int catId)
-    {
-        if (catId != kOurCategoryId)
-        {
-            o_show_page(pageCtl, catId);
-            return;
-        }
-        g_our_page_mode.store(1, std::memory_order_release);
-        __try
-        {
-            o_show_page(pageCtl, kBorrowedPageCat); // populate fires inside on first build
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            spdlog::warn("[optmenu] SEH showing our page");
-        }
-        g_our_page_mode.store(0, std::memory_order_release);
-    }
-
-    void populate_page_detour(void *page, void *ctx)
-    {
-        if (!g_our_page_mode.load(std::memory_order_acquire))
-        {
-            o_populate_page(page, ctx);
-            return;
-        }
-        __try
-        {
-            build_our_rows(page);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            spdlog::warn("[optmenu] SEH populating our page");
-        }
-    }
-
-    // ── MAP SUB-DIALOG JOB step (FUN_1407ad1c0, RVA 0x7ad1c0) - the map's own "create +
-    // register a sub-dialog over the map" mechanism (v19). On first step (job+0x130 == 0) it
-    // optionally builds a movie (Path B, desc @job+0x58), invokes the factory (+0xa8 Path B /
-    // +0xe8 Path A), stores the dialog @job+0x130, and attaches it for render/tick via
-    // FUN_140733ef0(*(job+0x50), dialog). This diagnostic dumps a live job's config so we can
-    // reproduce a Path-B (own-movie) settings job on the map's runner = REAL settings over the
-    // map. Read-only; logs the first few DISTINCT jobs seen, dev-gated.
-    using JobStepFn = void *(void *job, void *p2, void *p3, void *p4);
-    JobStepFn *o_jobstep = nullptr;
-    std::array<std::atomic<uintptr_t>, 8> g_jobs_seen{};
-    void jobstep_dump(uintptr_t job)
-    {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        __try
-        {
-            auto q = [&](uint32_t off) { return *reinterpret_cast<uint64_t *>(job + off); };
-            spdlog::info("[jobstep] job=0x{:X} +0x10(scene)=0x{:X} +0x50(rendctl)=0x{:X} "
-                         "+0x58..64(moviedesc)=0x{:X}/0x{:X} +0x68(movie)=0x{:X} "
-                         "+0xa8(factB)=0x{:X} +0xe8(factA)=0x{:X} +0x130(dlg)=0x{:X}",
-                         job, q(0x10), q(0x50), q(0x58), q(0x60), q(0x68),
-                         q(0xa8), q(0xe8), q(0x130));
-            const uint64_t dlg = q(0x130);
-            if (dlg > 0x10000)
-            {
-                const uint64_t vt = *reinterpret_cast<uint64_t *>(dlg);
-                spdlog::info("[jobstep]   dlg vt=exe+0x{:X}", vt > base ? vt - base : vt);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            spdlog::warn("[jobstep] SEH dumping job 0x{:X}", job);
-        }
-    }
-    void *jobstep_detour(void *job, void *p2, void *p3, void *p4)
-    {
-        if (goblin::config::debugLogging && job)
-        {
-            const uintptr_t j = reinterpret_cast<uintptr_t>(job);
-            bool known = false;
-            int freeSlot = -1;
-            for (int i = 0; i < (int)g_jobs_seen.size(); ++i)
-            {
-                const uintptr_t v = g_jobs_seen[i].load(std::memory_order_relaxed);
-                if (v == j) { known = true; break; }
-                if (v == 0 && freeSlot < 0) freeSlot = i;
-            }
-            if (!known && freeSlot >= 0)
-            {
-                g_jobs_seen[freeSlot].store(j, std::memory_order_relaxed);
-                jobstep_dump(j);
-            }
-        }
-        return o_jobstep(job, p2, p3, p4);
-    }
-
-    void *opttop_ctor_detour(void *dialog, void *scene, uint8_t a, void *b)
-    {
-        const uintptr_t d = reinterpret_cast<uintptr_t>(dialog);
-        g_opt_tab_added = false;
-        // Consume the F11 flag: if OUR open, suppress game tabs (show only ours);
-        // a normal game-settings open leaves this false -> game tabs untouched.
-        g_opt_suppress = g_our_f11_open.exchange(0, std::memory_order_acq_rel) != 0;
-        g_opt_ctor_dialog.store(d, std::memory_order_relaxed); // arm the append hook during the ctor
-        // (Task #5 scene-swap experiment REVERTED: handing the ctor the MAP scene crashed - the dialog
-        // does more than name-bind from the scene; it assumes the settings-movie/job context. Full
-        // re-host of the interactive dialog needs proper construction+registration in the map movie.)
-        void *ret = o_opttop_ctor(dialog, scene, a, b);        // appends fire here (suppressed if ours)
-        g_opt_ctor_dialog.store(0, std::memory_order_relaxed);
-        const bool was_suppress = g_opt_suppress;
-        g_opt_suppress = false;
-        // Track OUR dialog (F11 open) so the anti-restack guard + its dtor can find it.
-        if (was_suppress)
-            g_our_dialog.store(d, std::memory_order_release);
-        if (goblin::config::debugLogging && dialog)
-        {
-            __try
-            {
-                const uint64_t count = *reinterpret_cast<uint64_t *>(d + 0x1760);
-                spdlog::info("[optmenu] ctor done: dialog=0x{:X} tabCount={} ours={} suppress={}",
-                             d, count, g_opt_tab_added, was_suppress);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                spdlog::warn("[optmenu] SEH reading tab count");
-            }
-        }
-        return ret;
-    }
-
-    // ── MEMO-DIALOG control, Task #5 Proto 0 (Route B groundwork) ──
-    // The map's WorldMapMemoSelectDialog is created INSIDE the worldmap movie and
-    // renders + routes input OVER the visible map - exactly the surface our native
-    // settings list needs. Contract (V4b_settings_panel.md sec 2 + memo_ctor_re.raw):
-    // items inline @dlg+0x1248 stride 0x1A8, count u64 @+0x3370 (HARD cap 20, assert
-    // above), decide slot A = fn @item+0x88 + i32 this-offset @+0x90 + optional
-    // predicate @+0x98; the invoker (0x9D4680) calls fn(dialog + off, item, arg) and
-    // treats a NULL predicate as pass. Close request = **(u8**)(dlg+0xA68) = 1.
-    // Proto 0 proves control on the LIVE dialog the game opens (map -> place memo):
-    // post-ctor we relabel item 0 in place and point its decide at our fn; selecting
-    // it must log + close the dialog. The show-site hook captures the host object -
-    // every creator argument derives from it (Proto 1 = open the dialog ourselves).
-    // FUN_1409d0a80 is the _Func_impl invoke body of the map's sub-dialog factory
-    // std::function<MenuWindow*(SceneObjProxy const&)>: it tail-returns the created
-    // dialog (rax). Typed to RETURN the dialog so we can substitute our own.
-    using MemoShowFn = void *(void *ctx, void *scene);
-    MemoShowFn *o_memo_show = nullptr;
-    // Game heap allocator thunk FUN_141eb9ed0(rcx=size, rdx=align, r8=allocatorObj):
-    // it does allocObj->vtable[0x50](allocObj, size, align). The allocator object is a
-    // runtime-initialized singleton whose global ptr lives at DAT_143d87350; the memo
-    // creator + MenuWindow base ctor use the same one.
-    using GameAllocFn = void *(uint32_t size, uint32_t align, void *allocObj);
-    GameAllocFn *p_game_alloc = nullptr;
-    void **p_alloc_global = nullptr; // &DAT_143d87350; *p_alloc_global = the allocator obj
-    // ROUTE A EXPERIMENT: when set, an open of the map's place-marker (memo) sub-dialog
-    // is HIJACKED - instead of the memo dialog we allocate + construct the REAL
-    // OptionSettingTopDialog with the SAME map SceneObjProxy and return IT into the
-    // map's ownership pipeline, so the map ticks/renders/routes-input to our settings
-    // dialog exactly as it would the memo (native checkboxes/tabs over the live map).
-    // Dev-only (debug_logging). OptionSettingTopDialog object size = 0x18a0 (from the
-    // settings build-job factory: FUN_141eb9ed0(0x18a0,8) then ctor FUN_140966120).
-    // ON: functional settings dialog over the map (graft from ItemList) + refcount=1 close
-    // fix, diagnostics removed. Deploy INJECTOR ONLY.
-    constexpr bool HIJACK_MEMO_WITH_SETTINGS = false; // v29: settings now open via F11 + our own
-                                                      // 02_040 movie; leave the marker dialog alone
-    constexpr uint32_t OPTTOP_SIZE = 0x18a0;
-    using MemoCtorFn = void *(void *dlg, void *host, void *scene, uint8_t flag,
-                              void *p5, void *p6, void *p7, void *p8, void *p9,
-                              void *p10); // FUN_1409d21c0
-    MemoCtorFn *o_memo_ctor = nullptr;
-    // View-couple FUN_1409d1ff0 (a template with ~31 byte-identical instantiations -
-    // resolved via its UNIQUE call site inside the memo ctor, not by prologue): wires
-    // the Scaleform "ItemList" to the item data + selection. Re-run after any runtime
-    // repopulate/relabel.
-    using MemoCoupleFn = void(void *listProxy /*dlg+0xA78*/, void *itemList /*dlg+0x1240*/,
-                              uint32_t sel, uint8_t b);
-    MemoCoupleFn *p_memo_couple = nullptr;
-
-    constexpr size_t MEMO_OFF_LISTPROXY = 0xA78; // "ItemList" scene proxy
-    constexpr size_t MEMO_OFF_LIST = 0x1240;     // BasicViewItemList<_Item,20>
-    constexpr size_t MEMO_OFF_ITEMS = 0x1248;    // inline items
-    constexpr size_t MEMO_ITEM_STRIDE = 0x1A8;
-    constexpr size_t MEMO_OFF_COUNT = 0x3370;    // u64, HARD CAP 20
-    constexpr size_t MEMO_OFF_CLOSEREQ = 0xA68;  // u8** -> write 1 to close
-    constexpr size_t MEMO_IT_PAYLOAD = 0x48;     // u32 per-row payload
-    constexpr size_t MEMO_IT_FN = 0x88;          // decide fn (slot A)
-    constexpr size_t MEMO_IT_FNOFF = 0x90;       // i32 this-offset for the call
-    constexpr size_t MEMO_IT_PRED = 0x98;        // predicate fn (0 = always pass)
-
-    std::atomic<uintptr_t> g_memo_host{0};  // captured show-site host (Proto 1 seed)
-    std::atomic<uintptr_t> g_memo_scene{0}; // captured map scene at show time
-    std::atomic<uintptr_t> g_memo_ctx{0};   // captured show-site ctx (the map sub-dialog controller)
-    std::atomic<uintptr_t> g_memo_dialog{0}; // last constructed dialog (log only)
-
-    // Route A groundwork: find WHERE the map stores its current sub-dialog. When a row
-    // is selected the dialog is fully live + owned by the map, so scan the controller
-    // objects (ctx, host, *(ctx), *(host)) for a qword == the dialog ptr and log the
-    // offsets. That offset is the map's "current sub-dialog" member; the map's per-frame
-    // update reads it to tick/render/route-input to the dialog (the mechanism our
-    // OptionSettingTopDialog must join). Read-only, SEH-guarded.
-    void memo_scan_one_root(const char *tag, uintptr_t base, uintptr_t dialog)
-    {
-        if (!v3_heap_ptr(base))
-            return;
-        __try
-        {
-            for (uint32_t off = 0; off <= 0x5000; off += 8)
-                if (*reinterpret_cast<uintptr_t *>(base + off) == dialog)
-                    spdlog::info("[memoproto]   OWNER {}+0x{:X} == dialog", tag, off);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            spdlog::warn("[memoproto] SEH scanning {} for dialog", tag);
-        }
-    }
-
-    void memo_scan_owner_for_dialog(uintptr_t dialog)
-    {
-        const uintptr_t ctx = g_memo_ctx.load(std::memory_order_relaxed);
-        const uintptr_t host = g_memo_host.load(std::memory_order_relaxed);
-        memo_scan_one_root("ctx", ctx, dialog);
-        memo_scan_one_root("host", host, dialog);
-        __try
-        {
-            if (v3_heap_ptr(ctx))
-                memo_scan_one_root("*ctx", *reinterpret_cast<uintptr_t *>(ctx), dialog);
-            if (v3_heap_ptr(host))
-                memo_scan_one_root("*host", *reinterpret_cast<uintptr_t *>(host), dialog);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // In-place relabel of the item's owned label string (from the ctor's textObj;
-    // a basic_string with a stateful FD4 allocator in a _Compressed_pair, verified
-    // against the _Item ctor 0x9d3890 + the memo-ctor stack mirror: header @+0x10,
-    // allocator @+0x18, SSO buf 8 wchars @+0x20 OR heap ptr when cap > 7, size
-    // @+0x30, cap @+0x38).
-
-    // Our decide handler; the invoker calls fn(dialog + *(i32*)(item+0x90), item, arg),
-    // so with +0x90 = 0 rcx is the dialog itself. Proves callback + close control.
-
-    // Post-ctor Proto 0 mutation: log the live item table, then take over item 0
-    // (relabel + our decide, predicate cleared) and re-run the view-couple so the
-    // Scaleform list re-reads the data ([VERIFY] redraw semantics outside the ctor).
-
-
-    // SEH-safe structural dump of a scene proxy: its vtable, root (+0x20), the root's
-    // vtable, and +0x28. Tells us whether map_scene() is a live proxy shaped like the
-    // memo scene (crash is elsewhere) or stale/garbage (need a fresh map-root scene).
-
-    // Dump what "TabList"/"ItemList"/bogus resolve to under a scene (8 qwords each). The
-    // field that DIFFERS between a real name and the bogus name is the resolved handle;
-    // the scene under which "TabList" differs from bogus is where our clips bind.
-
-    // A name resolves under `scene` iff the handle field (resolver out+0x30 = dump d[2])
-    // is a real value, not the 0xFFFFFFFFFFFFFFFF "not found" sentinel (learned from the
-    // scene diagnostic: ItemList -> real ptr, TabList/bogus -> FFFF..FF under the memo scene).
-
-    // Scan an object for EMBEDDED SceneObjProxy members (a qword slot whose value equals
-    // the SceneObjProxy vftable) and, for each, test whether our map-ROOT clips resolve
-    // under it. The map's own WorldMapDialog stores a chrome proxy rooted at the map
-    // movie root (where StatusBar/MenuTitle AND our spliced TabList live) - that is the
-    // scene our OptionSettingTopDialog must bind against. `sceneProxyVt` is captured live
-    // (= *(memoScene)). Logs any proxy under which StatusBar or TabList resolves.
-
-    // F11-direct deferred builder (fwd-declared above; body here where the opttop/alloc decls
-    // are in scope). Once our 02_040 movie async-loads (scene root != 0), construct the dialog
-    // against its scene. The movie renders itself over the map; the dialog binds real 02_040
-    // clips at ctor -> real settings skin over the live map.
-
-    // Construct the REAL OptionSettingTopDialog against the map's SceneObjProxy and
-    // return it into the map's sub-dialog ownership pipeline. Returns null on any
-    // failure so the caller can fall back to the memo dialog. SEH-guarded.
-
-    // RENDER DIAGNOSTIC: dump a dialog's identifying fields so we can DIFF our
-    // OptionSettingTopDialog against the REAL memo dialog and find the state that gates
-    // rendering over the map. Logs the vtable (exe-relative) + the DLReferenceCountObject
-    // refcount + every non-zero qword in [0x00..0x120] (the header + base MenuWindow region,
-    // where menu-id / owner / scene / visibility live). Read-only, SEH-guarded.
 
 
     void v3_native_factory_consume(void *live_ctx, uint32_t frame)
@@ -7113,8 +6381,6 @@ namespace
             if (ok)
             {
                 V3NativeObject obj{};
-                obj.row_id = s.point.original_row_id;
-                obj.source_icon_id = s.point.source_icon_id;
                 obj.child = s.child;
                 obj.map_x = s.map_x;
                 obj.map_z = s.map_z;
@@ -7169,7 +6435,7 @@ namespace
     // reconciles across a few frames instead of one spike. Detaching happens while the
     // movie is alive and rendering, so the freed render nodes recycle on normal frames
     // (async) - unlike the close-time lever C, whose nodes never get a reconcile pass.
-    size_t g_v3_vp_cursor = 0; // (unused; reserved for round-robin if needed)
+    // A g_v3_vp_cursor "reserved for round-robin if needed" was declared here and never touched.
     void v3_viewport_reconcile()
     {
         if (!goblin::variants::kViewportWindow || !g_v3_remove_at)
@@ -7278,229 +6544,17 @@ namespace
             }
         }
     }
+    // v3_try_matrix_batch had no callers anywhere in src/ - its only entry condition was set by the retired
+    // custom-capture path above. Removed 2026-07-30.
 
-    void v3_try_matrix_batch()
-    {
-        if (g_v3_matrix_state.load(std::memory_order_acquire) != 0)
-            return;
-        const uint64_t started = g_v3_matrix_started_ms.load(std::memory_order_acquire);
-        if (!started || GetTickCount64() - started < 3500)
-            return;
-        for (uint32_t i = 0; i < V3_MATRIX_SLOTS; ++i)
-            if (!v3_heap_ptr(g_v3_matrix_children[i].load(std::memory_order_acquire)))
-                return;
+    // v3_try_visual_move had no callers anywhere in src/ - its only entry condition was set by the retired
+    // custom-capture path above. Removed 2026-07-30.
 
-        V3Candidate control{};
-        control.count = g_v3_target_count.load(std::memory_order_acquire);
-        control.wrapper = g_v3_target_wrapper.load(std::memory_order_relaxed);
-        control.parent = g_v3_target_parent.load(std::memory_order_relaxed);
-        uint64_t wrapper_parent = 0, live_count = 0;
-        if (!v3_heap_ptr(control.wrapper) || !v3_heap_ptr(control.parent) ||
-            !v3_read64(control.wrapper + 0x18, wrapper_parent) ||
-            wrapper_parent != control.parent || !v3_read64(control.parent + 0xe0, live_count))
-            return;
-        control.count = live_count;
 
-        // The generated surface dataset contains 6405 of our rows; the live
-        // 6468-object container is therefore the leading candidate for the real
-        // native marker layer (our rows plus currently eligible game/ERR points).
-        // Put the whole visual grid there while the build-scope correlation below
-        // independently verifies which parent native buildMarkers populates.
-        V3Candidate selected[V3_MATRIX_SLOTS]{};
-        for (uint32_t slot = 0; slot < V3_MATRIX_SLOTS; ++slot)
-            selected[slot] = control;
-
-        static constexpr const char *CELL[V3_MATRIX_SLOTS] =
-            {"TL", "TC", "TR", "ML", "MC", "MR", "BL", "BR"};
-        static constexpr float DX[V3_MATRIX_SLOTS] =
-            {80, 240, 400, 80, 240, 400, 80, 400};
-        static constexpr float DY[V3_MATRIX_SLOTS] =
-            {-1000, -1000, -1000, -840, -840, -840, -680, -680};
-
-        goblin::mapproject::MapView view{};
-        if (!goblin::mapproject::read_view(view))
-            return;
-
-        uint32_t expected = 0;
-        if (!g_v3_matrix_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
-            return;
-
-        uint32_t control_levels = 0;
-        const uintptr_t control_root = v3_parent_root(control.parent, control_levels);
-        spdlog::info("[v3matrix] WorldMapItem attach: parent=0x{:X} "
-                     "count={} root=0x{:X}/{} fullMid=({:.1f},{:.1f})",
-                     control.parent, control.count, control_root, control_levels,
-                     view.fullMidX, view.fullMidZ);
-
-        for (uint32_t slot = 0; slot < V3_MATRIX_SLOTS; ++slot)
-        {
-            const V3Candidate c = selected[slot];
-            const uintptr_t child = g_v3_matrix_children[slot].load(std::memory_order_acquire);
-            if (!v3_heap_ptr(c.wrapper) || !v3_heap_ptr(c.parent))
-            {
-                spdlog::info("[v3matrix] cell={} slot={} WorldMapItem candidate=NONE",
-                             CELL[slot], slot);
-                continue;
-            }
-            uint64_t before_count = 0, after_count = 0, child_parent_before = 0;
-            uint64_t child_parent_after = 0;
-            v3_read64(c.parent + 0xe0, before_count);
-            v3_read64(child + 0x38, child_parent_before);
-            uint32_t child_levels = 0, candidate_levels = 0;
-            const uintptr_t child_root = v3_parent_root(child, child_levels);
-            const uintptr_t candidate_root = v3_parent_root(c.parent, candidate_levels);
-            const int src_icon = slot < static_cast<uint32_t>(goblin::generated::MAP_ICON_TAG_COUNT)
-                                     ? goblin::generated::MAP_ICON_TAGS[slot].srcIconId : -1;
-            if (candidate_root != control_root || child_root != control_root)
-            {
-                spdlog::warn("[v3matrix] cell={} slot={} SKIPPED root mismatch: candidate=0x{:X} "
-                             "child=0x{:X} control=0x{:X}",
-                             CELL[slot], slot, candidate_root, child_root, control_root);
-                continue;
-            }
-
-            uint32_t refs_before_hold = 0, refs_held = 0;
-            if (!v3_hold_ref(child, refs_before_hold, refs_held))
-            {
-                spdlog::warn("[v3matrix] cell={} slot={} SKIPPED: AddRef failed", CELL[slot], slot);
-                continue;
-            }
-
-            const uintptr_t game_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-            const uintptr_t caller_rva = c.caller >= game_base ? c.caller - game_base : c.caller;
-            spdlog::info("[v3matrix] PRE cell={} slot={} srcIconId={} child=0x{:X} oldParent=0x{:X} "
-                         "target=0x{:X} count={} caller=exe+0x{:X} root=0x{:X}/{} refs {}->{}",
-                         CELL[slot], slot, src_icon, child, child_parent_before, c.parent,
-                         before_count, caller_rva, candidate_root, candidate_levels,
-                         refs_before_hold, refs_held);
-            spdlog::default_logger()->flush();
-
-            const uint32_t attach_exception = v3_guarded_attach(c.wrapper, child);
-            const bool attach_returned = attach_exception == 0;
-            if (attach_exception)
-                spdlog::error("[v3matrix] cell={} slot={} attach raised SEH 0x{:08X}",
-                              CELL[slot], slot, attach_exception);
-
-            v3_read64(c.parent + 0xe0, after_count);
-            v3_read64(child + 0x38, child_parent_after);
-            const float map_x = view.fullMidX + DX[slot];
-            const float map_y = view.fullMidZ + DY[slot];
-            const bool attached = attach_returned && child_parent_after == c.parent;
-            const bool positioned = attached &&
-                v3_position_child(child, map_x, map_y,
-                                  g_v3_matrix_base_tx[slot], g_v3_matrix_base_ty[slot]);
-            uint32_t refs_before_drop = 0, refs_after_drop = 0;
-            const bool dropped = v3_drop_held_ref(child, refs_before_drop, refs_after_drop);
-            spdlog::info("[v3matrix] POST cell={} slot={} count {}->{} parent=0x{:X} attached={} "
-                         "positioned={} map=({:.1f},{:.1f}) refs {}->{} dropped={}",
-                         CELL[slot], slot, before_count, after_count, child_parent_after,
-                         attached, positioned, map_x, map_y,
-                         refs_before_drop, refs_after_drop, dropped);
-            if (!attach_returned)
-                break;
-        }
-    }
-
-    void v3_try_visual_move()
-    {
-        const uintptr_t wrapper = g_v3_target_wrapper.load(std::memory_order_acquire);
-        const uintptr_t target_parent = g_v3_target_parent.load(std::memory_order_acquire);
-        const uintptr_t child = g_v3_custom_child.load(std::memory_order_acquire);
-        if (!v3_heap_ptr(wrapper) || !v3_heap_ptr(target_parent) || !v3_heap_ptr(child))
-            return;
-
-        uint64_t wrapper_parent = 0, target_count = 0, old_parent = 0, old_count = 0;
-        if (!v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != target_parent ||
-            !v3_read64(target_parent + 0xe0, target_count) || target_count != 104 ||
-            !v3_read64(child + 0x38, old_parent) || !v3_heap_ptr(old_parent) ||
-            old_parent == target_parent)
-            return;
-        v3_read64(static_cast<uintptr_t>(old_parent) + 0xe0, old_count);
-
-        goblin::mapproject::MapView view{};
-        if (!goblin::mapproject::read_view(view))
-            return;
-
-        uint32_t expected = 0;
-        if (!g_v3_visual_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
-            return;
-
-        V3VisualSnapshot s{};
-        s.wrapper = wrapper;
-        s.target_parent = target_parent;
-        s.old_parent = static_cast<uintptr_t>(old_parent);
-        s.child = child;
-        s.target_before = target_count;
-        s.old_before = old_count;
-
-        // Use the engine's normal move/attach operation. Index 0 matches the
-        // native map layer's observed insertion convention.
-        o_v3_attach(reinterpret_cast<void *>(wrapper), reinterpret_cast<void *>(child), 0);
-
-        v3_read64(target_parent + 0xe0, s.target_after);
-        v3_read64(s.old_parent + 0xe0, s.old_after);
-        v3_read64(child + 0x38, s.child_parent_after);
-
-        // DisplayObject vtbl +0x10/+0x18 are GetMatrix/SetMatrix. Preserve the
-        // sprite's scale/rotation and place its local translation at the live
-        // map-space view centre, which projects to the middle of the viewport.
-        using GetMatrixFn = const float *(void *);
-        using SetMatrixFn = void(void *, const float *);
-        uint64_t vt = 0, get_addr = 0, set_addr = 0;
-        if (v3_read64(child, vt) && v3_read64(static_cast<uintptr_t>(vt) + 0x10, get_addr) &&
-            v3_read64(static_cast<uintptr_t>(vt) + 0x18, set_addr) &&
-            v3_heap_ptr(get_addr) && v3_heap_ptr(set_addr))
-        {
-            float matrix[8]{};
-            __try
-            {
-                auto *get_matrix = reinterpret_cast<GetMatrixFn *>(get_addr);
-                auto *set_matrix = reinterpret_cast<SetMatrixFn *>(set_addr);
-                const float *current = get_matrix(reinterpret_cast<void *>(child));
-                memcpy(matrix, current, sizeof(matrix));
-                s.old_tx = matrix[3];
-                s.old_ty = matrix[7];
-                s.reference_zoom = view.zoom;
-                s.base_m0 = matrix[0];
-                s.base_m1 = matrix[1];
-                s.base_m4 = matrix[4];
-                s.base_m5 = matrix[5];
-                // GFx stores translation in twips (1/20 pixel), while MapView
-                // pan/snap coordinates and our projection math use pixels.
-                constexpr float kTwipsPerPixel = 20.0f;
-                // Fixed world-map centre, independent of the current viewport/pan/zoom.
-                // The previous experiment used (pan+visibleMid)/zoom, which is the
-                // point under the screen cursor and therefore moved between opens.
-                s.map_mid_x = view.fullMidX;
-                s.map_mid_y = view.fullMidZ;
-                const float target_tx = view.fullMidX * kTwipsPerPixel;
-                const float target_ty = view.fullMidZ * kTwipsPerPixel;
-
-                // The generated matrix already contains both the intended native
-                // icon scale and the centring pivot. The real marker parent supplies
-                // the zoom compensation, so preserve the authored 2x2 basis and add
-                // only the fixed map-space anchor to its existing translation.
-                matrix[3] = target_tx + s.old_tx;
-                matrix[7] = target_ty + s.old_ty;
-                set_matrix(reinterpret_cast<void *>(child), matrix);
-                s.new_tx = matrix[3];
-                s.new_ty = matrix[7];
-                s.positioned = true;
-
-                // Deliberately do not arm the old background-layer counter-scale.
-                // This candidate parent must prove that it supplies native marker
-                // zoom/z-order on its own.
-                g_v3_scale_ready.store(false, std::memory_order_release);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                s.positioned = false;
-            }
-        }
-        g_v3_visual = s;
-        g_v3_visual_published.store(true, std::memory_order_release);
-    }
-
+#if MFG_STALL_PROFILER
+    // The recorder behind the insert-core probe. Its only caller is v3_add_detour just below, which
+    // is profiler-only, and the counters it feeds are declared under the same guard at the top of
+    // the file - so it belongs inside it too.
     void v3_note_add(void *vector_ptr, void *parent_ptr, void *index_arg,
                      void *child_ptr, uintptr_t ret, uint64_t before_count)
     {
@@ -7542,6 +6596,8 @@ namespace
         g_v3_add_lock.clear(std::memory_order_release);
     }
 
+    // Profiler-only: every branch of this body is gated on the capture flag, and it sits on the
+    // engine's hottest path (every display-list add). Not built unless the profiler is.
     void v3_add_detour(void *vector, void *parent, void *index_arg, void *child)
     {
         // The map's native children are inserted before the first per-marker refresh call starts a
@@ -7557,6 +6613,7 @@ namespace
         if (capture)
             v3_note_add(vector, parent, index_arg, child, ret, before_count);
     }
+#endif // MFG_STALL_PROFILER
 
     void v3_place_detour(void *vector_ptr, void *parent_ptr, void *placement_ptr,
                          void *child_ptr, uint64_t replace)
@@ -7586,14 +6643,11 @@ namespace
         uint32_t char_id = 0;
         uint32_t depth = 0;
         const uintptr_t placement = reinterpret_cast<uintptr_t>(placement_ptr);
-        // The eight-cell discovery grid is retired. Keep this historical hook
-        // pass-through while the surrounding RE diagnostics are still present,
-        // but never capture/stage production native-marker factory objects.
-        const bool custom = false;
-        uint64_t before_count = 0;
-        if (custom)
-            v3_read64(reinterpret_cast<uintptr_t>(vector_ptr) + 8, before_count);
-        const uintptr_t ret = custom ? reinterpret_cast<uintptr_t>(_ReturnAddress()) : 0;
+        // A `const bool custom = false;` switch stood here with a `before_count` and a `ret` it
+        // gated, feeding the eight-cell discovery grid's capture tail. The grid is retired and the
+        // tail was removed on 2026-07-30; the switch and its two locals outlived it, which is the
+        // same compile-time-false-constant-inside-a-.cpp shape the audit was removing elsewhere.
+        // Everything below this point is the PRODUCTION factory match, and it is unconditional.
 
         // PlaceObject::Execute only queues a 0x78 timeline record. The real
         // DisplayObject arrives here later through Sprite::AddDisplayObject,
@@ -7663,43 +6717,11 @@ namespace
             }
             return;
         }
-        if (!custom || g_v3_custom_lock.test_and_set(std::memory_order_acquire))
-            return;
-
-        V3CustomSnapshot s{};
-        s.vector = reinterpret_cast<uintptr_t>(vector_ptr);
-        s.parent = reinterpret_cast<uintptr_t>(parent_ptr);
-        s.placement = placement;
-        s.child = reinterpret_cast<uintptr_t>(child_ptr);
-        s.ret = ret;
-        s.before_count = before_count;
-        s.char_id = char_id;
-        s.depth = depth;
-        v3_read64(s.vector + 8, s.after_count);
-        v3_read32(s.placement + 0x62, s.placement_flags);
-        v3_read64(s.child, s.child_vt);
-        v3_read64(s.child + 0x28, s.child_28);
-        v3_read64(s.child + 0x30, s.child_30);
-        v3_read64(s.child + 0x38, s.child_parent);
-        v3_read32(s.child + 0x6a, s.child_flags);
-        g_v3_custom = s;
-        g_v3_custom_hits.fetch_add(1, std::memory_order_relaxed);
-        g_v3_custom_lock.clear(std::memory_order_release);
-        const uint32_t matrix_slot = depth - 24;
-        float base_tx = 0.0f, base_ty = 0.0f;
-        const bool staged = v3_stage_source_child(s.child, base_tx, base_ty);
-        if (!staged)
-        {
-            spdlog::warn("[v3matrix] slot={} source staging failed; child not published",
-                         matrix_slot);
-            return;
-        }
-        g_v3_matrix_base_tx[matrix_slot] = base_tx;
-        g_v3_matrix_base_ty[matrix_slot] = base_ty;
-        g_v3_matrix_children[matrix_slot].store(s.child, std::memory_order_release);
-        uint64_t no_start = 0;
-        g_v3_matrix_started_ms.compare_exchange_strong(no_start, GetTickCount64(),
-                                                       std::memory_order_acq_rel);
+        // The custom-capture tail stood here: it staged the factory child, filled a V3CustomSnapshot
+        // and published a matrix slot. It was gated on a `custom` constant that was hard-coded false
+        // (the eight-cell discovery grid is retired), so none of it could run - and with no writer,
+        // the [v3custom] dump and the matrix slots it fed were dead too. Removed 2026-07-30; the
+        // constant and the two locals it gated followed on 2026-07-31.
     }
 
     void v3_attach_detour(void *wrapper_ptr, void *child_ptr, uint32_t index)
@@ -7727,7 +6749,6 @@ namespace
         {
             // Thousands of calls per map open - profiler-only, not general logging.
             v3_note_build_attach(wrapper, static_cast<uintptr_t>(parent), count);
-            v3_record_candidate(wrapper, static_cast<uintptr_t>(parent), caller, count);
         }
     }
 
@@ -7920,6 +6941,7 @@ namespace
         }
     }
 
+#if MFG_STALL_PROFILER
     void *jobpoll_detour(void *a, void *b, void *c, void *d)
     {
         if (!g_count.load(std::memory_order_relaxed) || !a)
@@ -7934,6 +6956,7 @@ namespace
                    static_cast<uint64_t>(t1.QuadPart - t0.QuadPart));
         return r;
     }
+#endif // MFG_STALL_PROFILER
 
     void pred_seed(uintptr_t *container)
     {
@@ -8140,6 +7163,10 @@ namespace
             }
         }
 
+#if MFG_STALL_PROFILER
+        // Drains the insert-core counters. Same guard as the counters and the recorder: without it
+        // this gated on g_v3_add_calls, which is permanently 0 in a default build, so the block was
+        // unreachable while its two format strings still shipped.
         const uint64_t add_calls = g_v3_add_calls.exchange(0, std::memory_order_relaxed);
         if (add_calls)
         {
@@ -8161,48 +7188,18 @@ namespace
                          s.insert_index,
                          s.child, s.child_vt, s.child_depth);
         }
+#endif // MFG_STALL_PROFILER
 
-        const uint64_t custom_hits = g_v3_custom_hits.exchange(0, std::memory_order_relaxed);
-        if (custom_hits)
-        {
-            while (g_v3_custom_lock.test_and_set(std::memory_order_acquire))
-                _mm_pause();
-            const V3CustomSnapshot s = g_v3_custom;
-            g_v3_custom = {};
-            g_v3_custom_lock.clear(std::memory_order_release);
-            spdlog::info("[v3custom] {}: {} hit(s), charId={} depth={} count {}->{} "
-                         "vector=0x{:X} parent=0x{:X} ret=exe+0x{:X}",
-                         tag, custom_hits, s.char_id, s.depth, s.before_count, s.after_count,
-                         s.vector, s.parent, s.ret >= exe_base ? s.ret - exe_base : s.ret);
-            spdlog::info("[v3custom] placement=0x{:X} flags=0x{:X}; child=0x{:X} vt=0x{:X} "
-                         "+28=0x{:X} +30=0x{:X} child-parent=0x{:X} child-flags=0x{:X}",
-                         s.placement, s.placement_flags, s.child, s.child_vt,
-                         s.child_28, s.child_30, s.child_parent, s.child_flags);
-        }
-
-        if (g_v3_visual_published.exchange(false, std::memory_order_acq_rel))
-        {
-            const V3VisualSnapshot &s = g_v3_visual;
-            spdlog::info("[v3visual] {}: engine attach wrapper=0x{:X} child=0x{:X} "
-                         "old-parent=0x{:X} target-parent=0x{:X}",
-                         tag, s.wrapper, s.child, s.old_parent, s.target_parent);
-            spdlog::info("[v3visual] target {}->{} old {}->{} child-parent-after=0x{:X} success={}",
-                         s.target_before, s.target_after, s.old_before, s.old_after,
-                         s.child_parent_after,
-                         s.target_after == s.target_before + 1 &&
-                         s.old_after + 1 == s.old_before &&
-                         s.child_parent_after == s.target_parent);
-            spdlog::info("[v3visual] matrix translation ({:.3f}, {:.3f})->({:.3f}, {:.3f}) "
-                         "positioned={}",
-                         s.old_tx, s.old_ty, s.new_tx, s.new_ty, s.positioned);
-            spdlog::info("[v3visual] fixed full-map midpoint=({:.3f}, {:.3f})",
-                         s.map_mid_x, s.map_mid_y);
-            spdlog::info("[v3visual] scale matrix [{:.5f} {:.5f}; {:.5f} {:.5f}] "
-                         "reference-zoom={:.5f} native-parent-scale=test",
-                         s.base_m0, s.base_m1, s.base_m4, s.base_m5, s.reference_zoom);
-        }
+        // The [v3custom] and [v3visual] dumps stood here. Both were gated on state that only the
+        // retired custom-capture path wrote, so neither could ever print a line.
     }
 
+// The stall sampler is COMPILED OUT unless MFG_STALL_PROFILER is set. It is the only user of
+// CreateToolhelp32Snapshot / Thread32First / Thread32Next / OpenThread / SuspendThread /
+// ResumeThread / Get/SetThreadContext in this file, so leaving it behind a runtime flag kept
+// that whole thread-inspection import cluster - and every [stallprobe] literal - in a shipped
+// DLL that can never run it.
+#if MFG_STALL_PROFILER
     struct ModRange
     {
         uintptr_t base = 0, end = 0;
@@ -8575,11 +7572,20 @@ namespace
         }
         g_running.store(false);
     }
+#endif // MFG_STALL_PROFILER
 } // namespace
 
-// Rows of our native settings page (see goblin_inject.hpp). ini_key doubles as
-// the i18n entry_labels key; goblin_messages injects the localized label into
-// GR_MenuText at startup, build_our_rows binds the checkbox to the bool.
+// Rows of our native settings page (see goblin_inject.hpp). ini_key doubles as the i18n
+// entry_labels key, and goblin_messages injects the localized label into GR_MenuText at startup.
+// Live consumers of THIS TABLE are menu_cfg_snapshot_take / menu_cfg_apply_if_changed, which give
+// the native menu its per-frame live-apply, plus goblin_messages, which builds the GR_MenuText
+// labels from it. (It used to say build_our_rows bound each row to its bool; that was the F11
+// settings-tab populate, retired 2026-07-31 - the table itself is load-bearing, so do not follow
+// that name into deleting it.)
+//
+// NOT the same thing as goblin::g_menutext_row_ids, the parallel vector of injected FMG ids. That
+// one has no unguarded reader left since the same removal: its only remaining consumers sit behind
+// #if MFG_CMDLIST_PROTO. It is kept with that prototype, not because this table needs it.
 // Proof set for now - grows as the overlay settings migrate over.
 const goblin::NativeMenuRowDef *goblin::native_menu_rows(size_t *count)
 {
@@ -8667,48 +7673,11 @@ void goblin::stall_probe::on_map_frame()
     // Lever B: reconcile which markers are attached to the visible map window.
     v3_viewport_reconcile();
 
-    if (!g_v3_scale_ready.load(std::memory_order_acquire))
-        return;
-
-    const V3ScaleState state = g_v3_scale;
-    goblin::mapproject::MapView view{};
-    if (!(state.reference_zoom > 0.01f) || !goblin::mapproject::read_view(view))
-        return;
-
-    uint64_t parent = 0, vt = 0, get_addr = 0, set_addr = 0;
-    if (!v3_read64(state.child + 0x38, parent) || parent != state.target_parent ||
-        !v3_read64(state.child, vt) ||
-        !v3_read64(static_cast<uintptr_t>(vt) + 0x10, get_addr) ||
-        !v3_read64(static_cast<uintptr_t>(vt) + 0x18, set_addr) ||
-        !v3_heap_ptr(get_addr) || !v3_heap_ptr(set_addr))
-        return;
-
-    // The background container's apparent scale follows MapView.zoom. Applying
-    // reference/current to the child's authored 2x2 basis cancels that zoom while
-    // leaving its twip translation (world position) untouched.
-    float factor = state.reference_zoom / view.zoom;
-    factor = std::clamp(factor, 0.05f, 20.0f);
-    using GetMatrixFn = const float *(void *);
-    using SetMatrixFn = void(void *, const float *);
-    float matrix[8]{};
-    __try
-    {
-        auto *get_matrix = reinterpret_cast<GetMatrixFn *>(get_addr);
-        auto *set_matrix = reinterpret_cast<SetMatrixFn *>(set_addr);
-        const float *current = get_matrix(reinterpret_cast<void *>(state.child));
-        memcpy(matrix, current, sizeof(matrix));
-        matrix[0] = state.base_m0 * factor;
-        matrix[1] = state.base_m1 * factor;
-        matrix[4] = state.base_m4 * factor;
-        matrix[5] = state.base_m5 * factor;
-        matrix[3] = state.target_tx + state.pivot_tx * factor;
-        matrix[7] = state.target_ty + state.pivot_ty * factor;
-        set_matrix(reinterpret_cast<void *>(state.child), matrix);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        // Diagnostic experiment only: leave the last good transform in place.
-    }
+    // A counter-scale pass for one transplanted child followed here: it read the child's matrix
+    // through the vtable and divided out the map zoom. It was permanently disarmed - g_v3_scale_ready
+    // is initialised false, stored false in two places and set true nowhere - so the ~40 lines after
+    // the gate never ran, and g_v3_scale was never written either. The deliberate disarm is recorded
+    // where the seed used to arm it: do not restore this without a reason to.
 }
 
 
@@ -8740,21 +7709,9 @@ void goblin::stall_probe::on_map_close()
     // then every touch is liveness-validated and SEH-guarded.
     g_v3_close_ms.store(GetTickCount64(), std::memory_order_release);
     g_v3_map_closed.store(true, std::memory_order_release);
-    g_solidfill_spike_done.store(0, std::memory_order_relaxed); // re-fire the spike on the next real build
-    g_v3_scale_ready.store(false, std::memory_order_release);
-    g_v3_matrix_state.store(0, std::memory_order_release);
-    g_v3_matrix_started_ms.store(0, std::memory_order_release);
-    for (auto &child : g_v3_matrix_children)
-        child.store(0, std::memory_order_release);
-    memset(g_v3_matrix_base_tx, 0, sizeof(g_v3_matrix_base_tx));
-    memset(g_v3_matrix_base_ty, 0, sizeof(g_v3_matrix_base_ty));
-    while (g_v3_candidate_lock.test_and_set(std::memory_order_acquire))
-        YieldProcessor();
-    g_v3_candidate_count = 0;
-    memset(g_v3_candidates, 0, sizeof(g_v3_candidates));
-    g_v3_candidate_lock.clear(std::memory_order_release);
-    g_v3_custom_child.store(0, std::memory_order_release);
-    g_v3_visual_state.store(0, std::memory_order_release);
+    // The matrix-slot, custom-child and visual-state resets that stood here went with the state
+    // they cleared: nothing wrote any of it once the eight-cell discovery grid was retired.
+    // (A candidate-parent table was locked and zeroed here on every map close; it had no reader.)
 }
 
 uint32_t goblin::stall_probe::v3_detach_all_children()
@@ -8803,8 +7760,8 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     const uint64_t us = freq.QuadPart
         ? static_cast<uint64_t>((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart)
         : 0;
-    g_v3_last_detached.store(removed, std::memory_order_relaxed);
-    g_v3_last_detach_us.store(us, std::memory_order_relaxed);
+    // (g_v3_last_detached / g_v3_last_detach_us were stored here for a reader that never existed,
+    // not even the Debug page. The measurement itself is not lost - it is the log line below.)
     spdlog::info("[v3native] self-detach: matched={} removed={} tracked={} in {} us",
                  found, removed, g_v3_native.objects.size(), us);
 
@@ -8881,6 +7838,7 @@ void goblin::stall_probe::setup()
     // Scaleform DisplayObjContainer native insert core
     // (v1.16 FUN_14113e970). Pass-through at all times; debug sessions retain
     // counters and the highest-count call until the next capture report.
+#if MFG_STALL_PROFILER
     try
     {
         modutils::hook<V3AddFn>(
@@ -8893,6 +7851,7 @@ void goblin::stall_probe::setup()
     {
         spdlog::warn("[stallprobe] v3 native insert-core spy unavailable: {}", e.what());
     }
+#endif // MFG_STALL_PROFILER
 
     // PlaceObject insertion path (v1.16 FUN_14113e7e0). The detour filters to
     // MAP_ICON_CHARID_BASE, so ordinary display-tree construction is untouched
@@ -8969,49 +7928,11 @@ void goblin::stall_probe::setup()
                      e.what());
     }
 
-    // Solid-fill spike DrawingContext primitives (dev-only, gated on debug_logging).
-    // A miss just disables the spike; nothing in the shipping path depends on these.
-    // endFill's prologue carries a relative CALL - mask its displacement so the AOB
-    // survives minor codegen shifts. (beginFill = the RE'd solid-color entry cc20.)
-    try
-    {
-        g_dc_begin = reinterpret_cast<DcBeginFn *>(modutils::scan<void>(
-            {.aob = "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 0F B6 FA 48 8B 49 38 48 85 C9 0F 84"}));
-        g_dc_beginfill = reinterpret_cast<DcBeginFillFn *>(modutils::scan<void>(
-            {.aob = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 33 ED 8B DA "
-                    "F6 81 D0 00 00 00 10 48"}));
-        g_dc_moveto = reinterpret_cast<DcMoveToFn *>(modutils::scan<void>(
-            {.aob = "40 53 48 81 EC 80 00 00 00 33 C0 0F 29 74 24 70 0F 57 C0 48 89 44 24 3C "
-                    "F3 0F 7F 44 24 24"}));
-        g_dc_lineto = reinterpret_cast<DcLineToFn *>(modutils::scan<void>(
-            {.aob = "40 53 48 83 EC 40 F6 81 D0 00 00 00 08 48 8B D9 0F 29 74 24 30 0F 28 F2 "
-                    "0F 29 7C 24 20 0F 28 F9"}));
-        g_dc_endfill = reinterpret_cast<DcEndFillFn *>(modutils::scan<void>(
-            {.aob = "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 33 C0 C7 83 CC 00 00 00 00 00 "
-                    "80 00 48 8B CB 48 89 43"}));
-        g_dc_shapereset = reinterpret_cast<DcShapeResetFn *>(modutils::scan<void>(
-            {.aob = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 28 48 8B D9 45 33 C0 "
-                    "BA 80 00 00 00 48 8B"}));
-        if (!g_dc_begin || !g_dc_beginfill || !g_dc_moveto || !g_dc_lineto ||
-            !g_dc_endfill || !g_dc_shapereset)
-        {
-            g_dc_beginfill = nullptr; // arm gate: all-or-nothing
-            spdlog::warn("[solidfill] one or more DrawingContext primitives unresolved; spike off");
-        }
-        else
-        {
-            spdlog::info("[solidfill] DrawingContext primitives resolved: begin=0x{:X} "
-                         "beginFill=0x{:X} endFill=0x{:X}",
-                         reinterpret_cast<uintptr_t>(g_dc_begin),
-                         reinterpret_cast<uintptr_t>(g_dc_beginfill),
-                         reinterpret_cast<uintptr_t>(g_dc_endfill));
-        }
-    }
-    catch (const std::exception &e)
-    {
-        g_dc_beginfill = nullptr;
-        spdlog::warn("[solidfill] DrawingContext primitive AOB miss (spike off): {}", e.what());
-    }
+    // Six DrawingContext primitives (begin / beginFill / moveTo / lineTo / endFill / shapeReset)
+    // were AOB-scanned here on every startup for the solid-fill spike. The spike itself no longer
+    // exists - nothing ever called any of the six - so this was six .text scans and three log
+    // lines for nothing. The patterns themselves live on in tools/aob_signatures.py as
+    // non-critical entries if the experiment is ever repeated.
 
     // Load-time movie interception (see goblin_own_movie.hpp). ABOVE the menu-mode gate on purpose:
     // it serves BOTH movies, and the map's half (our own hover panel and banner) is not part of the
@@ -9024,7 +7945,7 @@ void goblin::stall_probe::setup()
         // - its tab, its page and row hooks, its row icons, the load-time movie transform - so none of
         // it is patched into the game. What sits above this line (the map's own native panels among
         // them) is unaffected and keeps working.
-        spdlog::info("[optmenu] in-game menu not injected (menu_render_mode = imgui)");
+        spdlog::info("[nmenu] in-game menu not injected (menu_render_mode = imgui)");
         return;
     }
 
@@ -9083,94 +8004,13 @@ void goblin::stall_probe::setup()
         spdlog::warn("[menuprobe] updateTask hook unavailable: {}", e.what());
     }
 
-    // Native settings-menu tab injection Proto 0: hook OptionSettingTopDialog ctor
-    // (0x966120) to observe the live tab list (read-only, dev-only). A miss just
-    // disables the observer.
-    try
-    {
-        modutils::hook<OptTopCtorFn>(
-            {.aob = "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 C8 F5 FF FF "
-                    "48 81 EC 38 0B 00 00 48 C7 45 A0 FE FF FF FF"},
-            opttop_ctor_detour, o_opttop_ctor);
-        spdlog::info("[optmenu] OptionSettingTopDialog ctor hook armed");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[optmenu] ctor hook unavailable: {}", e.what());
-    }
-
-    // OptionSettingTopDialog dtor hook (0x966980): clears our anti-restack tracker on
-    // close. A miss just means F11 could re-stack (the tracker never clears).
-    try
-    {
-        modutils::hook<OptTopDtorFn>(
-            {.aob = "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 50 "
-                    "48 89 74 24 58 48 8B F1 48 8D 05 ?? ?? ?? ?? 48 89 01 80 B9 98 18 00 00 00 "
-                    "74 73 E8 ?? ?? ?? ?? 90 48 8B F8 48 8D 8E 68 17 00 00"},
-            opttop_dtor_detour, o_opttop_dtor);
-        spdlog::info("[optmenu] OptionSettingTopDialog dtor hook armed");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[optmenu] dtor hook unavailable: {}", e.what());
-    }
-
-    // Tab-inject primitives: build a settings-tab category / destruct temp, and HOOK
-    // the tab-append so we inject our tab during the ctor. A miss just disables inject.
-    try
-    {
-        p_build_cat = reinterpret_cast<BuildCatFn *>(modutils::scan<void>(
-            {.aob = "4C 8B DC 49 89 4B 08 57 48 81 EC B0 00 00 00 48 C7 44 24 28 FE FF FF FF "
-                    "49 89 5B 18 48 8B F9 C7 44 24 20 00 00 00 00 49 8D 43 C0 49 89 43 10 "
-                    "BA B0 AD 01 00 49 8D 4B C0 E8 ?? ?? ?? ?? 48 8B D8 8B 15 ?? ?? ?? ?? "
-                    "83 C2 14 89 54 24 30 0F 57 C0"})); // mov edx,110000 + icon calc = unique
-        p_dtor_cat = reinterpret_cast<DtorCatFn *>(modutils::scan<void>(
-            {.aob = "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 50 "
-                    "48 8B F9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 41 08 48 89 44 24 48 "
-                    "48 8D 59 10 48 89 5C 24 48 48 83 7B 20 08 72 0E"}));
-        modutils::hook<AppendTabFn>(
-            {.aob = "40 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 48 8B FA "
-                    "48 8B D9 48 8B 81 58 05 00 00 48 FF C0 48 83 F8 0A"},
-            append_tab_detour, o_append_tab);
-        if (p_build_cat && p_dtor_cat && o_append_tab)
-            spdlog::info("[optmenu] tab-inject primitives resolved + append hook armed");
-        else
-        {
-            p_build_cat = nullptr;
-            spdlog::warn("[optmenu] tab-inject primitives incomplete; inject off");
-        }
-    }
-    catch (const std::exception &e)
-    {
-        p_build_cat = nullptr;
-        spdlog::warn("[optmenu] tab-append primitive AOB miss: {}", e.what());
-    }
-
-    // Our-page hooks: the show-page dispatch (FUN_14093b760 - MUST be intercepted for
-    // our out-of-range category id, its 10-slot page cache is indexed unchecked) and
-    // the borrowed page's populate (FUN_140957ef0 - swapped to our rows when armed).
-    // Both are cold options-UI functions (hooking is safe). A miss just means our tab
-    // opens no page.
-    try
-    {
-        modutils::hook<ShowPageFn>(
-            {.aob = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 99 B8 00 00 00 "
-                    "48 8B F1 48 63 C2 48 8B 44 C1 68 48 85 C0 75"},
-            show_page_detour, o_show_page);
-        modutils::hook<PopulatePageFn>(
-            {.aob = "40 55 56 57 48 8D AC 24 50 FE FF FF 48 81 EC B0 02 00 00 "
-                    "48 C7 44 24 70 FE FF FF FF 48 89 9C 24 E0 02 00 00 48 8B 05 ?? ?? ?? ?? "
-                    "48 33 C4 48 89 85 A0 01 00 00 48 8B FA 48 8B D9 48 8D 4D F0"},
-            populate_page_detour, o_populate_page);
-        // (The 02_042 graphics-screen populate hook went with the F6 host on 2026-07-28 - one less patch
-        //  in the game. See docs/research_f6_graphics_host_retired.md.)
-        if (o_show_page && o_populate_page)
-            spdlog::info("[optmenu] our-page hooks armed (show-page + populate)");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[optmenu] our-page hook AOB miss: {}", e.what());
-    }
+    // FIVE HOOKS AND TWO AOB SCANS FOR THE F11 SETTINGS TAB WERE ARMED HERE UNTIL 2026-07-31:
+    // the OptionSettingTopDialog ctor and dtor, the tab-append, the show-page dispatch and the
+    // borrowed page's populate, plus scans for the category build/destruct primitives. Every one
+    // of them patched a function in the GAME'S OWN settings menu, on every launch, to serve a
+    // feature that had no trigger - see the note where that code used to live. Removing them takes
+    // five prologue rewrites and two .text scans off every start, and six [optmenu] literals out
+    // of the binary.
 
     // Keybinding-form row hooks (dev prototype, keysetting_*_re.txt): the row-vector
     // builder FUN_140868590 and the row VALUE provider FUN_140867de0. Both are cold
@@ -9200,14 +8040,16 @@ void goblin::stall_probe::setup()
             spdlog::warn("[form] keybinding-form row hooks incomplete; row swap off");
     }
 
-    // Standalone settings-open (F11) primitives: build-job / ref-move / push-job. A miss
-    // just disables F11 open. push-job/ref-move reuse the confirm-dialog machinery.
+    // Job-push primitives: ref-move + push-job (they reuse the confirm-dialog machinery), plus the
+    // two singleton slots resolved alongside them. This is what open_screen() uses to put our screen
+    // up over plain gameplay; a miss disables that, and the two slots only cost the HUD-mode restore
+    // and the in-game test.
+    // (A third scan, p_build_job, resolved the settings-open job builder for the retired F11
+    //  prototype. It was never called - only null-checked, and its result gated the log line below,
+    //  which is why that line announced "settings-open (F11) primitives resolved" in a build with no
+    //  F11 at all.)
     try
     {
-        p_build_job = reinterpret_cast<BuildJobFn *>(modutils::scan<void>(
-            {.aob = "48 8B C4 55 57 41 56 48 8D 68 A1 48 81 EC C0 00 00 00 48 C7 45 D7 FE FF FF FF "
-                    "48 89 58 18 48 89 70 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 37 41 0F B6 F8 "
-                    "48 8B F2"}));
         p_refmove = reinterpret_cast<RefMoveFn *>(modutils::scan<void>(
             {.aob = "48 89 54 24 10 53 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 8B DA "
                     "C7 44 24 20 00 00 00 00 48 8B 09 48 89 0A 48 85 C9 74"}));
@@ -9223,19 +8065,15 @@ void goblin::stall_probe::setup()
         p_worldchrman_slot = reinterpret_cast<void **>(modutils::scan<void *>(
             {.aob = "48 8B 05 ?? ?? ?? ?? 48 85 C0 0F 84 ?? ?? ?? ?? 48 8B 98 08 E5 01 00",
              .relative_offsets = {{3, 7}}}));
-        if (p_build_job && p_refmove && p_push_job)
-            spdlog::info("[optmenu] settings-open (F11) primitives resolved (worldChrMan={})",
+        if (p_refmove && p_push_job)
+            spdlog::info("[form] job-push primitives resolved (worldChrMan={})",
                          p_worldchrman_slot != nullptr);
         else
-        {
-            p_build_job = nullptr;
-            spdlog::warn("[optmenu] settings-open primitives incomplete; F11 off");
-        }
+            spdlog::warn("[form] job-push primitives incomplete; over-gameplay open off");
     }
     catch (const std::exception &e)
     {
-        p_build_job = nullptr;
-        spdlog::warn("[optmenu] settings-open primitive AOB miss: {}", e.what());
+        spdlog::warn("[form] job-push primitive AOB miss: {}", e.what());
     }
 
     // Task #9 capture: hook the SAME pushJob AFTER the raw scan above (the hook
@@ -9270,37 +8108,11 @@ void goblin::stall_probe::setup()
         spdlog::warn("[subopen] builder capture hook unavailable: {}", e.what());
     }
 
-    // Task #5 Proto 0: WorldMapMemoSelectDialog control (Route B). Both hooks are
-    // pass-through; all mutation is dev-gated on debug_logging inside the detours.
-    // A miss just disables the proto. The view-couple is a template with byte-
-    // identical instantiations, so it is resolved through its unique call site
-    // inside the memo ctor (the E8 disp at the pattern tail).
-    try
-    {
-        p_memo_couple = reinterpret_cast<MemoCoupleFn *>(modutils::scan<void>(
-            {.aob = "54 24 30 E8 ?? ?? ?? ?? 45 33 C9 44 8B C3 49 8B D6 48 8D 8E 78 0A 00 00 "
-                    "E8 ?? ?? ?? ??",
-             .relative_offsets = {{25, 29}}}));
-        p_game_alloc = reinterpret_cast<GameAllocFn *>(modutils::scan<void>(
-            {.aob = "49 8B 00 4D 8B C8 4C 8B C2 48 8B D1 49 8B C9 48 FF 60 50 90 F3 41 0F 58 C7 "
-                    "FF C7 48 83 C3 08 F3 48 85 C9 74 41"}));
-        // Resolve the allocator singleton global (mov r8,[rip+d] in the settings build-job
-        // factory: `4C 8B 05 <d32> 4C 89 40 18 8D 53 08 B9 A0 18 00 00`); relative_offsets
-        // turns the rip-disp into the global's address (= &DAT_143d87350).
-        p_alloc_global = reinterpret_cast<void **>(modutils::scan<void>(
-            {.aob = "4C 8B 05 ?? ?? ?? ?? 4C 89 40 18 8D 53 08 B9 A0 18 00 00",
-             .relative_offsets = {{3, 7}}}));
-        spdlog::info("[memoproto] memo-dialog hooks armed (couple=0x{:X} alloc=0x{:X} "
-                     "allocGlobal=0x{:X})",
-                     reinterpret_cast<uintptr_t>(p_memo_couple),
-                     reinterpret_cast<uintptr_t>(p_game_alloc),
-                     reinterpret_cast<uintptr_t>(p_alloc_global));
-    }
-    catch (const std::exception &e)
-    {
-        p_memo_couple = nullptr;
-        spdlog::warn("[memoproto] memo-dialog hooks unavailable: {}", e.what());
-    }
+    // The memo-dialog proto's three AOB scans stood here. They resolved the view-couple, the
+    // game allocator and the allocator global on every startup, and the only thing that ever
+    // read the three results was the log line that printed them: no detour was installed, and
+    // the prototype they belonged to is gone (see the note further up this file). Removing them
+    // takes three .text scans off every launch.
 
     // Scaleform attachMovie DAPI bridge (v1.16 FUN_1410e00c0). Its export name
     // and initializer object describe the ActionScript object that is about to
@@ -9320,10 +8132,11 @@ void goblin::stall_probe::setup()
         spdlog::warn("[stallprobe] v3 attachMovie bridge spy unavailable: {}", e.what());
     }
 
-    // High-level display-object move/attach API (v1.16 FUN_1410c8440). The
-    // detour observes the wrapper for the 104-child candidate marker layer; once the
-    // depth-24 custom child also exists, v3_try_visual_move performs one normal
-    // engine attach through this function's trampoline.
+    // High-level display-object move/attach API (v1.16 FUN_1410c8440). LOAD-BEARING: the detour
+    // on it is the only writer of the native-marker anchor (v3_note_movie_attach), which the seed,
+    // the tick and the viewport reconcile all read - see the note on v3_attach_detour. It also
+    // feeds two profiler-only records. (An earlier note here said v3_try_visual_move performs an
+    // engine attach through this trampoline; that function had no callers and is gone.)
     try
     {
         modutils::hook<V3AttachFn>(
@@ -9337,7 +8150,8 @@ void goblin::stall_probe::setup()
         spdlog::warn("[stallprobe] v3 high-level attach experiment unavailable: {}", e.what());
     }
 
-    // Close-wait job spy (diagnostics only; pass-through outside capture windows).
+    // Close-wait job timing (profiler-only; pass-through outside capture windows).
+#if MFG_STALL_PROFILER
     try
     {
         modutils::hook<Fn4>(
@@ -9349,13 +8163,18 @@ void goblin::stall_probe::setup()
     {
         spdlog::warn("[stallprobe] job-poll spy unavailable: {}", e.what());
     }
+#endif // MFG_STALL_PROFILER
 }
 
 void goblin::stall_probe::capture(const char *tag, unsigned duration_ms)
 {
-    // Compile-time OFF by default: this suspends the calling (map UI) thread from a worker for the
-    // whole window - see goblin_build_variants.hpp.
-    if (!goblin::variants::kStallProfiler) return;
+#if MFG_STALL_PROFILER
+    // This suspends the calling (map UI) thread from a worker for the whole window - see
+    // goblin_build_variants.hpp. The `#if` is not decoration: a runtime `if (kStallProfiler)`
+    // still leaves every string literal and every imported API of the sampler in the shipped
+    // binary, because unreferenced .rdata is not swept the way unreferenced code is. Measured on
+    // the 2026-07-30 build: with the runtime gate, "spy armed" was in the DLL 4 times and
+    // "stallprobe" 18 times with the profiler OFF.
     if (!goblin::config::debugLogging) return;
     bool expected = false;
     if (!g_running.compare_exchange_strong(expected, true)) return;
@@ -9368,4 +8187,8 @@ void goblin::stall_probe::capture(const char *tag, unsigned duration_ms)
     {
         g_running.store(false);
     }
+#else
+    (void)tag;
+    (void)duration_ms;
+#endif
 }

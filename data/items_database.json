@@ -922536,16 +922536,16 @@
  },
  {
   "map": "m12_05_00_00",
-  "x": 1628.4193115234375,
-  "y": -540.4000244140625,
-  "z": 1199.120849609375,
+  "x": 0.0,
+  "y": 0.0,
+  "z": 0.0,
   "areaNo": 12,
   "gridX": 5,
   "gridZ": 0,
   "dispMask": "dispMask01",
   "itemLotId": 12050510,
   "eventFlag": 12057510,
-  "partName": "AEG239_013",
+  "partName": "",
   "items": [
    {
     "id": 2900,
@@ -922557,7 +922557,7 @@
    }
   ],
   "primary_category": "consumable",
-  "source": "emevd_treasure"
+  "from_fallback": true
  },
  {
   "map": "m12_05_00_00",
@@ -923536,16 +923536,16 @@
  },
  {
   "map": "m20_01_00_00",
-  "x": -167.7604217529297,
-  "y": 185.57644653320312,
-  "z": -272.1850280761719,
+  "x": 0.0,
+  "y": 0.0,
+  "z": 0.0,
   "areaNo": 20,
   "gridX": 1,
   "gridZ": 0,
   "dispMask": "pad2_0",
   "itemLotId": 20010520,
   "eventFlag": 20017520,
-  "partName": "AEG417_017",
+  "partName": "",
   "items": [
    {
     "id": 10151,
@@ -923557,7 +923557,7 @@
    }
   ],
   "primary_category": "crafting_material",
-  "source": "emevd_treasure"
+  "from_fallback": true
  },
  {
   "map": "m20_01_00_00",

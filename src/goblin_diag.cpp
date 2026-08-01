@@ -165,7 +165,12 @@ namespace goblin::diag
         o << "Overlay (DX12): ";
         switch (s_ov)
         {
-        case OverlayState::OffByConfig: o << "disabled in ini (menu_enabled=false)\n"; break;
+        // Print the reason the caller gave. Hardcoding "menu_enabled=false" was wrong for the
+        // DEFAULT configuration: menu_render_mode ships as `native`, so the overlay is off
+        // because the native menu owns the hotkey (reason: "native menu mode"), with
+        // menu_enabled still true. A diagnostic that names the wrong setting sends the reader
+        // to change something that is not the cause.
+        case OverlayState::OffByConfig: o << "off - " << (s_ov_reason.empty() ? "disabled in ini" : s_ov_reason) << "\n"; break;
         case OverlayState::Active:      o << "active\n"; break;
         case OverlayState::Failed:      o << "FAILED - " << (s_ov_reason.empty() ? "unknown" : s_ov_reason) << "\n"; break;
         case OverlayState::Pending:     o << (s_ov_set ? "initializing...\n" : "active\n"); break;

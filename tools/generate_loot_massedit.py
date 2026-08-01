@@ -367,13 +367,36 @@ LOOT_CATEGORIES = {
         'startId': 4700000,
     },
     'Magic - Prayerbooks': {
-        # Prayerbooks and Scrolls that unlock spells at vendors
+        # Prayerbooks and Scrolls that unlock spells at vendors - plus, on the Convergence
+        # profiles, the Spell Runes that REPLACED that whole system.
+        #
+        # The Convergence gives out almost no spell pickups: its three magic categories hold
+        # 5 sorceries, 2 incantations and 1 scroll between them, because "most spells in
+        # Convergence are obtained by using Spell Runes" (their wiki) - 18 caster schools x
+        # 6 tiers (Faint / Shimmering / Glowing / Shining / Radiant / Shadow), of which 99
+        # lots are placed in the world. They are consumables that teach a spell, which is
+        # what a scroll/prayerbook is, so they belong in this bucket rather than a new one.
+        #
+        # An ID RANGE is safe here even though LOOT_CATEGORIES is shared: 8300-8489 was
+        # checked against every profile's items_database and is EMPTY in vanilla, err, erte,
+        # goldenage, goldenage361, vins, reborn and graceborne - only convergence3 (97 ids)
+        # and convergence2 (55) use it, so the range needs no profile gate and picks up both
+        # Convergence generations by itself.
+        #
+        # Why this matters beyond the runes: the runes carry sortGroup=10, which is exactly
+        # what 'Loot - Stat Boosts' filters on, so before this rule 96 of the 99 rune lots
+        # were landing in Stat Boosts - a 157-marker category that was mostly Spell Runes
+        # with the Starlight Shards it exists for in the minority. Prayerbooks is ordered
+        # ahead of Stat Boosts, so first-match-wins moves them without touching that filter.
         'filter': lambda items: any(
-            i['category'] == 1 and i['id'] in (
-                8850, 8851, 8852, 8854,  # Conspectus, Royal House, Ranni's, Gelmirian Scrolls
-                8855, 8856, 8857, 8858,  # Fire Monks', Giant's, Godskin, Two Fingers' Prayerbooks
-                8859, 8862, 8864, 8865, 8866,  # Assassin's, Golden Order, Dragon Cult, Ancient Dragon, Academy
-                2008014,  # Secret Rite Scroll (DLC)
+            i['category'] == 1 and (
+                i['id'] in (
+                    8850, 8851, 8852, 8854,  # Conspectus, Royal House, Ranni's, Gelmirian Scrolls
+                    8855, 8856, 8857, 8858,  # Fire Monks', Giant's, Godskin, Two Fingers' Prayerbooks
+                    8859, 8862, 8864, 8865, 8866,  # Assassin's, Golden Order, Dragon Cult, Ancient Dragon, Academy
+                    2008014,  # Secret Rite Scroll (DLC)
+                )
+                or 8300 <= i['id'] <= 8489  # Convergence Spell Runes (18 schools x 6 tiers)
             )
             for i in items
         ),

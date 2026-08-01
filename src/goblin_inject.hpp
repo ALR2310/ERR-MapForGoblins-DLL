@@ -94,18 +94,31 @@ namespace goblin
 
     std::vector<NativeMarkerPoint> native_marker_snapshot(int layer);
 
-    // Live row of the VISIBLE native marker nearest the map reticle (screen
-    // centre), within a pin-sized radius - or nullptr. The native-tooltip proxy:
-    // called once per frame from the map hover hook (our raw display objects are
-    // invisible to the engine hit test). out_dist2 (optional) receives the
-    // canvas-space squared distance for nearest-wins arbitration vs engine pins;
-    // out_map_x/out_map_z receive the marker's map-space position (the units of
-    // CS::WorldMapPointPinData+0x10, which anchors the engine name panel).
+    // Live row of the VISIBLE native marker nearest the map reticle, within a
+    // pin-sized radius - or nullptr. The reticle is NOT assumed to be the screen
+    // centre: it is read from the map dialog when the game exposes it, and inferred
+    // (centre vs cursor, measured once per session) only when it cannot be. The
+    // native-tooltip proxy: called once per frame from the map hover hook (our raw
+    // display objects are invisible to the engine hit test). out_dist2 (optional)
+    // receives the canvas-space squared distance for nearest-wins arbitration vs
+    // engine pins; out_map_x/out_map_z receive the marker's map-space position (the
+    // units of CS::WorldMapPointPinData+0x10, which anchors the engine name panel).
     void *native_reticle_row(float *out_dist2 = nullptr,
                              float *out_map_x = nullptr, float *out_map_z = nullptr);
 
     // Same canvas-space squared reticle distance for ANY live WorldMapPointParam
     // row (engine pin rows included) - the shared metric of that arbitration.
+    // It resolves the anchor through the SAME function native_reticle_row uses,
+    // which is the property that matters: until 2026-07-31 this one measured from
+    // the view centre while that one had already moved to the live reticle, so the
+    // caller compared distances taken from different points and picked the wrong
+    // marker at full zoom-out.
+    // Precisely: same anchor FUNCTION, evaluated a second time - not the same
+    // stored value. On the normal path both evaluations read the same published
+    // reticle and agree exactly. They can differ by a pixel or two only in the
+    // fallback regime, where the anchor is the OS cursor and the two calls sample
+    // it separately; that is well inside the pin-sized pick radius, so it cannot
+    // flip the arbitration. Call it once per frame - it is not loop-cheap.
     bool row_reticle_dist2(const void *rowptr, float &out_dist2);
 
     // Original (pre-remap) row ids of injected markers whose icon is currently HIDDEN
@@ -114,10 +127,8 @@ namespace goblin
     // live-loot flag rewrites and manual hide (both keyed on the live param) are seen.
     std::unordered_set<uint64_t> hidden_marker_original_ids();
 
-    // True if the injected marker at this live WorldMapPointParam* is currently hidden
-    // (collected / kindling / manually hidden / live hide-flag). The hover tooltip uses
-    // it to stop showing a marker the instant it's hidden. False if not one of ours.
-    bool is_row_ptr_hidden(void *rowptr);
+    // (is_row_ptr_hidden(void*) was declared here for a hover-tooltip consumer that was never
+    //  written. See the note at its former definition in goblin_inject.cpp.)
 
     // If a category focus is active but NO shown marker remains in it (all collected /
     // hidden), clear the focus. Returns true if it cleared (caller reapplies visibility).
@@ -153,7 +164,8 @@ namespace goblin
     // Toggle the WorldMapPointParam swap between vanilla and expanded states.
     // Used as an ERSC-hosting workaround: revert before host, re-apply after.
     void set_param_injection_active(bool active);
-    bool is_param_injection_active();
+    // (is_param_injection_active() was declared here and had no callers: menu_auto_toggle_loop
+    //  reads the static behind it directly. Its twin setter IS live and stays.)
 
     // Live marker visibility: sets each injected row's textEnableFlagId1 so the
     // primary line/icon shows only when its category is enabled AND the row is

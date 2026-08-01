@@ -2,9 +2,19 @@
 #include <string>
 #include <cstdint>
 
-// Lightweight map-icon status registry. Each load step reports its outcome here;
-// the overlay Debug tab renders a human-readable report a player can screenshot
-// for a bug report (so we can see WHAT failed and WHY without a log).
+// Lightweight map-icon status registry: each load step reports its outcome here and report()
+// renders a human-readable summary a player could screenshot into a bug report.
+//
+// NOT COMPILED as of 2026-07-31 (goblin_diag.cpp is commented out of CMakeLists.txt). The idea did
+// not survive contact with how bug reports actually arrive: nobody ever sent a screenshot of it -
+// players send the LOG file. Its reader, the overlay Debug tab readout, went on 2026-07-29, and
+// fourteen of the sixteen setters only repeated a spdlog line standing right next to them. The two
+// that carried something unique - the logo plaque re-point outcome and the live worldmap sprite
+// pointer (which reveals the game's heap region, the thing that identified the looks_heap bound bug
+// in 2026-06) - were moved into the log before the module left, so nothing was lost.
+//
+// To build it back in, restore the two lines in CMakeLists.txt, re-add the setter calls and give
+// report() a reader; the native menu's Debug page already has a copy-to-clipboard row to model on.
 // All setters are thread-safe: load steps run on the game's loader thread, the
 // report is read from the Present/overlay thread.
 namespace goblin::diag

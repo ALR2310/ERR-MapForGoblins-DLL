@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.28.1)
 set(CMAKE_GENERATOR_PLATFORM x64)
 
 project( MapForGoblins
-  VERSION   "2.0.6"
+  VERSION   "2.1.1"
   LANGUAGES CXX RC)
 
 # Which baked-data dir to compile. Default = ERR (src/generated). The vanilla
@@ -123,8 +123,12 @@ add_library( MapForGoblins SHARED
   src/goblin_i18n_bundle.hpp
   src/goblin_config.hpp
   src/goblin_config.cpp
-  src/goblin_diag.hpp
-  src/goblin_diag.cpp
+  # src/goblin_diag.{hpp,cpp} - the map-icon status registry. Deliberately NOT compiled: it existed
+  # so a player could screenshot a load-step summary into a bug report, and its only reader (the
+  # overlay Debug tab readout) went on 2026-07-29 because nobody ever sent one - players send LOGS.
+  # Fourteen of its sixteen setters only duplicated a neighbouring spdlog line; the two that did
+  # not (the logo plaque outcome, the worldmap sprite pointer that shows the heap region) were
+  # moved into the log before this. Same treatment as the add-on host and sfimage: sources stay.
   src/goblin_collected.hpp
   src/goblin_collected.cpp
   src/goblin_inject.hpp
@@ -140,10 +144,17 @@ add_library( MapForGoblins SHARED
   src/goblin_native_menu.hpp
   src/goblin_native_menu.cpp
     src/goblin_own_movie.cpp
-  src/goblin_menu_addons.hpp
-  src/goblin_menu_addons.cpp
-  src/goblin_sfimage.hpp
-  src/goblin_sfimage.cpp
+  # src/goblin_menu_addons.{hpp,cpp} - the add-on SDK HOST. Deliberately NOT compiled: the SDK
+  # ships as a separate mod, so the module walk that looks for MfgMenuAddonInit, the page list and
+  # the row routing must not be in this binary. The sources stay in the tree and are still the
+  # reference for that mod. To build the host back in, restore these two lines AND set
+  # MFG_MENU_ADDON_HOST=1 (goblin_build_variants.hpp, or -DMFG_MENU_ADDON_HOST=1).
+  # src/goblin_sfimage.{hpp,cpp} - the Scaleform image-resource builder. Deliberately NOT compiled:
+  # its last external caller was icon_resource_for() in goblin_stall_probe.cpp, removed 2026-07-30
+  # with the own-draw icon routes (menu icons are spliced into the movie instead). After that,
+  # create_resource / make_raw_image / wrap_resource / heap / value_of / available called only each
+  # other - a closed island. Same treatment as the add-on host above: the sources stay in the tree.
+  # To build it back in, restore these two lines and re-add the two #includes noted in its header.
   src/goblin_messages.hpp
   src/goblin_messages.cpp
   src/goblin_overlay.hpp
@@ -223,8 +234,13 @@ target_compile_definitions(MapForGoblins PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPA
 # Build variants (src/goblin_build_variants.hpp). Each defaults in the header; passing one here is how
 # the documented "switch it back with a rebuild" actually works, e.g.
 #   cmake -DMFG_STALL_PROFILER=1 ...
+# MFG_OVERLAY_OWN_WINDOW / MFG_OWN_WINDOW_MODE were missing from this list, so the one variant
+# with ~1100 lines behind it could not be switched from the command line at all - and, unbuilt,
+# it silently stopped compiling (it still read a config field that had been renamed away).
 foreach(mfg_variant MFG_LEGACY_PIN_MARKERS MFG_SLOW_MAP_OPEN MFG_NO_SELF_DETACH
-                    MFG_ATTACH_ALL_MARKERS MFG_STALL_PROFILER)
+                    MFG_ATTACH_ALL_MARKERS MFG_STALL_PROFILER
+                    MFG_OVERLAY_OWN_WINDOW MFG_OWN_WINDOW_MODE
+                    MFG_MENU_ADDON_HOST MFG_CMDLIST_PROTO)
   if(DEFINED ${mfg_variant})
     target_compile_definitions(MapForGoblins PRIVATE ${mfg_variant}=${${mfg_variant}})
     message(STATUS "MapForGoblins build variant: ${mfg_variant}=${${mfg_variant}}")
@@ -275,28 +291,39 @@ endif()
 # The snapshot-vs-release distinction lives in the output folder, not the binary.
 set(FULL_VERSION "${CMAKE_PROJECT_VERSION}")
 # Build identity for the runtime startup log (helps triage user bug reports): the profile
-# name (derived from the bake dir) + the short git commit the DLL was built from (+ "-dirty"
-# when the working tree has uncommitted tracked changes). Same commit => same string => the
-# build-once-promote byte-identity (above) still holds. Captured at CONFIGURE time; git on
-# PATH is not guaranteed under the VS build env, so fall back to "nogit".
+# name (derived from the bake dir) + the short git commit the DLL was built from, with a "d"
+# PREFIX when the working tree has uncommitted tracked changes (d947216c). Same commit => same
+# string => the build-once-promote byte-identity (above) still holds. git on PATH is not
+# guaranteed under the VS build env, so it falls back to "nogit".
 if(GENERATED_SUBDIR STREQUAL "generated")
   set(BUILD_NAME "err")
 else()
   string(REPLACE "generated_" "" BUILD_NAME "${GENERATED_SUBDIR}")
 endif()
-execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" rev-parse --short HEAD
-                OUTPUT_VARIABLE GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT GIT_HASH)
-  set(GIT_HASH "nogit")
-else()
-  execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" diff --quiet HEAD
-                  RESULT_VARIABLE _git_dirty ERROR_QUIET)
-  if(_git_dirty)
-    set(GIT_HASH "${GIT_HASH}-dirty")
-  endif()
-endif()
-configure_file(${CMAKE_SOURCE_DIR}/src/version.h.in
-               ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
+# version.h is generated on EVERY BUILD, not at configure time. Configure-time capture meant the
+# hash went stale the moment a commit landed without CMake re-running: a DLL built from 97c3534
+# reported 947216c-dirty on 2026-07-30. cmake/mfg_version.cmake only rewrites the header when its
+# content actually changes, so incremental builds do not rebuild the four TUs that include it.
+add_custom_target(mfg_version ALL
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/version.h
+  COMMAND ${CMAKE_COMMAND}
+          -DSRC_DIR=${CMAKE_SOURCE_DIR}
+          -DIN_FILE=${CMAKE_SOURCE_DIR}/src/version.h.in
+          -DOUT_FILE=${CMAKE_BINARY_DIR}/generated/version.h
+          -DFULL_VERSION=${FULL_VERSION}
+          -DBUILD_NAME=${BUILD_NAME}
+          -P ${CMAKE_SOURCE_DIR}/cmake/mfg_version.cmake
+  COMMENT "Stamping build identity (version + profile + git hash)"
+  VERBATIM)
+add_dependencies(MapForGoblins mfg_version)
+# Generate it once now as well, so the very first configure leaves a usable header on disk.
+execute_process(COMMAND ${CMAKE_COMMAND}
+                -DSRC_DIR=${CMAKE_SOURCE_DIR}
+                -DIN_FILE=${CMAKE_SOURCE_DIR}/src/version.h.in
+                -DOUT_FILE=${CMAKE_BINARY_DIR}/generated/version.h
+                -DFULL_VERSION=${FULL_VERSION}
+                -DBUILD_NAME=${BUILD_NAME}
+                -P ${CMAKE_SOURCE_DIR}/cmake/mfg_version.cmake)
 target_include_directories(MapForGoblins PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # Win32 VERSIONINFO resource (CompanyName/FileDescription/versions) so the DLL
 # carries proper metadata - better for AV reputation than a blank unsigned DLL.

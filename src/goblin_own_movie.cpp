@@ -58,7 +58,6 @@ namespace
     // sprite, the character it places and a free depth out of the movie rather than knowing them as
     // constants - so this file is the MENU screen's transform and nothing else.
 
-    std::atomic<int> g_armed{0};
     std::atomic<bool> g_ready{false};
 
     const char *g_status = "not tried";
@@ -92,7 +91,6 @@ namespace
     size_t g_tail_offset = 0;
     size_t g_tag_count = 0;
     bool g_icons_added = false;
-    int g_captions_renamed = 0;
 
     bool parse_tags(const uint8_t *b, size_t n, size_t start, std::vector<Tag> &out)
     {
@@ -191,8 +189,12 @@ namespace
     // screen hung for several seconds on F8 and then crashed, so the dialog depends on that child being
     // there (it resolves or measures it). Hiding it at runtime instead - see the visibility call in
     // goblin_stall_probe.cpp - leaves the object in place and only turns it off.
-    constexpr uint16_t kRowSectionSpriteCid = 198;
-    constexpr bool kDropRowPanel = false;
+    // A kDropRowPanel switch stood here, hard-coded false, gating a branch that dropped the dark
+    // row-section panel from the movie instead of hiding it at runtime. Dropping it hung and then
+    // crashed the game (reverted 2026-07-29 - the panel is hidden live by hide_row_panel now), so
+    // the switch could never be turned on; its branch and the kRowSectionSpriteCid it needed went
+    // with it. A compile-time switch that ships as a constant belongs in goblin_build_variants.hpp,
+    // not in a .cpp - that is the whole point of that header.
     constexpr uint16_t kBgSpriteCid = 169;
     constexpr uint16_t kCaptionSpriteCid = 168;
     int g_caption_block_dropped = 0;
@@ -270,13 +272,12 @@ namespace
     // Both pieces are generated at build time (tools/generate_menu_icon_tags.py, which
     // re-parses its own output before emitting it), so all that is left here is to find the
     // row tag and prove the movie is the one those bytes were built against.
-    // Which construction to splice comes from the ini (native_menu_icons), because the two
-    // candidates have to be comparable without a rebuild:
-    //   1 = one strip of all icons behind a real DefineShape mask, picked by shifting the strip
-    //   2 = one named child per icon, all baked invisible, the chosen one scaled up
-    // Neither uses frames: a timeline cannot be stopped from a tag stream, so a multi-frame
-    // sprite animates in every instance we do not reach. Variant 1 previously faulted inside
-    // Scaleform when its mask was an image character - it now gets a genuine shape.
+    // ONE construction is spliced: a named child per icon, all baked invisible, the chosen one
+    // scaled up. The ini key that used to pick between two candidates (`native_menu_icons`) was
+    // removed along with the strip-plus-mask variant on 2026-07-29 - it is not in build_schema()
+    // and not in ini_retired_keys(); nothing reads it anywhere.
+    // The construction uses no frames: a timeline cannot be stopped from a tag stream, so a
+    // multi-frame sprite would animate in every instance we do not reach.
     // Defined further down with the rest of the header-icon work; used here because the logo bitmap
     // goes in at the same place as the icon defines.
     uint16_t logo_cid();
@@ -290,8 +291,9 @@ namespace
     // bottom, and extra clips alone would not fit.
     //
     // The clips are OUR placements of the game's own row character, so they carry the icon child the
-    // rebuilt row clip has. Whether the engine ever ASKS for slots 11..13 is not assumed - the row
-    // path hook logs the highest slot it is called with, so one run in game settles it.
+    // rebuilt row clip has. Whether the engine ever ASKS for the added slots (11..14 - four of them,
+    // kRowSlots 15 minus kRowAuthored 11) is not assumed: the row-path hook logs the highest slot it
+    // is called with, so one run in game settles it.
     constexpr uint16_t kRowPoolCid = 190;       // KeySetting/ItemList
     constexpr int32_t kRowPitchPx = 49;         // authored 63.75; 14 rows then end where 11 did
     // Measured chain: KeySetting sits at y = 480 px, ItemList at -369.65 px inside it, so row 0
@@ -510,13 +512,8 @@ namespace
                     ++g_caption_block_dropped;
                     continue;
                 }
-                if (kDropRowPanel && cid == kRowSectionSpriteCid &&
-                    emit_sprite_without(out, t, src, kBgSpriteCid))
-                {
-                    spdlog::info("[ownmovie] row panel dropped: BG sprite {} removed from the row "
-                                 "section {}", kBgSpriteCid, kRowSectionSpriteCid);
-                    continue;
-                }
+                // (A third branch here dropped the BG sprite from the row section outright. See the
+                //  kDropRowPanel note at the top of this file for why it can never be taken again.)
             }
             emit_tag(out, t, src);
         }
@@ -524,17 +521,11 @@ namespace
     }
 
     // The key-binding screen labels two of its columns ("Keyboard" over the first bind and
-    // "Mouse" over the second) with EditText fields whose FMG id is encoded IN THE INSTANCE
-    // NAME - StaticText_280005 / StaticText_280006 (gfx_02_160_dump.txt line 917). On our
-    // settings list those headers mean nothing, and in this client they draw as tofu boxes
-    // because the fields are 22pt while the rest of the menu is 24pt.
-    //
-    // They cannot be hidden at runtime: they sit inside sprite 168, which frame 2 of
-    // KeySetting/BG places as an UNNAMED child, and the engine resolves paths by name only -
-    // which is why a runtime pass over eight candidate paths found nothing. So the name is
-    // taken away instead: renaming them to something the name-driven populator does not match
-    // leaves the fields empty. The replacements are the SAME LENGTH, so this is an in-place
-    // patch - no tag length changes, nothing after them shifts.
+    // (A dozen lines here argued that the two tofu column headers cannot be hidden at runtime and
+    //  so must be RENAMED out of the name-driven populator's reach. That reasoning was disproved by
+    //  the experiment recorded at the top of this file: renaming their instances did not blank them,
+    //  because the text is initialText baked into the DefineEditText tags. The placement is dropped
+    //  instead - emit_sprite_without(kBgSpriteCid, kCaptionSpriteCid) in rebuild().)
     // ── move the row section (menu centring) ─────────────────────────────────────────
     // The key-binding screen lays its rows out to the LEFT of the section origin, so the menu reads as
     // "left half" even though the origin itself is centred. Three runtime attempts to move it failed (see
@@ -547,7 +538,7 @@ namespace
     // nTranslateBits 16, tx 19200, ty 9600} (twips; 19200 = 960 px = the centre of a 1920 stage), then the
     // name "KeySetting". So the body is 10 bytes before the name, the matrix 5 of those, and tx lives in
     // bits 7..22 of the matrix - a same-length in-place edit, which keeps every following offset intact
-    // (the same rule rename_column_captions follows).
+    // (the same rule retune_help_text and retune_row_font follow).
     // Derived, not guessed. Measured from the movie: 'KeySetting' (the section) sits at x=960, its
     // 'ItemList' child at -854 inside it, and the LEFT column items ('Item_N_0') at +7 inside that, each
     // about 750 px wide (child extents -14 .. 704). Our page fills only the left column - the screen is
@@ -939,26 +930,10 @@ namespace
         return 0;
     }
 
-    int rename_column_captions(std::vector<uint8_t> &buf)
-    {
-        static const char *const kFrom[] = {"StaticText_280005", "StaticText_280006"};
-        static const char *const kTo[] = {"MfgHiddenText_005", "MfgHiddenText_006"};
-        int patched = 0;
-        for (size_t k = 0; k < 2; ++k)
-        {
-            const size_t n = std::strlen(kFrom[k]);
-            if (std::strlen(kTo[k]) != n)
-                continue; // a length change would shift the whole tag stream
-            for (size_t i = 0; i + n <= buf.size(); ++i)
-                if (std::memcmp(buf.data() + i, kFrom[k], n) == 0)
-                {
-                    std::memcpy(buf.data() + i, kTo[k], n);
-                    ++patched;
-                    i += n - 1;
-                }
-        }
-        return patched;
-    }
+    // rename_column_captions() stood here: it renamed StaticText_280005/280006 in place (same-length
+    // patch) so the FMG-id-driven populator would not fill them. It kept running on every rebuild
+    // long after the fix that actually works replaced it, and reported its count in the transform
+    // log - a number that only ever described work with no effect. Removed 2026-07-31.
 
     // Emit `t` (a DefineSprite) with `extra` inserted at the start of its frame-1 tag list, i.e.
     // right after the {cid, frameCount} header - the same spot the row-clip edit uses, so the
@@ -1030,11 +1005,10 @@ namespace
         }
         if (g_tail_offset && g_tail_offset < n)
             out.insert(out.end(), src + g_tail_offset, src + n);
-        g_captions_renamed = rename_column_captions(out);
         shift_row_section(out); // menu centring, same-length in-place edit
         retune_help_text(out);  // the description block under the rows
         retune_row_pitch(out);  // tighter rows, to pay for the clips added above
-        retune_row_font(out);   // 21 px, so more of a bar fits in the value column
+        retune_row_font(out);   // kRowFontTwips = 22 px, so more of a bar fits in the value column
         // Only re-point the header icon if the bitmap actually went in - a placement pointing at a
         // character that does not exist draws nothing at all, which is worse than the game's own icon.
         if (g_logo_spliced)
@@ -1102,7 +1076,8 @@ namespace
     std::vector<uint8_t> g_parse_bytes;       // the movie we serve to the parser (must outlive it)
     alignas(16) uint8_t g_parse_source[0x48]; // our File, cloned from one of the engine's own
     bool g_source_template = false;           // a memory-file object has been seen and copied
-    std::atomic<uint32_t> g_parsed_seen{0};
+    // (a g_parsed_seen counter sat here with a single occurrence - this declaration. The live
+    //  count of movies the parser was handed is g_movies_seen, logged in tag_loop_detour.)
 
     // `outPos` comes back with the position the parser is AT - the reader has already taken the header
     // out of this source and reads ahead of itself, so that position is what the swap has to preserve.
@@ -1318,6 +1293,17 @@ namespace
         }
         // A named movie that is not ours needs no bytes read at all. One without a name has to be looked
         // at, because that is exactly what an overridden movie looks like from here.
+        //
+        // NO "IS THIS OUR OPEN?" TERM HERE, and it is not an oversight. A g_armed counter armed in
+        // open_screen was added to this gate on 2026-07-30 so the player's own Key Assignments screen
+        // would keep the stock layout. Measured in game the next run: the gate can never be satisfied.
+        // The engine parses every menu movie ONCE, in the startup preload burst - 02_160 came through
+        // as movie #98, 21 seconds before the first press of the menu key - and every later screen is
+        // an INSTANCE of that one parse. So with the counter in the gate the transform never ran at
+        // all: no centring shift, no row pitch, no extra row clips, no category icons, no logo in the
+        // header, and the row painting then resolved paths into clips that do not exist (an SEH storm
+        // on close). Leaving the player's screen alone has to be decided per INSTANCE, at screen
+        // level - it cannot be decided at parse time, because there is only one parse for both.
         if ((!named_mine && !nameless) || !goblin::config::native_menu_enabled())
         {
             o_tag_loop(movieData, ctx, arg3);
@@ -1350,16 +1336,19 @@ namespace
             o_tag_loop(movieData, ctx, arg3);
             return;
         }
-        g_status = g_icons_added ? "icons spliced into the movie" : "rebuilt, no icons added";
+        // Not a ternary: rebuild() returns false on every path that leaves g_icons_added unset
+        // (see the icon splice in rebuild), so control only reaches here WITH icons. The other arm
+        // was a string in .rdata for a state that cannot happen.
+        g_status = "icons spliced into the movie";
         // `read ahead` is the position the source was at: everything before it the parser already has
         // buffered from the original movie, so it wants to be a long way short of where our first
         // insertion lands. If it ever is not, a tag boundary would move under the parser and this line
         // is where that shows.
         spdlog::info("[ownmovie] '{}' transformed on the way into the parser: {} bytes in, {} out, "
-                     "{} tags, {} trailing, {} captions renamed (read ahead {}, stream bound {})",
+                     "{} tags, {} trailing (read ahead {}, stream bound {})",
                      name, len, g_parse_bytes.size(), g_tag_count,
                      g_tail_offset && g_tail_offset < len ? len - g_tail_offset : 0,
-                     g_captions_renamed, at, total);
+                     at, total);
         spdlog::info("[ownmovie] caption block dropped from the panel: {}",
                      g_caption_block_dropped ? "yes" : "no");
         o_tag_loop(movieData, ctx, arg3);
@@ -1393,13 +1382,9 @@ void goblin::own_movie::install()
 
 bool goblin::own_movie::available() { return g_ready.load(std::memory_order_acquire); }
 
-void goblin::own_movie::arm() { g_armed.fetch_add(1, std::memory_order_acq_rel); }
-
-void goblin::own_movie::disarm()
-{
-    int prev = g_armed.load(std::memory_order_acquire);
-    while (prev > 0 && !g_armed.compare_exchange_weak(prev, prev - 1, std::memory_order_acq_rel))
-        ;
-}
+// arm() / disarm() stood here: a nesting counter the host raised around its own screen open, so the
+// transform could tell our load of 02_160 from the player's. It is gone because there is no such
+// thing as "our load" - see the note in tag_loop_detour: the movie is parsed once, in the startup
+// preload, and every screen afterwards instances that parse.
 
 const char *goblin::own_movie::status() { return g_status; }

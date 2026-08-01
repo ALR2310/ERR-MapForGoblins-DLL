@@ -4,7 +4,6 @@
     "AllOn": "tout activer",
     "AllOff": "tout désactiver",
     "RandomizerHint": "Vous utilisez un Randomizer ? Activez live_loot_flags + live_loot_labels + live_loot_icons pour que les marqueurs correspondent aux emplacements d'objets mélangés.",
-    "FastMapOpenWarning": "BETA : accélère l'ouverture de la carte. Si la carte a des bugs ou plante, désactivez cette option.",
     "IniOnly": "(.ini uniquement)",
     "PressAKey": "appuyez sur une touche",
     "PressComboRelease": "appuyez sur la combinaison, puis relâchez",
@@ -105,7 +104,6 @@
   "entry_labels": {
     "require_map_fragments": "Exiger les fragments de carte",
     "location_emphasis": "Mise en avant du lieu",
-    "fast_map_open": "Ouverture rapide de la carte",
     "show_armaments": "Armes",
     "show_armour": "Armures",
     "show_ashes_of_war": "Cendres de guerre",
@@ -198,7 +196,6 @@
   "entry_comments": {
     "require_map_fragments": "Exiger la découverte du fragment de carte avant d'afficher les icônes de cette zone",
     "location_emphasis": "Les marqueurs de la carte où vous vous trouvez sont plus grands; ceux qui semblent seulement proches (un donjon sous vos pieds, ou la surface au-dessus) sont plus petits. Rien n'est jamais masqué.",
-    "fast_map_open": "BETA : accélère l'ouverture de la carte du monde quand beaucoup d'icônes sont affichées.\nDésactivez si la carte a des bugs ou plante.",
     "show_armaments": "Armes, boucliers, arcs, sceptres, etc.",
     "show_armour": "Pièces d'armure (casques, torse, gantelets, jambes)",
     "show_ashes_of_war": "Cendres de guerre (compétences d'arme)",

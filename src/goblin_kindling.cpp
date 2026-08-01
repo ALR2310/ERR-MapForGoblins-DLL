@@ -60,7 +60,6 @@ constexpr uint8_t  HIDDEN_AREA = 99;
 struct KindlingSlot
 {
     uint64_t row_id;     // current (post-remap) WorldMapPointParam row ID
-    uint64_t orig_id;    // original ID from MAP_ENTRIES (pre-remap)
     int slot;            // 1..5 (kindling slot)
     uint32_t entity_id;  // 1045373501..505
 };
@@ -240,16 +239,13 @@ static uint32_t seh_read_dword(uintptr_t addr)
     }
 }
 
-static uintptr_t eldenring_base()
-{
-    HMODULE h = GetModuleHandleA(nullptr) /* main module = the game exe */;
-    return reinterpret_cast<uintptr_t>(h);
-}
+// An eldenring_base() helper lived here. Its three callers each took the exe base, checked it for
+// null and then never used the value - and GetModuleHandleA(nullptr) cannot return null for our own
+// process, so the check could not fire either. Addresses in this file come from the AOB-resolved
+// slots above, not from the base.
 
 static bool is_game_world_loaded()
 {
-    uintptr_t base = eldenring_base();
-    if (!base) return false;
     uintptr_t val = seh_read_qword(world_sfx_man_slot());
     return val >= 0x10000;
 }
@@ -260,8 +256,6 @@ static bool is_game_world_loaded()
 static bool cond_is_alive(uintptr_t cond, uint32_t eid)
 {
     if (cond < 0x10000) return false;
-    uintptr_t base = eldenring_base();
-    if (!base) return false;
     if (seh_read_qword(cond) != distance_vft()) return false;
     return seh_read_dword(cond + COND_TO_EID_OFFSET) == eid;
 }
@@ -316,9 +310,6 @@ static std::map<uint32_t, uintptr_t> discover_kindling_conds()
 {
     auto t0 = std::chrono::steady_clock::now();
     std::map<uint32_t, uintptr_t> found;
-    uintptr_t base = eldenring_base();
-    if (!base) return found;
-
     uintptr_t target_cond_vft = distance_vft();
     if (!target_cond_vft) return found;
 
@@ -555,7 +546,9 @@ void goblin::kindling::initialize()
             continue;
         }
 
-        g_slots.push_back({e.row_id, e.row_id, slot, entity_id_for_slot(slot)});
+        // (an orig_id field took the second e.row_id here; nothing ever read it, and the
+        // original->dynamic mapping is served by g_original_to_dynamic)
+        g_slots.push_back({e.row_id, slot, entity_id_for_slot(slot)});
     }
 
     std::sort(g_slots.begin(), g_slots.end(),

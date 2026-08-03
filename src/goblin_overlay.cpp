@@ -648,6 +648,20 @@ void draw_settings_tab()
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("%s", tr::tr(tr::TextId::OverlayOpacityTip, lang));
     slider_key("overlay_opacity");
+
+    // Where the map-screen panels sit horizontally. 100 is the corner they were authored for, 0 is
+    // the centre of the map area, above 100 pushes them further left. Exposed because an ultrawide
+    // report could not be reproduced here: three aspect packs were diffed and the visible rect's
+    // left edge is identical in all of them, so on every .gfx we have the panels land in the same
+    // place. Rather than guess at a mechanism we cannot observe, let the player move them.
+    // Read every frame the tooltip draws, so dragging this moves the panel with the map still open.
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+    ImGui::SliderFloat(tr::tr(tr::TextId::MapPanelOffset, lang),
+                       &goblin::config::mapPanelOffsetPercent, -50.0f, 200.0f, "%.0f%%",
+                       ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("%s", tr::tr(tr::TextId::MapPanelOffsetTip, lang));
+    slider_key("map_panel_offset_percent");
     ImGui::Separator();
 
     bool changed = false;

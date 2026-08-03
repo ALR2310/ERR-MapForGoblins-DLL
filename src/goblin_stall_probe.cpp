@@ -16,6 +16,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "goblin_mapproject.hpp"
 #include "goblin_gfx_probe.hpp"
 #include "goblin_collected.hpp" // read_player_map_id() for the location emphasis
+#include "goblin_crashdiag.hpp" // measurement, not behaviour: see the header
 #include "goblin_inject.hpp"
 #include "modutils.hpp"
 
@@ -272,6 +273,10 @@ namespace
 
     std::atomic<uintptr_t> g_v3_target_wrapper{0};
     std::atomic<uintptr_t> g_v3_target_parent{0};
+    // v3_movie_of(anchor) captured when the anchor was taken. Arm D of the anchor test
+    // compares against it: a candidate in a different Scaleform movie is a new generation
+    // by construction, because our children live in the old one and are unreachable from it.
+    std::atomic<uintptr_t> g_v3_target_movie{0};
     std::atomic<uint64_t> g_v3_target_count{0};
     std::atomic<int> g_v3_target_layer{-1};
     // True once the map closed after the current target was published. Gates the
@@ -307,22 +312,15 @@ namespace
     // only lengthens the loop, it does not widen it - the shared per-icon tag stays legal.
     constexpr size_t V3_FACTORY_BATCH = 48;
 
-    // TWO floors, deliberately DIFFERENT - unifying them was a regression, measured 2026-08-01.
+    // kPickerMinItems (100) stood here and is GONE, 2026-08-03. It gated who may become the
+    // anchor, on the theory that a high floor keeps tiny side clips from stealing it. Measured, it
+    // did the opposite: every retarget that fired at count=100 FAILED to build (0 of 4), because a
+    // list topping out near 105 only reaches 100 after the build burst has spent its RM2 pulses -
+    // "pulses seen=0", created=0, and an empty map on that open. Every count=48 retarget built all
+    // 7136 (18 of 18). The replacement is a state test, not a floor: see v3_note_movie_attach.
     //
-    // kPickerMinItems gates who may become the target in v3_note_movie_attach. It must stay HIGH:
-    // the arms it guards fire whenever a list reaches it, and every re-anchor forces a reseed that
-    // re-queues ~9.5k markers and rebuilds them. Dropped to 48 for one build, and an ERR session
-    // logged SIX retargets in 33 seconds, every one at exactly count=48, each one a full rebuild -
-    // which is the frame-rate collapse the tester saw a couple of minutes into the world. The
-    // original comment beside those arms promised "tiny side clips can never steal the target";
-    // 48 broke that promise.
-    //
-    // kSeedMinItems gates when we may START BUILDING on the target we already have. It must stay
-    // LOW, because RM2 factory pulses only exist during the build burst: on the DLC map the list
-    // tops out near 105, so a 100 floor was satisfied - if at all - only after the pulses were
-    // spent, and CATEGORIES READY reported created=0.
-    // High picker + low seed is not a contradiction: pick late and confidently, then build at once.
-    constexpr uint64_t kPickerMinItems = 100;
+    // kSeedMinItems stays, and is a different question - it gates when we may START BUILDING on the
+    // anchor we already have, and it is still doing its job.
     constexpr uint64_t kSeedMinItemsValue = 48;
 
     // ERR-look placement for the "cleared" badge twin. The badge frame is
@@ -530,6 +528,12 @@ namespace
         uint16_t gx = 0;
         uint16_t gz = 0;
         float emph = 1.0f;    // location-emphasis size factor (1.0 = untouched)
+        // A focus ring, not a marker. Rings take the location emphasis's SIZE (they must stay on
+        // top of the icon they circle, whatever size that icon is) but never its COLOUR: a ring is
+        // a "look here" mark, and dimming it to match a marker on another map is the one thing it
+        // must not do. Until 2026-08-03 they inherited both, because a ring rides its host's
+        // coordinates and the emphasis is decided from coordinates alone.
+        bool is_ring = false;
         // Location-emphasis colour, as last WRITTEN (1.0 / 0.0 = untouched). Memoised so a
         // re-decide only pays for a colour write when the answer actually moved - that
         // write is a copy-on-write inside the engine, not a store.
@@ -848,11 +852,78 @@ namespace
         return depth == 0xFFFFFFFFu || !v3_heap_ptr(parent);
     }
 
+    std::atomic<uintptr_t> g_menuman{0};
+
+    // ── the engine's own map phase ───────────────────────────────────────────────────────────────
+    // CS::CSMenuManImp+0x90 is a 0x47-byte array of per-menu-window lifecycle bytes indexed by the
+    // window's menu id; the world map's is 0x3D. Established by disassembling MenuWindow::update
+    // (exe+0x745570): `cmp ax,0x47` bounds the id, `movzx eax,[rdx+rcx+0x90]` reads the byte at
+    // exe+0x745708, `or [rdx+rcx+0x90],7` sets it at exe+0x74571A, and the close path writes 0 at
+    // exe+0x7ADB83 - two engine steps BEFORE the destructor hook we currently rely on.
+    //
+    // Why this replaces g_v3_map_closed: that flag was SET by the destructor but CLEARED by our own
+    // retargets, so it read "open" throughout the window in which every 2026-08-03 fault happened.
+    // A retarget is something WE do; it is not evidence the map opened. This byte has exactly one
+    // writer - the engine.
+    //
+    // Scope, honestly: this is hygiene plus the epoch FIX 2 needs. It does NOT fix the crashes.
+    // Measured: all four fault groups had WorldMapDialog::update on the stack, so the map was open
+    // and this byte read 3 or 7 in every one of them. Gate B is the crash fix.
+    std::atomic<uint8_t> g_map_phase{0xFF};   // last sampled raw byte: 0 / 1 / 3 / 7, 0xFF = unknown
+    std::atomic<uint16_t> g_map_menu_id{0x3D};
+    std::atomic<bool> g_map_menu_id_resolved{false};
+    // LATCH: "a real map screen has come and gone since we last anchored". Set only by the sampler
+    // when the byte reads 0; cleared only when an anchor is taken. A retarget can never set it,
+    // which is the whole structural point.
+    std::atomic<bool> g_map_screen_gone{true};
+
+    uint8_t v3_map_phase_read(uintptr_t mm, uint16_t id)
+    {
+        __try
+        {
+            return *reinterpret_cast<const volatile uint8_t *>(mm + 0x90 + id);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0xFF;
+        }
+    }
+
+    uint8_t v3_map_phase_sample()
+    {
+        const uintptr_t mm = g_menuman.load(std::memory_order_acquire);
+        if (!v3_heap_ptr(mm)) return 0xFF;
+        const uint16_t id = g_map_menu_id.load(std::memory_order_relaxed);
+        if (id >= 0x47) return 0xFF;
+        const uint8_t raw = v3_map_phase_read(mm, id);
+        // Self-validation instead of trusting the offset blindly: the engine only ever stores
+        // 0, 1, 3 or 7 here. Anything else means this is not the field we think it is, and an
+        // unrecognised signal must never be allowed to gate anything off.
+        if (raw != 0 && raw != 1 && raw != 3 && raw != 7) return 0xFF;
+        return raw;
+    }
+
+    // "a WorldMapDialog object exists at all". 0xFF (unknown) counts as alive on purpose: an
+    // unresolved signal must never be able to switch the mod off.
+    bool v3_map_object_alive()
+    {
+        return g_map_phase.load(std::memory_order_acquire) != 0;
+    }
+    // Stricter: the dialog is enabled and not closing.
+    bool v3_map_drivable()
+    {
+        const uint8_t p = g_map_phase.load(std::memory_order_acquire);
+        return p == 0xFF || (p & 2) != 0;
+    }
+
     void v3_note_movie_attach(uintptr_t wrapper, uintptr_t parent, uint64_t count)
     {
         const auto &ctx = g_v3_movie_ctx;
         if (!ctx.active)
             return;
+        // Never take an anchor while no dialog object exists. Counting on the same parent is still
+        // fine and keeps prev_count honest, so this gates the take, not the observation.
+        const bool phase_alive = v3_map_object_alive();
         const int live_layer = goblin::maphover::map_layer();
         const uintptr_t prev_parent = g_v3_target_parent.load(std::memory_order_relaxed);
         const int prev_layer = g_v3_target_layer.load(std::memory_order_relaxed);
@@ -875,49 +946,76 @@ namespace
                 // be cleared and v3_viewport_reconcile may re-attach the children we kept. This is
                 // sound where the old vtable heuristic was not: the signal is live game activity on
                 // THIS parent, not a pointer that might have been recycled.
-                if (g_v3_map_closed.load(std::memory_order_relaxed))
-                    g_v3_map_closed.store(false, std::memory_order_relaxed);
+                // (A burst on this parent used to CLEAR g_v3_map_closed here. That is the defect:
+                //  a retarget, or a burst we happen to observe, is not evidence that the map opened.
+                //  The gate now has exactly one writer per direction, the engine's phase byte.)
             }
             else
             {
-                bool take =
-                    prev_parent == 0 ||
-                    (count > prev_count && !g_v3_native.seeded) ||
-                    (count >= kPickerMinItems &&
-                     g_v3_map_closed.load(std::memory_order_relaxed)) ||
-                    (count >= kPickerMinItems && prev_layer >= 0 && live_layer >= 0 &&
-                     live_layer != prev_layer);
-                // Dead-anchor arm: an attached list may take over from an anchor that has left
-                // the live tree, at the SEED floor rather than the picker floor. This is what
-                // lets the DLC map's real list win: measured 2026-08-01 (2.1.1 layer-2 logs),
-                // the live layer-2 parent legitimately tops out at 81 children, so no count
-                // floor of 100 can ever accept it, while the OLD view's detached 105-child pin
-                // list kept the anchor and every created child was rejected against it
-                // (created=0, 14272 rejections). This is NOT the floor unification that caused
-                // the 2026-08-01 retarget storm (six retargets in 33 s, each a full ~9.5k
-                // rebuild): that storm stole a HEALTHY anchor at count=48 over and over. Here
-                // the arm is gated on the current anchor reading detached - a one-way state per
-                // movie generation - and the replacement below must itself be live, so it can
-                // fire at most once per teardown, and the seed floor still keeps the tiny side
-                // clips out. (prev_parent != 0 is implied: a zero prev already set `take`.)
-                if (!take && count >= kSeedMinItemsValue && v3_node_detached(prev_parent))
-                    take = true;
-                // Candidate liveness: never anchor onto a node that is out of the live tree or
-                // whose movie view cannot be resolved. The count test alone is what took the
-                // bad layer-2 anchor: at a layer switch the OLD view's list still carries its
-                // 105 children (>= the picker floor) through the ~1 s deferred teardown, so
-                // size cannot tell it from the real one - attachment can, and the movie resolve
-                // is the cross-check that the node is a display object at all.
-                if (take && (v3_node_detached(parent) || v3_movie_of(parent) == 0))
+                // The anchor condition, as a STATE TEST. No count floor, no delay, no retry.
+                //
+                // Measured across the two 2.1.2 sessions of 2026-08-03: every retarget logging
+                // count=48 built all 7136 markers (18 of 18), and every retarget logging count=100
+                // failed (0 of 4 - three produced created=0 with parentCount=105, one never reached
+                // CATEGORIES READY). The parent was never wrong; the anchor was LATE. kPickerMinItems
+                // = 100 on a list that tops out near 105 fires after the build burst has already
+                // spent its pulses, which is why those opens report "pulses seen=0" and the player
+                // sees an empty map on that open and a full one on the next.
+                //
+                // Arm C is the structural fix: it keys off the engine's own phase byte reading 0,
+                // i.e. the dialog was destroyed, so it fires on the FIRST attach into the new screen
+                // (count=1) - the earliest possible moment, with the whole pulse pool still ahead.
+                const uintptr_t cand_movie = v3_movie_of(parent);
+                const bool cand_live = cand_movie != 0 && !v3_node_detached(parent);
+                const uintptr_t anchor_movie = g_v3_target_movie.load(std::memory_order_relaxed);
+                const bool anchor_dead =
+                    prev_parent != 0 &&
+                    (v3_node_detached(prev_parent) || v3_movie_of(prev_parent) == 0);
+
+                // The SIZE FLOOR on every arm that moves to a DIFFERENT container. Measured
+                // 2026-08-03 the hard way: with no floor at all, arm B fired on the first attach of
+                // each new burst and anchored onto a 2-child side clip, nine opens running. The
+                // markers still built, but the counter-zoom samples a REAL WorldMapItem widget of
+                // the anchor's parent, and a 2-child clip has none - so cur_fx/cur_fy froze at
+                // whatever the open started with and every icon kept that scale.
+                //
+                // 48 is not a guess: it is kSeedMinItemsValue, and every retarget logged at
+                // count=48 built all 7136 markers (18 of 18). The floor that had to GO was the
+                // separate picker floor of 100, which fired only after the burst had spent its
+                // pulses on lists topping out near 105 (0 of 4 built). Late was the disease; this
+                // is not a return to it.
+                //
+                // Arm A keeps no floor (there is nothing to lose by anchoring early when we have no
+                // anchor at all, and arm E can still upgrade), and arm E is an upgrade within one
+                // movie, which is already ordered by count.
+                const bool big_enough = count >= kSeedMinItemsValue;
+
+                const char *arm = nullptr;
+                // Arm A takes the floor too. Without it the first anchor of a session landed on a
+                // 2-child clip (measured: "arm=A-first count=2"), and since kSeedMinItems is 48 we
+                // could not have built on it anyway - so waiting for 48 costs nothing and spares
+                // that session's first open the frozen counter-zoom.
+                if (prev_parent == 0 && big_enough)                  arm = "A-first";
+                else if (anchor_dead && big_enough)                  arm = "B-anchor-dead";
+                else if (g_map_screen_gone.load(std::memory_order_acquire) && big_enough)
+                                                                     arm = "C-new-screen";
+                else if (cand_movie != anchor_movie && big_enough)   arm = "D-new-movie";
+                else if (g_v3_native.objects.empty() && count > prev_count) arm = "E-upgrade";
+
+                // Why it cannot storm the way 2026-08-01 did: once objects is non-empty only B, C
+                // or D can move the anchor. B is one-way per movie generation, C needs the dialog
+                // to have been destroyed, D needs a genuinely different movie. That storm was six
+                // moves off a HEALTHY anchor inside one live movie, which no arm here allows.
+                bool take = arm != nullptr && cand_live && phase_alive;
+                if (arm != nullptr && !cand_live)
                 {
-                    take = false;
                     static uintptr_t s_refused_parent = 0;
                     if (parent != s_refused_parent)
                     {
                         s_refused_parent = parent;
                         spdlog::info("[v3movie] re-anchor refused: parent=0x{:X} count={} "
-                                     "layer={} not in the live tree",
-                                     parent, count, live_layer);
+                                     "layer={} arm={} not in the live tree",
+                                     parent, count, live_layer, arm);
                     }
                 }
                 if (take)
@@ -934,12 +1032,15 @@ namespace
                     // created=0 and the icons that had just appeared vanished. Discovery is what
                     // that arm is for; once we are building, only a real teardown, a layer switch
                     // or a dead anchor may move it.
-                    if (prev_parent)
-                        spdlog::info("[v3movie] RETARGET parent 0x{:X} -> 0x{:X} "
-                                     "count={} layer={} mapClosed={}",
-                                     prev_parent, parent, count, live_layer,
-                                     g_v3_map_closed.load(std::memory_order_relaxed));
-                    g_v3_map_closed.store(false, std::memory_order_relaxed);
+                    spdlog::info("[v3movie] RETARGET arm={} parent 0x{:X} -> 0x{:X} count={} "
+                                 "layer={} movie 0x{:X} -> 0x{:X} screenGone={}",
+                                 arm, prev_parent, parent, count, live_layer, anchor_movie,
+                                 cand_movie, g_map_screen_gone.load(std::memory_order_relaxed));
+                    g_v3_target_movie.store(cand_movie, std::memory_order_relaxed);
+                    // One-shot per REAL screen. Only the phase byte reading 0 can re-arm it, so a
+                    // retarget can never hand itself permission to retarget again - the exact
+                    // defect g_v3_map_closed had.
+                    g_map_screen_gone.store(false, std::memory_order_release);
                     g_v3_target_wrapper.store(wrapper, std::memory_order_relaxed);
                     g_v3_target_parent.store(parent, std::memory_order_relaxed);
                     g_v3_target_layer.store(live_layer, std::memory_order_relaxed);
@@ -1017,43 +1118,289 @@ namespace
         }
     }
 
-    // Give the build reference BACK, the way Scaleform itself does.
+    // Counters for the acceptance test: non-zero here is Gate B earning its place, and the
+    // breakdown says WHICH precondition the engine would have tripped over.
+    // Why the seed did not run. Every gate in v3_native_seed_from_live_callback increments one of
+    // these; they are printed together at CATEGORIES READY and at the queue-drop warning and reset
+    // per generation. Three separate causes for "the map came up empty" were fixed one at a time on
+    // 2026-08-03, each found only by adding a log after the fact, because a refusal on this path is
+    // silent by construction: nothing seeds, so no watchdog fires either. One line, whole chain.
+    std::atomic<uint32_t> g_seed_no_screen{0};   // the phase byte says no dialog exists
+    std::atomic<uint32_t> g_seed_epoch{0};       // a screen has come and gone since we anchored
+    std::atomic<uint32_t> g_seed_map_closed{0};  // the close flag is still up
+    std::atomic<uint32_t> g_seed_anchor_bad{0};  // wrapper/parent do not read as a live pair
+    std::atomic<uint32_t> g_seed_small{0};       // the anchor's list is under the seed floor
+    std::atomic<uint32_t> g_seed_ok{0};          // a NEW seed actually started
+    std::atomic<uint32_t> g_seed_managing{0};    // already seeded, kept managing (the common case)
+
+    void v3_seed_trace(const char *when)
+    {
+        // The anchor itself, printed rather than inferred. A stale anchor shows up here as a
+        // liveCount that never grows: healthy opens go 81 -> 988 or 1526 as the game populates the
+        // container, a stale one sits at 81 while the game fills a different one entirely.
+        const uintptr_t anchor = g_v3_target_parent.load(std::memory_order_relaxed);
+        uint64_t anchor_count = 0;
+        if (!v3_heap_ptr(anchor) || !v3_read64(anchor + 0xe0, anchor_count))
+            anchor_count = UINT64_MAX;
+        spdlog::info("[v3seed] {}: anchor=0x{:X} liveCount={} managing={} ok={} refused: "
+                     "noScreen={} epoch={} mapClosed={} anchorBad={} small={}",
+                     when, anchor,
+                     anchor_count == UINT64_MAX ? -1 : static_cast<int64_t>(anchor_count),
+                     g_seed_managing.exchange(0, std::memory_order_relaxed),
+                     g_seed_ok.exchange(0, std::memory_order_relaxed),
+                     g_seed_no_screen.exchange(0, std::memory_order_relaxed),
+                     g_seed_epoch.exchange(0, std::memory_order_relaxed),
+                     g_seed_map_closed.exchange(0, std::memory_order_relaxed),
+                     g_seed_anchor_bad.exchange(0, std::memory_order_relaxed),
+                     g_seed_small.exchange(0, std::memory_order_relaxed));
+    }
+
+    std::atomic<uint32_t> g_v3_reject_slot{0};   // null snapshot slot - the exe+0x11CC530 fault
+    std::atomic<uint32_t> g_v3_reject_array{0};  // corrupt display-list Array header
+
+    // GATE B1 - what SetMatrix will dereference, checked before we call it.
     //
-    // v3_drop_held_ref above refuses to take the count to zero, so on its own it can only ever
-    // hand an object to somebody else - it never destroys one. With the viewport window on
-    // nobody else is left: the parent's reference went with the detach, the movie generation
-    // that created the child is gone, and ours is the last one. Decrementing it there would
-    // strand the block at count 0, allocated forever - the same leak wearing a different hat.
+    // Every fault in the 2026-08-03 runs was the engine dereferencing an allocator or lookup result
+    // it never null-checks, on a child whose Scaleform snapshot state is gone or exhausted. The
+    // chain SetMatrix enters:
+    //     vt+0x18 -> exe+0x117F050 -> exe+0x1179520
+    //     exe+0x1179520: if (*(this+0x60) == 0) { node = GetWritableNodeData(this) exe+0x117DE00;
+    //                                             exe+0x11CC510(node, m) }
+    //     exe+0x11CC510 -> exe+0x1157A70 -> exe+0x11CC530 stores through the snapshot slot
+    //     exe+0x1157A70, when *(node+0x10)==0, appends a change record and needs a fresh 0x3F0
+    //                    chunk from exe+0x115AB20, whose result is stored unchecked at exe+0x115AB88
+    // so the two things that can be missing are the snapshot slot (the 0x11CC530 fault, write 0x10)
+    // and the room for one more change record (the 0x115AB88 fault, write 0x0).
     //
-    // Scaleform::RefCountNTSImpl::Release is `if (--RefCount == 0) delete this;`, and MSVC
-    // compiles `delete this` on a class with a virtual destructor into vtable slot 0, the
-    // scalar deleting destructor. Verified on the marker child type: vtable exe+0x2CBA380,
-    // slot 0 = exe+0x10EF320, which calls the real destructor at exe+0x10C6220 and then frees
-    // through the engine's own allocator singleton (`call [allocator_vtable+0x60]`). Going
-    // through slot 0 means the block goes back to the heap it came from - the lesson of the
-    // v2.0.4 crash wave, where our own allocations reached Scaleform's free.
+    // The child_vtable guard in v3_position_child is necessary but NOT sufficient: in the
+    // full-memory hang dump all 50,823 objects carrying that vtable had the right vtable and
+    // refcount 1, and 8,946 of them had a null snapshot slot. A vtable says what a block IS, not
+    // whether its render state still exists.
     //
-    // Safety rests on one fact, not on hope: WE HOLD A REFERENCE, so this block cannot have
-    // been freed and reused underneath us. That is the whole point of keeping the reference in
-    // the first place ("without it, detaching would free the child"). The vtable equality test
-    // is a net for the case where that invariant was already broken elsewhere; if it fails we
-    // touch nothing and keep leaking, which is exactly the behaviour we are replacing.
-    bool v3_release_child(uintptr_t child, uint64_t expect_vtable, bool &destroyed)
+    // Validate before calling, never catch after: the __try around SetMatrix stays as a net, but it
+    // must stop being the mechanism.
+    bool v3_node_context_ok(uintptr_t child)
+    {
+        uint64_t entry = 0;
+        if (!v3_read64(child + 0x48, entry) || !v3_heap_ptr(entry)) return false;
+        const uint64_t page = entry & ~0xFFFull;
+        const uint64_t off = entry - page;
+        if (off < 0x30 || ((off - 0x30) % 0x48) != 0) return false;
+        uint64_t tbl = 0, snap = 0;
+        if (!v3_read64(page + 0x20, tbl) || !v3_heap_ptr(tbl)) return false;
+        if (!v3_read64(tbl + 0x28 + ((off - 0x30) / 0x48) * 8, snap) || !v3_heap_ptr(snap))
+        {
+            g_v3_reject_slot.fetch_add(1, std::memory_order_relaxed);
+            return false;  // the exe+0x11CC530 fault
+        }
+        // The change-record chunk check that stood here is GONE, 2026-08-03, on its own numbers.
+        // It refused whenever the owner's current 0x3F0 chunk was full, on the theory that
+        // exe+0x1157A70 would then have to allocate a fresh one and might get NULL back
+        // (the exe+0x115AB88 fault). But a full chunk is the NORMAL state - the engine allocates
+        // the next one and almost always succeeds - so the check was a prediction of failure, not
+        // a precondition for it. Measured over one session: slot=0, array=0, chunk=4559. It caught
+        // nothing real and skipped 4,559 legitimate SetMatrix calls, which is why every icon it hit
+        // kept the scale it had at map-open instead of counter-zooming.
+        //
+        // What stays is the snapshot-slot test above: that one IS a precondition (the engine stores
+        // through the slot without checking it) and it has never yet rejected a live child.
+        return true;
+    }
+
+    // GATE B2 - the parent container's display-list Array header, checked before the engine attach
+    // (DisplayObjectContainer::InsertChildAtDepth, exe+0x10C8440) walks it. In the 13:00:46 crash
+    // `data` read 0x7FF7DB74908D - an address inside eldenring.exe's .text - and `size` read
+    // 0x00007FF7_00000003, a pointer-shaped value sitting in a count field. Both are caught here.
+    bool v3_container_array_ok(uintptr_t cont)
+    {
+        uint64_t data = 0, size = 0, cap = 0;
+        if (!v3_read64(cont + 0xD8, data) || !v3_read64(cont + 0xE0, size) ||
+            !v3_read64(cont + 0xE8, cap))
+            return false;
+        if (size > cap || cap > 0x10000) return false;
+        if ((cap == 0) != (data == 0)) return false;
+        if (data && (data & 7)) return false;
+        return true;
+    }
+
+    // Counters for the acceptance test: a non-zero value here is Gate B earning its place, and the
+    // breakdown says which precondition the engine would have tripped over.
+
+    // Hand our build reference back to Scaleform. RefCountNTSImpl::Release is
+    // `if (--RefCount == 0) delete this;` and MSVC compiles `delete this` on a class with a virtual
+    // destructor into vtable slot 0, the scalar deleting destructor - verified on the marker child
+    // type (vtable exe+0x2CBA380, slot 0 = exe+0x10EF320, which calls the real dtor exe+0x10C6220
+    // and then frees through the engine's own allocator singleton). Only ever called while the
+    // owning movie is still alive; see the call site for why that is the whole point.
+    // ── stage 2: expire the parked player instead of exploiting the reuse ───────────────────────
+    //
+    // The world map's SwfPlayer is "mode 2": every close PARKS it on a list at mgr+0xD00 with a
+    // countdown initialised to exactly 1.0f, and a reopen before that countdown drains hands back
+    // the IDENTICAL MovieView - display list intact and, crucially, with NO attachMovie burst. Our
+    // markers are built only from the RM2 pulses that a burst produces, so those opens built
+    // nothing and the map came up empty. Measured 19:45-19:49: 61 opens, 61 closes, 49 retargets -
+    // 12 opens with no burst at all, which is exactly the symptom.
+    //
+    // Rather than try to hold children across that window (their render entry is bound to the movie
+    // instance and cannot be re-pointed - see v3_child_releasable), remove the window: ask the
+    // engine to drop the parked entry. Then every open constructs a fresh MovieView and emits a
+    // burst, and the build path stops depending on how fast the player pressed the button.
+    //
+    // The only mutation is a float the engine itself writes negative one second later. If we lose a
+    // race on it the entry simply is not expired and we get today's behaviour - no corruption. The
+    // dangerous part would be touching a freed node, so the node is re-validated inside the same
+    // guarded block immediately before the store, and the identity test is an exact pointer match
+    // against the movie we just released against, which cannot match another menu's player.
+    std::atomic<uintptr_t> g_park_target{0};   // the movie whose parked entry we want expired
+    uint32_t g_park_frames = 0;
+    uint64_t g_vt_sfmgr = 0;
+    uint64_t g_vt_swfplayer = 0;
+
+    void v3_park_expire_tick()
+    {
+        const uintptr_t want = g_park_target.load(std::memory_order_relaxed);
+        if (!want) return;
+        if (++g_park_frames > 600)   // ~10 s of frames: the entry is not there, stop looking
+        {
+            g_park_target.store(0, std::memory_order_relaxed);
+            spdlog::info("[v3park] no parked entry for movie 0x{:X} after {} frames - disarmed",
+                         want, g_park_frames);
+            g_park_frames = 0;
+            return;
+        }
+        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!exe) return;
+        uint64_t outer = 0, mgr = 0, mvt = 0;
+        if (!v3_read64(exe + 0x3D83148, outer) || !v3_heap_ptr(outer)) return;
+        if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr)) return;
+        if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt)) return;
+        if (g_vt_sfmgr == 0) g_vt_sfmgr = mvt;
+        else if (mvt != g_vt_sfmgr) return;   // not the object we learned; refuse rather than guess
+
+        uint64_t node = 0;
+        if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node)) return;
+        const uint64_t head = node;
+        for (int hop = 0; hop < 16; ++hop)
+        {
+            uint64_t player = 0, pvt = 0, pmovie = 0;
+            if (v3_read64(static_cast<uintptr_t>(node) + 0x10, player) && v3_heap_ptr(player) &&
+                v3_read64(static_cast<uintptr_t>(player), pvt) && v3_heap_ptr(pvt) &&
+                v3_read64(static_cast<uintptr_t>(player) + 0x18, pmovie) &&
+                pmovie == static_cast<uint64_t>(want) &&
+                (g_vt_swfplayer == 0 || pvt == g_vt_swfplayer))
+            {
+                if (g_vt_swfplayer == 0) g_vt_swfplayer = pvt;   // learn it from the exact match
+                const float expired = -1.0f;
+                if (v3_write_bytes(static_cast<uintptr_t>(node) + 0x18, &expired, sizeof expired))
+                {
+                    spdlog::info("[v3park] expired the parked entry for movie 0x{:X} "
+                                 "(node 0x{:X}, {} frames) - the next open rebuilds and bursts",
+                                 want, node, g_park_frames);
+                    g_park_target.store(0, std::memory_order_relaxed);
+                    g_park_frames = 0;
+                }
+                return;
+            }
+            uint64_t next = 0;
+            if (!v3_read64(static_cast<uintptr_t>(node), next) || !v3_heap_ptr(next)) return;
+            node = next;
+            if (node == head) return;   // circular list, one lap done
+        }
+    }
+
+    // ── the world map's CURRENT movie, read every frame without an attachMovie burst ────────────
+    //
+    //     dialog = MapArea - 0x27D8 ;  cell = *(dialog + 0x140) ;  movie = *cell
+    //
+    // dialog+0x140 is not a copy of the movie pointer - it is the ADDRESS of the owning
+    // CS::MenuWindowJob's movie slot (job+0x10), so the dialog always reads through to whatever the
+    // job holds now and cannot go stale while the job lives. The field belongs to the MenuWindow
+    // base class, not to WorldMapDialog: it holds for 8 unrelated dialog classes in the dump.
+    //
+    // This is what we never had. Until now the only way to learn the movie was to wait for a burst,
+    // and a quick reopen emits none - which is exactly the case we kept getting wrong.
+    //
+    // The round trip through job+0x130 is MANDATORY, not belt-and-braces: the job pool threads its
+    // free list through the vptr word, and a free slot's +0x10 was measured holding plausible
+    // garbage. Pointer shape alone cannot tell a live job from a recycled one.
+    uint64_t g_job_vtable = 0;    // learned once, then required constant
+    uint64_t g_movie_vtable = 0;
+
+    uintptr_t v3_movie_now()
+    {
+        if (!v3_map_object_alive()) return 0;
+        void *area = goblin::maphover::map_dialog();
+        if (!area) return 0;
+        const uintptr_t dialog = reinterpret_cast<uintptr_t>(area) - 0x27D8;
+        uint64_t cell = 0;
+        if (!v3_read64(dialog + 0x140, cell) || !v3_heap_ptr(cell) || (cell & 7)) return 0;
+        const uintptr_t job = static_cast<uintptr_t>(cell) - 0x10;
+        uint64_t jvt = 0, back = 0, movie = 0, mvt = 0;
+        if (!v3_read64(job, jvt) || !v3_heap_ptr(jvt)) return 0;
+        if (g_job_vtable == 0) g_job_vtable = jvt;
+        else if (jvt != g_job_vtable) return 0;
+        // The round trip: this job must point back at the dialog we started from.
+        if (!v3_read64(job + 0x130, back) || back != dialog) return 0;
+        if (!v3_read64(static_cast<uintptr_t>(cell), movie) || !v3_heap_ptr(movie)) return 0;
+        if (!v3_read64(static_cast<uintptr_t>(movie), mvt) || !v3_heap_ptr(mvt)) return 0;
+        if (g_movie_vtable == 0) g_movie_vtable = mvt;
+        else if (mvt != g_movie_vtable) return 0;
+        return static_cast<uintptr_t>(movie);
+    }
+
+    // Is this child safe to destroy RIGHT NOW? Validate before calling, never catch after.
+    //
+    // The SEH net around the destructor is not a substitute for this. By the time the destructor
+    // faults it has already mutated live engine state: it overwrites three vtable slots and runs a
+    // movie-registry unregister that AddRefs and Releases the movie, and only then reaches the free
+    // of child+0x50 that trips EnterCriticalSection on a dead heap. A "refused" from the SEH path
+    // therefore means "we already did damage", not "we declined".
+    //
+    // The slot test checks the slot's VTABLE, not merely that it is non-null. Measured over the
+    // 50,825 children in the full dump: 8,946 null slots, 11,366 correct, and 29,801 carrying the
+    // WRONG vtable - every one of which sails through a plain null check.
+    constexpr uint64_t V3_SLOT_VTABLE_RVA = 0x2CB9EF0;
+
+    bool v3_child_releasable(uintptr_t child, uint64_t expect_vtable, uintptr_t movie)
+    {
+        if (!v3_heap_ptr(child) || expect_vtable == 0 || !v3_heap_ptr(movie)) return false;
+        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!exe) return false;
+        uint64_t vt = 0;
+        if (!v3_read64(child, vt) || vt != expect_vtable) return false;          // T1
+        uint64_t probe = 0;
+        if (!v3_read64(movie + 0x5338, probe)) return false;                     // T2
+        uint64_t root = 0, owner = 0;
+        if (!v3_read64(child + 0x20, root) || !v3_heap_ptr(root)) return false;  // T3
+        if (!v3_read64(static_cast<uintptr_t>(root) + 0x10, owner) ||
+            owner != static_cast<uint64_t>(movie))
+            return false;
+        uint64_t entry = 0;                                                       // T4
+        if (!v3_read64(child + 0x48, entry) || !v3_heap_ptr(entry)) return false;
+        const uint64_t page = entry & ~0xFFFull;
+        const uint64_t off = entry - page;
+        if (off < 0x30 || ((off - 0x30) % 0x48) != 0) return false;
+        uint64_t tbl = 0, slot = 0, svt = 0;
+        if (!v3_read64(page + 0x20, tbl) || !v3_heap_ptr(tbl)) return false;
+        if (!v3_read64(tbl + 0x28 + ((off - 0x30) / 0x48) * 8, slot) || !v3_heap_ptr(slot))
+            return false;
+        if (!v3_read64(static_cast<uintptr_t>(slot), svt) || svt != exe + V3_SLOT_VTABLE_RVA)
+            return false;
+        return true;
+    }
+
+    bool v3_release_held(uintptr_t child, uint64_t expect_vtable, bool &destroyed)
     {
         destroyed = false;
-        if (!v3_heap_ptr(child) || expect_vtable == 0)
-            return false;
+        if (!v3_heap_ptr(child) || expect_vtable == 0) return false;
         __try
         {
-            const uint64_t vt = *reinterpret_cast<uint64_t *>(child);
-            if (vt != expect_vtable)
-                return false;
+            const uint64_t vt = *reinterpret_cast<const uint64_t *>(child);
+            if (vt != expect_vtable) return false;
             auto *refs = reinterpret_cast<uint32_t *>(child + 8);
             const uint32_t before = *refs;
-            if (before == 0 || before >= 0x10000000)
-                return false;
-            if (--*refs != 0)
-                return true; // somebody else still owns it; they will destroy it
+            if (before == 0 || before >= 0x10000000) return false;
+            if (--*refs != 0) return true;  // somebody else still owns it and will destroy it
             using DeletingDtor = void *(__fastcall *)(void *, unsigned);
             (*reinterpret_cast<DeletingDtor **>(child))[0](reinterpret_cast<void *>(child), 1);
             destroyed = true;
@@ -1062,47 +1409,6 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
-        }
-    }
-
-    // Children whose generation has been abandoned. They are alive only because of the
-    // reference we still hold, so an entry stays valid for as long as it sits here - nothing
-    // can recycle the block while the count is above zero. Drained a slice at a time from the
-    // map frame so a reset never pays for thousands of destructors at once.
-    struct V3Grave
-    {
-        uintptr_t child = 0;
-        uint64_t vtable = 0;
-    };
-    std::vector<V3Grave> g_v3_graveyard;
-    size_t g_v3_graves_destroyed = 0;
-    size_t g_v3_graves_refused = 0;
-
-    void v3_graveyard_bury(uintptr_t child, uint64_t vtable)
-    {
-        if (!v3_heap_ptr(child) || vtable == 0)
-            return;
-        g_v3_graveyard.push_back(V3Grave{child, vtable});
-    }
-
-    void v3_graveyard_drain(size_t budget)
-    {
-        size_t done = 0;
-        while (!g_v3_graveyard.empty() && done < budget)
-        {
-            const V3Grave g = g_v3_graveyard.back();
-            g_v3_graveyard.pop_back();
-            bool destroyed = false;
-            if (v3_release_child(g.child, g.vtable, destroyed))
-            {
-                if (destroyed)
-                    ++g_v3_graves_destroyed;
-            }
-            else
-            {
-                ++g_v3_graves_refused; // counted, never silently dropped
-            }
-            ++done;
         }
     }
 
@@ -1116,6 +1422,15 @@ namespace
             !v3_read64(static_cast<uintptr_t>(parent) + 0xe0, count) ||
             count > 65536)
             count = 0;
+        // Gate B2. InsertChildAtDepth walks the parent's display-list Array without checking it.
+        // In the 13:00:46 crash that Array's data pointer read as an address inside the exe's own
+        // .text and its size field held a pointer-shaped value; the engine walked it and faulted.
+        // Refusing one child is a missing icon, walking a corrupt array is a dead process.
+        if (!v3_container_array_ok(static_cast<uintptr_t>(parent)))
+        {
+            g_v3_reject_array.fetch_add(1, std::memory_order_relaxed);
+            return 0xE0000001u;  // our own sentinel: refused, never entered the engine
+        }
         // Keep SEH in a destructor-free leaf; MSVC rejects __try in the
         // spdlog-heavy caller because that function owns C++ temporaries.
         __try
@@ -1430,6 +1745,11 @@ namespace
         if (g_v3_native.child_vtable == 0)
             g_v3_native.child_vtable = vt;  // reported by the tick (no spdlog in an SEH leaf)
         else if (vt != g_v3_native.child_vtable)
+            return false;
+        // Gate B1. The vtable above proves the block is one of ours; this proves the engine can
+        // actually complete the SetMatrix we are about to ask for. 8,946 of 50,823 vtable-correct
+        // children in the hang dump would have failed here.
+        if (!v3_node_context_ok(child))
             return false;
 
         float matrix[8]{};
@@ -1749,31 +2069,21 @@ namespace
                           site, tid, expect);
     }
 
-    void v3_factory_clear_request(bool drop_held_ref, uint64_t bury_vtable = 0)
+    void v3_factory_clear_request(bool drop_held_ref)
     {
         for (auto &s : g_v3_factory_slots)
         {
-            if (s.held && v3_heap_ptr(s.child))
+            if (drop_held_ref && s.held && v3_heap_ptr(s.child))
             {
-                if (drop_held_ref)
-                {
-                    uint32_t before = 0, after = 0;
-                    v3_drop_held_ref(s.child, before, after);
-                }
-                else if (bury_vtable != 0)
-                {
-                    // Staged but never consumed, and the generation is going away: the
-                    // reference we took in the place detour is the only one left, so this
-                    // child leaks exactly like a consumed one unless it is buried too.
-                    v3_graveyard_bury(s.child, bury_vtable);
-                }
+                uint32_t before = 0, after = 0;
+                v3_drop_held_ref(s.child, before, after);
             }
             s = V3FactorySlot{};
         }
         g_v3_factory_active = 0;
     }
 
-    void v3_native_reset()
+    void v3_native_reset(const char *site)
     {
         // NEVER touch the abandoned children here. Under the all-layers model
         // a reset only ever happens when the manager re-anchors to a NEW
@@ -1786,44 +2096,36 @@ namespace
         // Same reasoning for held factory refs: dropping them would write a
         // refcount into the dead movie's memory.
         //
-        // What that reasoning does NOT license is walking away from the children entirely,
-        // which is what this function used to do ("leak the (dead) ref instead"). Report 19
-        // measured the price: three sessions, ten map opens each, dead on the eleventh, with
-        // ~7,136 marker display objects orphaned per open until the GFx allocator refused and
-        // the engine dereferenced the NULL it got back. Every open in that log re-anchored to
-        // a NEW parent, so the reset arm - this one - ran every single time.
         //
-        // The distinction the old comment missed: an object we hold a reference on is NOT in
-        // the "may already be freed AND reallocated" category. The reference is what keeps it
-        // out of it. Parking a matrix into a foreign block is a wild write; handing our own
-        // reference back is not. So the children move to the graveyard and are destroyed a
-        // slice per frame, and only the things we do NOT own are still left alone.
+        // 2026-08-03: an attempt to reclaim these children (a graveyard drained per frame through
+        // the engine's own deleting destructor) was written and MEASURED, and it did nothing at
+        // all - "0 destroyed, 7136 refused" on every single generation, the refusals accumulating
+        // to 64,224 over eleven map opens. Whatever state the children are in by the time a drain
+        // reaches them, it is not the one a release requires. It came back out; the probe below is
+        // what stays, because the honest next step is to learn what that state actually is rather
+        // than to guess at another release.
         v3_note_thread("v3_native_reset (frees all four containers)");
         v3_check_owner("v3_native_reset");
-        const uint64_t vt = g_v3_native.child_vtable;
-        size_t buried = 0, unowned = 0;
-        if (vt != 0)
+        // Read-only sample of this generation's children, re-checked once the NEXT generation has
+        // been built. `site` matters: on 2.1.1 only the tick's re-anchor arm reset, and the sample
+        // came back committed=16 vtableOk=16 refs1=16 every time. The anchor fix resets from more
+        // places (gen=23 across 11 opens, i.e. two per open), so WHICH caller abandoned a
+        // generation may be exactly what decides whether its children are still there.
         {
-            for (const auto &o : g_v3_native.objects)
+            uintptr_t sample[16] = {};
+            size_t n = 0;
+            const size_t total = g_v3_native.objects.size();
+            if (total)
             {
-                if (!o.ref_held || !v3_heap_ptr(o.child))
-                {
-                    ++unowned;
-                    continue;
-                }
-                v3_graveyard_bury(o.child, vt);
-                ++buried;
+                const size_t want = total < 16 ? total : 16;
+                const size_t stride = total / want;
+                for (size_t i = 0; i < want && n < 16; ++i)
+                    sample[n++] = g_v3_native.objects[i * stride].child;
             }
+            goblin::crashdiag::sample_generation(g_v3_native.child_vtable, sample, n, total, site);
         }
-        else
-        {
-            unowned = g_v3_native.objects.size();
-        }
-        v3_factory_clear_request(false, vt);
-        if (buried || unowned)
-            spdlog::info("[v3native] generation abandoned: {} children buried for release, "
-                         "{} not ours to free, {} already queued",
-                         buried, unowned, g_v3_graveyard.size() - buried);
+        goblin::crashdiag::note_generation(g_v3_native.parent, g_v3_native.wrapper);
+        v3_factory_clear_request(false);
         g_v3_native = V3NativeManager{};
         v3_pulse_counters_reset(); // per generation, like the manager itself
     }
@@ -1865,18 +2167,56 @@ namespace
         g_v3_target_parent.store(0, std::memory_order_relaxed);
         g_v3_target_layer.store(-1, std::memory_order_relaxed);
         g_v3_target_count.store(0, std::memory_order_release);
-        v3_native_reset();
+        v3_native_reset("drop_dead_anchor");
     }
 
     bool v3_native_seed_from_live_callback()
     {
+        // Phase gate, and this is the one that was missing.
+        //
+        // This seed runs from the FACTORY PULSE, not from v3_native_tick, so the gate at the top of
+        // the tick never covered it. Measured 19:02-19:03: a close released the generation, and 0.7 s
+        // later - with the dialog already gone - this path reseeded onto the anchor we had kept.
+        // That anchor was about to be torn down, so the burst produced nothing: "pulses seen=7876,
+        // attached=0, created=0, parentCount=81" against 230 or 1526 on a healthy open, and no
+        // CATEGORIES READY at all. Seconds later a real burst arrived and arm B-anchor-dead
+        // re-anchored - correctly, but the open had already been spent. That is the "icons invisible
+        // on a quick reopen" report, and it survived keeping the anchor because keeping the anchor
+        // was never the problem: seeding onto it while no map screen exists is.
+        if (!v3_map_object_alive())
+        {
+            g_seed_no_screen.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // ...and the anchor must belong to THIS screen.
+        //
+        // Liveness alone does not decide it, because the engine's teardown is deferred by about a
+        // second: 0.17 s after a close the previous parent is still attached and still resolves, so
+        // every check we have passes and we seed onto a container that is about to die. Measured
+        // 19:21:55 - release at close, seed 0.17 s later, "pulses seen=7876 attached=0", no
+        // CATEGORIES READY, and five seconds after that arm B-anchor-dead re-anchors onto the real
+        // list. By then the burst's pulse pool is spent, so the correct anchor has nothing left to
+        // build with, and the player sees an empty map that fills in only on the next slow reopen.
+        //
+        // g_map_screen_gone is exactly the fact needed: set by the phase byte when the dialog is
+        // destroyed, cleared only when an anchor is taken. While it is up, any anchor we hold is
+        // from the previous screen, whatever it looks like. Waiting costs nothing - the pulses we
+        // decline to waste here are the ones the real anchor uses.
+        if (g_map_screen_gone.load(std::memory_order_acquire))
+        {
+            g_seed_epoch.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         const int layer = goblin::maphover::map_layer();
         const uintptr_t wrapper = g_v3_target_wrapper.load(std::memory_order_acquire);
         const uintptr_t parent = g_v3_target_parent.load(std::memory_order_relaxed);
         const int target_layer = g_v3_target_layer.load(std::memory_order_relaxed);
         if (g_v3_native.seeded &&
             g_v3_native.wrapper == wrapper && g_v3_native.parent == parent)
+        {
+            g_seed_managing.fetch_add(1, std::memory_order_relaxed);
             return true; // same live session (incl. quick reopen) - keep managing
+        }
         // The manager survives map close. If the map closed and no fresh burst
         // re-anchored the target yet, both manager and target may point into a
         // torn-down movie - never build there. RM2 factory pulses exist ONLY
@@ -1884,7 +2224,10 @@ namespace
         // burst), so on a stale manager the reseed must happen INLINE below,
         // not in the map-frame tick - by then the pulses are gone.
         if (g_v3_map_closed.load(std::memory_order_relaxed))
+        {
+            g_seed_map_closed.fetch_add(1, std::memory_order_relaxed);
             return false;
+        }
         // Liveness before the floors: a heap-valid anchor that has left the live tree
         // can never seed correctly, however many children its frozen count reports.
         // The 2.1.1 layer-2 runs proved the shape: the OLD view's pin list kept 105
@@ -1928,8 +2271,10 @@ namespace
                              layer, wrapper, parent, wrapper_parent, live_count,
                              kSeedMinItems);
             }
+            g_seed_small.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        g_seed_ok.fetch_add(1, std::memory_order_relaxed);
         if (target_layer < 0)
             // The burst ran before map_layer() resolved; stamp the live layer
             // (informational only - the shared parent hosts every layer).
@@ -1972,7 +2317,7 @@ namespace
                              "(vtable {:X} vs new {:X}) - it does not read as live",
                              g_v3_native.objects.size(), g_v3_native.parent, old_vt, new_vt);
         }
-        v3_native_reset();
+        v3_native_reset("re-anchor");
         g_v3_native.layer = layer;
         g_v3_native.wrapper = wrapper;
         g_v3_native.parent = parent;
@@ -2048,8 +2393,8 @@ namespace
         // Colour first, matrix second, deliberately: the matrix goes in through the display
         // object's own setter, so whatever change bookkeeping that setter does runs AFTER
         // the colour landed in the same node data.
-        const float want_fade = v3_fade(obj.area, obj.gx, obj.gz);
-        const float want_cool = v3_cool(obj.area, obj.gx, obj.gz);
+        const float want_fade = obj.is_ring ? 1.0f : v3_fade(obj.area, obj.gx, obj.gz);
+        const float want_cool = obj.is_ring ? 0.0f : v3_cool(obj.area, obj.gx, obj.gz);
         if ((want_fade != obj.fade || want_cool != obj.cool) &&
             v3_write_cxform(obj.child, want_fade, want_cool))
         {
@@ -2125,6 +2470,13 @@ namespace
             }
         }
 
+        // Focus-ring accounting for one merge. Rings are the only children that CHANGE which marker
+        // they belong to, so every symptom about them is really a question about this loop: how many
+        // were seen, how many were re-pointed at a marker on a different map (the only case that
+        // re-decides emphasis and repaints), how many actually moved, and how many could not be
+        // projected at all.
+        uint32_t ring_seen = 0, ring_visible = 0, ring_other_map = 0;
+        uint32_t ring_remapped = 0, ring_moved = 0, ring_unprojected = 0;
         size_t visible_count = 0;
         const size_t queued_before = g_v3_native.pending.size();
         for (const auto &point : snapshot)
@@ -2139,6 +2491,14 @@ namespace
                 // drive visibility (retire+recreate here used to dead-queue
                 // the row and stall the refresh).
                 V3NativeObject &obj = g_v3_native.objects[found->second];
+                const bool ring =
+                    (point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0;
+                if (ring)
+                {
+                    ++ring_seen;
+                    if (point.visible) ++ring_visible;
+                    if (!v3_is_own_location(point.area, point.gx, point.gz)) ++ring_other_map;
+                }
                 // A ring is re-pointed at a different marker between merges, so its map
                 // travels with it; a marker's own never changes. Re-deciding the emphasis
                 // from the point costs a compare and keeps both correct.
@@ -2149,6 +2509,7 @@ namespace
                     obj.gz = point.gz;
                     obj.emph = v3_emphasis(obj.area, obj.gx, obj.gz);
                     v3_native_reapply(obj);
+                    if (ring) ++ring_remapped;
                 }
                 // Deliberately NOT re-deciding the emphasis of every object here: a merge
                 // walks all ~9500 of them, and doing a transform write for each in one call
@@ -2166,7 +2527,18 @@ namespace
                 float mx = 0.0f, mz = 0.0f;
                 if (goblin::mapproject::to_map(point.area, point.gx, point.gz, point.px, point.pz,
                                                mx, mz))
+                {
                     v3_native_move(obj, mx, mz);
+                    if (ring) ++ring_moved;
+                }
+                else if (ring)
+                {
+                    // to_map goes through the engine converter for anything outside the overworld,
+                    // and that call is now gated on a freshness stamp. If rings pile up here, the
+                    // gate is the reason they sit at stale positions - a self-inflicted suspect,
+                    // counted rather than assumed.
+                    ++ring_unprojected;
+                }
                 // The master switch is already folded into `point.visible` by the snapshot, so a
                 // switched-off map merges as "every point invisible" and nothing can be shown
                 // against the switch here.
@@ -2235,6 +2607,12 @@ namespace
                          g_v3_native.layer, g_v3_native.observed_count,
                          snapshot.size(), visible_count,
                          g_v3_native.pending.size() - g_v3_native.pending_index);
+        // Print only when a ring did something, so a static map stays quiet.
+        if (ring_remapped || ring_moved || ring_unprojected)
+            spdlog::info("[v3ring] merge{}: seen={} visible={} onOtherMap={} remapped={} moved={} "
+                         "unprojected={}",
+                         initial ? " (seed)" : "", ring_seen, ring_visible, ring_other_map,
+                         ring_remapped, ring_moved, ring_unprojected);
     }
 
     void v3_native_tick()
@@ -2242,6 +2620,10 @@ namespace
         if (!goblin::variants::kNativeMarkers) return;
         const int layer = goblin::maphover::map_layer();
         if (layer < 0 || layer > 2) return;
+        // Phase gate. No dialog object exists, so a retarget/reset/reseed here would be work
+        // against a screen that is not there. 0xFF (unresolved) counts as alive, so an unknown
+        // signal can never switch the markers off.
+        if (!v3_map_object_alive()) return;
         v3_note_thread("v3_native_tick (map frame)");
         v3_check_owner("v3_native_tick");
 
@@ -2250,17 +2632,6 @@ namespace
         // on frames where the current target does not validate, which is exactly the window a
         // teardown-and-reopen spends here. 256 destructors is well under a frame's worth of
         // the seed burst that shares this tick.
-        if (!g_v3_graveyard.empty())
-        {
-            const size_t before = g_v3_graveyard.size();
-            v3_graveyard_drain(256);
-            if (g_v3_graveyard.empty())
-                spdlog::info("[v3native] generation released: {} destroyed, {} refused "
-                             "(last slice {})",
-                             g_v3_graves_destroyed, g_v3_graves_refused,
-                             before);
-        }
-
         const uintptr_t wrapper = g_v3_target_wrapper.load(std::memory_order_acquire);
         const uintptr_t parent = g_v3_target_parent.load(std::memory_order_relaxed);
         // The shared parent hosts every layer's markers - the target's stamp
@@ -2292,7 +2663,7 @@ namespace
         }
         if (g_v3_native.parent != parent)
         {
-            v3_native_reset();
+            v3_native_reset("tick_new_parent");
             g_v3_native.layer = layer;
             g_v3_native.wrapper = wrapper;
             g_v3_native.parent = parent;
@@ -2305,30 +2676,21 @@ namespace
             g_v3_native.observed_count = live_count;
             return;
         }
-        // QUICK REOPEN with no burst: the game reused the same movie and parent, so
-        // v3_note_movie_attach never cleared the gate and viewport_reconcile would stay shut on an
-        // empty map. Clear it here, but only on PROOF the map is genuinely open again:
-        //   * the map dialog's own per-frame hook has advanced past the close stamp (that hook
-        //     stops during the close-then-teardown window, so a fresh value cannot come from
-        //     there); >8 ms guards the same-tick boundary where both stamps read equal, and
-        //   * the cached parent still carries this generation's vtable. A teardown-and-reopen whose
-        //     rebuild burst has not landed yet has a fresh heartbeat but a FREED old parent, whose
-        //     block no longer holds our signature - so we do not clear, and nothing relinks into it.
-        if (g_v3_map_closed.load(std::memory_order_relaxed) && g_v3_native.seeded &&
-            !g_v3_native.objects.empty())
+        // The QUICK-REOPEN heartbeat arm stood here and is GONE, 2026-08-03. It cleared
+        // g_v3_map_closed on the theory that a fresh maphover heartbeat plus a parent still
+        // carrying this generation's vtable proves the map reopened. Both halves are unsound: the
+        // heartbeat is stamped by placename_detour, which is on EVERY faulting stack, so it is
+        // "alive" precisely when we crash; and a vtable says what a block is, not whether its
+        // render state exists. It was the third of three places that cleared the gate without the
+        // engine's say-so. The phase byte sampled in menu_update_detour is now the only writer.
+        if (g_v3_native.parent_vtable == 0 && v3_heap_ptr(g_v3_native.parent))
         {
-            const uint64_t closed_at = g_v3_close_ms.load(std::memory_order_acquire);
-            const uint64_t last_live = goblin::maphover::last_activity_ms();
             uint64_t pvt = 0;
-            const bool pvt_ok = v3_read64(g_v3_native.parent, pvt) && pvt != 0;
-            if (pvt_ok && g_v3_native.parent_vtable == 0)
+            if (v3_read64(g_v3_native.parent, pvt) && pvt != 0)
             {
                 g_v3_native.parent_vtable = pvt; // first frame it is genuinely alive
                 g_v3_native.parent_movie = v3_movie_of(g_v3_native.parent);
             }
-            const bool parent_live = pvt_ok && pvt == g_v3_native.parent_vtable;
-            if (last_live > closed_at + 8 && parent_live)
-                g_v3_map_closed.store(false, std::memory_order_relaxed);
         }
         if (g_v3_native.layer != layer)
         {
@@ -2427,8 +2789,9 @@ namespace
             {
                 V3NativeObject &obj = g_v3_native.objects[g_v3_native.emph_cursor++];
                 const float emph = v3_emphasis(obj.area, obj.gx, obj.gz);
-                if (emph == obj.emph && obj.fade == v3_fade(obj.area, obj.gx, obj.gz) &&
-                    obj.cool == v3_cool(obj.area, obj.gx, obj.gz))
+                const float want_fade = obj.is_ring ? 1.0f : v3_fade(obj.area, obj.gx, obj.gz);
+                const float want_cool = obj.is_ring ? 0.0f : v3_cool(obj.area, obj.gx, obj.gz);
+                if (emph == obj.emph && obj.fade == want_fade && obj.cool == want_cool)
                     continue;
                 obj.emph = emph;
                 v3_native_reapply(obj);
@@ -2492,7 +2855,8 @@ namespace
             // timeline ctx on sprite 171, and an open map. A player report (Linux, DLC map) hit
             // this with 1331 markers dropped, and the message alone could not tell which gate was
             // shut - so print the three of them plus how many children were rejected.
-            spdlog::warn("[v3native] {} queued markers never built; dropping the queue to keep "
+            v3_seed_trace("at queue drop");
+        spdlog::warn("[v3native] {} queued markers never built; dropping the queue to keep "
                          "live refresh alive. gates: qmark_injected={} map_open={} "
                          "rejected_so_far={} attached={}; pulses seen={} unseeded={} "
                          // budget_regranted is NOT a block: it counts the pulses that arrived with
@@ -2603,7 +2967,16 @@ namespace
                              "created={} failed={} wrongCtx={} parentCount={} inferredHeavy={}",
                              g_v3_native.layer, lightweight, g_v3_native.failed,
                              g_v3_native.wrong_contexts, live_count, heavy);
+                v3_seed_trace("at READY");
                 g_v3_native.completion_reported = true;
+                // The generation is fully built, so the PREVIOUS one's movie is certainly gone by
+                // now: this is the moment its sampled children answer whether they outlived it.
+                goblin::crashdiag::note_map_open_completed(
+                    g_v3_native.layer, static_cast<uint32_t>(lightweight), g_v3_native.failed,
+                    static_cast<uint32_t>(g_v3_native.objects.size()));
+                goblin::crashdiag::memory("open", static_cast<uint32_t>(g_v3_native.objects.size()));
+                goblin::crashdiag::arena("open");
+                goblin::crashdiag::probe_survivors();
             }
         }
 
@@ -2665,7 +3038,7 @@ namespace
     // Whatever menu is active this frame (see menu_update_detour) - the generic host.
     std::atomic<uintptr_t> g_active_menu{0};
     // CSMenuMan itself, for the read-only window scan when no window host is found.
-    std::atomic<uintptr_t> g_menuman{0};
+
     // g_form_pushed ("was the screen pushed rather than slotted - decides how the close is
     // noticed") and g_form_job stood here. Both were declared and never touched again: the screen
     // stack in g_screens carries `pushed` per level, and the close is noticed by heartbeat.
@@ -2705,6 +3078,34 @@ namespace
     // Defined with the icon code: re-applies the row icon strips. Called AFTER the dialog's own
     // update, which is the only moment in the frame that is later than the timeline advance.
     void repaint_row_icons_after_advance(uintptr_t dlg);
+
+    // ── which way is left/right physically held? ─────────────────────────────────────
+    // Keyboard through GetAsyncKeyState, pad through the overlay's XInput cache (a direct
+    // XInputGetState would read back the buttons our own hook injects). 0x0004/0x0008 =
+    // XINPUT_GAMEPAD_DPAD_LEFT/RIGHT.
+    int arrow_dir_held()
+    {
+        const uint16_t pad = goblin::overlay::gamepad_buttons();
+        const bool left = (GetAsyncKeyState(VK_LEFT) & 0x8000) || (pad & 0x0004);
+        const bool right = (GetAsyncKeyState(VK_RIGHT) & 0x8000) || (pad & 0x0008);
+        return left == right ? 0 : (right ? 1 : -1);
+    }
+
+    // ── why there is no cursor guard here ────────────────────────────────────────────
+    // A slider row and the grid both want left/right, and TWO attempts to take the press
+    // away from the grid failed in game on 2026-08-04:
+    //   1. snap an odd (right-column) cursor back to the left cell - never fired: the grid
+    //      SKIPS the unfocusable empty filler and lands on the neighbouring ROW, so the
+    //      landing index is even;
+    //   2. remember {cursor +0xD4, top row +0x348} before this update and write the pair
+    //      back after it - made it worse. The dialog's update repaints the highlight from
+    //      the moved cursor BEFORE we restore the field, so the two desynced: the next
+    //      up/down then appeared to skip a row (measured, reported).
+    // The fix is not a better guard, it is a layout where the press has nowhere to go: a
+    // slider is edited on its OWN screen holding exactly one row (build_value), so the
+    // grid's move is refused by its own bounds. FUN_14093F540 itself never touches the
+    // cursor - it calls the dialog's vt[8] and the command dispatcher - so there is no
+    // earlier point in this detour to intercept anyway.
 
     void form_update_detour(void *dlg, float dt, void *consumed)
     {
@@ -4745,6 +5146,84 @@ namespace
             spdlog::info("[menuicons] icons drawn (slot {} column {})", slot, column);
     }
 
+    // POD-only body for draw_row_slider (SEH + spdlog temporaries may not share a frame).
+    // Returns -1 resolve failed, else the cell applied.
+    int draw_row_slider_raw(uintptr_t base, uintptr_t dlg, int32_t slot, int cell,
+                            void *rowProxy)
+    {
+        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        using SetPosFn = void(void *proxy, int32_t x, int32_t y);
+        char path[96];
+        void *root = reinterpret_cast<void *>(dlg + 0x120);
+        int applied = -1;
+        __try
+        {
+            uint8_t buf[0x60] = {};
+            void *r = nullptr;
+            // Same two routes as the icon strip: the live row handle when the renderer gave
+            // us one, the path from the movie root for the repaint pass.
+            if (rowProxy)
+            {
+                r = p_resolve(rowProxy, buf, "MfgSlider");
+                if (!p_valid(r))
+                {
+                    p_dtor(buf + 0x28);
+                    std::memset(buf, 0, sizeof(buf));
+                    r = nullptr;
+                }
+            }
+            if (!r)
+            {
+                _snprintf_s(path, sizeof(path), _TRUNCATE,
+                            "KeySetting/ItemList/Item_%d_0/MfgSlider", slot);
+                r = p_resolve(root, buf, path);
+            }
+            if (p_valid(r))
+            {
+                reinterpret_cast<SetPosFn *>(base + 0x733230)(
+                    r, -cell * goblin::menu_icon_tags::SLIDER_CELL_PITCH_PX, 0);
+                applied = cell;
+            }
+            p_dtor(buf + 0x28);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return applied;
+    }
+
+    // The native-look slider bar, driven exactly like the icon strip: one named child
+    // ("MfgSlider", placed with NO matrix), shifted to the cell for the row's value.
+    // Cell 0 is empty, so every non-slider row parks the strip there - which is also what
+    // an untouched instance (the game's own key-binding screen) shows.
+    void draw_row_slider(uintptr_t base, int32_t slot, const goblin::nmenu::Row *row,
+                         void *rowProxy = nullptr)
+    {
+        const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
+        if (!dlg || slot < 0)
+            return;
+        int cell = 0;
+        if (row && row->kind == goblin::nmenu::RowKind::Slider)
+        {
+            cell = 1 + static_cast<int>(row->slider_frac *
+                                        (goblin::menu_icon_tags::SLIDER_CELLS - 1) + 0.5f);
+            if (cell < 1)
+                cell = 1;
+            if (cell > goblin::menu_icon_tags::SLIDER_CELLS)
+                cell = goblin::menu_icon_tags::SLIDER_CELLS;
+        }
+        const int applied = draw_row_slider_raw(base, dlg, slot, cell, rowProxy);
+        // One-shot, and only for a REAL slider cell: whether the second spliced name
+        // resolves at all. The measured history (icons, 2026-07) is that exactly one added
+        // named child ever resolved, so this line IS the experiment's readout.
+        static std::atomic<int> s_logged{0};
+        if (cell > 0 && s_logged.exchange(1) == 0)
+            spdlog::info("[menuslider] 'MfgSlider' resolves: {} (slot {}, cell {})",
+                         applied >= 0 ? "yes" : "NO", slot, cell);
+    }
+
     void *row_render_detour(void *item, void *rowProxy)
     {
         const uintptr_t it = reinterpret_cast<uintptr_t>(item);
@@ -4795,7 +5274,7 @@ namespace
         case goblin::nmenu::RowKind::Back:
         case goblin::nmenu::RowKind::SubPage:
         case goblin::nmenu::RowKind::Toggle:
-        case goblin::nmenu::RowKind::Number:
+        case goblin::nmenu::RowKind::Slider:
         case goblin::nmenu::RowKind::Enum:
         case goblin::nmenu::RowKind::ValueOption:
         case goblin::nmenu::RowKind::Rebind:
@@ -4825,6 +5304,7 @@ namespace
         }
         draw_our_row(base, rowProxy, style, label, row->value, row->plate);
         draw_row_icon(base, icon_slot, row->ini_key, rowProxy);
+        draw_row_slider(base, icon_slot, row, rowProxy);
         return item;
     }
 
@@ -5327,6 +5807,7 @@ namespace
             if (!row)
                 continue;
             draw_row_icon(base, slot, row->ini_key);
+            draw_row_slider(base, slot, row);
         }
     }
 
@@ -6388,6 +6869,73 @@ namespace
         }
     }
 
+    // ── left/right stepping for Slider rows ──────────────────────────────────────────
+    // The screen's own input cannot deliver this: up/down is the grid's internal logic (not
+    // a window command) and no command with a D-pad Left/Right action id is registered on
+    // this screen (measured - cmdlist_notes). So the press is read physically through
+    // arrow_dir_held() - the same reading the cursor guard in form_update_detour uses, which
+    // is what keeps "step the value" and "undo the grid's row jump" perfectly in sync.
+    // Held = repeat, like the game's own sliders: one step on the press, then after
+    // kSliderRepeatDelayMs a step every kSliderRepeatMs.
+    constexpr uint64_t kSliderRepeatDelayMs = 400;
+    constexpr uint64_t kSliderRepeatMs = 90;
+
+    int g_slider_dir = 0;           // direction currently held (0 = none)
+    uint64_t g_slider_next = 0;     // when the held direction fires again
+    bool g_slider_stepped = false;  // something moved during this hold
+
+    void poll_slider(const Screen &top)
+    {
+        if (goblin::nmenu::rebind_pending())
+        {
+            g_slider_dir = 0;
+            g_slider_stepped = false;
+            return; // the rebind page owns raw input
+        }
+        const int dir = arrow_dir_held(); // the same reading the cursor guard uses
+        const uint64_t now = GetTickCount64();
+        if (dir == 0)
+        {
+            // Release ends the hold. The steps themselves skip reapply_live_settings() (every
+            // current slider value is read live per frame by its consumer), so one call here
+            // settles anything heavier a future slider key may gate - and one log line covers
+            // the whole hold instead of one per repeat.
+            if (g_slider_stepped)
+            {
+                goblin::reapply_live_settings();
+                spdlog::info("[form] slider hold released - settings re-applied");
+            }
+            g_slider_dir = 0;
+            g_slider_stepped = false;
+            return;
+        }
+        if (dir != g_slider_dir)
+        {
+            g_slider_dir = dir;
+            g_slider_next = now + kSliderRepeatDelayMs; // fire this press now, repeat later
+        }
+        else if (now < g_slider_next)
+            return;
+        else
+            g_slider_next = now + kSliderRepeatMs;
+        size_t ix = 0;
+        bool preview = false;
+        if (!selected_model_index(top.dlg, &ix, &preview) || preview)
+            return;
+        size_t count = 0;
+        const goblin::nmenu::Row *rows = goblin::nmenu::rows(&count);
+        if (!rows || ix >= count || rows[ix].kind != goblin::nmenu::RowKind::Slider)
+            return;
+        if (!goblin::nmenu::slider_step(ix, dir))
+            return; // already at the end the press points at
+        g_slider_stepped = true;
+        build_form_rows();
+        // Same engine gate the rebind path uses: FUN_140942690 reads the grid cursor and never
+        // moves it, so the selection survives every repaint of the hold.
+        if (safe_to_call_engine(top, now))
+            refresh_form_view(top.dlg);
+    }
+
     // ESC does not reach our screen's Back command: the host is the key-binding screen, whose own
     // command table registers action 0x18 for Q (and for the pad's circle), not for Escape, so the
     // engine simply has nothing bound to it there. The screen therefore ignored ESC entirely. Read the
@@ -6439,6 +6987,8 @@ namespace
         g_form_dialog.store(0, std::memory_order_release);
         g_form_update_watch.store(0, std::memory_order_release);
         g_close_request.store(0, std::memory_order_release);
+        g_slider_dir = 0; // a hold must not carry into the next open
+        g_slider_stepped = false;
         for (std::vector<FormItem> &p : g_form_pools)
             p.clear();
         goblin::nmenu::set_nested(false);
@@ -6692,6 +7242,7 @@ namespace
         if (safe_to_call_engine(top, GetTickCount64()))
             paint_help_line();
         poll_rebind();
+        poll_slider(top);
         arm_action_log_on_escape();
         // ── the strips, EVERY frame ──────────────────────────────────────────────────
         // The SDK says why they cannot be written once: DisplayList::MoveDisplayObject
@@ -6755,6 +7306,52 @@ namespace
         // its vtable slots read back as string data, so a job may only be PUSHED onto it, never
         // stored in a slot of it (window_like() is the gate for that).
         g_menuman.store(reinterpret_cast<uintptr_t>(menuman), std::memory_order_release);
+        // The map phase, sampled once per frame on the game UI thread. This is CSMenuMan::updateTask,
+        // so it runs whether or not any menu is up - which is exactly what makes it able to see the
+        // close edge. Nothing else in the mod reads the byte directly.
+        {
+            // Resolve the world map's menu id from the live dialog rather than hardcoding it:
+            // wmd_update passes r8 = dialog + 0x27D8, and the id is a u16 at dialog+0x180. Until it
+            // resolves, 0x3D stands (WorldMapDialog::create builds it as 3 + 0x3a).
+            if (!g_map_menu_id_resolved.load(std::memory_order_relaxed))
+            {
+                if (void *area = goblin::maphover::map_dialog())
+                {
+                    uint32_t id = 0;
+                    const uintptr_t dialog = reinterpret_cast<uintptr_t>(area) - 0x27D8;
+                    if (v3_read32(dialog + 0x180, id) && (id & 0xFFFF) < 0x47)
+                    {
+                        g_map_menu_id.store(static_cast<uint16_t>(id & 0xFFFF),
+                                            std::memory_order_relaxed);
+                        g_map_menu_id_resolved.store(true, std::memory_order_relaxed);
+                        spdlog::info("[mapphase] world map menu id resolved: 0x{:X}", id & 0xFFFF);
+                    }
+                }
+            }
+            const uint8_t raw = v3_map_phase_sample();
+            const uint8_t prev = g_map_phase.exchange(raw, std::memory_order_release);
+            if (raw != 0xFF && prev != raw)
+                spdlog::info("[mapphase] {} -> {} ({})", prev, raw,
+                             raw == 0 ? "gone"
+                                      : (raw == 1 ? "idle/closing"
+                                                  : ((prev == 0 || prev == 0xFF) ? "open" : "focus")));
+            // The OPEN edge, and the only place g_v3_map_closed is ever cleared. One writer per
+            // direction: the engine's byte going non-zero means a dialog exists again.
+            if (prev == 0 && raw != 0 && raw != 0xFF)
+                g_v3_map_closed.store(false, std::memory_order_release);
+            // While the map is closed is exactly when the parked entry exists and the engine is
+            // counting it down. One bounded walk per frame, read-only until the exact match.
+            if (raw == 0)
+                v3_park_expire_tick();
+            if (raw == 0)
+            {
+                g_map_screen_gone.store(true, std::memory_order_release);
+                // The EARLY close edge: the engine zeroes this byte two steps before the destructor
+                // our current close hook waits for. on_map_close() is idempotent.
+                if (prev != 0 && prev != 0xFF)
+                    goblin::stall_probe::on_map_close();
+            }
+        }
         hud_watch_sample(menuman); // armed right after our screen closes; prints only on change
         // ONE-SHOT: locate the STATIC slot that holds this singleton. With its RVA we can x-ref the code
         // that touches CSMenuMan+0x90.. offline and find the function the game itself uses to clear those
@@ -7148,8 +7745,17 @@ namespace
                     // necessarily hooked up yet at the instant it is created, and the first
                     // markers get their fade from the merge a moment later.)
                     const float emph = v3_emphasis(s.point.area, s.point.gx, s.point.gz);
-                    const float fade = v3_fade(s.point.area, s.point.gx, s.point.gz);
-                    const float cool = v3_cool(s.point.area, s.point.gx, s.point.gz);
+                    // A ring takes the emphasis SIZE but never its dimming - and this is the site
+                    // that has to know it too. Missing it here wrote the dim colour straight into
+                    // the child at creation while the object recorded 1.0, so the budgeted pass
+                    // compared equal and never corrected it: rings came out with mismatched
+                    // brightness that no later pass could touch.
+                    const bool staged_ring =
+                        (s.point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0;
+                    const float fade =
+                        staged_ring ? 1.0f : v3_fade(s.point.area, s.point.gx, s.point.gz);
+                    const float cool =
+                        staged_ring ? 0.0f : v3_cool(s.point.area, s.point.gx, s.point.gz);
                     if (fade != 1.0f || cool != 0.0f)
                         v3_write_cxform(s.child, fade, cool);
                     const bool positioned = attached &&
@@ -7196,9 +7802,11 @@ namespace
                 obj.area = s.point.area;
                 obj.gx = s.point.gx;
                 obj.gz = s.point.gz;
+                obj.is_ring =
+                    (s.point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0;
                 obj.emph = v3_emphasis(obj.area, obj.gx, obj.gz);
-                obj.fade = v3_fade(obj.area, obj.gx, obj.gz);
-                obj.cool = v3_cool(obj.area, obj.gx, obj.gz);
+                obj.fade = obj.is_ring ? 1.0f : v3_fade(obj.area, obj.gx, obj.gz);
+                obj.cool = obj.is_ring ? 0.0f : v3_cool(obj.area, obj.gx, obj.gz);
                 obj.visible = s.point.visible;
                 // We kept the build reference above iff B was on -> this child may be
                 // safely detached/re-attached by the viewport reconcile.
@@ -7248,6 +7856,11 @@ namespace
             return;
         if (!g_v3_native.seeded || g_v3_native.objects.empty() ||
             g_v3_map_closed.load(std::memory_order_relaxed))
+            return;
+        // Stricter than the tick's gate: reconcile drives engine attach and remove-at, so it needs
+        // the dialog enabled and not closing, not merely existing. Leaves o.attached alone when
+        // shut, so the next drivable frame resumes instead of rebuilding.
+        if (!v3_map_drivable())
             return;
         const uintptr_t wrapper = g_v3_native.wrapper;
         const uintptr_t parent = g_v3_native.parent;
@@ -8598,6 +9211,11 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     // not even the Debug page. The measurement itself is not lost - it is the log line below.)
     spdlog::info("[v3native] self-detach: matched={} removed={} tracked={} in {} us",
                  found, removed, g_v3_native.objects.size(), us);
+    spdlog::info("[v3gate] precondition rejects this session: slot={} array={}",
+                 g_v3_reject_slot.load(std::memory_order_relaxed),
+                 g_v3_reject_array.load(std::memory_order_relaxed));
+    goblin::crashdiag::note_map_closed(static_cast<uint32_t>(g_v3_native.objects.size()));
+    goblin::crashdiag::memory("close", static_cast<uint32_t>(g_v3_native.objects.size()));
 
     // The children were bulk-DETACHED (their TreeCacheNodes are gone, which is what pays for the
     // close freeze), but with the viewport window on they carry our retained reference, so the
@@ -8606,17 +9224,103 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     // through v3_viewport_reconcile instead of showing an empty map. A REAL teardown changes the
     // parent, and the reset arm in v3_native_tick drops the tracking there.
     // Without that retained reference the detach really did free them, so clearing is correct.
+    // GIVE THE REFERENCE BACK HERE, while the movie is still alive.
+    //
+    // Measured in the 11.84 GB full-memory dump: the Scaleform arena is a FIXED, fully pre-committed
+    // 160.00 MiB (0x7FF38C0E0000..0x7FF3960E0000, 167,770,368 usable), and at the hang it was
+    // 137,819,248 bytes in use - 82.15%. Inside it sat 49,952 of our marker children with parent==0
+    // and refcount==1, exactly 7.0000 x 7136, i.e. seven whole abandoned generations. All 49,952
+    // pointed at ONE movie, 0x7FF38E183D50, whose own refcount read 51,001 - the movie is pinned
+    // alive BY our orphans, so neither it nor anything it owns can ever go back to the arena. When
+    // the arena finally cannot satisfy a request the engine stores the NULL unchecked and the
+    // process dies: two independent sites did exactly that within one second (exe+0x11BFE7E write
+    // 0x1770 and exe+0x12326E8 write 0x0), with no frame of ours anywhere in either chain.
+    //
+    // Process commit never moved through any of this, which is why an earlier measurement wrongly
+    // cleared the leak: the arena is committed up front, so filling it is invisible to the OS.
+    //
+    // WHY HERE and not at the reset, where an earlier attempt put it: at reset the movie is already
+    // gone, and a child's destructor reaches into its movie's context - that attempt reported
+    // "0 destroyed, 7136 refused" because the destructor itself faulted, after the refcount had
+    // already been decremented. Map close is the last moment the whole structure is intact.
+    //
+    // Release is the engine's own: decrement, and at zero call vtable slot 0, the MSVC scalar
+    // deleting destructor (exe+0x10EF320 for this class), which destructs and frees through
+    // Scaleform's allocator - the same heap the block came from. If anything else still holds a
+    // reference the count simply drops and its owner destroys it later, which is correct too.
     if (goblin::variants::kViewportWindow)
     {
+        uint32_t released = 0, destroyed = 0, refused = 0, unsafe = 0;
+        const uint64_t vt = g_v3_native.child_vtable;
+        // The movie that owns this generation, read directly rather than inferred. Destroying a
+        // child is safe only while the MovieImpl that created it is alive: both fault paths
+        // (exe+0x1136C9B reading [movie+0x5338], and the entry-release virtual call in
+        // exe+0x11578F0) resolve through it.
+        const uintptr_t movie = v3_movie_now();
         for (auto &o : g_v3_native.objects)
-            o.attached = false;
+        {
+            if (!o.ref_held || !v3_heap_ptr(o.child) || vt == 0)
+                continue;
+            // Refuse BEFORE entering the destructor. Reaching the SEH net means the destructor has
+            // already rewritten vtable slots and run a movie-registry unregister - "refused" there
+            // is damage, not a decline.
+            if (!v3_child_releasable(o.child, vt, movie))
+            {
+                ++unsafe;
+                continue;
+            }
+            bool gone = false;
+            if (v3_release_held(o.child, vt, gone))
+            {
+                ++released;
+                if (gone) ++destroyed;
+                o.child = 0;
+                o.ref_held = false;
+            }
+            else
+            {
+                ++refused;
+            }
+        }
+        spdlog::info("[v3native] generation released at close: {} released, {} destroyed, "
+                     "{} refused, {} unsafe(pre-test), of {} tracked, movie=0x{:X}",
+                     released, destroyed, refused, unsafe, g_v3_native.objects.size(), movie);
+        // Ask for this movie's parked entry to be expired, so the next open cannot reuse it and
+        // therefore cannot skip the burst we build from. Harmless if the entry is never found.
+        if (v3_heap_ptr(movie))
+            g_park_target.store(movie, std::memory_order_relaxed);
     }
-    else
-    {
-        g_v3_native.objects.clear();
-        g_v3_native.by_row.clear();
-        g_v3_native.queued.clear();
-    }
+    // Nothing is kept for a quick reopen any more. That path was written for a reopen that reuses
+    // the same movie and parent; measured across every session on 2026-08-03, 30 of 30 opens
+    // retargeted to a NEW parent, so it never once fired - and holding a generation for it is what
+    // pins the movie.
+    g_v3_native.objects.clear();
+    g_v3_native.by_row.clear();
+    g_v3_native.queued.clear();
+    // The generation is GONE now, not merely detached, so the manager must not believe it still has
+    // one. Leaving `seeded` set was worth a bug report on its own: a QUICK reopen reuses the same
+    // parent, so the tick's reset arm never fires, no reseed happens, and the map comes up empty -
+    // while a slow reopen gets a new parent, resets, reseeds, and looks fine. Dropping the anchor
+    // as well means the next attach burst re-anchors through arm A at the seed floor, which is the
+    // same path a first open takes.
+    g_v3_native.seeded = false;
+    g_v3_native.completion_reported = false;
+    // KEEP THE ANCHOR. Only the generation is gone; the container it lived in usually is not.
+    //
+    // Clearing it as well was wrong, and the log says exactly how: on a QUICK reopen the game
+    // reuses the same movie and emits NO attachMovie burst at all - three opens in a row logged
+    // `mapphase 0 -> 3 (open)` followed by nothing, no RETARGET, no seed, no CATEGORIES READY,
+    // because v3_note_movie_attach only runs on a burst. With no anchor there was nothing to seed
+    // onto, so the map came up empty and stayed empty until a real teardown or a layer switch
+    // produced a fresh burst. That is the "icons invisible on quick reopen" report.
+    //
+    // Keeping it is safe because the deferred-seed path validates it before committing: a detached
+    // parent, or one whose movie no longer resolves, is dropped there and the next burst re-anchors.
+    // Liveness, not our bookkeeping, decides.
+    // The receipt for the release above, and the only proof that matters: destroying 7136 objects
+    // means nothing unless the arena actually got the bytes back. Deliberately the LAST thing this
+    // function does - read before the release and it just reports the old number.
+    goblin::crashdiag::arena("close");
     return removed;
 }
 
@@ -8787,9 +9491,13 @@ void goblin::stall_probe::setup()
     // row icons find their clip. A miss only costs icons.
     try
     {
+        // By SIGNATURE, not by address - see report 20 and the note in aob_signatures.py. The
+        // literal 0x736FC0 was measured on game build 2.6.2.0 and would land inside an instruction
+        // on any other, which MinHook would then overwrite.
         modutils::hook<RowPathFn>(
-            {.address = reinterpret_cast<void *>(
-                 reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + 0x736FC0)},
+            {.aob = "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 90 FE FF FF FF 49 89 5B 20 48 8B 05 "
+                    "?? ?? ?? ?? 48 33 C4 48 89 84 24 80 00 00 00 48 8B FA 48 8B D9 49 89 53 98 C7 "
+                    "44 24 20 00 00 00 00 45 8B 08 45 8B 40 04"},
             row_path_detour, o_row_path);
         spdlog::info("[menuicons] row-slot hook armed");
     }
@@ -8808,8 +9516,8 @@ void goblin::stall_probe::setup()
         if (!goblin::config::debugLogging)
             throw std::runtime_error("debug logging off - action probe not installed");
         modutils::hook<ActionTestFn>(
-            {.address = reinterpret_cast<void *>(
-                 reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + 0x758500)},
+            {.aob = "4C 8B DC 48 81 EC 88 00 00 00 49 C7 43 98 FE FF FF FF 49 8D 43 B0 49 89 43 20 "
+                    "41 89 53 18 41 0F B6 00"},
             action_test_detour, o_action_test);
         spdlog::info("[action] input-action predicate hook armed (inert until ESC)");
     }

@@ -20,13 +20,18 @@ namespace goblin::nmenu
         Back,        // "< Back" - go up one level
         SubPage,     // opens another page in place
         Toggle,      // bool config value, decide flips it
-        // NOT CURRENTLY REACHABLE (checked 2026-07-31): Number, Enum and ValueOption - with them
-        // kPageValue, build_value(), kRanges and kLanguages. kind_of() only ever runs on keys that
-        // a page lists, the page table kLayout contains no Float or Language key, and the three
-        // that exist (overlay_font_scale, overlay_opacity, ui_language) sit in the schema's
-        // "Menu & Hotkeys" section which no page enters. The machinery works - it is a page short.
-        // Either list those keys on a page or delete the branches; do not assume it is live.
-        Number,      // numeric config value, decide opens its value page
+        // A numeric row, drawn with the game's own slider art (the "MfgSlider" strip spliced
+        // into the row clip). On a LIST page it shows its bar and its number and confirming it
+        // opens kPageValue; on THAT screen it is the only row, and left/right (kbd arrows /
+        // D-pad) steps the value through slider_step(). The one-row screen is not decoration:
+        // the grid claims left/right too and walks to the neighbouring row, and on a one-row
+        // list its own bounds refuse the move. See build_value() and form_update_detour.
+        Slider,      // numeric config value, stepped on its own screen via slider_step()
+        // NOT CURRENTLY REACHABLE (checked 2026-07-31, still true 2026-08-04): Enum and
+        // ValueOption - with them kPageValue, build_value() and kLanguages. kind_of() only ever
+        // runs on keys that a page lists, and the one Language key (ui_language) sits in the
+        // schema's "Menu & Hotkeys" section which no page enters. The machinery works - it is a
+        // page short. Either list such a key on a page or delete the branches; do not assume live.
         Enum,        // value from a fixed list, decide opens its value page
         ValueOption, // one choice ON a value page; decide applies it and returns
         Rebind,      // hotkey, decide opens the "press a key" page
@@ -42,10 +47,14 @@ namespace goblin::nmenu
         const wchar_t *value = L"";
         int32_t page_id = -1;     // SubPage target
         const char *ini_key = nullptr;
-        void *target = nullptr;   // Toggle: bool*, Number: float*/uint8_t*, Enum: std::string*
-        uint8_t type_tag = 0;     // goblin::IniType as u8, for Number/Enum
+        void *target = nullptr;   // Toggle: bool*, Slider: float*/uint8_t*, Enum: std::string*
+        uint8_t type_tag = 0;     // goblin::IniType as u8, for Slider/Enum
         int32_t collected = 0;    // Progress
         int32_t total = 0;        // Progress
+        // Slider: where the value sits in its range, 0..1. The host draws the native-look
+        // bar from it (the "MfgSlider" strip spliced into the row clip) - the model knows
+        // the range, the host knows the strip, and this fraction is the whole interface.
+        float slider_frac = 0.0f;
         void (*action)() = nullptr;
         uint32_t addon_row_id = 0; // rows contributed by another mod (type_tag 0xFF)
         int32_t addon_kind = 0;
@@ -71,7 +80,7 @@ namespace goblin::nmenu
     constexpr int32_t kPageHidden = 2;
     // id 3: the About page (version + links). It took the slot the removed Tools page left free.
     constexpr int32_t kPageAbout = 3;
-    // The list of choices for one Number/Enum entry, and the "press a key" screen for one
+    // The list of choices for one Enum entry, and the "press a key" screen for one
     // hotkey entry. Both edit a single entry, remembered by the model while the page is up,
     // so one page id each is enough.
     constexpr int32_t kPageValue = 4;
@@ -112,6 +121,14 @@ namespace goblin::nmenu
     // Handle "decide" on a row: navigates, toggles, steps or runs the action. Returns
     // true if the row list changed (the caller must rebuild the native view).
     bool activate(size_t row_index);
+
+    // Step a Slider row by one increment (dir < 0 = down, > 0 = up), clamped to its range -
+    // no wrap, the ends feel like ends, exactly as the game's own sliders behave. Refuses
+    // unless the slider's own one-row screen (kPageValue) is the live page. Returns true if
+    // the value moved (the caller must rebuild the native view). Live re-apply is the
+    // caller's business: the host calls reapply_live_settings() once per hold, on release,
+    // so a held repeat does not run the full re-apply ten times a second.
+    bool slider_step(size_t row_index, int dir);
 
     // Go up one level. Returns false when already at the root (the caller should then
     // let the screen close normally).

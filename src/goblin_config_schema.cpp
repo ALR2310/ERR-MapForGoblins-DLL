@@ -19,6 +19,7 @@ namespace goblin::config
 
     bool locationEmphasis = true;
     float locationEmphasisOwnScale = 1.05f;
+    float mapPanelOffsetPercent = 100.0f;
     float locationEmphasisOtherScale = 0.95f;
     float locationEmphasisOtherFade = 0.75f;
     float locationEmphasisOtherCool = 0.90f;
@@ -132,6 +133,12 @@ namespace
                   "look nearby: a dungeon sits under the overworld, so its icons land on the\n"
                   "same spot of the map as the surface ones. Markers of your own map draw\n"
                   "bigger, markers of any other map draw smaller. Nothing is ever hidden."),
+                                IniEntry{"map_panel_offset_percent", IniType::Float, &cfg::mapPanelOffsetPercent, "100",
+                         "Horizontal position of the marker tooltip and the focus banner on the map "
+                         "screen. 100 = the corner they were authored for, 0 = the centre of the map "
+                         "area, above 100 = further left, below 0 = right of centre. Only needed if "
+                         "the panels sit wrong on your display; ultrawide setups have been reported. "
+                         "Takes effect immediately, no need to reopen the map."},
                 IniEntry{"location_emphasis_own_scale", IniType::Float, &cfg::locationEmphasisOwnScale, "1.05",
                          "Size of the markers that belong to the map you are standing in (1.0 = unchanged).", false, nullptr},
                 IniEntry{"location_emphasis_other_scale", IniType::Float, &cfg::locationEmphasisOtherScale, "0.95",

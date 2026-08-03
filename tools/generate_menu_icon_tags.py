@@ -11,9 +11,22 @@ crashed three times over; see the note in goblin_stall_probe.cpp.
 What this generator emits (src/generated_shared/goblin_menu_icon_tags.hpp):
   ICON_BLOB[] = N x DefineBitsLossless2 (one per category icon, fresh charIds)
                 + ONE DefineSprite with N frames, frame i placing bitmap i
+                + the SLIDER strip (see below)
   ROW_TAG[]   = a REPLACEMENT DefineSprite tag for cid 189 whose frame 1 additionally places
-                that icon sprite as a named child "MfgIcon"
+                that icon sprite as a named child "MfgIcon" and the slider strip as "MfgSlider"
   ICON_FRAME_OF_KEY[] = ini key -> frame number inside the icon sprite (1-based)
+
+The SLIDER strip is the native settings slider rebuilt for this movie. In the game's own
+widget (02_042_PC_GraphicSetting, sprite 78 "Slider") the whole visual is ONE external
+texture, MENU_FL_Slider (396x40, drawn 1:1), sliding to the right under a 400x36 mask -
+sprite 76 gives it 1000 frames, one per position. A frame-driven copy is out (a multi-frame
+sprite ANIMATES in every instance we do not drive - the game's own key-binding screen uses
+this very row clip), so the same look is authored the way the icons are: a strip of
+SLIDER_CELLS static cells, cell k = the texture at the position for fraction k/(cells-1),
+behind one row-level mask window; showing a value is a horizontal shift of the strip, and
+cell 0 is empty so untouched instances show nothing. Geometry measured from 02_042
+(scratch/recon_042_slider_geom.py): image x -591.45px (0%) .. -202px (100%), mask window
+x -196.5..203.5, y -36..0, image y -37.15.
 
 The DLL then splices:  orig[0..tag189start) + ICON_BLOB + ROW_TAG + orig[tag189end..)
 so our defs are parsed immediately before the row clip that uses them (both are defines, so
@@ -33,12 +46,28 @@ sys.path.insert(0, 'scratch')
 import config
 
 GFX = str(config.GAME_DIR / 'menu' / '02_160_keyconfiguration.gfx')
+GFX_042 = str(config.GAME_DIR / 'menu' / 'win' / '02_042_pc_graphicsetting.gfx')
 OUT = 'src/generated_shared/goblin_menu_icon_tags.hpp'
 ROW_CID = 189          # the row clip we extend
 ICON_PX = 32           # icons are drawn into a 40px-tall row
 ICON_X = 14.0          # px. Was 2.0 - flush with the separator caption, which ate the indent
                        # ordinary rows have; 14 leaves that indent visible and still clears the label
 ICON_Y = 11.0         # rows are 63.7 apart; 4 sat too high and 18 too low, measured in game
+
+# ── the slider strip (native look, shift-driven) ──────────────────────────────────────
+SLIDER_IMG_CID_042 = 28      # MENU_FL_Slider's GFX_DefineExternalImage2 in 02_042
+# Native geometry, px, in the widget's own space (recon_042_slider_geom.py):
+SL_IMG_X0, SL_IMG_X1 = -591.45, -202.0   # sliding image x at 0% and at 100%
+SL_IMG_Y = -37.15
+SL_WIN_L, SL_WIN_R = -196.5, 203.5       # mask window (shape 75 under scale 1.0 x 1.286)
+SL_WIN_T, SL_WIN_B = -36.0, 0.0
+SL_SCALE = 0.45              # 400x36 native window -> 180x16.2 in our value column
+SLIDER_CELLS = 100           # cells 1..100 = 0..100%; cell 0 is empty on purpose
+# Strip pitch must exceed window width (180) + scaled image width (396*0.45 = 178.2) so a
+# neighbouring cell's texture can never reach into the visible window.
+SLIDER_PITCH = 384           # px between cells
+SLIDER_X = 586.0             # window position in the row: the value column starts at 582.6
+SLIDER_Y = 19.0              # bar 16.2px tall, centred on the icons' 11..43 band
 
 PLACE2, PLACE3, SHOWFRAME, END, DEFSPRITE, REMOVE2, LOSSLESS2 = 26, 70, 1, 0, 39, 28, 36
 
@@ -429,8 +458,47 @@ def main():
     # reset, so the shift we set stays set. An untouched instance (the right column, the player's own
     # key-binding screen) sits at identity, and since the icons now start at ICON_X + ICON_PX, the
     # mask window shows the empty cell there exactly as before.
+    # ── the slider strip ────────────────────────────────────────────────────────────
+    # Its ids come AFTER both icon variants' ids (A and B share the same range - only one
+    # is ever spliced - so the slider must clear the higher of the two, sprite_b_cid).
+    slider_img_cid = sprite_b_cid + 1
+    slider_mask_cid = sprite_b_cid + 2
+    slider_strip_cid = sprite_b_cid + 3
+    mv042 = M.Movie(GFX_042)
+    if SLIDER_IMG_CID_042 not in mv042.defs:
+        raise SystemExit(f'MENU_FL_Slider (cid {SLIDER_IMG_CID_042}) not found in {GFX_042}')
+    t42, s42, e42 = mv042.defs[SLIDER_IMG_CID_042]
+    if t42 != 1009:
+        raise SystemExit(f'cid {SLIDER_IMG_CID_042} in 02_042 is tag {t42}, expected 1009 '
+                         '(GFX_DefineExternalImage2)')
+    # The def carries only {cid, format, size, resource name}; the engine loads the texture
+    # by NAME from the global menu image sets, so the copied tag works in any movie.
+    img_body = bytearray(mv042.d[s42:e42])
+    img_body[0:2] = struct.pack('<H', slider_img_cid)
+    slider_blob = build_tag(1009, bytes(img_body))
+    win_w = (SL_WIN_R - SL_WIN_L) * SL_SCALE
+    win_h = (SL_WIN_B - SL_WIN_T) * SL_SCALE
+    slider_blob += define_shape_rect(slider_mask_cid, win_w, win_h)
+    strip_s = bytearray()
+    for k in range(1, SLIDER_CELLS + 1):
+        f = (k - 1) / float(SLIDER_CELLS - 1)
+        ix = (SLIDER_X + k * SLIDER_PITCH
+              + (SL_IMG_X0 + (SL_IMG_X1 - SL_IMG_X0) * f - SL_WIN_L) * SL_SCALE)
+        iy = SLIDER_Y + (SL_IMG_Y - SL_WIN_T) * SL_SCALE
+        strip_s += place2(slider_img_cid, k, matrix_bytes(SL_SCALE, ix, iy))
+    strip_s += build_tag(SHOWFRAME, b'')
+    strip_s += build_tag(END, b'')
+    slider_blob += build_tag(DEFSPRITE, struct.pack('<HH', slider_strip_cid, 1) + bytes(strip_s))
+    blob_b += slider_blob
+
+    # Mask pairs: icons on 16(clip 17)/17, slider on 18(clip 19)/19 - the row's own children
+    # stay on 1..15. Same no-matrix rule for the strip placement as for MfgIcon (see above);
+    # the row-level offset SLIDER_X/SLIDER_Y is baked into every cell.
     icon_places = (place2(mask_b_cid, 16, matrix_bytes(1.0, ICON_X, ICON_Y), clip_depth=17)
-                   + place2(strip_b_cid, 17, b'', 'MfgIcon'))
+                   + place2(strip_b_cid, 17, b'', 'MfgIcon')
+                   + place2(slider_mask_cid, 18, matrix_bytes(1.0, SLIDER_X, SLIDER_Y),
+                            clip_depth=19)
+                   + place2(slider_strip_cid, 19, b'', 'MfgSlider'))
 
     tt, b0, b1 = mv.defs[ROW_CID]
     if tt != DEFSPRITE:
@@ -463,6 +531,12 @@ def main():
         missing = [c for c in orig_refs if c not in new_refs]
         if missing:
             raise SystemExit('SELF-CHECK %s: row clip lost char refs %s' % (label, missing))
+        if label == 'B':
+            for c, what in ((slider_img_cid, 'slider image'),
+                            (slider_mask_cid, 'slider mask'),
+                            (slider_strip_cid, 'slider strip')):
+                if c not in mv2.defs:
+                    raise SystemExit(f'SELF-CHECK B: {what} (cid {c}) missing after parse-back')
         print('self-check %s OK: %d defs, sprite %d, %d B blob + %d B row tag'
               % (label, len(mv2.defs), sprite, len(blb), len(rtag)))
 
@@ -479,8 +553,14 @@ def main():
         f.write('    // id we add must still be unused in the movie that actually loaded.\n')
         f.write(f'    constexpr size_t ORIG_ROW_BODY_LEN = {len(body)};\n')
         f.write(f'    constexpr uint16_t FIRST_CID = {base};\n')
-        f.write(f'    constexpr uint16_t LAST_CID = {sprite_b_cid};\n')
+        f.write(f'    constexpr uint16_t LAST_CID = {slider_strip_cid};\n')
         f.write(f'    constexpr int ICON_COUNT = {len(bitmap_cids)};\n')
+        f.write('    // The slider strip: cell k (1-based) shows the native bar at fraction\n')
+        f.write('    // (k-1)/(SLIDER_CELLS-1); cell 0 is empty. Show a value by shifting the\n')
+        f.write('    // "MfgSlider" child to x = -cell * SLIDER_CELL_PITCH_PX (same mechanism\n')
+        f.write('    // as the icon strip; the placement carries no matrix).\n')
+        f.write(f'    constexpr int SLIDER_CELLS = {SLIDER_CELLS};\n')
+        f.write(f'    constexpr int SLIDER_CELL_PITCH_PX = {SLIDER_PITCH};\n')
         # Only variant B is emitted since 2026-07-29: the strip-behind-a-mask variant (A) was
         # removed from the DLL, and its blob was ~160 KB of data nothing read. blob_a/row_tag_a are
         # still BUILT above so the layout arithmetic stays honest and reviving A stays a one-line

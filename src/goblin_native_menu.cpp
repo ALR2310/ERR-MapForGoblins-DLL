@@ -97,14 +97,21 @@ namespace
         float min;
         float max;
         float step;
+        const wchar_t *suffix; // printed after the number in the slider's value column
     };
     // Ranges mirror the overlay's own sliders (goblin_overlay.cpp): font scale 0.8-3.0
     // and opacity 0.3-1.0. The remaining Float entries are the overlay WINDOW geometry
     // (overlay_window_x/y/w/h) - meaningless to edit from the in-game menu, so they stay
     // read-only Info rows.
     constexpr NumRange kRanges[] = {
-        {"overlay_font_scale", 0.80f, 3.00f, 0.10f},
-        {"overlay_opacity", 0.30f, 1.00f, 0.05f},
+        {"overlay_font_scale", 0.80f, 3.00f, 0.10f, L""},
+        {"overlay_opacity", 0.30f, 1.00f, 0.05f, L""},
+        // Map panel position, in percent: 0 = centre of the map area, 100 = the corner the panels
+        // were authored for, above 100 = further left. Step 10 gives 26 stops over -50..200, which
+        // is about 69 stage units each - fine enough to place it, and a held arrow sweeps the whole
+        // range in ~2.5 s at the repeat rate. Same range as the overlay's slider, deliberately:
+        // two menus disagreeing about the limits of one setting is a bug report waiting to happen.
+        {"map_panel_offset_percent", -50.0f, 200.0f, 10.0f, L"%"},
     };
     const NumRange *range_for(const char *key)
     {
@@ -410,14 +417,46 @@ namespace
         if (e.type == goblin::IniType::VkKey || e.type == goblin::IniType::GamepadMask)
             return RowKind::Rebind;
         if (range_for(e.key))
-            return RowKind::Number;
+            return RowKind::Slider;
         return RowKind::Info;
+    }
+
+    // ── slider row: what its value column shows ──────────────────────────────────────
+    // The current value of a slider row, both as text and as a 0..1 fraction. The BAR is
+    // not text any more: the host draws the game's own slider look from the fraction (the
+    // "MfgSlider" strip spliced into the row clip - see generate_menu_icon_tags.py), so
+    // the value column carries only the number, right-aligned clear of the bar. A first
+    // text-bar round (':' / '·' glyphs) read as a progress bar, not a slider - reported in
+    // game 2026-08-04 and replaced the same day. The number drops its decimals when the
+    // whole range walks on integers ("100%"), and keeps them when it does not ("1.20").
+    std::wstring slider_text(const goblin::IniEntry &e, const NumRange &r, float *out_frac)
+    {
+        const float v = !e.target ? r.min
+                        : e.type == goblin::IniType::Float
+                            ? *static_cast<float *>(e.target)
+                            : static_cast<float>(*static_cast<uint8_t *>(e.target));
+        float f = r.max > r.min ? (v - r.min) / (r.max - r.min) : 0.f;
+        if (f < 0.f)
+            f = 0.f;
+        if (f > 1.f)
+            f = 1.f;
+        if (out_frac)
+            *out_frac = f;
+        const bool whole = r.step == static_cast<float>(static_cast<int>(r.step)) &&
+                           r.min == static_cast<float>(static_cast<int>(r.min));
+        wchar_t num[32];
+        _snwprintf_s(num, _TRUNCATE, whole ? L"%.0f%s" : L"%.2f%s", v, r.suffix);
+        return colored(num, kColValue);
     }
 
     // ── the choices behind one entry ─────────────────────────────────────────────────
     // Both value kinds boil down to "a list of options with one of them current", which is
     // what the value page renders. Numbers get their list from the range, enums from their
     // fixed table - so the page itself needs no per-type code.
+    // Since 2026-08-04 the NUMBER half of these helpers is unreachable: range keys are
+    // Slider rows stepped in place, and only an Enum still opens the value page (itself a
+    // page short of reachable - see the RowKind note in the header). The range branches
+    // stay with the Enum machinery they are interleaved with.
     size_t option_count(const goblin::IniEntry &e)
     {
         if (e.type == goblin::IniType::Language)
@@ -545,12 +584,18 @@ namespace
     const char *const kMenuSettingKeys[] = {
         "enable_toggle_hotkey", "toggle_key",          "toggle_gamepad_combo",
         "enable_manual_hide",   "hide_marker_key",     "hide_marker_gamepad", "hover_info",
+        // Right after hover_info on purpose: it positions the very panels that setting turns on,
+        // and a player who has just found the tooltip in the wrong place looks for the fix here.
+        // A key in kRanges only gets a numeric range - it appears on a page ONLY if it is listed
+        // here, which is why adding the range alone showed nothing in game.
+        "map_panel_offset_percent",
     };
 
     const LayoutPage kLayout[] = {
         {"Categories", kCategorySections, 8, nullptr, 0, true, false},
         {"Compatibility", kCompatSections, 1, nullptr, 0, false, false},
-        {"Menu settings", nullptr, 0, kMenuSettingKeys, 7, false, false},
+        {"Menu settings", nullptr, 0, kMenuSettingKeys,
+         sizeof(kMenuSettingKeys) / sizeof(kMenuSettingKeys[0]), false, false},
         {"Debug", kDebugSections, 1, nullptr, 0, false, true},
     };
     constexpr size_t kLayoutCount = sizeof(kLayout) / sizeof(kLayout[0]);
@@ -594,7 +639,11 @@ namespace
                 r.help = hold(std::move(tip));
         }
         r.label = hold(std::move(label));
-        r.value = hold(value_of(e));
+        // A slider row shows its number and carries the bar fraction for the host's
+        // native-look strip; everything else keeps the schema formatting.
+        // (key_is_readonly rows are Info by the line above, so they take the plain branch.)
+        const NumRange *nr = r.kind == RowKind::Slider ? range_for(e.key) : nullptr;
+        r.value = hold(nr ? slider_text(e, *nr, &r.slider_frac) : value_of(e));
         r.ini_key = e.key;
         r.icon_id = row_icon;
         r.target = e.target;
@@ -1284,7 +1333,7 @@ namespace
         }
     }
 
-    // ── value page: the choices behind one Number/Enum entry ─────────────────────────
+    // ── value page: the choices behind one Enum entry ────────────────────────────────
     void build_value()
     {
         const goblin::IniEntry *e = g_edit_entry;
@@ -1295,6 +1344,31 @@ namespace
         }
         std::wstring name = wide(tr::entry_label(e->key, mlang()));
         g_title = name.empty() ? wide(e->key) : name;
+        // ── a slider gets a screen of its own, holding EXACTLY ONE row ───────────────
+        // That single row is the whole reason this branch exists. Left/right belongs to
+        // the slider, but the grid claims it too and walks to the neighbouring row; two
+        // attempts to take the press away from the grid failed in game (see the note in
+        // goblin_stall_probe's form_update_detour). On a one-row list the grid's own
+        // bounds refuse the move, so nothing has to be intercepted at all.
+        // Therefore: NO "Back" row here, however tempting - a second row would hand the
+        // grid somewhere to go and bring the whole problem back. The engine's own cancel
+        // (Q / circle) closes this screen, exactly as it closes every other screen of ours.
+        if (const NumRange *r = range_for(e->key))
+        {
+            Row row;
+            row.kind = RowKind::Slider;
+            row.label = hold(name.empty() ? wide(e->key) : name);
+            row.value = hold(slider_text(*e, *r, &row.slider_frac));
+            row.ini_key = e->key;
+            row.target = e->target;
+            row.type_tag = static_cast<uint8_t>(e->type);
+            row.icon_id = icon_for_key(e->key);
+            std::wstring tip = wide(tr::entry_comment(e->key, e->comment ? e->comment : "", mlang()));
+            if (!tip.empty())
+                row.help = hold(std::move(tip));
+            push(row);
+            return;
+        }
         const int cur = current_option(*e);
         const size_t n = option_count(*e);
         for (size_t i = 0; i < n; ++i)
@@ -1526,10 +1600,30 @@ bool goblin::nmenu::activate(size_t row_index)
         }
         build_current();
         return true;
-    case RowKind::Number:
+    case RowKind::Slider:
+        // ON the slider's own screen there is nothing left to confirm - the row IS the
+        // widget and left/right is what edits it.
+        if (g_page == kPageValue)
+            return false;
+        // On a list page the row shows its bar and its number, and confirming it opens the
+        // one-row screen where the value is actually changed (see build_value).
+        if (const goblin::IniEntry *e = entry_for_key(row.ini_key))
+        {
+            g_edit_entry = e;
+            if (g_nested)
+            {
+                g_child_page = kPageValue;
+                return false;
+            }
+            g_stack.push_back(g_page);
+            g_page = kPageValue;
+            g_preview_page = -1;
+            build_current();
+            return true;
+        }
+        return false;
     case RowKind::Enum:
-        // A list of choices beats stepping-with-wrap: every option is visible at once, the
-        // live one is marked, and it needs no left/right input the grid already owns.
+        // A list of choices: every option is visible at once and the live one is marked.
         if (const goblin::IniEntry *e = entry_for_key(row.ini_key))
         {
             g_edit_entry = e;
@@ -1619,6 +1713,46 @@ bool goblin::nmenu::activate(size_t row_index)
         return false;
     }
     return false;
+}
+
+bool goblin::nmenu::slider_step(size_t row_index, int dir)
+{
+    if (dir == 0 || row_index >= g_rows.size())
+        return false;
+    // ONLY on the slider's own one-row screen. On a list page the same press is the grid's
+    // to interpret (it walks to the neighbouring row), and a value that also moved under a
+    // navigation press is exactly the confusion this design was chosen to end.
+    if (g_page != kPageValue)
+        return false;
+    const Row &row = g_rows[row_index];
+    if (row.kind != RowKind::Slider)
+        return false;
+    const goblin::IniEntry *e = entry_for_key(row.ini_key);
+    const NumRange *r = e ? range_for(e->key) : nullptr;
+    if (!e || !r || !e->target)
+        return false;
+    const float cur = e->type == goblin::IniType::Float
+                          ? *static_cast<float *>(e->target)
+                          : static_cast<float>(*static_cast<uint8_t *>(e->target));
+    // Clamp, no wrap. A value the ini holds BETWEEN steps just moves by one step from where
+    // it is - snapping it to the grid first would jump the panel the player is trying to nudge.
+    float next = cur + (dir > 0 ? r->step : -r->step);
+    if (next < r->min)
+        next = r->min;
+    if (next > r->max)
+        next = r->max;
+    if (next == cur)
+        return false; // already at the end the press points at
+    if (e->type == goblin::IniType::Float)
+        *static_cast<float *>(e->target) = next;
+    else
+        *static_cast<uint8_t *>(e->target) = static_cast<uint8_t>(next + 0.5f);
+    g_dirty = true;
+    // Deliberately NO reapply_live_settings() here: every current slider value is read live
+    // per frame by its consumer, and the host runs one reapply when the hold ends - see the
+    // header. A log per step would also be noise at repeat rate; the release path logs.
+    build_current();
+    return true;
 }
 
 const goblin::nmenu::Row *goblin::nmenu::right_row(size_t index)

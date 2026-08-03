@@ -32,6 +32,9 @@ namespace goblin
         // what says which is which without hovering.
         extern bool locationEmphasis;
         extern float locationEmphasisOwnScale;
+        // Horizontal placement of the map tooltip/banner, as a percentage between the
+        // centre of the visible map area (0) and the authored left corner (100).
+        extern float mapPanelOffsetPercent;
         extern float locationEmphasisOtherScale;
         // Colour half of the same lever: how much a marker of another map fades. Our icons
         // are premultiplied, so one factor scales colour and alpha together = a clean fade.

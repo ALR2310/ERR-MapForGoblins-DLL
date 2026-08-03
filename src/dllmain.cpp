@@ -13,6 +13,7 @@
 
 #include "goblin_collected.hpp"
 #include "goblin_config.hpp"
+#include "goblin_crashdiag.hpp" // the mod's own state, printed into every crash record
 #include "goblin_guarded.hpp"  // "we asked for this fault": what the crash logger must not record
 #include "goblin_inject.hpp"
 #include "goblin_kindling.hpp"
@@ -270,8 +271,74 @@ namespace goblin::watch
 // goblin_stall_probe), so nothing here needs a stub.
 #endif // MFG_STALL_PROFILER
 
-// One record: a header line with the label, the code and the faulting address, then the stack.
-static void crash_write_record(const char *label, DWORD code, uintptr_t fault)
+static void crash_write(const char *buf, int len)
+{
+    DWORD wr = 0;
+    if (g_crash_file != INVALID_HANDLE_VALUE && len > 0)
+        WriteFile(g_crash_file, buf, static_cast<DWORD>(len), &wr, nullptr);
+}
+
+// The stack, walked properly.
+//
+// This used to be RtlCaptureStackBackTrace from inside the handler, which has two faults that cost
+// report 19 a day: it walks the HANDLER's stack, so the first frames are the logger and ntdll's
+// dispatcher rather than anything that crashed, and it is a heuristic walk with no unwind info, so
+// frames go missing wherever the engine uses a frame pointer or a chained unwind. When a CONTEXT is
+// available (it always is - both handlers get one) RtlVirtualUnwind gives the real chain, starting
+// at the instruction that actually faulted.
+static void crash_write_stack(const CONTEXT *ctx)
+{
+    if (!ctx)
+        return;
+    CONTEXT c = *ctx; // unwinding mutates it
+    char line[512];
+    for (int i = 0; i < 32; ++i)
+    {
+        int len = wsprintfA(line, "  #%02d ", i);
+        len += crash_fmt_addr(line + len, static_cast<uintptr_t>(c.Rip));
+        line[len++] = '\n';
+        crash_write(line, len);
+
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
+        if (!rf)
+        {
+            // A leaf with no unwind data: the return address is at the stack pointer. One step of
+            // this is worth taking (it is how a leaf helper's caller is recovered); more would be
+            // guessing, so stop if it does not land somewhere plausible.
+            uintptr_t ret = 0;
+            __try
+            {
+                ret = *reinterpret_cast<uintptr_t *>(c.Rsp);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return;
+            }
+            if (ret < 0x10000)
+                return;
+            c.Rip = ret;
+            c.Rsp += 8;
+            continue;
+        }
+        PVOID handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, rf, &c, &handler_data, &establisher,
+                         nullptr);
+        if (!c.Rip)
+            return;
+    }
+}
+
+// One record: a header line with the label, the code and the faulting address, the mod's own state,
+// and then the stack.
+//
+// The state line is the part that was missing. A record saying "the engine faulted at exe+0x1157BEE
+// reading 0x20" cannot be acted on; the same record plus "opens=11 gen=11 tracked=7136 mapOpen=1"
+// names the situation immediately. It is read from atomics, so it stays truthful even when our
+// containers are the thing that went wrong.
+static void crash_write_record(const char *label, DWORD code, uintptr_t fault,
+                               const EXCEPTION_RECORD *rec, const CONTEXT *ctx)
 {
     if (g_crash_file == INVALID_HANDLE_VALUE)
         return;
@@ -282,18 +349,60 @@ static void crash_write_record(const char *label, DWORD code, uintptr_t fault)
                         st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, label,
                         static_cast<unsigned>(code));
     len += crash_fmt_addr(line + len, fault);
-    line[len++] = '\n';
-    DWORD wr = 0;
-    WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
-    void *frames[20];
-    const USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
-    for (USHORT i = 0; i < n; ++i)
+    // Read vs write and the address touched. Both are in the record already and both were being
+    // thrown away, so every past report needed the minidump just to learn which it was.
+    if (rec && code == static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION) &&
+        rec->NumberParameters >= 2)
     {
-        len = wsprintfA(line, "  #%02d ", i);
-        len += crash_fmt_addr(line + len, reinterpret_cast<uintptr_t>(frames[i]));
-        line[len++] = '\n';
-        WriteFile(g_crash_file, line, static_cast<DWORD>(len), &wr, nullptr);
+        len += wsprintfA(line + len, " %s ",
+                         rec->ExceptionInformation[0] == 0   ? "read"
+                         : rec->ExceptionInformation[0] == 1 ? "write"
+                                                             : "execute");
+        len += crash_hex64(line + len, rec->ExceptionInformation[1]);
     }
+    // Heap corruption names its victim. 0xC0000374 is raised by the heap when a block header or
+    // guard fails to validate, which is at FREE time, not at corruption time - so the stack is
+    // useless for finding the writer, but the parameters identify the heap and usually the block.
+    // Recorded twice on 2026-08-03 (18:11:45 and 18:33:04), both while the game was shutting down,
+    // both through the game's own _free_base. We put memory on that heap ourselves - gfx_alloc uses
+    // the game's _malloc_base and hands the pointers to Scaleform - so the block address is the
+    // first thing worth knowing.
+    if (rec && code == 0xC0000374 && rec->NumberParameters > 0)
+    {
+        len += wsprintfA(line + len, " params[%u]", rec->NumberParameters);
+        const DWORD n = rec->NumberParameters > 6 ? 6 : rec->NumberParameters;
+        for (DWORD i = 0; i < n; ++i)
+        {
+            line[len++] = ' ';
+            len += crash_hex64(line + len, rec->ExceptionInformation[i]);
+        }
+    }
+    line[len++] = '\n';
+    crash_write(line, len);
+    len = goblin::crashdiag::format_state(line, static_cast<int>(sizeof(line)));
+    crash_write(line, len);
+    if (ctx)
+    {
+        len = wsprintfA(line, "  [regs] rax=");
+        len += crash_hex64(line + len, ctx->Rax);
+        len += wsprintfA(line + len, " rcx=");
+        len += crash_hex64(line + len, ctx->Rcx);
+        len += wsprintfA(line + len, " rdx=");
+        len += crash_hex64(line + len, ctx->Rdx);
+        len += wsprintfA(line + len, " rbx=");
+        len += crash_hex64(line + len, ctx->Rbx);
+        len += wsprintfA(line + len, " rsi=");
+        len += crash_hex64(line + len, ctx->Rsi);
+        len += wsprintfA(line + len, " rdi=");
+        len += crash_hex64(line + len, ctx->Rdi);
+        len += wsprintfA(line + len, " r8=");
+        len += crash_hex64(line + len, ctx->R8);
+        len += wsprintfA(line + len, " r9=");
+        len += crash_hex64(line + len, ctx->R9);
+        line[len++] = '\n';
+        crash_write(line, len);
+    }
+    crash_write_stack(ctx);
     FlushFileBuffers(g_crash_file);
 }
 
@@ -385,12 +494,14 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
     // game alive throughout, are what this removes.
     if (code == 0xC0000005 && goblin::guarded::inside())
         return EXCEPTION_CONTINUE_SEARCH;
-    // Budget per SIGNATURE, not per process. The flat "first twelve records win" latch that
-    // stood here loses the only record that matters as soon as anything repeats: in report 19
-    // one guarded engine call faulted twelve times inside a single second, spent the whole
-    // budget, and the crash that killed the process ten minutes later went unrecorded in all
-    // three sessions. Three records per distinct (code, address) still bounds the file, and a
-    // newcomer can no longer be crowded out by a storm of something already known.
+    // Budget per SIGNATURE, not per process.
+    //
+    // The flat "first twelve records win" latch that stood here loses the only record that matters
+    // as soon as anything repeats. Report 19: one guarded engine call faulted twelve times inside a
+    // single second, spent the entire budget, and the fault that actually killed the process ten to
+    // twenty minutes later went unrecorded - in all three sessions. Three records per distinct
+    // (code, address) still bounds the file, and a newcomer can no longer be crowded out by a storm
+    // of something already known.
     static volatile LONG64 s_keys[16] = {};
     static volatile LONG s_hits[16] = {};
     const LONG64 key =
@@ -412,7 +523,7 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
     if (g_crash_file == INVALID_HANDLE_VALUE)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    crash_write_record("EXCEPTION", code, fault);
+    crash_write_record("EXCEPTION", code, fault, ep->ExceptionRecord, ep->ContextRecord);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -424,10 +535,71 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
 //
 // Both are kept because either can be missing: a game that installs its own filter after ours shadows
 // the second, and then the first-chance line is all there is.
+// Our own minidump, written only here, i.e. only when the process is going down.
+//
+// The dumps that arrive with reports are triage dumps: thread stacks and nothing else. In report 19
+// that was not enough to read even our OWN globals - 101 memory ranges, none of them our .data - so
+// the corrupted object could never be walked back to whoever corrupted it. WithDataSegs adds the
+// module data sections (our state) and WithIndirectlyReferencedMemory adds what the registers and
+// stacks point at (the object that faulted). Deliberately NOT WithFullMemory: this process carries
+// about 12 GB of commit and nobody can upload that.
+static void crash_write_dump(PEXCEPTION_POINTERS ep)
+{
+    wchar_t path[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!n || n >= MAX_PATH)
+        return;
+    wchar_t dir[MAX_PATH];
+    lstrcpynW(dir, path, MAX_PATH);
+    for (int i = static_cast<int>(lstrlenW(dir)) - 1; i >= 0; --i)
+        if (dir[i] == L'\\' || dir[i] == L'/')
+        {
+            dir[i] = 0;
+            break;
+        }
+    wchar_t file[MAX_PATH];
+    wsprintfW(file, L"%s\\MapForGoblins_%04d%02d%02d_%02d%02d%02d.dmp", dir, st.wYear, st.wMonth,
+              st.wDay, st.wHour, st.wMinute, st.wSecond);
+    HANDLE h = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    // Resolved dynamically: dbghelp is not otherwise linked, and adding an import for it would
+    // change the import table this DLL's antivirus profile is sensitive to.
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    if (dbg)
+    {
+        using WriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+        auto write = reinterpret_cast<WriteDumpFn>(
+            reinterpret_cast<void *>(GetProcAddress(dbg, "MiniDumpWriteDump")));
+        if (write)
+        {
+            struct
+            {
+                DWORD ThreadId;
+                PEXCEPTION_POINTERS ExceptionPointers;
+                BOOL ClientPointers;
+            } info{GetCurrentThreadId(), ep, FALSE};
+            constexpr int kNormal = 0x0000;
+            constexpr int kWithDataSegs = 0x0001;
+            constexpr int kWithIndirectlyReferencedMemory = 0x0040;
+            constexpr int kWithThreadInfo = 0x1000;
+            write(GetCurrentProcess(), GetCurrentProcessId(), h,
+                  kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory | kWithThreadInfo,
+                  &info, nullptr, nullptr);
+        }
+    }
+    CloseHandle(h);
+}
+
 static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
 {
     crash_write_record("CRASH", ep->ExceptionRecord->ExceptionCode,
-                       reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress));
+                       reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress),
+                       ep->ExceptionRecord, ep->ContextRecord);
+    crash_write_dump(ep);
     // Hand it on: whatever wrote the process dumps before still does.
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -443,6 +615,27 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
     g_crash_file = CreateFileW(log_file.wstring().c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Stamp which binary this session is, in the crash file itself. Identifying the build behind
+    // report 19 meant byte-matching the shipped releases against a module record in a minidump, and
+    // for an older release the matching symbols might not have existed at all. TimeDateStamp is the
+    // key the linker map is filed under, so this one line makes symbolisation a lookup.
+    {
+        char hdr[256];
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        int len = wsprintfA(hdr, "\n[%04d-%02d-%02d %02d:%02d:%02d] [SESSION] %s v%s git=%s base=",
+                            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                            BUILD_NAME, PROJECT_VERSION, GIT_HASH);
+        len += crash_hex64(hdr + len, g_self_base);
+        len += wsprintfA(hdr + len, " size=");
+        len += crash_hex64(hdr + len, g_self_size);
+        len += wsprintfA(hdr + len, " stamp=");
+        len += crash_hex64(hdr + len, nt->FileHeader.TimeDateStamp);
+        hdr[len++] = '\n';
+        DWORD wr = 0;
+        if (g_crash_file != INVALID_HANDLE_VALUE)
+            WriteFile(g_crash_file, hdr, static_cast<DWORD>(len), &wr, nullptr);
+    }
     AddVectoredExceptionHandler(1, crash_veh);
     SetUnhandledExceptionFilter(crash_ueh);
 }

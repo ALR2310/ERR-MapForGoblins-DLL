@@ -247,6 +247,66 @@ namespace
     // line backdrop (cid 218 sits at tx 0 with sx 1.0984 and is drawn about its own centre),
     // whose width is not exposed anywhere we can read - hence a constant, tuned by eye.
     constexpr float kPanelLeftInset = 270.0f;
+    // ULTRAWIDE. `left` above is the game's own visible-rect left edge in STAGE units, and on a
+    // 16:9 display it reads -267.2, so left + 270 lands at +2.8 - just inside the stage. An
+    // ultrawide setup (reported on 3440x1440 with the Ultrawide Fix, mod 283, variant 21.5x9)
+    // shows more of the world horizontally, so that edge moves far to the left, and the panel
+    // follows it clean off the screen: the reporter sees only a sliver of the backdrop and no text
+    // at all. The Ultrawide Fix ships its own 02_120_worldmap.gfx, but the stage rect in it is
+    // still exactly 1920x1080 - verified by parsing both files - so the stage is a fixed, aspect-
+    // independent frame while the visible rect is not.
+    //
+    // So: follow the visible edge, but never past the STAGE's own left edge, which is 0 by
+    // definition and does not move with the display. On 16:9 the wanted position is +2.8, so the
+    // floor never engages and nothing changes at all; on ultrawide the panel stops hugging the
+    // screen edge and sits at the stage edge instead - further in than intended, but ON SCREEN.
+    //
+    // The floor was 4.0 for one build and that was wrong: it sat ABOVE the natural 16:9 value, so
+    // it fired on the aspect everyone plays at (measured: wanted=2.7999878, used=4, logged as
+    // clamped). Harmless as a 1.2-unit shift, but it made the log claim a clamp on a display that
+    // needs none - and a diagnostic that cries wolf is worse than none.
+    //
+    // This is a floor, not the real answer. The real answer needs the visible rect from an actual
+    // ultrawide machine - the "[maphover] map bounds:" line, logged once per session - because
+    // without it there is no way to know whether that edge is even reported correctly under the
+    // fix. Ask for that log before tuning anything here further.
+    constexpr float kPanelMinStageX = 0.0f;
+
+    // Where the panels sit horizontally, as a percentage the player can move.
+    //
+    //   100 = the corner the panels were authored for   (visible_left + kPanelLeftInset)
+    //     0 = the centre of the map area                ((visible_left + visible_right) / 2)
+    //  >100 = further left,   <0 = right of centre
+    //
+    // Expressed through the visible rect rather than through constants, so if a display or a mod
+    // ever does report a different rect, 100 still means "where it was meant to be" on that setup.
+    //
+    // Why a setting at all: the ultrawide report cannot be reproduced here. Three aspect packs were
+    // diffed placement by placement and the rect's left edge is -267.2 in every one of them - the
+    // packs scale the map mask, they never move it - so on every .gfx we possess the panels land in
+    // the same place and the reported symptom cannot occur. Rather than guess at a mechanism we
+    // cannot see, give the player a slider: one minute of their time against an unbounded number of
+    // display and mod combinations we would otherwise have to chase.
+    //
+    // Read fresh on every call, never cached: the tooltip path recomputes this each frame it draws,
+    // so moving the slider shows up on the next frame with the map still open.
+    float panel_left_x(float visible_left, float visible_right)
+    {
+        const float authored = visible_left + kPanelLeftInset;
+        const float centre = (visible_left + visible_right) * 0.5f;
+        float pct = goblin::config::mapPanelOffsetPercent;
+        if (!(pct > -1000.0f && pct < 1000.0f))
+            pct = 100.0f;  // a broken ini value must not park the panel off in nowhere
+        const float x = centre + (pct * 0.01f) * (authored - centre);
+        static float s_logged = -99999.0f;
+        if (x != s_logged)
+        {
+            s_logged = x;
+            spdlog::info("[maphover] panel x: visibleLeft={} centre={} authored={} pct={} used={}",
+                         visible_left, centre, authored, pct, x);
+        }
+        return x;
+    }
     // Both panels sit in the corner: the tooltip first, the focus banner a line and a half below
     // it (the sprite spaces its own lines 35.9 apart).
     constexpr int kTipTopY = 60;
@@ -674,7 +734,7 @@ namespace
         // nearest marker every frame, so the panel also jumped between different ones.
         float left = 0.0f, right = 0.0f;
         map_x_bounds(map_area, &left, &right);
-        const float tx = left + kPanelLeftInset;
+        const float tx = panel_left_x(left, right);
         const float ty = static_cast<float>(map_middle_y(map_area, kTipTopY));
         if (!g_have_own_tip)
         {
@@ -763,7 +823,7 @@ namespace
         // (authored at ty -39.3) is on screen.
         float left = 0.0f, right = 0.0f;
         map_x_bounds(map_area, &left, &right);
-        const float bx = left + kPanelLeftInset;
+        const float bx = panel_left_x(left, right);
         const float by = static_cast<float>(kBannerTopY);
         if (!g_have_own_tip)
         {

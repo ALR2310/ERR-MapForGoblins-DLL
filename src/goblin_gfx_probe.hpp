@@ -25,6 +25,11 @@ namespace goblin::gfx_probe
     /// same heap the game's own free() does, so nothing rests on our allocator matching by luck.
     /// Returns null if the allocator could not be resolved.
     void *game_alloc(size_t bytes);
+    // For buffers the ENGINE will free through its own DL heap allocator, whose Free is
+    // _aligned_free: that reads a back-pointer at (p & ~7) - 8 and frees THAT, so such a buffer
+    // must come from the matching _aligned_malloc. The FMG slot buffers are the case; the
+    // Scaleform tag objects are not (nothing frees those).
+    void *game_aligned_alloc(size_t bytes);
 
     /// A movie's own file name, read from the definition its load context points at (ctx+0x38). This is
     /// how a parse is told apart from another movie's: the field reads the same whether the file came

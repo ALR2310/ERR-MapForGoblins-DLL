@@ -829,12 +829,30 @@ void goblin::inject_map_entries()
     size_t param_file_size = wrapper_row_loc_end;
     size_t total_alloc = WRAPPER_HEADER + param_file_size;
 
-    // Allocate the expanded ParamTable from the process heap.
-    // HEAP_ZERO_MEMORY zero-inits.
-    allocation = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total_alloc);
+    // The GAME's _aligned_malloc, not HeapAlloc. This buffer becomes FD4ParamResCap's +0x80 (the
+    // param file bytes, stored as allocation + WRAPPER_HEADER), and ~FD4ParamResCap frees it:
+    //   [obj+0x80] - 0x10 -> DL free -> the DL range table finds no owner -> the fallback
+    //   DLKRD::HeapAllocator<Win32RuntimeHeapImpl>::Free -> _aligned_free -> _free_base.
+    // _aligned_free does not free the pointer it is handed; it frees the back-pointer that
+    // _aligned_malloc stored at (p & ~7) - 8. A HeapAlloc block has no such back-pointer, so the
+    // engine read the encoded _HEAP_ENTRY sitting in front of our block and passed THAT to
+    // RtlFreeHeap, which rejected it for not being 16-byte aligned and terminated the process.
+    // That is the 0xC0000374 recorded at every shutdown once the map had been used.
+    //
+    // Found by scanning all 239 FD4ParamResCap instances in the full-memory dump: 237 carry a
+    // DL-arena buffer, and exactly 2 carry a process-heap one - WorldMapPointParam and
+    // TutorialParam, i.e. precisely the two params we expand. They are fingerprinted apart from the
+    // engine's own by the wrapper header: an engine block satisfies u32[alloc] == [obj+0x78], ours
+    // satisfies u32[alloc] + u32[alloc+4]*8 == [obj+0x78].
+    //
+    // Keep replacing the pointer and keep the +0x10 wrapper - the engine tolerates a foreign buffer
+    // perfectly well, it just frees it its own way. Only the allocator was wrong.
+    allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
     if (!allocation)
     {
-        spdlog::error("alloc failed ({} bytes)", total_alloc);
+        spdlog::error("alloc failed ({} bytes) - the game's aligned allocator is unavailable, so "
+                      "the marker table is left untouched rather than handed over unfreeable",
+                      total_alloc);
         return;
     }
 
@@ -1259,10 +1277,14 @@ bool goblin::inject_tutorial_popup_rows()
     size_t param_file_size = wrapper_row_loc_end;
     size_t total_alloc = WRAPPER_HEADER + param_file_size;
 
-    auto *allocation = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total_alloc);
+    // Same ownership contract as the marker table above - see the note there. TutorialParam has no
+    // ini toggle, so before this fix it made the crash unavoidable on every single exit.
+    auto *allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
     if (!allocation)
     {
-        spdlog::error("[TOAST] alloc failed ({} bytes) for TutorialParam expansion", total_alloc);
+        spdlog::error("[TOAST] alloc failed ({} bytes) for TutorialParam expansion - the game's "
+                      "aligned allocator is unavailable, expansion skipped",
+                      total_alloc);
         return false;
     }
 

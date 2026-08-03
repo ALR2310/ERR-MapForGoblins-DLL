@@ -1,4 +1,7 @@
 #include "goblin_gfx_probe.hpp"
+#include <utility>
+#include <vector>
+#include <mutex>
 
 #include "goblin_guarded.hpp" // engine calls that fault by design stay out of the crash log
 #include "generated_shared/goblin_menu_icon_tags.hpp"
@@ -216,6 +219,36 @@ namespace
     using GameMallocFn = void *(*)(size_t);
     std::atomic<uint64_t> g_game_malloc{0};
 
+    // _aligned_malloc_base. A SECOND game allocator, and the FMG buffers must come from this one.
+    //
+    // The engine releases a MsgRepository slot through DLKRD::HeapAllocator<Win32RuntimeHeapImpl>,
+    // whose Free is _aligned_free - and _aligned_free does not free the pointer it is given. It
+    // reads a back-pointer the matching _aligned_malloc stored at (p & ~7) - 8 and frees THAT. A
+    // buffer from plain _malloc_base has no such back-pointer, so the engine reads whatever happens
+    // to precede it - in practice the XOR-encoded _HEAP_ENTRY - and hands that to RtlFreeHeap, which
+    // rejects it for not being 16-byte aligned and terminates the process. Fifteen values in sixteen
+    // fail that test, and the sixteenth is worse: a successful free of unrelated memory.
+    using GameAlignedMallocFn = void *(*)(size_t size, size_t alignment);
+    std::atomic<uint64_t> g_game_aligned_malloc{0};
+
+    void resolve_game_aligned_malloc()
+    {
+        if (g_game_aligned_malloc.load(std::memory_order_relaxed)) return;
+        try
+        {
+            void *m = modutils::scan<void>(
+                {.aob = "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 85 D2 74 ?? 48 8D 42 FF 48 85 C2 "
+                        "75 ?? 8D 43 08 48 3B D0 48 0F 47 C2"});
+            g_game_aligned_malloc.store((uint64_t)m, std::memory_order_relaxed);
+            spdlog::info("[fmg] aligned buffer source ready @ 0x{:X}", (uint64_t)m);
+        }
+        catch (const std::exception &e)
+        {
+            spdlog::error("[fmg] aligned buffer source unavailable ({}); FMG expansion skipped",
+                          e.what());
+        }
+    }
+
     void resolve_game_malloc()
     {
         if (g_game_malloc.load(std::memory_order_relaxed)) return;
@@ -375,6 +408,12 @@ namespace
     // but the names cost hours when they lie, so they are being corrected as each site is touched.
     constexpr uint64_t RVA_FN_REMOVEOBJECT2_ADDSNAPSHOT = 0x11BDE10; // RemoveObject2::AddToTimelineSnapshot
     constexpr uint64_t RVA_FN_PLACEOBJECT3_ADDSNAPSHOT = 0x11BDB40;  // PlaceObject3, same slot
+
+
+    // (verify_prologue() stood here: a guard that compared the bytes at a hardcoded RVA before
+    //  hooking it. It was the right stopgap for report 20 - it turns a code-corrupting hook into a
+    //  disabled feature - but every one of its callers now resolves by AOB instead, and a scan
+    //  cannot land mid-instruction by construction. Kept in history, not in the binary.)
 
     // Native tag vtables captured LIVE from the stock sprite-171 frames at load (a composite icon frame
     // is RM2+RM2+PO3). This avoids hardcoding the vtable addresses - the RVAs above are used only if the
@@ -1892,17 +1931,49 @@ namespace
     // node. The frame executor (0x1411bf131) dispatches purely on tag[0]=vtable with no validity/heap
     // check, so a VirtualAlloc'd tag with the correct vtable runs identically to a native one - no need
     // to find/clone a real RM2. Removing a depth that holds nothing is a harmless no-op. Returns 0 on fail.
+    // ONE tag per depth, kept for the process's life, instead of one per call.
+    //
+    // A RemoveObject2 tag is 16 bytes of {vtable, depth} and depends on NOTHING else, so a second
+    // tag for the same depth is byte-identical to the first. The frame-array tags built at icon
+    // injection are deliberately permanent for exactly this reason; the transient ones were not,
+    // and they leaked: remove_native_icon_record builds one per removed marker and hands it to a
+    // synchronous Execute that retains nothing, so every call added a block nobody would ever free.
+    // Measured in the full-memory dump 2026-08-04: 64,224 such blocks, 0x20 heap bytes each,
+    // 2,055,168 bytes, in a single 5.5-minute session, every header intact.
+    //
+    // Caching rather than freeing on purpose. These buffers come from the game's own malloc and
+    // there is no matching free helper on our side; introducing one would put a third allocator
+    // pairing into a codebase that has just spent a day on a mismatched pair. Distinct depths are a
+    // handful in practice, so the cache is bounded by the map's depth range, not by call count.
+    std::mutex g_rm2_tag_mutex;
+    std::vector<std::pair<uint16_t, uint64_t>> g_rm2_tags;
+
     uint64_t build_remove_tag(uint16_t depth)
     {
+        std::lock_guard<std::mutex> lock(g_rm2_tag_mutex);
+        for (const auto &e : g_rm2_tags)
+            if (e.first == depth)
+                return e.second;
         void *t = gfx_alloc(0x10);
         if (!t)
             return 0;
         uint64_t vt = rm2_vtable();                          // captured-live (RVA fallback)
         safe_copy(t, &vt, 8);                                 // vtable @+0
         safe_copy((void *)((uint64_t)t + 8), &depth, 2);      // depth u16 @+8 (body+0)
+        g_rm2_tags.emplace_back(depth, (uint64_t)t);
         return (uint64_t)t;
     }
 
+}
+
+void *goblin::gfx_probe::game_aligned_alloc(size_t bytes)
+{
+    resolve_game_aligned_malloc();
+    const uint64_t f = g_game_aligned_malloc.load(std::memory_order_relaxed);
+    if (!f) return nullptr;
+    void *p = reinterpret_cast<GameAlignedMallocFn>(f)(bytes, 16);
+    if (p) memset(p, 0, bytes);
+    return p;
 }
 
 void *goblin::gfx_probe::game_alloc(size_t bytes)
@@ -2295,8 +2366,14 @@ void goblin::gfx_probe::setup()
             // belonged to the retired settings re-host and were proven in-game to be what rendered map
             // tiles as black squares. See docs/research_retired_native_ui_experiments.md before
             // reintroducing anything that hooks 0x14074a2f0 or 0x11E23B0.
+            // Resolved by SIGNATURE, never by address. The literal RVA that stood here was measured
+            // on game build 2.6.2.0 and, on 2.6.1.0, pointed into the middle of an instruction in
+            // the neighbouring function - MinHook wrote a jmp over it and the game died on a
+            // fabricated MMX opcode (report 20). A scan either finds the real function on whatever
+            // build is running, or throws and leaves the hook uninstalled; it can never land
+            // half-way into one.
             modutils::hook<ExecFn>(
-                {.address = reinterpret_cast<void *>((uint64_t)GetModuleHandleW(nullptr) + RVA_FN_REMOVEOBJECT2_ADDSNAPSHOT)},
+                {.aob = "48 89 5C 24 18 56 41 56 41 57 48 83 EC 20 48 8B 01"},
                 rm2exec_detour, o_rm2exec);
         }
     }

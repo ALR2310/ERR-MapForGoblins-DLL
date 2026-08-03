@@ -76,6 +76,8 @@ namespace goblin::i18n
         OverlayTextSizeTip,
         OverlayOpacity,
         OverlayOpacityTip,
+        MapPanelOffset,
+        MapPanelOffsetTip,
         ProgressNoMarkers,
         IconPreviewHint,
         IconPreviewOpen,

@@ -1,5 +1,10 @@
 // World-map coordinates (see the header - this is NOT a world->screen projector any more). See goblin_mapproject.hpp.
 #include "goblin_mapproject.hpp"
+
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
 #include "goblin_maphover.hpp"       // map_dialog() -> the live CS::WorldMapArea
 #include "goblin_worldmap_probe.hpp" // fold non-overworld areas via the game's converter
 
@@ -76,7 +81,65 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
         map_z = CONST_Z - (static_cast<float>(gz) * 256.0f + pz);
         return true;
     }
-    return goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z);
+    // MEMOISE the engine converter. A non-overworld tile has to go through the engine's
+    // world->map converter, and that call is gated on a freshness stamp because the cached view
+    // model dies with the map generation. The gate is correct and must stay - but the game only
+    // converts during its own map build, so between bursts the stamp is stale and every such
+    // projection failed. Measured 2026-08-03: 111 of 128 focus rings reported `unprojected`, which
+    // is why rings on other maps froze at old positions while overworld ones (pure arithmetic
+    // above, no engine call) kept working. That looked like "only focused icons update"; it was
+    // really "only tiles that need no converter update".
+    //
+    // A tile's projection is a constant: the converter looks the tile up and adds a fixed offset,
+    // and marker positions never move. So one successful answer is good for the session, and after
+    // the first build burst nothing here needs the engine again.
+    struct Key
+    {
+        uint8_t area;
+        uint16_t gx, gz;
+        float px, pz;
+        bool operator==(const Key &o) const
+        {
+            return area == o.area && gx == o.gx && gz == o.gz && px == o.px && pz == o.pz;
+        }
+    };
+    struct KeyHash
+    {
+        size_t operator()(const Key &k) const
+        {
+            uint64_t h = k.area;
+            h = h * 1099511628211ull ^ k.gx;
+            h = h * 1099511628211ull ^ k.gz;
+            uint32_t bx = 0, bz = 0;
+            memcpy(&bx, &k.px, 4);
+            memcpy(&bz, &k.pz, 4);
+            h = h * 1099511628211ull ^ bx;
+            h = h * 1099511628211ull ^ bz;
+            return static_cast<size_t>(h);
+        }
+    };
+    // Read from the map frame AND the overlay thread, so it is locked. The lock is uncontended in
+    // practice and a hit costs one hash - far less than the engine call it replaces.
+    static std::mutex memo_mutex;
+    static std::unordered_map<Key, std::pair<float, float>, KeyHash> memo;
+    const Key key{area, gx, gz, px, pz};
+    {
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        const auto hit = memo.find(key);
+        if (hit != memo.end())
+        {
+            map_x = hit->second.first;
+            map_z = hit->second.second;
+            return true;
+        }
+    }
+    if (!goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z))
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        memo.emplace(key, std::make_pair(map_x, map_z));
+    }
+    return true;
 }
 
 // project() (world -> screen) and calib() lived here. Their only consumer was the overlay's

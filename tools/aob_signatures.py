@@ -261,6 +261,55 @@ SIGNATURES = [
         "refs": ["goblin_gfx_probe.cpp:169"],
         "note": "_malloc_base (game static-CRT malloc). We allocate Scaleform-owned buffers (frame array/tag arrays/tags) here so the game's _free_base frees them on the same _crtheap; a foreign heap there = corruption (v2.0.4 crashes).",
     },
+    {
+        "name": "game_crt_aligned_malloc",
+        "pattern": "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 85 D2 74 ?? 48 8D 42 FF 48 85 C2 75 ?? 8D 43 08 48 3B D0 48 0F 47 C2",
+        "slot": None,
+        "critical": True,
+        "refs": ["goblin_gfx_probe.cpp:238"],
+        "note": "_aligned_malloc_base. FMG slot buffers MUST come from here: the engine releases a "
+                "MsgRepository slot through DLKRD::HeapAllocator<Win32RuntimeHeapImpl>::Free, which is "
+                "_aligned_free - and that frees the back-pointer stored at (p & ~7) - 8, not the pointer "
+                "itself. A plain _malloc_base buffer has no back-pointer there, so the engine fed the "
+                "XOR-encoded _HEAP_ENTRY to RtlFreeHeap and the process died with 0xC0000374 on ten of "
+                "ten quits (traced 2026-08-04). Distinct from game_crt_malloc, which stays correct for "
+                "the Scaleform tag objects - nothing ever frees those.",
+    },
+    # ---- Hooks that used to be hardcoded RVAs (report 20) - a wrong address CORRUPTS CODE ----
+    {
+        "name": "rm2_addsnapshot",
+        "pattern": "48 89 5C 24 18 56 41 56 41 57 48 83 EC 20 48 8B 01",
+        "slot": None,
+        "critical": True,
+        "refs": ["goblin_gfx_probe.cpp:2416"],
+        "note": "RemoveObject2::AddToTimelineSnapshot. Was the literal RVA 0x11BDE10, measured on game "
+                "build 2.6.2.0. Report 20: a player on 2.6.1.0 crashed because that function sits 0x20 "
+                "higher there, so the RVA landed on the second byte of `movzx edx,word[rcx+8]` in the "
+                "neighbour, MinHook wrote its jmp over it, and the orphaned 0F plus the jmp decoded as "
+                "`psubsw mm7,[rdi+0x30]` - AV reading 0x30. Present since v2.0.1, so it killed every "
+                "player not on 2.6.2.0. Pattern is 17 bytes of pure opcode/ModRM with no wildcards.",
+    },
+    {
+        "name": "menu_row_path",
+        "pattern": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 90 FE FF FF FF 49 89 5B 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 80 00 00 00 48 8B FA 48 8B D9 49 89 53 98 C7 44 24 20 00 00 00 00 45 8B 08 45 8B 40 04",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp:9337"],
+        "note": "The menu row-slot path builder, hooked so row icons find their clip. Was the literal "
+                "0x736FC0 - same landmine as rm2_addsnapshot. Needs 66 bytes for uniqueness; the four "
+                "wildcards cover one RIP-relative displacement (the stack-cookie load). A miss only "
+                "costs the menu row icons, hence critical=False.",
+    },
+    {
+        "name": "input_action_test",
+        "pattern": "4C 8B DC 48 81 EC 88 00 00 00 49 C7 43 98 FE FF FF FF 49 8D 43 B0 49 89 43 20 41 89 53 18 41 0F B6 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp:9357"],
+        "note": "The input-action predicate, hooked only when debug_logging is on (the ESC action probe). "
+                "Was the literal 0x758500. Diagnostics-only, but it was still a code-corrupting hook on "
+                "any other game build, so it goes through an AOB like the rest.",
+    },
     # ---- Active save slot (per-character manual hides) - non-critical ----
     {
         "name": "game_man_slot",

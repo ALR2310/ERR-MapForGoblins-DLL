@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.28.1)
 set(CMAKE_GENERATOR_PLATFORM x64)
 
 project( MapForGoblins
-  VERSION   "2.1.1"
+  VERSION   "2.1.2"
   LANGUAGES CXX RC)
 
 # Which baked-data dir to compile. Default = ERR (src/generated). The vanilla
@@ -171,6 +171,8 @@ add_library( MapForGoblins SHARED
   src/goblin_mapproject.cpp
   src/goblin_worldmap_probe.hpp
   src/goblin_worldmap_probe.cpp
+  src/goblin_crashdiag.hpp
+  src/goblin_crashdiag.cpp
   src/generated_shared/goblin_overlay_icons.hpp
   src/generated_shared/goblin_overlay_icons.cpp
   src/generated_shared/goblin_map_icons.hpp

@@ -355,20 +355,33 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
     size_t new_file_size = new_str_data_start + new_str_data.size();
 
 
-    // Allocate the expanded FMG buffer from the process heap.
-    // The GAME's malloc, not ours. PROVEN 2026-07-28: at world unload the engine CLEARS the
-    // MsgRepository slots we patch (logged `slot changed under us ... now=0x0`), so it releases whatever
-    // the slot held - our buffer - with its own allocator. HeapAlloc(GetProcessHeap()) happened to be
-    // compatible because the game's statically linked UCRT frees through the process heap too, but that
-    // is luck, not a contract. Falls back to the old path if the game allocator is unresolved.
-    fmg_allocation = goblin::gfx_probe::game_alloc(new_file_size);
-    if (fmg_allocation)
-        memset(fmg_allocation, 0, new_file_size);
-    else
-        fmg_allocation = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, new_file_size);
+    // Allocate the expanded FMG buffer with the allocator the ENGINE will free it with.
+    //
+    // The engine does release these: at world unload it clears the MsgRepository slots we patch.
+    // The release path was traced in full on 2026-08-04:
+    //   ~MsgbndFileCap -> MsgRepositoryImp::ReleaseMsg -> the DL heap lookup, which finds the
+    //   pointer in NO registered DL arena and falls back to
+    //   DLKRD::HeapAllocator<DLKR::Win32RuntimeHeapImpl>::Free -> _aligned_free -> _free_base.
+    //
+    // _aligned_free does NOT free the pointer it is handed. It reads a back-pointer that the
+    // matching _aligned_malloc stored at (p & ~7) - 8 and frees that instead. A buffer from plain
+    // _malloc_base has no back-pointer there, so the engine read the XOR-encoded _HEAP_ENTRY that
+    // precedes our block and passed it to RtlFreeHeap, which rejected it for not being 16-byte
+    // aligned and terminated the process. That is the 0xC0000374 recorded on ten of ten quits.
+    //
+    // The old comment here claimed HeapAlloc(GetProcessHeap()) was "compatible". It was not: the
+    // process has exactly one heap and it IS the CRT heap, so both paths were identically broken.
+    // The v2.0.5 switch to the game's malloc neither caused this nor made it worse - the defect was
+    // never about WHICH heap, it was about the missing _aligned_malloc back-pointer.
+    //
+    // There is no fallback any more, deliberately. Any other allocator here is a guaranteed crash at
+    // shutdown; not expanding the FMG costs some marker names and nothing else.
+    fmg_allocation = goblin::gfx_probe::game_aligned_alloc(new_file_size);
     if (!fmg_allocation)
     {
-        spdlog::error("[FMG] alloc failed ({} bytes)", new_file_size);
+        spdlog::error("[FMG] aligned alloc unavailable ({} bytes) - expansion skipped so the "
+                      "engine cannot free a buffer it did not align",
+                      new_file_size);
         return false;
     }
 

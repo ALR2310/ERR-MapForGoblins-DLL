@@ -341,7 +341,7 @@ namespace
         uintptr_t node = 0;  // timeline record from create_native_icon_instance
         uintptr_t child = 0; // captured display child (PlaceObject hook)
         uint32_t age = 0;    // pulses waited for materialization
-        uintptr_t root = 0;
+        uintptr_t root = 0;  // the child's movie view (v3_movie_of at capture)
         float base_tx = 0.0f, base_ty = 0.0f;
         float basis[4] = {};
         bool held = false;
@@ -612,6 +612,17 @@ namespace
         // such container, so a match is strong proof the cached parent pointer is still THIS live
         // parent. A freed parent reads 0 here, which is the reliable death signal.
         uint64_t parent_vtable = 0;
+        // The MOVIE the parent belonged to when we seeded on it. The vtable above is a good death
+        // signal for a FREED block (it reads 0) but not for a freed and REUSED one: the allocator
+        // hands the block to another display object, that object's own non-zero vtable lands in the
+        // slot, and if it happens to be the same class the check passes outright. Movie identity
+        // ([node+0x20]->+0x10, see v3_movie_of) is written once in a node's ctor and never cleared,
+        // so a reused block answers with the NEW owner's movie - or fails to resolve - and the
+        // mismatch is caught. Captured with parent_vtable and compared before any per-frame engine
+        // attach or detach. Four player minidumps (report 19, 2026-08-02) fault inside Scaleform's
+        // display-list and pool code on the very thread that owns this manager, with a freed-memory
+        // poison value in the object register; the vtable-only gate is what let those through.
+        uintptr_t parent_movie = 0;
     };
     V3NativeManager g_v3_native;
 
@@ -780,6 +791,63 @@ namespace
         return result;
     }
 
+    // Movie identity for any display node: the engine's own primitive redone in
+    // guarded reads (DisplayObjectBase::FindMovieImpl, exe+0x117dd40):
+    //   while (obj && !(flags(+0x6A) & 0x80)) obj = pParent(+0x38); // 0x80 = InteractiveObject
+    //   return obj ? pASRoot(+0x20)->pMovieImpl(+0x10) : NULL;
+    // pASRoot is written once in the node's ctor and never cleared on detach, so
+    // this answers correctly for a DETACHED node - which the old 16-level +0x38
+    // up-walk could not: the engine's removal primitive (FUN_1410c87c0) zeroes
+    // pParent and sets depth to -1, so a detached node's up-walk terminates at
+    // itself. That is exactly the "roots ...(lv 1)" in the 2.1.1 layer-2
+    // rejection storm, and a tree deeper than the walk cap returned a mid-chain
+    // node instead (a Linux player report rejected every child that way). Our
+    // anchor candidates are containers, i.e. InteractiveObjects, so the flag
+    // test passes on the first iteration and [node+0x20] alone identifies the
+    // movie view. Pure guarded reads only; per the validate-before-call rule the
+    // engine function itself is never called.
+    uintptr_t v3_movie_of(uintptr_t object)
+    {
+        uintptr_t current = object;
+        for (uint32_t level = 0;; ++level)
+        {
+            if (!v3_heap_ptr(current) || level >= 16)
+                return 0;
+            // The u16 flags live at +0x6A; through the aligned u32 at +0x68
+            // their 0x80 bit reads as 0x00800000.
+            uint32_t packed = 0;
+            if (!v3_read32(current + 0x68, packed))
+                return 0;
+            if (packed & 0x00800000u)
+                break;
+            uint64_t next = 0;
+            if (!v3_read64(current + 0x38, next))
+                return 0;
+            current = static_cast<uintptr_t>(next);
+        }
+        uint64_t as_root = 0, movie = 0;
+        if (!v3_read64(current + 0x20, as_root) || !v3_heap_ptr(as_root) ||
+            !v3_read64(static_cast<uintptr_t>(as_root) + 0x10, movie) ||
+            !v3_heap_ptr(movie))
+            return 0;
+        return static_cast<uintptr_t>(movie);
+    }
+
+    // Has the engine taken this node out of its display list? Removal
+    // (FUN_1410c87c0) zeroes pParent(+0x38) and sets depth(+0x2C) to -1. Our
+    // anchor candidates are always containers deep inside the dialog tree,
+    // never the movie root, so a zero parent is itself disqualifying and the
+    // depth is the cross-check. Unreadable memory reports detached too: a freed
+    // block is certainly not a live anchor.
+    bool v3_node_detached(uintptr_t object)
+    {
+        uint32_t depth = 0;
+        uint64_t parent = 0;
+        if (!v3_read32(object + 0x2c, depth) || !v3_read64(object + 0x38, parent))
+            return true;
+        return depth == 0xFFFFFFFFu || !v3_heap_ptr(parent);
+    }
+
     void v3_note_movie_attach(uintptr_t wrapper, uintptr_t parent, uint64_t count)
     {
         const auto &ctx = g_v3_movie_ctx;
@@ -810,33 +878,73 @@ namespace
                 if (g_v3_map_closed.load(std::memory_order_relaxed))
                     g_v3_map_closed.store(false, std::memory_order_relaxed);
             }
-            else if (prev_parent == 0 ||
-                     (count > prev_count && !g_v3_native.seeded) ||
-                     (count >= kPickerMinItems &&
-                      g_v3_map_closed.load(std::memory_order_relaxed)) ||
-                     (count >= kPickerMinItems && prev_layer >= 0 && live_layer >= 0 &&
-                      live_layer != prev_layer))
+            else
             {
-                // Re-anchor ONLY on: first target / monotonically-largest list while we have not
-                // committed yet / rebuild after a REAL teardown / an actual known layer switch.
-                //
-                // The "largest list" arm is now gated on NOT being seeded. Measured 2026-08-01 on
-                // the DLC map: we seeded on a parent of 81, built 3072+ markers in 18 ms, and then
-                // a list of 82 - one item larger - took the target, which forces a reseed, and a
-                // reseed calls v3_native_reset() and throws every built child away. The burst's
-                // pulses were spent by then, so the rebuild produced created=0 and the icons that
-                // had just appeared vanished. Discovery is what that arm is for; once we are
-                // building, only a real teardown or a layer switch may move the anchor.
-                if (prev_parent)
-                    spdlog::info("[v3movie] RETARGET parent 0x{:X} -> 0x{:X} "
-                                 "count={} layer={} mapClosed={}",
-                                 prev_parent, parent, count, live_layer,
-                                 g_v3_map_closed.load(std::memory_order_relaxed));
-                g_v3_map_closed.store(false, std::memory_order_relaxed);
-                g_v3_target_wrapper.store(wrapper, std::memory_order_relaxed);
-                g_v3_target_parent.store(parent, std::memory_order_relaxed);
-                g_v3_target_layer.store(live_layer, std::memory_order_relaxed);
-                g_v3_target_count.store(count, std::memory_order_release);
+                bool take =
+                    prev_parent == 0 ||
+                    (count > prev_count && !g_v3_native.seeded) ||
+                    (count >= kPickerMinItems &&
+                     g_v3_map_closed.load(std::memory_order_relaxed)) ||
+                    (count >= kPickerMinItems && prev_layer >= 0 && live_layer >= 0 &&
+                     live_layer != prev_layer);
+                // Dead-anchor arm: an attached list may take over from an anchor that has left
+                // the live tree, at the SEED floor rather than the picker floor. This is what
+                // lets the DLC map's real list win: measured 2026-08-01 (2.1.1 layer-2 logs),
+                // the live layer-2 parent legitimately tops out at 81 children, so no count
+                // floor of 100 can ever accept it, while the OLD view's detached 105-child pin
+                // list kept the anchor and every created child was rejected against it
+                // (created=0, 14272 rejections). This is NOT the floor unification that caused
+                // the 2026-08-01 retarget storm (six retargets in 33 s, each a full ~9.5k
+                // rebuild): that storm stole a HEALTHY anchor at count=48 over and over. Here
+                // the arm is gated on the current anchor reading detached - a one-way state per
+                // movie generation - and the replacement below must itself be live, so it can
+                // fire at most once per teardown, and the seed floor still keeps the tiny side
+                // clips out. (prev_parent != 0 is implied: a zero prev already set `take`.)
+                if (!take && count >= kSeedMinItemsValue && v3_node_detached(prev_parent))
+                    take = true;
+                // Candidate liveness: never anchor onto a node that is out of the live tree or
+                // whose movie view cannot be resolved. The count test alone is what took the
+                // bad layer-2 anchor: at a layer switch the OLD view's list still carries its
+                // 105 children (>= the picker floor) through the ~1 s deferred teardown, so
+                // size cannot tell it from the real one - attachment can, and the movie resolve
+                // is the cross-check that the node is a display object at all.
+                if (take && (v3_node_detached(parent) || v3_movie_of(parent) == 0))
+                {
+                    take = false;
+                    static uintptr_t s_refused_parent = 0;
+                    if (parent != s_refused_parent)
+                    {
+                        s_refused_parent = parent;
+                        spdlog::info("[v3movie] re-anchor refused: parent=0x{:X} count={} "
+                                     "layer={} not in the live tree",
+                                     parent, count, live_layer);
+                    }
+                }
+                if (take)
+                {
+                    // Re-anchor ONLY on: first target / monotonically-largest list while we have
+                    // not committed yet / rebuild after a REAL teardown / an actual known layer
+                    // switch / a live list replacing an anchor that is out of the live tree.
+                    //
+                    // The "largest list" arm is now gated on NOT being seeded. Measured 2026-08-01
+                    // on the DLC map: we seeded on a parent of 81, built 3072+ markers in 18 ms,
+                    // and then a list of 82 - one item larger - took the target, which forces a
+                    // reseed, and a reseed calls v3_native_reset() and throws every built child
+                    // away. The burst's pulses were spent by then, so the rebuild produced
+                    // created=0 and the icons that had just appeared vanished. Discovery is what
+                    // that arm is for; once we are building, only a real teardown, a layer switch
+                    // or a dead anchor may move it.
+                    if (prev_parent)
+                        spdlog::info("[v3movie] RETARGET parent 0x{:X} -> 0x{:X} "
+                                     "count={} layer={} mapClosed={}",
+                                     prev_parent, parent, count, live_layer,
+                                     g_v3_map_closed.load(std::memory_order_relaxed));
+                    g_v3_map_closed.store(false, std::memory_order_relaxed);
+                    g_v3_target_wrapper.store(wrapper, std::memory_order_relaxed);
+                    g_v3_target_parent.store(parent, std::memory_order_relaxed);
+                    g_v3_target_layer.store(live_layer, std::memory_order_relaxed);
+                    g_v3_target_count.store(count, std::memory_order_release);
+                }
             }
         }
         if (!(count == 500 || count == 6400 || count == 6468 || count % 1000 == 0))
@@ -856,24 +964,12 @@ namespace
         }
     }
 
-    uintptr_t v3_parent_root(uintptr_t object, uint32_t &levels)
-    {
-        levels = 0;
-        uintptr_t current = object;
-        uintptr_t seen[16]{};
-        while (v3_heap_ptr(current) && levels < 16)
-        {
-            seen[levels++] = current;
-            uint64_t next = 0;
-            if (!v3_read64(current + 0x38, next) || !v3_heap_ptr(next))
-                return current;
-            for (uint32_t i = 0; i < levels; ++i)
-                if (seen[i] == next)
-                    return current;
-            current = static_cast<uintptr_t>(next);
-        }
-        return current;
-    }
+    // v3_parent_root() stood here: a 16-level +0x38 up-walk that returned the topmost
+    // reachable node, used as the "same movie" test in the place detour and the factory
+    // consume loop. It answered wrong in exactly the two cases that mattered - a DETACHED
+    // node's walk terminates at itself (the removal primitive zeroes pParent), and a tree
+    // deeper than 16 levels returned a mid-chain node - so both callers now compare
+    // v3_movie_of() identities instead, and the walk went with them on 2026-08-02.
 
     bool v3_hold_ref(uintptr_t child, uint32_t &before, uint32_t &after)
     {
@@ -1597,6 +1693,46 @@ namespace
         v3_pulse_counters_reset(); // per generation, like the manager itself
     }
 
+    // Drop an anchor that is provably out of the live tree, instead of holding it for
+    // the rest of the session. Detach is one-way for a movie generation (pASRoot is
+    // ctor-written and the dialog teardown never re-attaches its old lists), so a
+    // detached anchor can only ever keep refusing - which is exactly how the 2.1.1
+    // layer-2 regression stayed broken until restart. Clearing the target re-arms the
+    // picker's prev_parent==0 / largest-list discovery on the very next WorldMapItem
+    // attach, and the manager is reset the same way a reseed does it: the abandoned
+    // children are never touched (see v3_native_reset), no row is marked failed or
+    // skip-for-session, and the fresh seed's snapshot merge rebuilds the queue - so
+    // the pulses of a still-running burst remain usable for the re-anchored build.
+    // Only called from manager-owner contexts (seed / tick / factory pulse), like
+    // v3_native_reset itself.
+    void v3_drop_dead_anchor(const char *where, uintptr_t parent)
+    {
+        spdlog::warn("[v3native] anchor 0x{:X} left the live tree ({}); dropping it "
+                     "for rediscovery",
+                     parent, where);
+        // If the manager's children sit on a DIFFERENT parent that is still live (the
+        // target moved on and then died before we ever seeded on it), take them off
+        // first, exactly like the reseed path does - resetting past a live parent is
+        // what left the 13:52:34 ghost icons drawn on the overworld. When the dead
+        // node IS the manager's parent the children are on the dead generation and
+        // must be left alone, which is v3_native_reset's own rule.
+        if (g_v3_native.seeded && !g_v3_native.objects.empty() &&
+            g_v3_native.parent && g_v3_native.parent != parent &&
+            !v3_node_detached(g_v3_native.parent) &&
+            v3_movie_of(g_v3_native.parent) != 0)
+        {
+            const uint32_t removed = goblin::stall_probe::v3_detach_all_children();
+            spdlog::info("[v3native] anchor drop: detached {} of {} children from the "
+                         "still-live parent 0x{:X}",
+                         removed, g_v3_native.objects.size(), g_v3_native.parent);
+        }
+        g_v3_target_wrapper.store(0, std::memory_order_relaxed);
+        g_v3_target_parent.store(0, std::memory_order_relaxed);
+        g_v3_target_layer.store(-1, std::memory_order_relaxed);
+        g_v3_target_count.store(0, std::memory_order_release);
+        v3_native_reset();
+    }
+
     bool v3_native_seed_from_live_callback()
     {
         const int layer = goblin::maphover::map_layer();
@@ -1614,6 +1750,19 @@ namespace
         // not in the map-frame tick - by then the pulses are gone.
         if (g_v3_map_closed.load(std::memory_order_relaxed))
             return false;
+        // Liveness before the floors: a heap-valid anchor that has left the live tree
+        // can never seed correctly, however many children its frozen count reports.
+        // The 2.1.1 layer-2 runs proved the shape: the OLD view's pin list kept 105
+        // children through the ~1 s deferred teardown, passed every floor, and every
+        // child we then created was rejected against it. Drop it outright (see
+        // v3_drop_dead_anchor) rather than warn-and-hold - the count of a detached
+        // list never changes, so a plain refusal here would repeat forever.
+        if (v3_heap_ptr(wrapper) && v3_heap_ptr(parent) &&
+            (v3_node_detached(parent) || v3_movie_of(parent) == 0))
+        {
+            v3_drop_dead_anchor("seed", parent);
+            return false;
+        }
         uint64_t wrapper_parent = 0, live_count = 0;
         // Enough WorldMapItems that this is unambiguously the active native marker parent, while
         // most of the stock build burst's sprite-171 callbacks still lie ahead to act as factory
@@ -2001,6 +2150,7 @@ namespace
             // signature and made the liveness guard reject the parent forever. It is adopted
             // lazily below, the first frame the parent shows a real vtable.
             g_v3_native.parent_vtable = 0;
+            g_v3_native.parent_movie = 0;  // adopted together with the vtable, on the same frame
             g_v3_native.observed_count = live_count;
             return;
         }
@@ -2021,7 +2171,10 @@ namespace
             uint64_t pvt = 0;
             const bool pvt_ok = v3_read64(g_v3_native.parent, pvt) && pvt != 0;
             if (pvt_ok && g_v3_native.parent_vtable == 0)
+            {
                 g_v3_native.parent_vtable = pvt; // first frame it is genuinely alive
+                g_v3_native.parent_movie = v3_movie_of(g_v3_native.parent);
+            }
             const bool parent_live = pvt_ok && pvt == g_v3_native.parent_vtable;
             if (last_live > closed_at + 8 && parent_live)
                 g_v3_map_closed.store(false, std::memory_order_relaxed);
@@ -2139,6 +2292,22 @@ namespace
 
         if (!g_v3_native.seeded)
         {
+            // NEVER commit the deferred seed to a parent outside the live tree. Every bad
+            // layer-2 run of the 2.1.1 series seeded right here: the picker had anchored
+            // onto the OLD view's 105-child pin list at a layer switch, the teardown then
+            // detached it (pParent 0, depth -1 - the rejected children's "lv 1" up-walks),
+            // and a detached list's count is frozen, so "stable for 8 frames" is a
+            // property it satisfies PERFECTLY. The inline seed never fired on those runs
+            // (measured: good runs get a seed pulse 10-21 ms after the retarget, bad runs
+            // never do), so this path was the one that committed, with no validation at
+            // all. The live parent (81 children) was refused by floors alone; liveness,
+            // not size, is what tells the two apart. Drop the dead anchor so the next
+            // burst can re-anchor - holding it is what made the breakage session-long.
+            if (v3_node_detached(parent) || v3_movie_of(parent) == 0)
+            {
+                v3_drop_dead_anchor("tick seed", parent);
+                return;
+            }
             // Let the game's small remaining vanilla/ERR WorldMapItem burst
             // settle before our count changes the same parent.
             if (live_count != g_v3_native.observed_count)
@@ -6697,6 +6866,24 @@ namespace
             g_v3_consume_nosprite.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        // Anchor movie identity, revalidated on every pulse BEFORE anything is issued
+        // from the queue. The live ctx's sprite is by construction inside the movie the
+        // engine is executing right now, so its movie view is the ground truth to hold
+        // the anchor against. If the anchor is detached, or lives in a different movie
+        // view, no child created this pulse can ever attach to it - the 2.1.1 layer-2
+        // runs proved that one child at a time, 14272 rejections and created=0.
+        // Detecting it here instead keeps pending_index untouched and the burst's
+        // remaining pulses alive: the drop re-arms discovery, a later attach in this
+        // same burst re-anchors, and the fresh seed rebuilds the queue and builds on
+        // the pulses that are left.
+        const uintptr_t live_movie = v3_movie_of(static_cast<uintptr_t>(sprite));
+        const uintptr_t target_movie = v3_movie_of(g_v3_native.parent);
+        if (v3_node_detached(g_v3_native.parent) || target_movie == 0 ||
+            (live_movie != 0 && target_movie != live_movie))
+        {
+            v3_drop_dead_anchor("factory pulse", g_v3_native.parent);
+            return;
+        }
         g_v3_native.in_factory = true;
 
         // Per-item synchronous pipeline: queue ONE record, run the engine's
@@ -6706,8 +6893,6 @@ namespace
         // after the previous record was decoded and neutralized. (The 16-wide
         // variant needed a fresh tag per request - ~9.4k extra movie-heap
         // allocations that all came back as close-teardown frees.)
-        uint32_t target_levels = 0;
-        const uintptr_t target_root = v3_parent_root(g_v3_native.parent, target_levels);
         uint32_t attempts = 0;
         while (attempts < V3_FACTORY_BATCH &&
                g_v3_native.frame_budget != 0 &&
@@ -6782,12 +6967,16 @@ namespace
                                      "(row={} depth={})",
                                      s.point.original_row_id, s.depth);
                 }
-                else if (!v3_heap_ptr(target_root) || target_root != s.root)
+                else if (s.root != target_movie)
                 {
+                    // s.root now carries the CHILD's movie view (captured in the place
+                    // detour), and target_movie is nonzero - the pulse-top validation
+                    // already returned otherwise. A mismatch on a single item with a
+                    // healthy anchor is genuinely a wrong context, not a dead anchor.
                     ++g_v3_native.wrong_contexts;
-                    spdlog::warn("[v3native] child root changed: childRoot=0x{:X} "
-                                 "targetRoot=0x{:X}",
-                                 s.root, target_root);
+                    spdlog::warn("[v3native] child movie changed: childMovie=0x{:X} "
+                                 "targetMovie=0x{:X}",
+                                 s.root, target_movie);
                 }
                 else
                 {
@@ -6919,10 +7108,25 @@ namespace
         // the heap. The parent's own vtable slot is the reliable death signal: it reads 0 once
         // freed. Require it non-zero and matching this generation before any engine detach or
         // attach touches the container.
+        // ... and that vtable test is NOT enough on its own. It catches a freed block (slot reads 0)
+        // but not a freed and REUSED one, where the new owner's vtable sits in the slot. Attaching
+        // into such a container is a WRITE into somebody else's object, which is how the heap gets
+        // corrupted with no fault at the scene: report 19's four minidumps all fault later, inside
+        // Scaleform's display-list and pool code, one of them on an object reading the freed-memory
+        // poison 0x5555555555555550. So the movie the parent belonged to when we seeded must still
+        // be the movie it reports now: that identity is written once in the node's ctor and is not
+        // cleared on detach, so a reused or detached block cannot fake it. Same test the anchor
+        // paths already use - reconcile was the one per-frame engine mutation left outside it.
         {
             uint64_t pvt = 0;
             if (!v3_read64(parent, pvt) || pvt == 0 ||
                 (g_v3_native.parent_vtable != 0 && pvt != g_v3_native.parent_vtable))
+                return;
+            if (v3_node_detached(parent))
+                return;
+            const uintptr_t movie = v3_movie_of(parent);
+            if (movie == 0 ||
+                (g_v3_native.parent_movie != 0 && movie != g_v3_native.parent_movie))
                 return;
         }
 
@@ -7140,20 +7344,28 @@ namespace
         if (slot)
         {
             const uintptr_t child = reinterpret_cast<uintptr_t>(child_ptr);
-            uint32_t child_levels = 0, target_levels = 0;
-            const uintptr_t child_root = v3_parent_root(child, child_levels);
+            // Same-movie test by MOVIE IDENTITY (v3_movie_of), not by the +0x38 up-walk
+            // the old v3_parent_root did. The walk answered wrong in exactly the two
+            // cases that mattered: a DETACHED target's walk terminates at itself (the
+            // 2.1.1 layer-2 storm's "lv 1" roots, 14272 children rejected), and a tree
+            // deeper than the 16-level cap returns a mid-chain node (a Linux player
+            // report rejected every child on two "different" roots that way). pASRoot
+            // survives both, so this compare is stable for attached and detached nodes
+            // alike.
+            const uintptr_t child_movie = v3_movie_of(child);
             const uintptr_t target_parent = g_v3_target_parent.load(std::memory_order_acquire);
-            const uintptr_t target_root = v3_parent_root(target_parent, target_levels);
+            const uintptr_t target_movie =
+                v3_heap_ptr(target_parent) ? v3_movie_of(target_parent) : 0;
             uint32_t refs_before = 0, refs_held = 0;
             float base_tx = 0.0f, base_ty = 0.0f;
             float basis[4] = {};
-            const bool same_movie = v3_heap_ptr(child_root) && child_root == target_root;
+            const bool same_movie = child_movie != 0 && child_movie == target_movie;
             const bool held = same_movie && v3_hold_ref(child, refs_before, refs_held);
             const bool staged = held && v3_stage_source_child(child, base_tx, base_ty, basis);
             if (staged)
             {
                 slot->child = child;
-                slot->root = child_root;
+                slot->root = child_movie;
                 slot->base_tx = base_tx;
                 slot->base_ty = base_ty;
                 memcpy(slot->basis, basis, sizeof(basis));
@@ -7167,16 +7379,16 @@ namespace
                     v3_drop_held_ref(child, before_drop, after_drop);
                 }
                 ++g_v3_native.failed;
-                // The WALK DEPTH of each root matters, and it was missing from a player report
-                // where every child was rejected on two different roots (Linux, DLC map). The
-                // walk stops at 16 levels, so a tree deeper than that returns a mid-chain node
-                // instead of the movie root, and "same movie" then compares two unrelated nodes.
-                // A pair of levels reading 16/16 is that cap; anything less is a genuine mismatch.
+                // A zero movie means the resolve failed (unreadable node, or no pASRoot),
+                // which is a different failure from two RESOLVED movies disagreeing - print
+                // both raw values so the log keeps that distinction. (The old walk-root form
+                // of this line printed walk levels; "lv 1" there is what proved the target
+                // was detached in the 2.1.1 layer-2 storm.)
                 spdlog::warn("[v3native] deferred child rejected: child=0x{:X} "
-                             "charId={} depth={} roots 0x{:X}(lv {})/0x{:X}(lv {}) held={} "
+                             "charId={} depth={} movies 0x{:X}/0x{:X} held={} "
                              "staged={}",
-                             child, char_id, depth, child_root, child_levels, target_root,
-                             target_levels, held, staged);
+                             child, char_id, depth, child_movie, target_movie,
+                             held, staged);
                 *slot = V3FactorySlot{};
                 if (g_v3_factory_active)
                     --g_v3_factory_active;

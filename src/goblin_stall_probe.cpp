@@ -1017,6 +1017,95 @@ namespace
         }
     }
 
+    // Give the build reference BACK, the way Scaleform itself does.
+    //
+    // v3_drop_held_ref above refuses to take the count to zero, so on its own it can only ever
+    // hand an object to somebody else - it never destroys one. With the viewport window on
+    // nobody else is left: the parent's reference went with the detach, the movie generation
+    // that created the child is gone, and ours is the last one. Decrementing it there would
+    // strand the block at count 0, allocated forever - the same leak wearing a different hat.
+    //
+    // Scaleform::RefCountNTSImpl::Release is `if (--RefCount == 0) delete this;`, and MSVC
+    // compiles `delete this` on a class with a virtual destructor into vtable slot 0, the
+    // scalar deleting destructor. Verified on the marker child type: vtable exe+0x2CBA380,
+    // slot 0 = exe+0x10EF320, which calls the real destructor at exe+0x10C6220 and then frees
+    // through the engine's own allocator singleton (`call [allocator_vtable+0x60]`). Going
+    // through slot 0 means the block goes back to the heap it came from - the lesson of the
+    // v2.0.4 crash wave, where our own allocations reached Scaleform's free.
+    //
+    // Safety rests on one fact, not on hope: WE HOLD A REFERENCE, so this block cannot have
+    // been freed and reused underneath us. That is the whole point of keeping the reference in
+    // the first place ("without it, detaching would free the child"). The vtable equality test
+    // is a net for the case where that invariant was already broken elsewhere; if it fails we
+    // touch nothing and keep leaking, which is exactly the behaviour we are replacing.
+    bool v3_release_child(uintptr_t child, uint64_t expect_vtable, bool &destroyed)
+    {
+        destroyed = false;
+        if (!v3_heap_ptr(child) || expect_vtable == 0)
+            return false;
+        __try
+        {
+            const uint64_t vt = *reinterpret_cast<uint64_t *>(child);
+            if (vt != expect_vtable)
+                return false;
+            auto *refs = reinterpret_cast<uint32_t *>(child + 8);
+            const uint32_t before = *refs;
+            if (before == 0 || before >= 0x10000000)
+                return false;
+            if (--*refs != 0)
+                return true; // somebody else still owns it; they will destroy it
+            using DeletingDtor = void *(__fastcall *)(void *, unsigned);
+            (*reinterpret_cast<DeletingDtor **>(child))[0](reinterpret_cast<void *>(child), 1);
+            destroyed = true;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    // Children whose generation has been abandoned. They are alive only because of the
+    // reference we still hold, so an entry stays valid for as long as it sits here - nothing
+    // can recycle the block while the count is above zero. Drained a slice at a time from the
+    // map frame so a reset never pays for thousands of destructors at once.
+    struct V3Grave
+    {
+        uintptr_t child = 0;
+        uint64_t vtable = 0;
+    };
+    std::vector<V3Grave> g_v3_graveyard;
+    size_t g_v3_graves_destroyed = 0;
+    size_t g_v3_graves_refused = 0;
+
+    void v3_graveyard_bury(uintptr_t child, uint64_t vtable)
+    {
+        if (!v3_heap_ptr(child) || vtable == 0)
+            return;
+        g_v3_graveyard.push_back(V3Grave{child, vtable});
+    }
+
+    void v3_graveyard_drain(size_t budget)
+    {
+        size_t done = 0;
+        while (!g_v3_graveyard.empty() && done < budget)
+        {
+            const V3Grave g = g_v3_graveyard.back();
+            g_v3_graveyard.pop_back();
+            bool destroyed = false;
+            if (v3_release_child(g.child, g.vtable, destroyed))
+            {
+                if (destroyed)
+                    ++g_v3_graves_destroyed;
+            }
+            else
+            {
+                ++g_v3_graves_refused; // counted, never silently dropped
+            }
+            ++done;
+        }
+    }
+
     uint32_t v3_guarded_attach(uintptr_t wrapper, uintptr_t child)
     {
         // Render order follows child-list order: index 0 parked our icons
@@ -1660,14 +1749,24 @@ namespace
                           site, tid, expect);
     }
 
-    void v3_factory_clear_request(bool drop_held_ref)
+    void v3_factory_clear_request(bool drop_held_ref, uint64_t bury_vtable = 0)
     {
         for (auto &s : g_v3_factory_slots)
         {
-            if (drop_held_ref && s.held && v3_heap_ptr(s.child))
+            if (s.held && v3_heap_ptr(s.child))
             {
-                uint32_t before = 0, after = 0;
-                v3_drop_held_ref(s.child, before, after);
+                if (drop_held_ref)
+                {
+                    uint32_t before = 0, after = 0;
+                    v3_drop_held_ref(s.child, before, after);
+                }
+                else if (bury_vtable != 0)
+                {
+                    // Staged but never consumed, and the generation is going away: the
+                    // reference we took in the place detour is the only one left, so this
+                    // child leaks exactly like a consumed one unless it is buried too.
+                    v3_graveyard_bury(s.child, bury_vtable);
+                }
             }
             s = V3FactorySlot{};
         }
@@ -1685,10 +1784,46 @@ namespace
         // engine's own map-build chain on reopen-after-freeze). Layer switches
         // no longer reset at all, so there is nothing visible to park anyway.
         // Same reasoning for held factory refs: dropping them would write a
-        // refcount into the dead movie's memory - leak the (dead) ref instead.
+        // refcount into the dead movie's memory.
+        //
+        // What that reasoning does NOT license is walking away from the children entirely,
+        // which is what this function used to do ("leak the (dead) ref instead"). Report 19
+        // measured the price: three sessions, ten map opens each, dead on the eleventh, with
+        // ~7,136 marker display objects orphaned per open until the GFx allocator refused and
+        // the engine dereferenced the NULL it got back. Every open in that log re-anchored to
+        // a NEW parent, so the reset arm - this one - ran every single time.
+        //
+        // The distinction the old comment missed: an object we hold a reference on is NOT in
+        // the "may already be freed AND reallocated" category. The reference is what keeps it
+        // out of it. Parking a matrix into a foreign block is a wild write; handing our own
+        // reference back is not. So the children move to the graveyard and are destroyed a
+        // slice per frame, and only the things we do NOT own are still left alone.
         v3_note_thread("v3_native_reset (frees all four containers)");
         v3_check_owner("v3_native_reset");
-        v3_factory_clear_request(false);
+        const uint64_t vt = g_v3_native.child_vtable;
+        size_t buried = 0, unowned = 0;
+        if (vt != 0)
+        {
+            for (const auto &o : g_v3_native.objects)
+            {
+                if (!o.ref_held || !v3_heap_ptr(o.child))
+                {
+                    ++unowned;
+                    continue;
+                }
+                v3_graveyard_bury(o.child, vt);
+                ++buried;
+            }
+        }
+        else
+        {
+            unowned = g_v3_native.objects.size();
+        }
+        v3_factory_clear_request(false, vt);
+        if (buried || unowned)
+            spdlog::info("[v3native] generation abandoned: {} children buried for release, "
+                         "{} not ours to free, {} already queued",
+                         buried, unowned, g_v3_graveyard.size() - buried);
         g_v3_native = V3NativeManager{};
         v3_pulse_counters_reset(); // per generation, like the manager itself
     }
@@ -2109,6 +2244,22 @@ namespace
         if (layer < 0 || layer > 2) return;
         v3_note_thread("v3_native_tick (map frame)");
         v3_check_owner("v3_native_tick");
+
+        // Return the previous generation's children to the heap, a slice per frame. This runs
+        // before the early returns below on purpose: an abandoned generation must drain even
+        // on frames where the current target does not validate, which is exactly the window a
+        // teardown-and-reopen spends here. 256 destructors is well under a frame's worth of
+        // the seed burst that shares this tick.
+        if (!g_v3_graveyard.empty())
+        {
+            const size_t before = g_v3_graveyard.size();
+            v3_graveyard_drain(256);
+            if (g_v3_graveyard.empty())
+                spdlog::info("[v3native] generation released: {} destroyed, {} refused "
+                             "(last slice {})",
+                             g_v3_graves_destroyed, g_v3_graves_refused,
+                             before);
+        }
 
         const uintptr_t wrapper = g_v3_target_wrapper.load(std::memory_order_acquire);
         const uintptr_t parent = g_v3_target_parent.load(std::memory_order_relaxed);

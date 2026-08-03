@@ -1902,6 +1902,19 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
     static std::vector<NativeMarkerPoint> cache;
     static int cache_layer = -1;
     static std::chrono::steady_clock::time_point cache_at{};
+    // Map-space position per row, resolved ONCE and kept for the session. Under the same lock as
+    // the snapshot, and outliving it on purpose: the snapshot is thrown away and rebuilt every
+    // 200 ms, the positions in it never move.
+    //
+    // The loop below used to call mapproject::to_map for all ~7,100 rows on EVERY frame, and for
+    // any row outside the overworld that is a call into the engine's world->map converter. Report
+    // 19: twelve access violations a second down that path, because the converter is reached
+    // through a cached CS::WorldMapViewModel that dies with the map generation. Positions are
+    // static, so re-asking the engine per frame bought nothing and paid in faults - and the
+    // freshness gate that now guards the converter would otherwise drop every legacy-dungeon
+    // marker out of the hover test whenever the game had not converted recently. Resolve once,
+    // keep the answer, and let a row that could not be resolved try again on the next refresh.
+    static std::unordered_map<uint64_t, std::pair<float, float>> projected;
     std::lock_guard<std::mutex> cache_lock(cache_mutex);
     const auto now = std::chrono::steady_clock::now();
     if (layer != cache_layer ||
@@ -1910,6 +1923,14 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         cache = native_marker_snapshot(layer);
         cache_layer = layer;
         cache_at = now;
+        for (const auto &p : cache)
+        {
+            if (!p.rowptr || projected.count(p.original_row_id))
+                continue;
+            float mx = 0.0f, mz = 0.0f;
+            if (goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz))
+                projected.emplace(p.original_row_id, std::make_pair(mx, mz));
+        }
     }
     float ax = 0.0f, ay = 0.0f;
     reticle_anchor(cU, cV, zoom, ax, ay); // the SAME anchor row_reticle_dist2 measures from
@@ -1920,9 +1941,10 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
     for (const auto &p : cache)
     {
         if (!p.visible || !p.rowptr) continue;
-        float mx = 0.0f, mz = 0.0f;
-        if (!goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz))
-            continue;
+        const auto hit = projected.find(p.original_row_id);
+        if (hit == projected.end()) continue; // not resolvable yet; retried on the next refresh
+        const float mx = hit->second.first;
+        const float mz = hit->second.second;
         const float dx = (mx - ax) * zoom;
         const float dy = (mz - ay) * zoom;
         const float d2 = dx * dx + dy * dy;

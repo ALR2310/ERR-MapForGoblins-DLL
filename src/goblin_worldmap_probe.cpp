@@ -2,6 +2,7 @@
 // world->map-space converter and re-invokes that converter to fold any marker.
 #include "goblin_worldmap_probe.hpp"
 
+#include "goblin_guarded.hpp"
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -22,13 +23,27 @@ namespace
     ConvertFn *o_convert = nullptr;
 
     std::atomic<void *> g_vm{nullptr};
-    // A g_last_ms timestamp was stamped here on every converter call and never read. If a
-    // freshness gate is ever wanted (project() currently trusts a captured VM with no staleness
-    // check, unlike goblin_maphover's 300 ms window), add the reader in the same change.
+    // The freshness gate the old note here asked for, now that report 19 has shown the bill for
+    // going without it. The view model is not a singleton: it is new-ed (0x450 bytes) by
+    // CS::MoveMapStep's constructor and freed and nulled by its destructor, so it dies on every
+    // map transition. g_vm is written ONLY from this detour, i.e. only when the GAME itself
+    // converts - our own project() calls go straight to o_convert and never refresh it. So a
+    // pointer that has not been re-stamped recently is a pointer to a dead generation, and
+    // handing it back to the converter walks a freed std::map of per-tile converters:
+    //   placename_detour -> native_reticle_row -> to_map -> project -> seh_fold
+    //   -> exe+0x8877D0 -> exe+0x876140 -> exe+0x87762A `mov r8,[rsi+0x10]` -> AV
+    // twelve times a session in that report, on the seed and on the hover path both.
+    //
+    // 300 ms is goblin_maphover's window, and the same reasoning applies: while the map is
+    // genuinely live the game converts far more often than that, so a stale stamp means the
+    // map is closed or mid-transition - the two states in which we must not call at all.
+    std::atomic<uint64_t> g_vm_ms{0};
+    constexpr uint64_t VM_FRESH_MS = 300;
 
     char convert_detour(void *vm, Vec2 *out, uint32_t *packed, Vec3 *world_local)
     {
         g_vm.store(vm, std::memory_order_relaxed);
+        g_vm_ms.store(GetTickCount64(), std::memory_order_release);
         return o_convert(vm, out, packed, world_local);
     }
 
@@ -68,9 +83,22 @@ bool goblin::worldmap_probe::project(uint8_t area, uint16_t gx, uint16_t gz, flo
                                      float &map_u, float &map_v)
 {
     void *vm = g_vm.load(std::memory_order_relaxed);
-    if (!vm || !o_convert) return false;  // VM captured on first map open; overlay only calls while open
+    if (!vm || !o_convert) return false;
+    // Validate before calling, never catch after. seh_fold's __except is a net for the case
+    // this test cannot see, not the mechanism - reaching it is now a defect, not an answer.
+    const uint64_t stamped = g_vm_ms.load(std::memory_order_acquire);
+    const uint64_t now = GetTickCount64();
+    if (stamped == 0 || now < stamped || now - stamped > VM_FRESH_MS)
+        return false;
     const uint32_t packed = (static_cast<uint32_t>(area) << 24) |
                             ((static_cast<uint32_t>(gx) & 0xFF) << 16) |
                             ((static_cast<uint32_t>(gz) & 0xFF) << 8);
-    return seh_fold(vm, packed, px, pz, map_u, map_v);
+    // This is a deliberate call into engine code that can fail, so the crash logger must not
+    // record it. Raised HERE and not around seh_fold's __try: that function returns from three
+    // points inside the guard, so an in-place decrement would be skipped on two of them and the
+    // thread_local depth would ratchet up until crash logging was dead for the session.
+    ++goblin::guarded::depth;
+    const bool ok = seh_fold(vm, packed, px, pz, map_u, map_v);
+    --goblin::guarded::depth;
+    return ok;
 }

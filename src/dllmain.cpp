@@ -385,8 +385,29 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
     // game alive throughout, are what this removes.
     if (code == 0xC0000005 && goblin::guarded::inside())
         return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG s_logged = 0;
-    if (InterlockedIncrement(&s_logged) > 12)
+    // Budget per SIGNATURE, not per process. The flat "first twelve records win" latch that
+    // stood here loses the only record that matters as soon as anything repeats: in report 19
+    // one guarded engine call faulted twelve times inside a single second, spent the whole
+    // budget, and the crash that killed the process ten minutes later went unrecorded in all
+    // three sessions. Three records per distinct (code, address) still bounds the file, and a
+    // newcomer can no longer be crowded out by a storm of something already known.
+    static volatile LONG64 s_keys[16] = {};
+    static volatile LONG s_hits[16] = {};
+    const LONG64 key =
+        static_cast<LONG64>((static_cast<uint64_t>(code) << 48) ^ (fault & 0xFFFFFFFFFFFFull));
+    int slot = -1;
+    for (int i = 0; i < 16; ++i)
+    {
+        const LONG64 seen = InterlockedCompareExchange64(&s_keys[i], key, 0);
+        if (seen == 0 || seen == key)
+        {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) // sixteen distinct signatures already: stop, the disk is not a log sink
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&s_hits[slot]) > 3)
         return EXCEPTION_CONTINUE_SEARCH;
     if (g_crash_file == INVALID_HANDLE_VALUE)
         return EXCEPTION_CONTINUE_SEARCH;

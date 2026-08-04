@@ -36,6 +36,15 @@ struct Canvas {
 // bare device-level queue guess is never used.
 bool install_hooks();
 
+// Record DXGI's OWN swapchain-creation entry points, for breaking a foreign proxy loop later
+// (see the note above create_swapchain_detour in the .cpp). Only meaningful while the factory
+// vtable is still pristine, so call it as EARLY as the mod runs - report 21 measured a 1.3 s
+// head start over the other overlay's hooks, and install_hooks() runs far too late to use it.
+// NOT callable from DllMain: it creates a DXGI factory, which loads dxgi.dll, and doing that
+// under the loader lock invites a deadlock. The first lines of the mod thread are both safe
+// and early enough. Idempotent; the first capture wins.
+void capture_creation_entrypoints();
+
 // True once the interception layer is installed.  This does not imply that a
 // game swapchain has been observed yet.
 bool hooks_installed();

@@ -1744,6 +1744,15 @@ using NvapiHdrColorControlFn =
 
 CreateSwapChainFn g_next_create_swapchain = nullptr;
 CreateSwapChainForHwndFn g_next_create_swapchain_for_hwnd = nullptr;
+
+// The creation entry points as they were BEFORE anyone (including us) touched the factory
+// vtable. Captured as early as we run, because the value only means something while it is
+// still pristine: in the report-21 session we loaded 1.3 s ahead of the other overlay, which
+// is the normal order for me3 natives. Used solely to break a proxy loop - see the note above
+// create_swapchain_detour. nullptr = we were not early enough, and the loop is then refused
+// rather than forwarded.
+void* g_pristine_create_swapchain = nullptr;
+void* g_pristine_create_swapchain_for_hwnd = nullptr;
 NvapiGetDisplayIdByNameFn g_next_nvapi_get_display_id_by_name = nullptr;
 NvapiHdrColorControlFn g_next_nvapi_hdr_color_control = nullptr;
 
@@ -1863,9 +1872,69 @@ bool install_swapchain_shadow(IDXGISwapChain* swapchain) noexcept {
     return false;
 }
 
+// ── foreign proxy loops: never call g_next from inside ourselves ────────────────────
+// Report 21 (2026-08-04): with ERSS/streamline loaded the game died of stack exhaustion,
+// 1752 return addresses deep, alternating two addresses inside create_swapchain_for_hwnd_detour
+// (~876 nested re-entries). Mechanism: streamline had already interposed creation when we
+// installed our vtable-slot detour, so our saved `g_next` leads into THEIR layer - and their
+// layer forwards COM-style through the live factory vtable, whose slot now holds OURS. us ->
+// their layer -> vtable -> us, forever. The coexistence design documented above covers
+// code-patch hooks; a proxy object that re-dispatches through the vtable was not considered.
+//
+// A legitimate pass-through can never re-enter our own detour on the same thread, so depth is
+// the whole test. On re-entry we must NOT call g_next (that IS the loop) - we call the pristine
+// DXGI entry point captured before anyone else hooked, which keeps creation working. If we have
+// no snapshot (we were not early enough), one failed creation is survivable; a stack overflow is
+// not, so the call is refused instead.
+thread_local int g_creation_depth = 0;
+std::atomic<bool> g_creation_loop_seen{false};
+
+struct CreationDepthScope {
+    CreationDepthScope() { ++g_creation_depth; }
+    ~CreationDepthScope() { --g_creation_depth; }
+    bool reentered() const { return g_creation_depth > 1; }
+    // The snapshot is worth ONE attempt, at the first re-entry only. Deeper than that means the
+    // snapshot re-entered us as well - it was captured late and is itself a proxy that
+    // re-dispatches through the vtable - and forwarding again would just rebuild the cycle
+    // through a different door. Two foreign proxies in a specific order are needed to reach
+    // this state (the `pristine != next` test catches the single-proxy case), which is exactly
+    // why it gets a structural answer rather than another equality check: at depth > 2 nothing
+    // in the chain is trustworthy, so the creation is refused. With this, unbounded recursion
+    // is impossible by construction, whatever the load order was.
+    bool may_use_snapshot() const { return g_creation_depth == 2; }
+};
+
+// A snapshot is only usable if it is NOT the pointer that is already looping. If we were late,
+// `g_pristine_*` and `g_next_*` are the same foreign proxy by construction, and calling it would
+// rebuild the very cycle we are breaking. Then the only safe answer is to refuse the creation.
+// This test alone is NOT sufficient - see CreationDepthScope::may_use_snapshot for the case it
+// cannot see (two foreign proxies, so the pointers differ yet the snapshot still loops).
+bool usable_snapshot(void* pristine, const void* next) {
+    return pristine && pristine != next;
+}
+
+void note_creation_loop(const char* which, bool forwarding) {
+    if (!g_creation_loop_seen.exchange(true))
+        flog("[overlay-v2] [WARN] %s re-entered our own detour - another overlay proxies creation "
+             "through the factory vtable. Breaking the loop; %s", which,
+             forwarding ? "forwarding to the entry point captured at startup."
+                        : "no usable startup snapshot, so this creation is refused.");
+}
+
 HRESULT STDMETHODCALLTYPE create_swapchain_detour(
     IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc,
     IDXGISwapChain** result_swapchain) {
+    CreationDepthScope depth;
+    if (depth.reentered()) {
+        const bool forward = depth.may_use_snapshot() &&
+                             usable_snapshot(g_pristine_create_swapchain,
+                                             reinterpret_cast<const void*>(g_next_create_swapchain));
+        note_creation_loop("CreateSwapChain", forward);
+        if (forward)
+            return reinterpret_cast<CreateSwapChainFn>(g_pristine_create_swapchain)(
+                factory, queue, desc, result_swapchain);
+        return DXGI_ERROR_INVALID_CALL;
+    }
     if (!g_adoption_probe_in_progress)
         g_creation_detour_calls.fetch_add(1, std::memory_order_relaxed);
     BindingScope binding_scope(g_creation_transaction);
@@ -1890,6 +1959,20 @@ HRESULT STDMETHODCALLTYPE create_swapchain_for_hwnd_detour(
     const DXGI_SWAP_CHAIN_DESC1* desc,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
     IDXGIOutput* restrict_to_output, IDXGISwapChain1** result_swapchain) {
+    CreationDepthScope depth;
+    if (depth.reentered()) {
+        const bool forward = depth.may_use_snapshot() &&
+                             usable_snapshot(g_pristine_create_swapchain_for_hwnd,
+                                             reinterpret_cast<const void*>(
+                                                 g_next_create_swapchain_for_hwnd));
+        note_creation_loop("CreateSwapChainForHwnd", forward);
+        if (forward)
+            return reinterpret_cast<CreateSwapChainForHwndFn>(
+                g_pristine_create_swapchain_for_hwnd)(
+                factory, queue, hwnd, desc, fullscreen_desc, restrict_to_output,
+                result_swapchain);
+        return DXGI_ERROR_INVALID_CALL;
+    }
     if (!g_adoption_probe_in_progress)
         g_creation_detour_calls.fetch_add(1, std::memory_order_relaxed);
     BindingScope binding_scope(g_creation_transaction);
@@ -2296,6 +2379,15 @@ HRESULT STDMETHODCALLTYPE present1_observer_detour(
 // detour; g_adoption_probe_in_progress makes that a pass-through no-op.
 bool resolve_adoption_targets(void** present_target, void** present1_target,
                               void** execute_target) noexcept {
+    // This probe creates a swapchain of its own, and in report 21 it was one of the two creations
+    // that fired into the proxy loop (the stack bottom is arm_adoption -> here). The loop is broken
+    // at the detour now, but there is no reason to keep feeding it: once a loop has been seen, the
+    // adoption route is not worth a creation attempt.
+    if (g_creation_loop_seen.load(std::memory_order_relaxed)) {
+        flog("[overlay-v2] [WARN] skipping the adoption probe: creation re-entry was already "
+             "observed, so another overlay owns this path");
+        return false;
+    }
     g_adoption_probe_in_progress = true;
     HWND hwnd = nullptr;
     bool class_registered = false;
@@ -2514,6 +2606,21 @@ void resolve_nvapi_hook_targets(HookTargets& targets) noexcept {
         targets.nvapi_hdr_color_control = nullptr;
         flog("[overlay-v2] [WARN] Elden Ring NVAPI HDR observer signature unavailable; vendor HDR remains unverified");
     }
+}
+
+// Read the two creation slots off a throwaway factory. All DXGI factories of a process share
+// one vtable, so this reads the same slots the game's factory will dispatch through.
+void capture_pristine_creation_slots() {
+    if (g_pristine_create_swapchain && g_pristine_create_swapchain_for_hwnd)
+        return; // first capture wins: a later one could already be somebody's proxy
+    ComPtr<IDXGIFactory2> factory;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) || !factory)
+        return;
+    void** vtable = *reinterpret_cast<void***>(factory.Get());
+    if (!vtable)
+        return;
+    g_pristine_create_swapchain = vtable[10];
+    g_pristine_create_swapchain_for_hwnd = vtable[15];
 }
 
 bool resolve_hook_targets(HookTargets& targets) {
@@ -2779,9 +2886,18 @@ void log_creation_slot_forensics(const char* name, void** slot,
 
 } // namespace
 
+void capture_creation_entrypoints() {
+    capture_pristine_creation_slots();
+}
+
 bool install_hooks() {
     if (g_installed.load(std::memory_order_acquire))
         return g_renderer_ready.load(std::memory_order_acquire);
+    // Last-resort capture. The one that MATTERS happens far earlier, from the mod thread
+    // (capture_creation_entrypoints): by the time install_hooks runs, another overlay may already
+    // own these slots - in report 21 it hooked 11.8 s before this point. Capturing here anyway
+    // costs nothing (first capture wins) and covers the case where nobody called us early.
+    capture_pristine_creation_slots();
     if (!hooks::init()) {
         flog("[overlay-v2] [ERROR] MinHook initialization failed");
         return false;

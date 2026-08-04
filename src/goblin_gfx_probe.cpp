@@ -873,12 +873,76 @@ namespace
         return _stricmp(dot, ".gfx") == 0 || _stricmp(dot, ".swf") == 0;
     }
 
+    // ── defs whose name never resolves: probe a few times, then STOP ────────────────
+    // Report 22 (2026-08-04, ERSS-FG player) measured what "just retry, the read is guarded"
+    // costs. A movieDef whose name field never resolved made the discovery pass below re-run on
+    // EVERY sprite load, forever: 27545 first-chance access violations in 31 minutes, a rock-steady
+    // ~14.5/sec. Our own __except swallows each one cheaply, which is exactly why it was invisible
+    // in our log - but a first-chance exception is a PROCESS-WIDE event. With ERSS-FG loaded, its
+    // vectored filter symbolized a ~39-frame stack per event (DbgHelp, plus a thread-suspension
+    // toolkit) and wrote 63 MB of log; the session ended in a crash inside another thread. The storm
+    // is our defect whoever else amplifies it.
+    //
+    // A def is retired after a few failures rather than the first: the probe also runs while a movie
+    // is still being parsed, and the name field is not necessarily written yet. Failures are counted
+    // per def; a success clears the count. Retiring costs only the name route - callers already
+    // handle "no name" by falling back to the shape heuristic.
+    constexpr int kNameProbeTries = 4;
+    constexpr size_t kDeadDefSlots = 64;
+    struct DeadDef
+    {
+        std::atomic<uint64_t> def;
+        std::atomic<int> fails;
+    };
+    DeadDef g_dead_defs[kDeadDefSlots];
+    std::atomic<unsigned> g_dead_cursor{0};
+    std::atomic<int> g_defs_retired{0};
+
+    // The slot for this def, or nullptr when the table is full of other defs (then the def is simply
+    // probed as before - a full table must never turn into "everything is dead").
+    DeadDef *dead_slot(uint64_t def, bool create)
+    {
+        for (size_t i = 0; i < kDeadDefSlots; ++i)
+            if (g_dead_defs[i].def.load(std::memory_order_relaxed) == def)
+                return &g_dead_defs[i];
+        if (!create)
+            return nullptr;
+        for (size_t i = 0; i < kDeadDefSlots; ++i)
+        {
+            uint64_t empty = 0;
+            if (g_dead_defs[i].def.compare_exchange_strong(empty, def, std::memory_order_relaxed))
+            {
+                g_dead_defs[i].fails.store(0, std::memory_order_relaxed);
+                return &g_dead_defs[i];
+            }
+        }
+        // Full: recycle round-robin. The table only holds defs that have FAILED, so the worst case
+        // of evicting one is that it gets its retries back.
+        const unsigned ix = g_dead_cursor.fetch_add(1, std::memory_order_relaxed) % kDeadDefSlots;
+        g_dead_defs[ix].def.store(def, std::memory_order_relaxed);
+        g_dead_defs[ix].fails.store(0, std::memory_order_relaxed);
+        return &g_dead_defs[ix];
+    }
+
+    // Called when a movie goes away, so a recycled heap address cannot inherit a dead verdict.
+    void forget_dead_defs()
+    {
+        for (size_t i = 0; i < kDeadDefSlots; ++i)
+        {
+            g_dead_defs[i].def.store(0, std::memory_order_relaxed);
+            g_dead_defs[i].fails.store(0, std::memory_order_relaxed);
+        }
+    }
+
     // Read a movie's own file name through its definition. false = it could not be established, and
     // callers must then fall back to whatever they did before.
     bool movie_file_url(uint64_t movieDef, char *out, size_t cap)
     {
         if (!looks_heap(movieDef) || cap < 32)
             return false;
+        if (DeadDef *d = dead_slot(movieDef, false))
+            if (d->fails.load(std::memory_order_relaxed) >= kNameProbeTries)
+                return false; // retired: see the note above, this is the storm fix
         const int known = g_url_off.load(std::memory_order_relaxed);
         if (known >= 0 && read_name_at(movieDef, known, out, cap))
             return true;
@@ -889,8 +953,20 @@ namespace
             {
                 if (g_url_off.exchange(off, std::memory_order_relaxed) != off)
                     spdlog::info("[gfxprobe] movie name found at def+0x{:X}: '{}'", off, out);
+                if (DeadDef *d = dead_slot(movieDef, false))
+                    d->fails.store(0, std::memory_order_relaxed);
                 return true;
             }
+        if (DeadDef *d = dead_slot(movieDef, true))
+        {
+            const int n = d->fails.fetch_add(1, std::memory_order_relaxed) + 1;
+            // INFO, and deliberately NOT behind debug_logging: this storm was invisible in our own
+            // log for a whole session and was only found in a third party's. One line per def.
+            if (n == kNameProbeTries)
+                spdlog::info("[gfxprobe] movie def 0x{:X} has no readable name after {} probes - "
+                             "not probing it again (total retired: {})",
+                             movieDef, n, g_defs_retired.fetch_add(1, std::memory_order_relaxed) + 1);
+        }
         return false;
     }
 
@@ -2150,6 +2226,10 @@ void goblin::gfx_probe::v3_on_map_close()
     // garbage. Dropping it here costs one re-latch on the next charId-171 lookup.
     g_moviedef.store(0, std::memory_order_relaxed);
     g_dict_dumped.store(false, std::memory_order_relaxed);
+    // Same reasoning one level down: the retired-def table is keyed by raw pointer, and once these
+    // movies are freed the allocator may hand the same address to a healthy def. Clearing here costs
+    // at most a few probes on the next open and keeps a dead verdict from outliving its object.
+    forget_dead_defs();
 }
 
 

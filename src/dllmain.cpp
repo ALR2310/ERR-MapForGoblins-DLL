@@ -21,6 +21,7 @@
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp"
 #include "goblin_overlay.hpp"
+#include "sc2/overlay_present.hpp" // capture_creation_entrypoints(), called first thing below
 #include "goblin_map_timing.hpp"
 #include "goblin_gfx_probe.hpp"
 #include "goblin_maphover.hpp"
@@ -704,6 +705,15 @@ static void manual_hide_hotkey_loop()
 
 static void setup_mod()
 {
+    // FIRST, before anything else takes time: record DXGI's own swapchain-creation entry points.
+    // They are only worth having while the factory vtable is still pristine, and this thread starts
+    // ~1.3 s ahead of a co-loaded frame-generation overlay's hooks (measured, report 21), whereas
+    // the SC2 install runs about ten seconds later - too late to capture anything but their proxy.
+    // Deliberately here and NOT in DllMain: creating a DXGI factory loads dxgi.dll, and doing that
+    // under the loader lock is a deadlock risk. See scratch/user_reports/ERSS_CONFLICT_HANDOFF.md.
+    try { cte::overlay::present::capture_creation_entrypoints(); }
+    catch (...) { /* a missing snapshot only costs the loop-break's best branch */ }
+
     safe_init_step(&init_modutils,    "modutils::initialize");
 
     // Arm + ENABLE the icon-injection hooks FIRST - before the params wait and before any other work. They

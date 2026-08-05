@@ -302,6 +302,26 @@ SIGNATURES = [
                 "player not on 2.6.2.0. Pattern is 17 bytes of pure opcode/ModRM with no wildcards.",
     },
     {
+        "name": "po3_addsnapshot",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 "
+                   "48 8B 01 48 8B EA 48 8D 15 ?? ?? ?? ?? 45 8B F0 48 8B D9 FF 50 38 80 7B 08 00 "
+                   "BE 01 00 00 00 B9 09 00 00 00 8B C6 0F 4C C1 0F B6 4B 08 33 FF 0F B6 54 18 0A "
+                   "0F B6 44 18 09 66 C1 E2 08 66",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp:capture_tag_vtables"],
+        "note": "PlaceObject3::AddToTimelineSnapshot, 0x11BDB40 on 2.6.2.0. NOT hooked - scanned once "
+                "at setup so capture_tag_vtables can confirm a candidate tag vtable by its +0x30 slot "
+                "CONTENT on any exe build (the mod+RVA literal compare failed on every shifted exe, "
+                "report 30). It shares its first 0x4C bytes with PlaceObject2's snapshot fn except the "
+                "RIP displacement (wildcarded); the tail bytes are the tag-BODY reads that tell the two "
+                "apart - PO3 reads depth at body+2 (0F B6 54 18 0A), PO2 at body+1 - which is layout, "
+                "not address, so it holds across builds (verified unique on 2.6.2/2.6.0/2.2.3). A miss "
+                "only costs the vtable capture its confirmation (falls back to the baked-RVA compare), "
+                "hence critical=False. The rm2 side needs no scan: the rm2exec hook already resolves "
+                "that function, and its return value is what the compare uses.",
+    },
+    {
         "name": "menu_row_path",
         "pattern": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 90 FE FF FF FF 49 89 5B 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 80 00 00 00 48 8B FA 48 8B D9 49 89 53 98 C7 44 24 20 00 00 00 00 45 8B 08 45 8B 40 04",
         "slot": None,

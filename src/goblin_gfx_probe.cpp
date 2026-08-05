@@ -463,6 +463,16 @@ namespace
     // but the names cost hours when they lie, so they are being corrected as each site is touched.
     constexpr uint64_t RVA_FN_REMOVEOBJECT2_ADDSNAPSHOT = 0x11BDE10; // RemoveObject2::AddToTimelineSnapshot
     constexpr uint64_t RVA_FN_PLACEOBJECT3_ADDSNAPSHOT = 0x11BDB40;  // PlaceObject3, same slot
+    // The same two functions at their LIVE addresses, for capture_tag_vtables' +0x30 identity
+    // compare. Resolved at setup by the SCAN infrastructure, never by the anchor table: the rm2
+    // address is what the rm2exec hook's own scan just found (definitionally right on any exe the
+    // hook works on), po3 has its own signature. An anchor CANNOT serve here - it verifies bytes
+    // in the live process, and by anchor-resolve time our rm2exec MinHook has already re-prologued
+    // the function, so the anchor failed AT HOME on the supported exe and rebased onto a byte-twin
+    // 0x12be10 away (measured 2026-08-06: capture dead, 0 pulses, every queued marker dropped).
+    // 0 = unresolved; the compare then falls back to mod+RVA, which is the pre-report-30 behavior.
+    std::atomic<uint64_t> g_rm2_fn_live{0};
+    std::atomic<uint64_t> g_po3_fn_live{0};
 
 
     // (verify_prologue() stood here: a guard that compared the bytes at a hardcoded RVA before
@@ -1457,6 +1467,19 @@ namespace
                 g_qmark_injected.store(true, std::memory_order_relaxed);
                 seh_inject_sprite171(sd, (uint64_t)rcx, fcnt); // SEH-guarded (runs for every user on map load)
             }
+            else
+            {
+                // The silent third path, named. Report 30's second launch ended exactly here:
+                // the ctor ring had no worldmap-shaped 171 when this load fired, nothing was
+                // logged, and the whole session ran without icons - the log read like the
+                // worldmap simply never arrived. Once per session; the next 171 load retries.
+                static std::atomic<int> s_ring_miss{0};
+                if (s_ring_miss.exchange(1) == 0)
+                    spdlog::info("[gfxprobe] a sprite-171 finished loading but no worldmap-shaped "
+                                 "171 (frame array 2..1000000, self-consistent) was in the ctor "
+                                 "ring - not injected on this load (name check: {})",
+                                 is_wm == 1 ? "worldmap" : is_wm == 0 ? "other movie" : "no name");
+            }
         }
         else if (cid == LOGO_PLAQUE_SPRITE && rcx &&
                  (uint64_t)rcx == g_worldmap_ctx.load(std::memory_order_relaxed) &&
@@ -1900,6 +1923,20 @@ namespace
         uint32_t fcnt = rd32(sd + OFF_FRAMEARR_COUNT);
         if (!looks_heap(fdata) || fcnt == 0)
             return;
+        // The two functions the identity compare expects in slot +0x30, at their LIVE addresses
+        // (scanned at setup - see the note at g_rm2_fn_live). As `mod + RVA` literals this compare
+        // failed on EVERY frame of a shifted exe (report 30, a 2.2.0 build), the capture came up
+        // empty, and with g_rm2_vt still 0 the sprite-171 tag list stayed empty too - so no RM2
+        // execution ever read as a factory pulse and the whole native marker build sat out the
+        // session. The baked sum stays as the last resort for an exe the scans could not place
+        // them on, where it keeps exactly the old behavior.
+        const uint64_t mod0 = (uint64_t)GetModuleHandleW(nullptr);
+        uint64_t rm2_fn = g_rm2_fn_live.load(std::memory_order_relaxed);
+        if (!rm2_fn)
+            rm2_fn = mod0 + RVA_FN_REMOVEOBJECT2_ADDSNAPSHOT;
+        uint64_t po3_fn = g_po3_fn_live.load(std::memory_order_relaxed);
+        if (!po3_fn)
+            po3_fn = mod0 + RVA_FN_PLACEOBJECT3_ADDSNAPSHOT;
         for (uint32_t f = 0; f < fcnt; ++f)
         {
             uint64_t elem = fdata + (uint64_t)f * FRAME_STRIDE;
@@ -1919,9 +1956,7 @@ namespace
             // whose depth happens to be 0x10 mod 256 would hand us the PO2 vtable to synthesize PO3
             // bodies with. Confirm identity instead: both candidates must carry the expected
             // AddToTimelineSnapshot in slot +0x30. Audited 2026-07-28.
-            const uint64_t mod0 = (uint64_t)GetModuleHandleW(nullptr);
-            const bool id_ok = rq(v0 + 0x30) == mod0 + RVA_FN_REMOVEOBJECT2_ADDSNAPSHOT &&
-                               rq(v2 + 0x30) == mod0 + RVA_FN_PLACEOBJECT3_ADDSNAPSHOT;
+            const bool id_ok = rq(v0 + 0x30) == rm2_fn && rq(v2 + 0x30) == po3_fn;
             if (looks_heap(v0) && v0 == v1 && looks_heap(v2) && v2 != v0 && f2 == 0x10 && id_ok)
             {
                 g_rm2_vt.store(v0, std::memory_order_relaxed);
@@ -2608,9 +2643,31 @@ void goblin::gfx_probe::setup()
             // fabricated MMX opcode (report 20). A scan either finds the real function on whatever
             // build is running, or throws and leaves the hook uninstalled; it can never land
             // half-way into one.
-            modutils::hook<ExecFn>(
+            //
+            // The scan result is ALSO the identity reference capture_tag_vtables compares the
+            // RM2 vtable's +0x30 slot against - kept from the same scan the hook rides on, so the
+            // two can never disagree about which function is RemoveObject2's on this exe.
+            ExecFn *rm2_fn = modutils::hook<ExecFn>(
                 {.aob = "48 89 5C 24 18 56 41 56 41 57 48 83 EC 20 48 8B 01"},
                 rm2exec_detour, o_rm2exec);
+            g_rm2_fn_live.store(reinterpret_cast<uint64_t>(rm2_fn), std::memory_order_relaxed);
+        }
+        // PlaceObject3's AddToTimelineSnapshot, the other half of that identity compare. Scan only
+        // (nothing hooks it); shares its first 0x4C bytes with PlaceObject2's snapshot fn except a
+        // RIP displacement (the wildcards), so the tail is the tag-BODY reads that tell the two
+        // apart - PO3 reads depth at body+2, which is layout, not address, and holds across builds.
+        try
+        {
+            g_po3_fn_live.store(reinterpret_cast<uint64_t>(modutils::scan<void>(
+                {.aob = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 "
+                        "EC 20 48 8B 01 48 8B EA 48 8D 15 ?? ?? ?? ?? 45 8B F0 48 8B D9 FF 50 38 "
+                        "80 7B 08 00 BE 01 00 00 00 B9 09 00 00 00 8B C6 0F 4C C1 0F B6 4B 08 33 "
+                        "FF 0F B6 54 18 0A 0F B6 44 18 09 66 C1 E2 08 66"})),
+                std::memory_order_relaxed);
+        }
+        catch (const std::exception &)
+        {
+            // 0 -> the capture compare falls back to mod+RVA (the pre-report-30 behavior).
         }
     }
     catch (const std::exception &e)

@@ -199,6 +199,16 @@ ANCHORS = [
     {"name": "trigger_vt_slot7_fn", "rva": 0x745BD0,
      "bytes": "40 57 48 81 EC D0 08 00 00 48 C7 44 24 20 FE FF",
      "used": "find_input_trigger (vt+0x38 content compare)"},
+
+    # NOT here, deliberately: rm2_addsnapshot / po3_addsnapshot (capture_tag_vtables'
+    # +0x30 identity compare, report 30). An anchor is a BYTE-identity check in the LIVE
+    # process, and rm2_addsnapshot is a function our own rm2exec MinHook has already
+    # re-prologued by the time the table resolves - so the anchor failed AT HOME on the
+    # supported exe and the resolver rebased it onto a byte-twin +0x12be10 away (measured
+    # 2026-08-06: capture dead, 0 pulses, every marker dropped). Any function this DLL
+    # hooks must never be anchored unless the resolve is guaranteed to run first. Those
+    # two are resolved by AOB instead (see po3_addsnapshot in aob_signatures.py; the rm2
+    # address is the rm2exec hook's own scan result).
 ]
 
 # Data addresses (vtables / singletons) shift on every patch and cannot be byte-anchored

@@ -1,4 +1,5 @@
 #include "goblin_stall_probe.hpp"
+#include "goblin_anchors.hpp" // every base+RVA engine helper resolves through this
 #include "goblin_config.hpp"
 
 #if MFG_STALL_PROFILER
@@ -3788,7 +3789,7 @@ namespace
     {
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         using TextCtorFn = void(void *, uint32_t);
-        auto p_text = reinterpret_cast<TextCtorFn *>(base + 0x760970);
+        auto p_text = reinterpret_cast<TextCtorFn *>(goblin::anchors::at(0x760970));
         std::memset(out, 0, 0x88);
         p_text(out + 0x8, static_cast<uint32_t>(self->a));
         p_text(out + 0x48, static_cast<uint32_t>(self->b));
@@ -3839,9 +3840,8 @@ namespace
                                         reinterpret_cast<void *>(&gamefn_pred_true),
                                         reinterpret_cast<void *>(&gamefn_type),
                                         reinterpret_cast<void *>(&gamefn_destroy)};
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         using RegisterFn = void(void *, void *, void *, void *);
-        auto p_reg = reinterpret_cast<RegisterFn *>(base + 0x744540);
+        auto p_reg = reinterpret_cast<RegisterFn *>(goblin::anchors::at(0x744540));
         struct InputSpec
         {
             GameFnHolder trig;
@@ -4340,8 +4340,13 @@ namespace
             return;
         __try
         {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-            const uintptr_t feman = *reinterpret_cast<uintptr_t *>(base + 0x3D6B880);
+            // Through the AOB-resolved slot, not the literal exe+0x3D6B880 this used to read:
+            // that address is a .data slot and it MOVES between exe builds (2.2.3 keeps the
+            // same singleton at +0x20 from here), so on any other build the literal read a
+            // neighbouring pointer. The scan that owns this slot already runs in setup.
+            if (!g_feman_slot)
+                return;
+            const uintptr_t feman = reinterpret_cast<uintptr_t>(*g_feman_slot);
             if (!v3_heap_ptr(feman))
                 return;
             // THE HUD MODE. A hardware write watch on menu id 7's state byte caught the hide in the act
@@ -4410,6 +4415,10 @@ namespace
                              : *reinterpret_cast<int8_t *>(feman + 0x78));
             const uintptr_t c = feman + 0x4E70;
             // Trust nothing: the vtable must still be the class we identified, or the offsets moved.
+            // The comparison address is a .rdata vtable, which no byte anchor can follow, so on an
+            // exe build other than this one it simply will not match and the probe bows out - which
+            // is the correct answer there anyway, since the struct offsets around it are unverified.
+            const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
             const uintptr_t vt = *reinterpret_cast<uintptr_t *>(c);
             if (vt != base + 0x2A9CC50)
             {
@@ -4488,7 +4497,7 @@ namespace
 #endif
             g_hud_orig_job = *reinterpret_cast<void **>(base_menu + 0x10);
             if (v3_heap_ptr(reinterpret_cast<uintptr_t>(g_hud_orig_job)))
-                reinterpret_cast<void (*)(void *)>(base + 0x1EBA1C0)(
+                reinterpret_cast<void (*)(void *)>(goblin::anchors::at(0x1EBA1C0))(
                     reinterpret_cast<uint8_t *>(g_hud_orig_job) + 8);
             else
                 g_hud_orig_job = nullptr;
@@ -4787,9 +4796,9 @@ namespace
     // POD-only: fill found[i] with "does the row have this child clip".
     void probe_row_clips_raw(uintptr_t base, void *rowProxy, char *found)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         __try
         {
             for (size_t i = 0; i < kRowClipCount; ++i)
@@ -4842,12 +4851,12 @@ namespace
     void draw_our_row(uintptr_t base, void *rowProxy, const char *styleFrame,
                       const wchar_t *label, const wchar_t *value, bool plate)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_settext = reinterpret_cast<SetTextFn *>(base + 0x74A000);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_frame = reinterpret_cast<GotoFrameFn *>(base + 0x7499E0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_frame = reinterpret_cast<GotoFrameFn *>(goblin::anchors::at(0x7499E0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         __try
         {
             p_visible(rowProxy, 1);
@@ -4902,10 +4911,10 @@ namespace
             using AppendFn = void(void *, void *);
             using NormalCtorFn = void *(void *out, void *listCtx, uint32_t kind, const void *row);
             using EmptyCtorFn = void *(void *out);
-            auto p_clear = reinterpret_cast<ClearFn *>(base + 0x868f20);
-            auto p_append = reinterpret_cast<AppendFn *>(base + 0x868fe0);
-            auto p_normal = reinterpret_cast<NormalCtorFn *>(base + 0x866f80);
-            auto p_empty = reinterpret_cast<EmptyCtorFn *>(base + 0x8686c0);
+            auto p_clear = reinterpret_cast<ClearFn *>(goblin::anchors::at(0x868F20));
+            auto p_append = reinterpret_cast<AppendFn *>(goblin::anchors::at(0x868FE0));
+            auto p_normal = reinterpret_cast<NormalCtorFn *>(goblin::anchors::at(0x866F80));
+            auto p_empty = reinterpret_cast<EmptyCtorFn *>(goblin::anchors::at(0x8686C0));
             uint8_t scratch[8] = {};
             p_clear(vec, scratch, *reinterpret_cast<uintptr_t *>(obj + 0x10),
                     *reinterpret_cast<uintptr_t *>(obj + 0x18));
@@ -5001,10 +5010,10 @@ namespace
         if (!dlg)
             return;
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         __try
         {
             void *root = reinterpret_cast<void *>(dlg + 0x120);
@@ -5039,11 +5048,10 @@ namespace
     {
         if (!dlg)
             return;
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         bool root_done = false;
         __try
@@ -5083,7 +5091,7 @@ namespace
                 // appears. Its own FadeOut later still works - the engine starts that itself.
                 using GotoAndStopFn = void(void *proxy, const char *label);
                 if (on)
-                    reinterpret_cast<GotoAndStopFn *>(base + 0x7499E0)(
+                    reinterpret_cast<GotoAndStopFn *>(goblin::anchors::at(0x7499E0))(
                         reinterpret_cast<uint8_t *>(root) + 0x18, kSettledLabel);
             }
             // ONLY if the root would not take it. Walking the named clips instead is not
@@ -5321,9 +5329,9 @@ namespace
     // engine can resolve from the movie root.
     void probe_icon_paths_raw(uintptr_t base, const char *const *paths, size_t count, char *found)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
         if (!dlg)
             return;
@@ -5419,9 +5427,9 @@ namespace
 
     void build_slot_table(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         int found = 0;
         __try
         {
@@ -5480,12 +5488,12 @@ namespace
     void draw_row_icon(uintptr_t base, int32_t slot, const char *ini_key,
                       void *rowProxy = nullptr)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         using SetFrameNumFn = void(void *proxy, int frame);
-        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(base + 0x749980);
+        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(0x749980));
         // One-shot: report whether a brand-new spliced clip name resolves at all - that
         // answers the long-standing question and tells us if icons can work this way.
         static std::atomic<int> s_reported{0};
@@ -5581,7 +5589,7 @@ namespace
                 if (ok)
                     // From the origin now: the strip's placement carries no matrix (so nothing
                     // resets it) and the row offset ICON_X/ICON_Y is baked into the strip itself.
-                    reinterpret_cast<SetPosFn *>(base + 0x733230)(
+                    reinterpret_cast<SetPosFn *>(goblin::anchors::at(0x733230))(
                         r, -frame * goblin::menu_icon_tags::ICON_CELL_PX, 0);
                 else
                     note("MfgIcon did not resolve in the row", slot, frame);
@@ -5614,9 +5622,9 @@ namespace
     int draw_row_slider_raw(uintptr_t base, uintptr_t dlg, int32_t slot, int cell,
                             void *rowProxy)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         using SetPosFn = void(void *proxy, int32_t x, int32_t y);
         char path[96];
         void *root = reinterpret_cast<void *>(dlg + 0x120);
@@ -5645,7 +5653,7 @@ namespace
             }
             if (p_valid(r))
             {
-                reinterpret_cast<SetPosFn *>(base + 0x733230)(
+                reinterpret_cast<SetPosFn *>(goblin::anchors::at(0x733230))(
                     r, -cell * goblin::menu_icon_tags::SLIDER_CELL_PITCH_PX, 0);
                 applied = cell;
             }
@@ -5796,12 +5804,11 @@ namespace
         bool ok = false;
         if (out_is_preview)
             *out_is_preview = false;
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         __try
         {
             using CursorFn = uint32_t(void *grid);
             using ItemAtFn = void *(void *viewList, uint32_t index);
-            const uint32_t index = reinterpret_cast<CursorFn *>(base + 0x739e20)(
+            const uint32_t index = reinterpret_cast<CursorFn *>(goblin::anchors::at(0x739E20))(
                 reinterpret_cast<void *>(dlg + 0xa38));
             void *viewList = reinterpret_cast<void *>(dlg + 0x1268);
             const uintptr_t vvt = *reinterpret_cast<uintptr_t *>(viewList);
@@ -5882,10 +5889,10 @@ namespace
     void set_form_captions(uintptr_t base, uintptr_t dlg, const wchar_t *title,
                            const wchar_t *hint)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_settext = reinterpret_cast<SetTextFn *>(base + 0x74A000);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         __try
         {
@@ -5922,12 +5929,12 @@ namespace
 
     void prepare_form_layout(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         using SetFrameNumFn = void(void *proxy, int frame);
-        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(base + 0x749980);
+        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(0x749980));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         static const char *const kHide[] = {
             "SelectKey/Win64", "SelectKey/PS4",  "SelectKey/PS5",     "SelectKey/XboxOne",
@@ -6020,7 +6027,7 @@ namespace
         {
             using PackFn = void *(uintptr_t entry, void *outPack);
             uint8_t pack[0x90] = {};
-            void *p = reinterpret_cast<PackFn *>(base + 0x745170)(entry, pack);
+            void *p = reinterpret_cast<PackFn *>(goblin::anchors::at(0x745170))(entry, pack);
             if (!p)
                 return false;
             // pack layout (cmdlist RE): DLString name @+0x8 - inline buffer unless long.
@@ -6066,11 +6073,11 @@ namespace
     // never behaves like a row the cursor can land on.
     void paint_right_panel(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_settext = reinterpret_cast<SetTextFn *>(base + 0x74A000);
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(base + 0x733340);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         for (int n = 0; n < 11; ++n)
         {
@@ -6171,10 +6178,10 @@ namespace
                 _snwprintf_s(fallback, _TRUNCATE, L"%s", label);
             tip = fallback;
         }
-        auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-        auto p_settext = reinterpret_cast<SetTextFn *>(base + 0x74A000);
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(base + 0x733150);
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(base + 0xD7F850);
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         __try
         {
@@ -6290,9 +6297,9 @@ namespace
             using RebuildFn = void(void *viewList, void *mgr);
             using RefreshFn = void(void *dlg);
             // The HOOKED builder, so our rows are the ones rebuilt.
-            reinterpret_cast<RebuildFn *>(base + 0x868590)(reinterpret_cast<void *>(dlg + 0x1268),
+            reinterpret_cast<RebuildFn *>(goblin::anchors::at(0x868590))(reinterpret_cast<void *>(dlg + 0x1268),
                                                           reinterpret_cast<void *>(dlg + 0x1290));
-            reinterpret_cast<RefreshFn *>(base + 0x942690)(reinterpret_cast<void *>(dlg));
+            reinterpret_cast<RefreshFn *>(goblin::anchors::at(0x942690))(reinterpret_cast<void *>(dlg));
             // The refresh leaves the grid's item count at the PREVIOUS page's value, so the
             // list is only walkable up to that many items. Restate it from what the rebuild
             // actually landed - after the refresh, never before: writing it first is what let
@@ -6736,7 +6743,7 @@ namespace
     {
         if (!obj)
             return;
-        auto p_unref = reinterpret_cast<int (*)(void *)>(base + 0x1EBA200);
+        auto p_unref = reinterpret_cast<int (*)(void *)>(goblin::anchors::at(0x1EBA200));
         if (p_unref(reinterpret_cast<uint8_t *>(obj) + 8) == 1)
             (*reinterpret_cast<void (**)(void *)>(*reinterpret_cast<void **>(obj)))(obj);
     }
@@ -6840,13 +6847,38 @@ namespace
     //     0x140807967  MOV byte ptr [RSP+0x34], 0x1     -> immediate at RVA 0x80796B
     // so the experiment is one byte, flipped around our own call and put straight back. The same
     // trick the CommandList work already used on a rip-relative operand.
-    constexpr uintptr_t kFormDescKindImm = 0x80796B;
+    // Kept as an OFFSET INTO the anchored function, not as an absolute RVA: the byte lives
+    // 0x7B into keyconfig_form_build, and that anchor is the thing that gets re-found on a
+    // different exe build. Writing a byte at an absolute address that moved would patch a
+    // random instruction. Verified: 0x80796B - 0x8078F0 = 0x7B.
+    constexpr uint32_t kFormDescKindFn = 0x8078F0; // anchor: keyconfig_form_build
+    constexpr uintptr_t kFormDescKindInFn = 0x7B;
 
     // Returns the previous value, or 0 if the patch could not be applied.
     uint8_t patch_form_desc_kind(uint8_t want)
     {
-        const uintptr_t at = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) +
-                             kFormDescKindImm;
+        const uintptr_t fn = goblin::anchors::at(kFormDescKindFn);
+        if (!fn)
+            return 0; // helper not located on this exe: no byte patch, no guesswork
+        // The instruction itself, not just the function, must be where we think it is:
+        // `C6 44 24 34 imm8` = MOV byte [rsp+0x34], imm8. Verified present at fn+0x77 on
+        // 2.6.2 / 2.6.0 / 2.2.3 / 2.2.0; a build that moves it inside the function gets no
+        // patch instead of a byte written into the middle of something else.
+        {
+            const auto *op = reinterpret_cast<const uint8_t *>(fn + kFormDescKindInFn - 4);
+            bool shape_ok = false;
+            __try
+            {
+                shape_ok = op[0] == 0xC6 && op[1] == 0x44 && op[2] == 0x24 && op[3] == 0x34;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                shape_ok = false;
+            }
+            if (!shape_ok)
+                return 0;
+        }
+        const uintptr_t at = fn + kFormDescKindInFn;
         DWORD old_prot = 0;
         if (!VirtualProtect(reinterpret_cast<void *>(at), 1, PAGE_EXECUTE_READWRITE, &old_prot))
             return 0;
@@ -6896,9 +6928,9 @@ namespace
             const uintptr_t vt = *reinterpret_cast<uintptr_t *>(win);
             if (!v3_heap_ptr(vt) && vt < base)
                 return false;
-            if (*reinterpret_cast<uintptr_t *>(vt) != base + 0x7342B0)
+            if (*reinterpret_cast<uintptr_t *>(vt) != goblin::anchors::at(0x7342B0))
                 return false;
-            if (*reinterpret_cast<uintptr_t *>(vt + 0x38) != base + 0x745BD0)
+            if (*reinterpret_cast<uintptr_t *>(vt + 0x38) != goblin::anchors::at(0x745BD0))
                 return false;
             // The sequence holder must read as a DLRefPtr: empty, or something on the heap.
             const uint64_t held = *reinterpret_cast<uint64_t *>(win + 0x10);
@@ -7100,9 +7132,9 @@ namespace
         {
             void *slotA = nullptr, *slotB = nullptr, *slotC = nullptr;
             auto p_keycfg =
-                reinterpret_cast<void *(*)(void **, void *, uint8_t)>(base + 0x8078f0);
-            auto p_conv1 = reinterpret_cast<void *(*)(void *, void **)>(base + 0x7A7E30);
-            auto p_conv2 = reinterpret_cast<void *(*)(void *, void **)>(base + 0x7A7B60);
+                reinterpret_cast<void *(*)(void **, void *, uint8_t)>(goblin::anchors::at(0x8078F0));
+            auto p_conv1 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(0x7A7E30));
+            auto p_conv2 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(0x7A7B60));
             // OWNER: win+0x50, what the game's own key-binding opener passes; the pushed path
             // uses the menu's own +0x10 the way F11's settings screen does.
             void *owner = reinterpret_cast<void *>(host + (pushed ? 0x10 : 0x50));
@@ -7130,7 +7162,7 @@ namespace
                 // conversion chain returns the address of the last slot), so slotC reads back as
                 // 0 afterwards - which is also why the release below is a no-op rather than a
                 // double free. Record the job BEFORE the store, or the log shows 0x0.
-                auto p_addref = reinterpret_cast<void (*)(void *)>(base + 0x1EBA1C0);
+                auto p_addref = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(0x1EBA1C0));
                 g_screens.back().job = reinterpret_cast<uintptr_t>(slotC);
                 if (pushed)
                 {
@@ -7162,7 +7194,7 @@ namespace
                     // hud_snapshot_take - an unowned +1 on an engine-owned object - and it is worth
                     // fixing even though this branch is rarely taken now (over the map the slot is
                     // usually held by the map's own job sequence, so we push instead).
-                    auto p_seq = reinterpret_cast<void (*)(void *, void *)>(base + 0x7A9250);
+                    auto p_seq = reinterpret_cast<void (*)(void *, void *)>(goblin::anchors::at(0x7A9250));
                     p_seq(reinterpret_cast<void *>(host + 0x10), r);
                 }
                 release_job_ref(base, slotC);
@@ -7431,7 +7463,7 @@ namespace
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         __try
         {
-            return reinterpret_cast<char (*)(void *)>(base + 0x7A9230)(
+            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(0x7A9230))(
                        reinterpret_cast<void *>(win + 0x10)) != 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -7497,11 +7529,10 @@ namespace
     // to be no frame with neither of them drawn.
     bool job_finished(uintptr_t win)
     {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         __try
         {
             uint64_t held = *reinterpret_cast<uint64_t *>(win + 0x1E8);
-            return reinterpret_cast<char (*)(void *)>(base + 0x7A9200)(&held) != 0;
+            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(0x7A9200))(&held) != 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -10595,25 +10626,42 @@ void goblin::stall_probe::setup()
     // options-UI functions and both pass straight through unless our form is armed, so
     // the game's own keybinding screen is untouched. Hooked by address: their prologues
     // are short/shared, so an AOB would not be unique.
+    //
+    // PATCHING BY ADDRESS IS THE ONE THING THAT MUST NOT BE ATTEMPTED ON AN EXE WE DID NOT
+    // MEASURE. Each of these four rewrites a prologue in place, so a shifted address means
+    // MinHook overwrites the middle of an unrelated instruction - the report-20 failure mode,
+    // but on every launch instead of on one call. So they take resolved addresses only, and
+    // only when EVERY anchor resolved: a partial table means the shift prior is unproven, and
+    // an unproven prologue address is not worth a cosmetic dev feature.
     {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        modutils::hook(reinterpret_cast<void *>(base + 0x868590),
-                       reinterpret_cast<void *>(&build_items_detour),
-                       reinterpret_cast<void **>(&o_build_items));
-        // Row DRAW (the item's vt+0x8): we paint name/value ourselves, so our rows are
-        // not limited to FMG strings.
-        modutils::hook(reinterpret_cast<void *>(base + 0x8674e0),
-                       reinterpret_cast<void *>(&row_render_detour),
-                       reinterpret_cast<void **>(&o_row_render));
-        modutils::hook(reinterpret_cast<void *>(base + 0x9411a0),
-                       reinterpret_cast<void *>(&form_decide_detour),
-                       reinterpret_cast<void **>(&o_form_decide));
-        // The dialog's per-frame update, used only as a liveness heartbeat.
-        modutils::hook(reinterpret_cast<void *>(base + 0x93F540),
-                       reinterpret_cast<void *>(&form_update_detour),
-                       reinterpret_cast<void **>(&o_form_update));
+        const bool anchored = goblin::anchors::all_ok();
+        const uintptr_t a_build = anchored ? goblin::anchors::at(0x868590) : 0;
+        const uintptr_t a_render = anchored ? goblin::anchors::at(0x8674E0) : 0;
+        const uintptr_t a_decide = anchored ? goblin::anchors::at(0x9411A0) : 0;
+        const uintptr_t a_update = anchored ? goblin::anchors::at(0x93F540) : 0;
+        if (a_build && a_render && a_decide && a_update)
+        {
+            modutils::hook(reinterpret_cast<void *>(a_build),
+                           reinterpret_cast<void *>(&build_items_detour),
+                           reinterpret_cast<void **>(&o_build_items));
+            // Row DRAW (the item's vt+0x8): we paint name/value ourselves, so our rows are
+            // not limited to FMG strings.
+            modutils::hook(reinterpret_cast<void *>(a_render),
+                           reinterpret_cast<void *>(&row_render_detour),
+                           reinterpret_cast<void **>(&o_row_render));
+            modutils::hook(reinterpret_cast<void *>(a_decide),
+                           reinterpret_cast<void *>(&form_decide_detour),
+                           reinterpret_cast<void **>(&o_form_decide));
+            // The dialog's per-frame update, used only as a liveness heartbeat.
+            modutils::hook(reinterpret_cast<void *>(a_update),
+                           reinterpret_cast<void *>(&form_update_detour),
+                           reinterpret_cast<void **>(&o_form_update));
+        }
         if (o_build_items && o_row_render && o_form_decide)
             spdlog::info("[form] keybinding-form row hooks armed (build + draw + decide)");
+        else if (!anchored)
+            spdlog::warn("[form] row hooks NOT armed: this exe build is not the one this DLL "
+                         "was measured on and not every helper could be located");
         else
             spdlog::warn("[form] keybinding-form row hooks incomplete; row swap off");
     }

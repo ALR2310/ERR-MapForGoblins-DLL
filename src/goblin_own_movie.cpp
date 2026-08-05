@@ -1,5 +1,7 @@
 #include "goblin_own_movie.hpp"
 
+#include "goblin_anchors.hpp" // the memory-file vtable is derived from an anchored ctor
+
 #include "generated_shared/goblin_logo.hpp" // LOGO_TAG: the same bitmap the map registers
 
 #include "goblin_config.hpp"
@@ -28,7 +30,14 @@ namespace
     // Because the loader only ever reads through those fields, re-pointing them at a buffer
     // of ours is all it takes to have our bytes parsed - no File implementation of our own,
     // no lifetime games with an object the engine allocated.
-    constexpr uintptr_t kMemFileVtable = 0x2BA4C80;
+    // NOT a baked RVA any more (it was exe+0x2BA4C80): a vtable lives in .rdata, which moves
+    // between exe builds like everything else, and a wrong vtable here means the "is this the
+    // engine's memory file?" test compares against an unrelated pointer - it would answer NO
+    // forever (transform silently off) or, worse, YES for something else. It is DERIVED from
+    // the anchored constructor instead: the ctor's last `lea rax,[rip+..]` before its first
+    // call is the class's own vptr. 0 when that cannot be established, and every caller below
+    // treats 0 as "never match", so the transform stays off rather than guessing.
+    uintptr_t memfile_vtable() { return goblin::anchors::memfile_vtable(); }
     constexpr size_t kMemFileBuffer = 0x18;
     constexpr size_t kMemFileSize = 0x20;
     constexpr size_t kMemFilePos = 0x24;
@@ -1138,7 +1147,8 @@ namespace
             return;
         __try
         {
-            if (*reinterpret_cast<uintptr_t *>(file) != base() + kMemFileVtable)
+            const uintptr_t vt = memfile_vtable();
+            if (!vt || *reinterpret_cast<uintptr_t *>(file) != vt)
                 return;
             std::memcpy(g_parse_source, file, sizeof(g_parse_source));
             g_source_template = true;
@@ -1169,7 +1179,8 @@ namespace
         __try
         {
             uint8_t *dst = reinterpret_cast<uint8_t *>(source);
-            if (*reinterpret_cast<uintptr_t *>(source) != base() + kMemFileVtable)
+            const uintptr_t vt = memfile_vtable();
+            if (!vt || *reinterpret_cast<uintptr_t *>(source) != vt)
             {
                 if (!g_source_template)
                     return false;

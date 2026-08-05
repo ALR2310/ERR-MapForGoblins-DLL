@@ -266,15 +266,52 @@ namespace
         }
     }
 
-    // The Scaleform global MemoryHeap: *(exe + 0x4593250), Alloc(size, align/stat) at vtable +0x50 (the
-    // same call goblin_sfimage.cpp uses for its image resource). Use this for anything the engine will
+    // The Scaleform global MemoryHeap, Alloc(size, align/stat) at vtable +0x50 (the same call
+    // goblin_sfimage.cpp uses for its image resource). Use this for anything the engine will
     // FREE - today that is the frame array and nothing else.
+    //
+    // The SLOT is scanned (AOB gfx_global_heap_slot), not baked. It read exe+0x4593250 until
+    // 2026-08-05, and that is a .data address: on 2.2.3 the same singleton sits 0x20 further
+    // along, so on a downpatched exe the literal read a NEIGHBOURING pointer and handed the
+    // engine's own free() a buffer from a foreign heap - the v2.0.4 corruption shape. Resolved
+    // once, on first use; 0 means no heap and the caller aborts injection.
+    std::atomic<uint64_t> g_gfx_heap_slot{0};
+    std::atomic<bool> g_gfx_heap_slot_tried{false};
+
+    uint64_t gfx_heap_slot()
+    {
+        if (!g_gfx_heap_slot_tried.exchange(true, std::memory_order_acq_rel))
+        {
+            uint64_t slot = 0;
+            try
+            {
+                // mov rcx,[slot]; mov rax,[rcx]; xor r8d,r8d; lea edx,[rax+0x30]; call [rax+0x50]
+                slot = reinterpret_cast<uint64_t>(modutils::scan<void *>(
+                    {.aob = "48 8B 0D ?? ?? ?? ?? 48 8B 01 45 33 C0 41 8D 50 30 FF 50 50",
+                     .relative_offsets = {{3, 7}}}));
+            }
+            catch (const std::exception &)
+            {
+                slot = 0;
+            }
+            // scan() ANSWERS WITH NULL rather than throwing, so the log has to hang off the
+            // value, not off a catch. Without this the failure was silent.
+            if (!slot)
+                spdlog::warn("[icons] Scaleform heap slot unresolved; engine-owned allocations "
+                             "are off for this session");
+            g_gfx_heap_slot.store(slot, std::memory_order_release);
+        }
+        return g_gfx_heap_slot.load(std::memory_order_acquire);
+    }
+
     void *gfx_heap_alloc(size_t n)
     {
         __try
         {
             auto sane = [](uint64_t v) { return v > 0x10000ull && v < 0x7FFFFFFFFFFFull; };
-            const uint64_t hptr = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)) + 0x4593250;
+            const uint64_t hptr = gfx_heap_slot();
+            if (!hptr)
+                return nullptr;
             const uint64_t heap = *reinterpret_cast<uint64_t *>(hptr);
             if (!sane(heap))
                 return nullptr;

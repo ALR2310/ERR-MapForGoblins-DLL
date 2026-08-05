@@ -254,6 +254,18 @@ SIGNATURES = [
                 "inline reader fallback at ctx+0x50.",
     },
     {
+        "name": "gfx_global_heap_slot",
+        "pattern": "48 8B 0D ?? ?? ?? ?? 48 8B 01 45 33 C0 41 8D 50 30 FF 50 50",
+        "slot": (3, 7),
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "The Scaleform global MemoryHeap* slot (2.6.2: exe+0x4593250), read from a "
+                "unique Alloc(0x30) call site (mov rcx,[slot]; mov rax,[rcx]; call [rax+0x50]). "
+                "gfx_heap_alloc used the raw slot literal until 2026-08-05; scanned at runtime "
+                "now so downpatched exes (2.2.3 keeps the slot at +0x20) still allocate the "
+                "engine-freed frame array from the right heap.",
+    },
+    {
         "name": "game_crt_malloc",
         "pattern": "40 53 48 83 EC 20 48 8B D9 48 83 F9 E0 77 ?? 48 85 C9 B8 01 00 00 00 48 0F 44 D8 EB ?? E8 ?? ?? ?? ?? 85 C0 74 ?? 48 8B CB E8 ?? ?? ?? ?? 85 C0",
         "slot": None,

@@ -123,6 +123,8 @@ add_library( MapForGoblins SHARED
   src/goblin_i18n_bundle.hpp
   src/goblin_config.hpp
   src/goblin_config.cpp
+  src/goblin_anchors.hpp
+  src/goblin_anchors.cpp
   # src/goblin_diag.{hpp,cpp} - the map-icon status registry. Deliberately NOT compiled: it existed
   # so a player could screenshot a load-step summary into a bug report, and its only reader (the
   # overlay Debug tab readout) went on 2026-07-29 because nobody ever sent one - players send LOGS.

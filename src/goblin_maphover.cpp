@@ -11,6 +11,7 @@
 // that row ptr; the inject layer matches it to one of our CategoryRow::p.
 #include "goblin_maphover.hpp"
 
+#include "goblin_anchors.hpp"     // every base+RVA engine helper resolves through this
 #include "goblin_guarded.hpp"     // these engine calls fault on purpose; the logger stays quiet
 #include "goblin_collected.hpp"  // read_player_pos() for the height line
 #include "goblin_config.hpp"     // hover_info: this panel is now its ONLY consumer
@@ -424,7 +425,7 @@ namespace
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<char (*)(void *, const float *)>(base + kPanelPosF)(
+            reinterpret_cast<char (*)(void *, const float *)>(goblin::anchors::at(kPanelPosF))(
                 reinterpret_cast<uint8_t *>(panel) + 8, at);
             ok = true;
         }
@@ -443,7 +444,7 @@ namespace
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<void (*)(void *, char)>(base + kPanelVisible)(
+            reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible))(
                 reinterpret_cast<uint8_t *>(panel) + 8, show ? 1 : 0);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -500,7 +501,7 @@ namespace
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<void (*)(void *, char)>(base + kPanelVisible)(w, 0);
+            reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible))(w, 0);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -515,9 +516,9 @@ namespace
 
     bool panel_present(uintptr_t base, void *root, const char *panel)
     {
-        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(base + kResolve);
-        auto p_valid = reinterpret_cast<char (*)(void *)>(base + kProxyValid);
-        auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
+        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(goblin::anchors::at(kResolve));
+        auto p_valid = reinterpret_cast<char (*)(void *)>(goblin::anchors::at(kProxyValid));
+        auto p_dtor = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(kProxyDtor));
         bool ok = false;
         ++goblin::guarded::depth;
         __try
@@ -544,13 +545,13 @@ namespace
     void tip_line(uintptr_t base, void *root, const char *panel, int i, const wchar_t *text,
                   uint32_t rgb, const float *at = nullptr)
     {
-        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(base + kResolve);
-        auto p_valid = reinterpret_cast<char (*)(void *)>(base + kProxyValid);
-        auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
-        auto p_visible = reinterpret_cast<void (*)(void *, char)>(base + kSetVisible);
-        auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(base + kSetPosI);
+        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(goblin::anchors::at(kResolve));
+        auto p_valid = reinterpret_cast<char (*)(void *)>(goblin::anchors::at(kProxyValid));
+        auto p_dtor = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(kProxyDtor));
+        auto p_visible = reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kSetVisible));
+        auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(goblin::anchors::at(kSetPosI));
         auto p_settext =
-            reinterpret_cast<void (*)(void *, const wchar_t *)>(base + kSetTextHtml);
+            reinterpret_cast<void (*)(void *, const wchar_t *)>(goblin::anchors::at(kSetTextHtml));
         ++goblin::guarded::depth;
         __try
         {
@@ -582,7 +583,7 @@ namespace
                             // as alpha, so it must be 0xFFRRGGBB, not 0x00RRGGBB (that was the
                             // "grey" - fully transparent).
                             void *fldp = fld;
-                            reinterpret_cast<void (*)(void **, uint32_t)>(base + kSetTextColor)(
+                            reinterpret_cast<void (*)(void **, uint32_t)>(goblin::anchors::at(kSetTextColor))(
                                 &fldp, rgb);
                         }
                     }
@@ -606,11 +607,11 @@ namespace
     // POD-only: show/hide our panel root and place it.
     void tip_root(uintptr_t base, void *root, const char *panel, bool show, int x, int y)
     {
-        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(base + kResolve);
-        auto p_valid = reinterpret_cast<char (*)(void *)>(base + kProxyValid);
-        auto p_dtor = reinterpret_cast<void (*)(void *)>(base + kProxyDtor);
-        auto p_visible = reinterpret_cast<void (*)(void *, char)>(base + kSetVisible);
-        auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(base + kSetPosI);
+        auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(goblin::anchors::at(kResolve));
+        auto p_valid = reinterpret_cast<char (*)(void *)>(goblin::anchors::at(kProxyValid));
+        auto p_dtor = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(kProxyDtor));
+        auto p_visible = reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kSetVisible));
+        auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(goblin::anchors::at(kSetPosI));
         ++goblin::guarded::depth;
         __try
         {
@@ -915,9 +916,9 @@ namespace
             using ResolveFn = void *(void *parent, void *out, const char *path);
             using ValidFn = char(void *proxy);
             using DtorFn = void(void *proxy);
-            auto p_resolve = reinterpret_cast<ResolveFn *>(base + 0x74A2F0);
-            auto p_valid = reinterpret_cast<ValidFn *>(base + 0x733150);
-            auto p_dtor = reinterpret_cast<DtorFn *>(base + 0xD7F850);
+            auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
+            auto p_valid = reinterpret_cast<ValidFn *>(goblin::anchors::at(0x733150));
+            auto p_dtor = reinterpret_cast<DtorFn *>(goblin::anchors::at(0xD7F850));
             char found[3] = {};
             __try
             {

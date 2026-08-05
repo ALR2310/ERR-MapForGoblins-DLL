@@ -77,7 +77,9 @@ ANCHORS = [
      "bytes": "48 89 4C 24 08 53 48 83 EC 30 48 C7 44 24 28 FE",
      "used": "build_our_form_items (right-column filler)"},
     {"name": "grid_cursor_get", "rva": 0x739E20,
-     "bytes": "8B 81 D4 00 00 00 C3 48 8D 64 24 08 FF 64 24 F8",
+     # The whole function is these 7 bytes; anything past the ret is the next build's padding
+     # and killed the match on 2.6.0/2.2.3 (the body itself sat at the cluster shift on both).
+     "bytes": "8B 81 D4 00 00 00 C3",
      "used": "selected_model_index (GridControl cursor)"},
 
     # ---- screen open / job plumbing ----
@@ -96,11 +98,14 @@ ANCHORS = [
     {"name": "job_holder_store_child", "rva": 0x7A9460,
      "bytes": "4C 89 44 24 18 48 89 54 24 10 56 57 41 56 48 83",
      "used": "open_keyconfig_form (child slot +0xA28)"},
+    # The two refcount thunks are one instruction each; bytes past the ret are data that
+    # changes per build. The exe holds many byte-identical copies of each - any copy is
+    # semantically the same call, so a nearest-match rebase is always safe for these.
     {"name": "refcount_addref", "rva": 0x1EBA1C0,
-     "bytes": "B8 01 00 00 00 F0 0F C1 01 C3 CC 8E 0D 0D 73 A7",
+     "bytes": "B8 01 00 00 00 F0 0F C1 01 C3",
      "used": "job ref dance"},
     {"name": "refcount_unref", "rva": 0x1EBA200,
-     "bytes": "83 C8 FF F0 0F C1 01 C3 90 76 10 4D 6C 78 ED E7",
+     "bytes": "83 C8 FF F0 0F C1 01 C3",
      "used": "job ref dance / release_job_ref"},
     {"name": "list_row_path_build", "rva": 0x736FC0,
      "bytes": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 90 FE",
@@ -145,6 +150,55 @@ ANCHORS = [
     {"name": "create_empty_movie_clip_as3", "rva": 0x10DFDA0,
      "bytes": "4C 8B DC 55 56 41 56 41 57 48 8B EC 48 83 EC 78",
      "used": "sfimage: expected occupant of ObjectInterface vtable slot 29"},
+
+    # ---- added 2026-08-05 with the runtime rebase resolver (goblin_anchors.cpp) ----
+    # Every code address the DLL calls as base+RVA must be in this table: the resolver verifies
+    # the bytes at the baked address once at startup and, on a shifted exe (downpatch, future
+    # patch), re-finds each anchor by its bytes near the shift its neighbours resolved at. These
+    # eleven were called as raw literals with no anchor at all until today's sweep.
+    {"name": "form_update_heartbeat", "rva": 0x93F540,
+     "bytes": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 98 FE",
+     "used": "form_update_detour hook (dialog liveness heartbeat)"},
+    {"name": "clip_set_pos_i", "rva": 0x7331A0,
+     "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 41 8B D8",
+     "used": "maphover own-tip (plain proxy setPosition, int pair; prologue identical to "
+             "clip_set_pos - the resolver's shift prior is what tells them apart)"},
+    {"name": "panel_set_visible", "rva": 0x735A60,
+     "bytes": "48 89 5C 24 08 57 48 83 EC 20 0F B6 DA 48 8B F9",
+     "used": "maphover game-popup wrapper show/hide"},
+    {"name": "panel_set_pos_f", "rva": 0x7356E0,
+     "bytes": "40 53 48 83 EC 30 F3 0F 10 49 78 33 C0 F3 0F 10",
+     "used": "maphover game-popup wrapper position (float pair)"},
+    {"name": "clip_set_text_color", "rva": 0x74A1D0,
+     "bytes": "89 54 24 10 48 83 EC 28 48 8B 09 48 8B 01 FF 50",
+     "used": "maphover own-tip text colour"},
+    {"name": "caption_text_ctor", "rva": 0x760970,
+     "bytes": "48 89 4C 24 08 53 48 83 EC 40 48 C7 44 24 38 FE",
+     "used": "set_form_captions (engine text-value ctor)"},
+    {"name": "caption_register", "rva": 0x744540,
+     "bytes": "40 53 55 56 57 48 81 EC 88 01 00 00 48 C7 44 24",
+     "used": "set_form_captions (register the text value on the movie)"},
+    {"name": "caption_pack", "rva": 0x745170,
+     "bytes": "48 89 54 24 10 53 48 83 EC 30 48 C7 44 24 28 FE",
+     "used": "set_form_captions (pack the entry for the caption slot)"},
+    # One-instruction holder tests: bytes past the ret are the next build's padding (the
+    # grid_cursor_get lesson), so these patterns stop at the ret.
+    {"name": "job_holder_test_seq", "rva": 0x7A9230,
+     "bytes": "48 83 79 30 00 75 09 48 83 39 00 75 03 B0 01 C3",
+     "used": "open_screen (is the sequence slot free)"},
+    {"name": "job_holder_test_child", "rva": 0x7A9200,
+     "bytes": "83 39 01 0F 97 C0 C3",
+     "used": "open_screen (is the child slot busy)"},
+    # The two functions the input-trigger vtable check reads OUT OF a candidate vtable
+    # (vt[0] and vt+0x38): anchoring the functions keeps that content compare working on a
+    # shifted exe with no data-address anchor. trigger_vt_slot0_fn is truncated before a
+    # call rel32 whose displacement is build-specific.
+    {"name": "trigger_vt_slot0_fn", "rva": 0x7342B0,
+     "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B D9",
+     "used": "find_input_trigger (vt[0] content compare)"},
+    {"name": "trigger_vt_slot7_fn", "rva": 0x745BD0,
+     "bytes": "40 57 48 81 EC D0 08 00 00 48 C7 44 24 20 FE FF",
+     "used": "find_input_trigger (vt+0x38 content compare)"},
 ]
 
 # Data addresses (vtables / singletons) shift on every patch and cannot be byte-anchored

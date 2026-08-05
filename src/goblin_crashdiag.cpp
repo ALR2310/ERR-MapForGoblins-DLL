@@ -1,6 +1,7 @@
 #include "goblin_crashdiag.hpp"
 
 #include "goblin_config.hpp"
+#include "goblin_safemem.hpp" // validate-then-read for the survivor walk
 
 #include <spdlog/spdlog.h>
 #include <windows.h>
@@ -67,30 +68,17 @@ namespace
 
     // Read a qword without trusting the address. Separate function because MSVC will not compile
     // __try in a frame that also holds objects needing unwinding.
+    // Validate-then-read (goblin_safemem.hpp). This one walks ABANDONED generations on purpose -
+    // every address it is handed is expected to be dead half the time - so it was among the
+    // loudest sources of first-chance exceptions in the process.
     bool probe_read64(uintptr_t addr, uint64_t &out)
     {
-        __try
-        {
-            out = *reinterpret_cast<const uint64_t *>(addr);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
+        return goblin::safemem::copy(&out, reinterpret_cast<const void *>(addr), sizeof(out));
     }
 
     bool probe_read32(uintptr_t addr, uint32_t &out)
     {
-        __try
-        {
-            out = *reinterpret_cast<const uint32_t *>(addr);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
+        return goblin::safemem::copy(&out, reinterpret_cast<const void *>(addr), sizeof(out));
     }
 
     // Hex without the CRT, for format_state (which can run inside an exception handler).

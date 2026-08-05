@@ -1741,6 +1741,21 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer,
     if (ring_frame && !g_category_rows.empty() && g_category_rows[0].p)
     {
         const std::vector<HighlightPoint> pts = focus_highlight_points();
+        // DEMAND vs POOL. The pool is fixed at NATIVE_RING_POOL and the point list is not capped,
+        // so a focus set larger than the pool silently leaves its tail unringed. Reported when the
+        // demand changes (the snapshot runs ~5x a second, so logging every pass would be noise):
+        // this is the one number that separates "the pool is too small" from "the live update
+        // missed some rings", and the user's report - rings absent after switching a progress
+        // category with the map open, present after a reopen - fits either until it is measured.
+        {
+            static std::atomic<size_t> s_last_demand{SIZE_MAX};
+            const size_t want = pts.size();
+            if (s_last_demand.exchange(want) != want)
+                spdlog::info("[v3ring] focus demand: {} icon(s) want a ring, pool is {} -> {} "
+                             "ringed, {} without",
+                             want, NATIVE_RING_POOL, want < NATIVE_RING_POOL ? want : NATIVE_RING_POOL,
+                             want > NATIVE_RING_POOL ? want - NATIVE_RING_POOL : 0);
+        }
         const auto &cr0 = g_category_rows[0];
         for (size_t k = 0; k < NATIVE_RING_POOL; ++k)
         {
@@ -2311,8 +2326,18 @@ static void apply_loot_settings()
 // One call to re-apply every LIVE-capable setting after the overlay edits the
 // config. Each step re-derives from baked state (idempotent). Takes effect on
 // the next world-map (re)open.
+// One counter for "what should be on screen has changed". Read by the native-marker tick;
+// see visibility_epoch() in the header for why a toggle cannot ride the periodic refresh.
+static std::atomic<uint32_t> g_visibility_epoch{0};
+
+uint32_t goblin::visibility_epoch()
+{
+    return g_visibility_epoch.load(std::memory_order_acquire);
+}
+
 void goblin::reapply_live_settings()
 {
+    g_visibility_epoch.fetch_add(1, std::memory_order_release);
     apply_category_visibility();           // show_* categories (+ focus isolation)
     apply_kill_display();                  // hide_killed_bosses
     apply_loot_settings();                 // anonymous_loot + live_loot_icons/labels/flags
@@ -2323,7 +2348,11 @@ void goblin::reapply_live_settings()
                                            // category/fragment enable-flag gating above.
 }
 
-void goblin::set_icons_hidden(bool hidden) { g_icons_user_disabled.store(hidden); }
+void goblin::set_icons_hidden(bool hidden)
+{
+    g_icons_user_disabled.store(hidden);
+    g_visibility_epoch.fetch_add(1, std::memory_order_release);
+}
 bool goblin::icons_hidden() { return g_icons_user_disabled.load(); }
 
 void goblin::toggle_hotkey_loop()

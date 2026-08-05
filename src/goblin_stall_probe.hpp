@@ -28,6 +28,17 @@ namespace goblin::stall_probe
     // is guaranteed alive; never caches ctx beyond this call.
     void v3_native_factory_pulse(void *ctx, unsigned frame);
 
+    // Does a world-map screen exist right now? Read from the ENGINE's own per-menu lifecycle
+    // byte (sampled in CSMenuMan::updateTask), so it is true from the moment the dialog is
+    // created - unlike maphover::map_dialog(), which only becomes non-null once the engine has
+    // called our hover hook at least once, i.e. AFTER the marker build burst has already run.
+    bool map_screen_alive();
+
+    // Called from the DLL's background watcher: when the map-frame heartbeat has been
+    // silent >700 ms while the map phase says a dialog exists, capture and log the map
+    // thread's stack (module+offset) so a multi-second open freeze names its culprit.
+    void sample_map_stall();
+
     // Debug V3 correlation: bracket the game's native buildMarkers call. Any
     // Scaleform attachMovie operations observed inside the bracket are grouped
     // by their actual display-list parent and logged at the end of the build.

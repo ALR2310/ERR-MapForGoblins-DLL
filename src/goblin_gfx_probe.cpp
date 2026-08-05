@@ -25,6 +25,7 @@ namespace goblin::watch { void pump(); }
 // namespace is referenced anywhere in src/ or tools/, and neither reaches the DLL (both blobs are
 // `inline const unsigned char` arrays, so their COMDATs are discarded) - but the file still parsed
 // 5.4 MB of them on every profile build. The headers stay in the tree as the experiment's data.
+#include "goblin_safemem.hpp" // validate-then-read: safe_copy below is the shared primitive
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -319,6 +320,12 @@ namespace
     constexpr uint32_t SPRITE171_RM2_CAP = 4096;
     uint64_t g_sprite171_rm2_tags[SPRITE171_RM2_CAP]{};
     std::atomic<uint32_t> g_sprite171_rm2_count{0};
+
+    // RM2::Execute traffic for the current map open; reset at close (see rm2_stats).
+    std::atomic<uint64_t> g_rm2_total{0};
+    std::atomic<uint64_t> g_rm2_s171{0};
+    std::atomic<uint64_t> g_rm2_no_dialog{0};
+    std::atomic<uint64_t> g_rm2_no_icons{0};
     uint32_t logo_charid() { return inject_base() + (uint32_t)goblin::generated::MAP_ICON_TAG_COUNT; }
 
     // The Path-A milestone watches (g_ms_charid / g_ms_reg_seen / g_ms_reg_rcx / g_ms_dictchecked /
@@ -431,10 +438,12 @@ namespace
         return v ? v : (uint64_t)GetModuleHandleW(nullptr) + RVA_VT_REMOVEOBJECT2;
     }
 
+    // Validate-then-read (goblin_safemem.hpp): this one primitive feeds rq/rd32/wr32/wr64 and
+    // therefore every pointer chase in this file - including the movie-name probe whose faults
+    // became a 15 Hz process-wide exception storm at two different players.
     bool safe_copy(void *dst, const void *src, size_t n)
     {
-        __try { memcpy(dst, src, n); return true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        return goblin::safemem::copy(dst, src, n);
     }
     // Upper bound is the x64 user-mode max (~128TB). The old 0x7FF000000000 bound REJECTED the game's
     // heap under ME2/ME3, which sits at 0x7FF2_xxxxxxxx (higher than ERR's heap) - that silently broke
@@ -1495,6 +1504,17 @@ namespace
         const bool exact_sprite171 = exact_count != 0 &&
             std::binary_search(g_sprite171_rm2_tags,
                                g_sprite171_rm2_tags + exact_count, t);
+        // Traffic accounting for THIS open (see rm2_stats in the header): which side lost the
+        // pulses when a build starves.
+        g_rm2_total.fetch_add(1, std::memory_order_relaxed);
+        if (exact_sprite171)
+        {
+            g_rm2_s171.fetch_add(1, std::memory_order_relaxed);
+            if (!g_qmark_injected.load(std::memory_order_relaxed))
+                g_rm2_no_icons.fetch_add(1, std::memory_order_relaxed);
+            else if (!goblin::stall_probe::map_screen_alive())
+                g_rm2_no_dialog.fetch_add(1, std::memory_order_relaxed);
+        }
         note_context(reinterpret_cast<uint64_t>(ctx), "rm2");
         void *ret = o_rm2exec(thisTag, ctx, frame);
         // Execute queued native placements only while this callback's timeline
@@ -1502,9 +1522,17 @@ namespace
         // integrated V3 build to crash before its first attach.
         // Materializing our children from inside the executor was suspected and cleared: with this pulse
         // off the black tiles remained, and they went away only when the resolver/loader hooks did.
+        // "Is a map screen up" comes from the ENGINE's phase byte, NOT from
+        // maphover::map_dialog(). That pointer is published by our own hover hook, which the
+        // engine first calls only AFTER the marker build burst - so using it here threw the
+        // burst away on any open where the hover callback had not run yet, and let it through
+        // only when a previous open had left a stale pointer behind. That is the whole of the
+        // "icons missing on reopen" report, and the traffic counters named it exactly: a starved
+        // open logged "7877 sprite-171, refused 7803 no-dialog" against "7877, refused 0" on a
+        // healthy one - the engine's burst is IDENTICAL every time (7877), we were discarding it.
         if (goblin::variants::kNativeMarkers && exact_sprite171 && ctx &&
             g_qmark_injected.load(std::memory_order_relaxed) &&
-            goblin::maphover::map_dialog() != nullptr)
+            goblin::stall_probe::map_screen_alive())
             goblin::stall_probe::v3_native_factory_pulse(ctx, frame);
         return ret;
     }
@@ -2103,8 +2131,14 @@ uint32_t goblin::gfx_probe::native_character_id(int sourceIconId)
 uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint16_t depth,
                                                           void *live_ctx, uint32_t frame)
 {
+    // The SECOND copy of the map_dialog() liveness test, and the one that kept the symptom alive
+    // after the pulse gate was fixed: pulses then arrived (`refused 0 no-screen`) only to have
+    // every creation refused here, which the split counters named exactly - `failed=6309
+    // (noNode=6308, notMaterialized=0, attach=0)`. Same reason as at the gate: that pointer comes
+    // from OUR hover hook, which the engine first calls after the build burst. Engine-owned state
+    // decides instead.
     const uint64_t ctx = reinterpret_cast<uint64_t>(live_ctx);
-    if (!ctx || !goblin::maphover::map_dialog()) return 0;
+    if (!ctx || !goblin::stall_probe::map_screen_alive()) return 0;
 
     int tag_index = -1;
     for (int i = 0; i < goblin::generated::MAP_ICON_TAG_COUNT; ++i)
@@ -2145,8 +2179,16 @@ uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint1
                                              frame);
         const uint64_t list = rq(ctx + 0x28);
         const uint64_t count = rq(ctx + 0x30);
-        if (looks_heap(list) && count > 0 && count < 4096)
-            for (uint64_t i = 0; i < count; ++i)
+        // Scan from the TAIL: the node this Execute just materialized is appended at the
+        // end of the display list, and the depth key is unique, so the direction cannot
+        // change which node is found - only how fast. The forward scan was O(count) per
+        // request, O(N^2) per build; measured 2026-08-05 at ~3000 attached markers it made
+        // one 96-marker factory pulse cost 60-75 ms of map-thread time, which is what
+        // starved the build on reopen (the queue watchdog fired first). The sanity bound
+        // moves 4096 -> 8192 with it: a legitimate list can pass 4096 late in a full
+        // 7137-marker build, and the bound only exists to reject a garbage count.
+        if (looks_heap(list) && count > 0 && count < 8192)
+            for (uint64_t i = count; i-- > 0;)
             {
                 const uint64_t node = rq(list + i * 8);
                 if (looks_heap(node) && rd32(node + 0x14) == depth)
@@ -2215,8 +2257,34 @@ bool goblin::gfx_probe::icons_injected()
     return g_qmark_injected.load(std::memory_order_relaxed);
 }
 
+void goblin::gfx_probe::rm2_stats(uint64_t &total, uint64_t &sprite171, uint64_t &no_screen,
+                                  uint64_t &no_icons)
+{
+    total = g_rm2_total.load(std::memory_order_relaxed);
+    sprite171 = g_rm2_s171.load(std::memory_order_relaxed);
+    no_screen = g_rm2_no_dialog.load(std::memory_order_relaxed);
+    no_icons = g_rm2_no_icons.load(std::memory_order_relaxed);
+}
+
 void goblin::gfx_probe::v3_on_map_close()
 {
+    // REPORT HERE, not only at CATEGORIES READY and the queue-drop warning. Those two fire only
+    // when a build finishes or starves for five seconds, so the very opens worth measuring - the
+    // ones the player closes after two or three seconds, which is exactly when a short burst was
+    // seen - printed nothing at all. Measured 2026-08-05: an open built 695 of 7137 from 15
+    // pulses and left no traffic line behind. Every open reports on its way out now.
+    spdlog::info("[v3native] RM2 at close: {} tags, {} sprite-171, refused {} no-screen / "
+                 "{} no-icons",
+                 g_rm2_total.load(std::memory_order_relaxed),
+                 g_rm2_s171.load(std::memory_order_relaxed),
+                 g_rm2_no_dialog.load(std::memory_order_relaxed),
+                 g_rm2_no_icons.load(std::memory_order_relaxed));
+    // Traffic counters are per OPEN: zero them here so the next open's numbers stand alone.
+    g_rm2_total.store(0, std::memory_order_relaxed);
+    g_rm2_s171.store(0, std::memory_order_relaxed);
+    g_rm2_no_dialog.store(0, std::memory_order_relaxed);
+    g_rm2_no_icons.store(0, std::memory_order_relaxed);
+
     // Icon definitions and resources stay loaded across map opens, so nothing of the injection is
     // undone here. What DOES have to go is our cached movieDef pointer: it is latched once (see
     // lookup_detour) and then dereferenced by tick() from the background watcher every 100ms-2s,
@@ -2242,6 +2310,10 @@ void goblin::gfx_probe::tick()
     // The background loop already paces us (100ms-2s), so no frame throttle here; the work below is one-shot.
     const bool probe = goblin::config::debugLogging;
     goblin::check_patched_slots(); // audit watch; no-op without debug logging
+    // Map-stall sampler: names the culprit of a multi-second map-open freeze by capturing
+    // the map thread's stack while the map-frame heartbeat is silent. Not probe-gated -
+    // freezes are reported from normal installs too.
+    goblin::stall_probe::sample_map_stall();
 #if MFG_STALL_PROFILER
     goblin::watch::pump();        // arm any queued hardware write watch (never on its own thread)
 #endif

@@ -228,6 +228,12 @@ namespace goblin
     void set_icons_hidden(bool hidden);
     bool icons_hidden();
 
+    // Bumped by anything that changes which markers SHOULD be visible: the master switch and
+    // every live-settings re-apply. The native-marker manager watches it so a toggle reaches
+    // children that ALREADY exist without waiting for the build queue - see the tick, where
+    // the periodic refresh is deliberately gated on a spent queue and this is not.
+    uint32_t visibility_epoch();
+
     // Codex-toast ids, allocated DYNAMICALLY at runtime above the live max so they
     // never collide with an overhaul's / another mod's tutorial content (same
     // principle as the marker textId remap). Two independent id spaces:

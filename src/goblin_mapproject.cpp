@@ -5,6 +5,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+
+#include <spdlog/spdlog.h> // the tile-origin model reports its own rejection
 #include "goblin_maphover.hpp"       // map_dialog() -> the live CS::WorldMapArea
 #include "goblin_worldmap_probe.hpp" // fold non-overworld areas via the game's converter
 
@@ -118,11 +120,52 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
             return static_cast<size_t>(h);
         }
     };
+    // THE POSITION IS PART OF THE KEY, AND POSITIONS MOVE. The comment above says a marker never
+    // moves; the live de-overlap made that false. Isolating a category changes who is on screen,
+    // so a marker that was pushed aside at build time asks for its ORIGINAL spot afterwards - a
+    // key nothing has ever converted. Measured 2026-08-05: build ran `1511 visible, 401 moved
+    // aside`, an isolated category ran `11 visible, 0 moved aside`, and exactly one focus ring
+    // could not follow its host (`moved=127 unprojected=1`) because its tile now needed the
+    // engine again and the converter's 300 ms freshness stamp had lapsed. Rings whose hosts had
+    // never been pushed aside kept hitting the memo and moved fine - which is why only one broke.
+    //
+    // So learn the TILE, not the point. The converter's answer is the tile's origin plus the
+    // position, the same shape the overworld branch computes by hand above (+px, -pz), so one
+    // successful answer yields `origin = (u - px, v + pz)` and every other position on that tile
+    // follows without the engine.
+    //
+    // ORDER MATTERS: the engine is still asked FIRST whenever it can answer, and the model is
+    // only the fallback for when it cannot. That keeps the ground truth in charge, and it makes
+    // the model verify itself for free - every engine answer for a tile we already know is a
+    // check. A tile whose prediction misses is marked unreliable and never extrapolated again.
+    struct Origin
+    {
+        float ou = 0.0f, ov = 0.0f;
+        bool usable = false;  // cleared for good if the engine ever contradicts the model
+    };
+    struct TileKey
+    {
+        uint8_t area;
+        uint16_t gx, gz;
+        bool operator==(const TileKey &o) const
+        {
+            return area == o.area && gx == o.gx && gz == o.gz;
+        }
+    };
+    struct TileHash
+    {
+        size_t operator()(const TileKey &k) const
+        {
+            return (static_cast<size_t>(k.area) << 32) ^ (static_cast<size_t>(k.gx) << 16) ^ k.gz;
+        }
+    };
     // Read from the map frame AND the overlay thread, so it is locked. The lock is uncontended in
     // practice and a hit costs one hash - far less than the engine call it replaces.
     static std::mutex memo_mutex;
     static std::unordered_map<Key, std::pair<float, float>, KeyHash> memo;
+    static std::unordered_map<TileKey, Origin, TileHash> tiles;
     const Key key{area, gx, gz, px, pz};
+    const TileKey tkey{area, gx, gz};
     {
         std::lock_guard<std::mutex> lock(memo_mutex);
         const auto hit = memo.find(key);
@@ -133,10 +176,44 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
             return true;
         }
     }
-    if (!goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z))
-        return false;
+    if (goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z))
     {
         std::lock_guard<std::mutex> lock(memo_mutex);
+        memo.emplace(key, std::make_pair(map_x, map_z));
+        Origin &o = tiles[tkey];
+        if (!o.usable)
+        {
+            o.ou = map_x - px;
+            o.ov = map_z + pz;
+            o.usable = true;
+        }
+        else
+        {
+            // The free self-check. Half a map unit is far below an icon's own size, so a real
+            // shape mismatch shows up immediately and a rounding difference does not.
+            const float du = (o.ou + px) - map_x;
+            const float dv = (o.ov - pz) - map_z;
+            if (du > 0.5f || du < -0.5f || dv > 0.5f || dv < -0.5f)
+            {
+                o.usable = false;
+                spdlog::warn("[mapproject] tile origin model rejected for area {} grid ({},{}): "
+                             "predicted ({:.1f},{:.1f}) vs engine ({:.1f},{:.1f}) - this tile "
+                             "will always ask the engine",
+                             area, gx, gz, o.ou + px, o.ov - pz, map_x, map_z);
+            }
+        }
+        return true;
+    }
+    // The engine could not answer (map closed, mid-transition, or the stamp lapsed). If this
+    // tile's shape is already known, place the point ourselves rather than reporting failure -
+    // that failure is what left a focus ring stranded on its previous host.
+    {
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        const auto hit = tiles.find(tkey);
+        if (hit == tiles.end() || !hit->second.usable)
+            return false;
+        map_x = hit->second.ou + px;
+        map_z = hit->second.ov - pz;
         memo.emplace(key, std::make_pair(map_x, map_z));
     }
     return true;

@@ -67,6 +67,18 @@ namespace goblin::gfx_probe
     // a fresh instance. No-op for normal icon/resource injection state.
     void v3_on_map_close();
 
+    // RM2::Execute traffic since the last map close, i.e. for THIS open. Answers the one
+    // question the build counters cannot: when an open builds far too few markers, was the
+    // engine's burst itself short, or did our own gate throw the pulses away? `total` counts
+    // every RM2 tag executed anywhere; `sprite171` those that matched the worldmap icon
+    // sprite's own tags; `no_screen` / `no_icons` count sprite-171 hits we then refused
+    // because no map screen was up or our frames were not injected.
+    //
+    // It answered its question on the first starved open it saw (2026-08-05): sprite-171 reads
+    // 7877 on EVERY open, healthy or not - the engine's burst never varies - while a starved one
+    // logged `refused 7803 no_screen`. The pulses were never scarce; we were discarding them.
+    void rm2_stats(uint64_t &total, uint64_t &sprite171, uint64_t &no_screen, uint64_t &no_icons);
+
     // Have our icon frames been appended to the worldmap icon sprite for the current map load?
     // Nothing native can materialize before that, so it is the first gate to check when markers
     // do not appear.

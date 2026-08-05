@@ -18,6 +18,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 #include "goblin_collected.hpp" // read_player_map_id() for the location emphasis
 #include "goblin_crashdiag.hpp" // measurement, not behaviour: see the header
 #include "goblin_inject.hpp"
+#include "goblin_safemem.hpp" // validate-then-read: v3_read*/v3_write_bytes are built on it
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -310,7 +311,22 @@ namespace
     // the markers themselves. The pool is what is scarce on that map, so take more per pulse.
     // The pipeline stays strictly one-record-in-flight (see v3_native_factory_consume), so this
     // only lengthens the loop, it does not widen it - the shared per-icon tag stays legal.
+    //
+    // DO NOT RAISE THIS TO CHASE A SHORT BURST. Tried 2026-08-05, 48 -> 1024 (with the per-frame
+    // budget raised to match), on the theory that ~9 us per marker makes a 1024-bite cost ~9 ms.
+    // It was measured WRONG the same evening and reverted: one pulse then cost 305 ms, a single
+    // map frame 75 ms, most creates came back "request produced no timeline node", and the FIRST
+    // reopen built 100 markers of 7137. Per-marker cost is not flat in the bite - somewhere
+    // between 48 and 1024 the engine stops materializing what one pulse queues, and the extra
+    // requests are not merely wasted, they are slow. 48 is the value with a full 7136 on nearly
+    // every open behind it; the rare open where the engine emits ~10 pulses instead of ~7877 is a
+    // real defect, but this is not its lever.
     constexpr size_t V3_FACTORY_BATCH = 48;
+
+    // The staging array is NOT the batch: the pipeline keeps exactly one record in flight (see
+    // v3_native_factory_consume, which arms slot 0 and finishes it before touching the next), so
+    // this stays at one entry rather than sizing a thread_local by the batch.
+    constexpr size_t V3_FACTORY_SLOTS = 1;
 
     // kPickerMinItems (100) stood here and is GONE, 2026-08-03. It gated who may become the
     // anchor, on the theory that a high floor keeps tiny side clips from stealing it. Measured, it
@@ -347,7 +363,7 @@ namespace
         goblin::NativeMarkerPoint point{};
         float map_x = 0.0f, map_z = 0.0f;
     };
-    thread_local V3FactorySlot g_v3_factory_slots[V3_FACTORY_BATCH];
+    thread_local V3FactorySlot g_v3_factory_slots[V3_FACTORY_SLOTS];
     thread_local uint32_t g_v3_factory_active = 0; // slots with node != 0
 
     // Record-materialization driver (RE: scratch/re_materialize_driver.md,
@@ -560,6 +576,21 @@ namespace
         size_t pending_index = 0;
         size_t frame_budget = 0;
         uint32_t failed = 0;
+        // ...and WHY it failed. One number could not tell the two causes apart, and they call for
+        // opposite fixes: a projection that is not ready yet is a TIMING problem (the row is fine,
+        // we asked too early), a missing charId is an INJECTION problem (our frames are not in
+        // this movie yet). Split 2026-08-05, when opens started reporting failed=5035 and 6091
+        // against failed=1 on a healthy one.
+        uint32_t failed_project = 0;  // mapproject::to_map said no
+        uint32_t failed_charid = 0;   // no injected character for this icon
+        // The three ways a request that got PAST those two can still come back empty. They all
+        // fed one `failed` and their logs are capped at four lines each, so a build that lost
+        // 6198 rows looked identical whichever one it was. Split 2026-08-05 for the same reason
+        // the project/charId split was made - and that split is what proved those two innocent
+        // (`failed=6198 (project=1 charId=0)`), which is how this layer got found at all.
+        uint32_t failed_nonode = 0;    // the Execute produced no timeline record
+        uint32_t failed_material = 0;  // the record never materialized into a display child
+        uint32_t failed_attach = 0;    // attach into the marker parent, or positioning, failed
         uint32_t wrong_contexts = 0;
         uint64_t settle_count = 0;
         uint32_t settle_frames = 0;
@@ -657,6 +688,16 @@ namespace
     // ready flag lived here, for the counter-scale pass in on_map_frame. The flag was never set
     // true and the state never written; both went with that pass on 2026-07-30.
 
+    // Plain SEH ON PURPOSE, not goblin_safemem - these four are the hot-walk primitives.
+    // The per-frame marker walk plus the factory's node search push them ~20k times per
+    // frame, and routing that through the validated path was measured (v3perf, 2026-08-05)
+    // at 0.6-1M copies and 250-470 ms of every second on the map thread - avg 6-16 ms of
+    // our overhead per frame, factory pulses at 60-75 ms each, the reopen build starved.
+    // The memory they touch is generation-gated and faults only exceptionally: a full
+    // 7136-marker build under these SEH readers raised ZERO first-chance AVs in the
+    // ERSS-FG log. Validate-then-read stays for the probes where a dead pointer is the
+    // routine case (goblin_safemem.hpp has the list); a hot path with liveness gates is
+    // exactly what its header's "NOT for" note is about.
     bool v3_read64(uintptr_t addr, uint64_t &out)
     {
         __try
@@ -810,29 +851,123 @@ namespace
     // test passes on the first iteration and [node+0x20] alone identifies the
     // movie view. Pure guarded reads only; per the validate-before-call rule the
     // engine function itself is never called.
+    // ── liveness gate for the two node validators ────────────────────────────────────
+    // These two run on the ENGINE'S ATTACH PATH - once per attached child, i.e. thousands
+    // of times per build burst - and they routinely probe a node that is already dead (the
+    // previous anchor during a cold open). Two measured failures bracket the right design:
+    //
+    //   * bare __try inside them: 36 first-chance AVs per cold open, and ModEngine3's host
+    //     symbolized every one through dbghelp on the faulting thread - that IS the 2-4 s
+    //     cold-open freeze ([stallcap] caught the map thread in me3_mod_host -> dbghelp).
+    //   * every read routed through safemem: no AVs, but 6k-20k VirtualQuery calls per
+    //     second (a refusal is never cached, by design) - factory pulses went from 6.5 us
+    //     to 14 ms and reopens starved again.
+    //
+    // So: ONE validated probe of the node's own header, then the cheap SEH readers for the
+    // walk itself - and a memo of the dead verdict, because the burst keeps asking about
+    // the SAME dead pointer. A live node costs a cache hit (a few compares); a dead one
+    // costs one VirtualQuery for the whole burst, and raises nothing.
+    //
+    // The memo is per-thread (these all run on the map thread) and EXPIRES: the allocator
+    // can hand that address to a live object, and a stale "dead" verdict would reject a
+    // healthy anchor - the one failure mode that costs icons rather than time.
+    constexpr uint64_t kDeadMemoMs = 1000;
+    thread_local uintptr_t t_dead_node = 0;
+    thread_local uint64_t t_dead_ms = 0;
+
+    // The header window the two validators read: +0x2c depth, +0x38 parent, +0x68 flags.
+    constexpr size_t kNodeHeaderBytes = 0x70;
+
+    // `bytes` is how far into the object the caller is about to read: the display-list
+    // fields the tick validates sit at +0xe0, well past a node header, and gating a 0x70
+    // window would have left exactly those reads unguarded. The memo keys on the POINTER
+    // only, so a refusal recorded for a wide read also short-circuits a narrower one for up
+    // to kDeadMemoMs - harmless, because a live object has its whole header mapped and the
+    // memo expires anyway.
+    // ── the same gate, minus the syscall, for the PER-ATTACH callers ────────────────────
+    // VirtualQuery is the wrong instrument on a path that runs thousands of times per build.
+    // Measured 2026-08-05 with the walk fully gated: one burst issued 45898 lookups and spent
+    // 2.42 SECONDS inside the pulses - [stallcap] caught the map thread in
+    // KERNELBASE!VirtualQuery <- safemem::query_region <- range_ok, i.e. our own gate WAS the
+    // freeze. The region cache does not save it: these display objects do not share a region,
+    // so nearly every probe missed.
+    //
+    // What the gate is actually for is ONE rare pointer - a dead anchor - probed over and over.
+    // So: consult the memo (pure compares, no syscall); if it says nothing, just do the SEH read
+    // and record the pointer if it faults. That costs ONE first-chance exception per dead
+    // pointer per kDeadMemoMs instead of the 36-47 per open that the bare __try produced, and
+    // zero syscalls. The VirtualQuery-backed v3_node_unusable stays for the per-FRAME callers
+    // (tick, viewport reconcile), where two lookups a frame are free.
+    bool v3_memo_dead(uintptr_t object)
+    {
+        if (!v3_heap_ptr(object))
+            return true;
+        return t_dead_node == object && GetTickCount64() - t_dead_ms <= kDeadMemoMs;
+    }
+
+    void v3_note_dead(uintptr_t object)
+    {
+        t_dead_node = object;
+        t_dead_ms = GetTickCount64();
+    }
+
+    bool v3_node_unusable(uintptr_t object, size_t bytes = kNodeHeaderBytes)
+    {
+        if (!v3_heap_ptr(object))
+            return true;
+        const uint64_t now = GetTickCount64();
+        if (t_dead_node == object && now - t_dead_ms <= kDeadMemoMs)
+            return true;
+        if (!goblin::safemem::readable(reinterpret_cast<const void *>(object), bytes))
+        {
+            t_dead_node = object;
+            t_dead_ms = now;
+            return true;
+        }
+        return false;
+    }
+
     uintptr_t v3_movie_of(uintptr_t object)
     {
         uintptr_t current = object;
         for (uint32_t level = 0;; ++level)
         {
-            if (!v3_heap_ptr(current) || level >= 16)
+            if (level >= 16 || v3_memo_dead(current))
                 return 0;
             // The u16 flags live at +0x6A; through the aligned u32 at +0x68
             // their 0x80 bit reads as 0x00800000.
             uint32_t packed = 0;
             if (!v3_read32(current + 0x68, packed))
+            {
+                v3_note_dead(current); // one fault per dead pointer, then the memo answers
                 return 0;
+            }
             if (packed & 0x00800000u)
                 break;
             uint64_t next = 0;
             if (!v3_read64(current + 0x38, next))
+            {
+                v3_note_dead(current);
                 return 0;
+            }
             current = static_cast<uintptr_t>(next);
         }
+        // The ROOT object this node points at needs the same gate as the node itself, and for
+        // one build it did not have it: `v3_heap_ptr(as_root)` is a range test, not a liveness
+        // test, so a live node whose root had already been freed faulted here on every attach.
+        // Measured 2026-08-05 (ERSS-FG named the exact frame: v3_read64 <- v3_movie_of+0xba <-
+        // v3_note_movie_attach <- the attach detour): 47 AVs across one cold open, ~77 ms apart
+        // because that is what ModEngine3's host spends symbolizing each one - the 2 s freeze.
         uint64_t as_root = 0, movie = 0;
-        if (!v3_read64(current + 0x20, as_root) || !v3_heap_ptr(as_root) ||
-            !v3_read64(static_cast<uintptr_t>(as_root) + 0x10, movie) ||
-            !v3_heap_ptr(movie))
+        if (!v3_read64(current + 0x20, as_root) ||
+            v3_memo_dead(static_cast<uintptr_t>(as_root)))
+            return 0;
+        if (!v3_read64(static_cast<uintptr_t>(as_root) + 0x10, movie))
+        {
+            v3_note_dead(static_cast<uintptr_t>(as_root));
+            return 0;
+        }
+        if (!v3_heap_ptr(movie))
             return 0;
         return static_cast<uintptr_t>(movie);
     }
@@ -845,10 +980,15 @@ namespace
     // block is certainly not a live anchor.
     bool v3_node_detached(uintptr_t object)
     {
+        if (v3_memo_dead(object))
+            return true;
         uint32_t depth = 0;
         uint64_t parent = 0;
         if (!v3_read32(object + 0x2c, depth) || !v3_read64(object + 0x38, parent))
+        {
+            v3_note_dead(object);
             return true;
+        }
         return depth == 0xFFFFFFFFu || !v3_heap_ptr(parent);
     }
 
@@ -869,6 +1009,9 @@ namespace
     // Scope, honestly: this is hygiene plus the epoch FIX 2 needs. It does NOT fix the crashes.
     // Measured: all four fault groups had WorldMapDialog::update on the stack, so the map was open
     // and this byte read 3 or 7 in every one of them. Gate B is the crash fix.
+    // Last visibility epoch this manager has applied (goblin::visibility_epoch). Map thread only.
+    uint32_t g_v3_seen_vis_epoch = 0;
+
     std::atomic<uint8_t> g_map_phase{0xFF};   // last sampled raw byte: 0 / 1 / 3 / 7, 0xFF = unknown
     std::atomic<uint16_t> g_map_menu_id{0x3D};
     std::atomic<bool> g_map_menu_id_resolved{false};
@@ -2525,9 +2668,11 @@ namespace
                 // stayed on the old one until the map was reopened. Moving costs a transform write,
                 // the same as the show/hide right below it.
                 float mx = 0.0f, mz = 0.0f;
+                bool projected = false;
                 if (goblin::mapproject::to_map(point.area, point.gx, point.gz, point.px, point.pz,
                                                mx, mz))
                 {
+                    projected = true;
                     v3_native_move(obj, mx, mz);
                     if (ring) ++ring_moved;
                 }
@@ -2542,7 +2687,18 @@ namespace
                 // The master switch is already folded into `point.visible` by the snapshot, so a
                 // switched-off map merges as "every point invisible" and nothing can be shown
                 // against the switch here.
-                v3_native_set_visible(obj, point.visible);
+                //
+                // A RING THAT COULD NOT BE PLACED MUST NOT BE DRAWN. A ring's position is only
+                // meaningful once it has been moved onto its host: before that it still carries
+                // the previous host's spot, or the borrowed coordinates an unused ring is parked
+                // at. Showing it anyway produced exactly the reported pair - "one icon with no
+                // ring, and one ring sitting somewhere odd with no icon under it" - because both
+                // halves are the SAME ring. Measured 2026-08-05 on a progress-category switch:
+                // `focus demand: 11 ... 0 without` (the pool was never the limit) with
+                // `moved=127 unprojected=1`, one ring exactly, matching the report.
+                // Markers are deliberately NOT gated this way: their coordinates are static and
+                // already correct from build time, so a failed refresh is no reason to hide one.
+                v3_native_set_visible(obj, point.visible && (projected || !ring));
                 continue;
             }
             // At seed time queue EVERY migrated row, hidden ones included:
@@ -2638,8 +2794,16 @@ namespace
         // layer says which layer was live at anchor time, nothing more, so the
         // live layer must NOT gate this validation (it silently froze the
         // whole manager on UG/DLC).
+        // Both go through the liveness gate, not just v3_heap_ptr: this runs on EVERY map frame
+        // against an anchor that a teardown may already have freed, so a dead read here is the
+        // routine case, not the exceptional one. With the range test alone it raised 10
+        // first-chance AVs across 38 opens (ERSS-FG, 2026-08-05: v3_read64/v3_read32 <-
+        // v3_native_tick+0xf1 <- placename_detour), each costing ~77 ms in somebody else's
+        // exception filter. Same defect as the as_root read in v3_movie_of, one site over.
+        // 0xE8 because live_count is read at parent+0xE0 - a node-header-sized window would
+        // have left the very read that faults outside the gate.
         uint64_t wrapper_parent = 0, live_count = 0;
-        if (!v3_heap_ptr(wrapper) || !v3_heap_ptr(parent) ||
+        if (v3_node_unusable(wrapper, 0x20) || v3_node_unusable(parent, 0xE8) ||
             !v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != parent ||
             !v3_read64(parent + 0xe0, live_count))
             return;
@@ -2856,7 +3020,20 @@ namespace
             // this with 1331 markers dropped, and the message alone could not tell which gate was
             // shut - so print the three of them plus how many children were rejected.
             v3_seed_trace("at queue drop");
-        spdlog::warn("[v3native] {} queued markers never built; dropping the queue to keep "
+            // Which side lost the pulses: the engine's burst or our gate. Logged HERE because
+            // this line is the one a starved build always writes.
+            {
+                uint64_t rt = 0, rs = 0, rd = 0, ri = 0;
+                goblin::gfx_probe::rm2_stats(rt, rs, rd, ri);
+                spdlog::warn("[v3native] RM2 traffic this open: {} tags executed, {} were "
+                             "sprite-171, refused {} no-screen / {} no-icons; "
+                             "failures so far: project={} charId={} noNode={} "
+                             "notMaterialized={} attach={}",
+                             rt, rs, rd, ri, g_v3_native.failed_project,
+                             g_v3_native.failed_charid, g_v3_native.failed_nonode,
+                             g_v3_native.failed_material, g_v3_native.failed_attach);
+            }
+            spdlog::warn("[v3native] {} queued markers never built; dropping the queue to keep "
                          "live refresh alive. gates: qmark_injected={} map_open={} "
                          "rejected_so_far={} attached={}; pulses seen={} unseeded={} "
                          // budget_regranted is NOT a block: it counts the pulses that arrived with
@@ -2865,7 +3042,10 @@ namespace
                          "blocked(driver/sprite/busy)={}/{}/{} budget_regranted={}",
                          g_v3_native.pending.size() - g_v3_native.pending_index,
                          goblin::gfx_probe::icons_injected(),
-                         goblin::maphover::map_dialog() != nullptr, g_v3_native.failed,
+                         // The engine's phase byte, not map_dialog(): this field is read as
+                         // "was the map up", and the pointer answers "has our hover hook run",
+                         // which is a different question and was misleading in two rounds.
+                         goblin::stall_probe::map_screen_alive(), g_v3_native.failed,
                          g_v3_native.objects.size(),
                          g_v3_pulse_seen.load(std::memory_order_relaxed),
                          g_v3_pulse_unseeded.load(std::memory_order_relaxed),
@@ -2875,8 +3055,25 @@ namespace
                          g_v3_consume_nobudget.load(std::memory_order_relaxed));
             g_v3_native.pending_index = g_v3_native.pending.size();
         }
-        if (g_v3_native.pending_index >= g_v3_native.pending.size() &&
-            now_ms >= g_v3_native.next_refresh_ms)
+        // A visibility toggle re-reads visibility NOW, whatever the build queue is doing.
+        // The periodic refresh below is gated on a SPENT queue on purpose (it must not
+        // interleave with a build), but a master or category toggle only ever re-decides
+        // objects that already exist - and making it wait cost the icons outright:
+        // measured 2026-08-05, master OFF before the map opens seeds every row invisible,
+        // the reconcile then keeps all of them DETACHED (out of window is what invisible
+        // means to it), and if the burst ran out of pulses the queue never spends, so
+        // turning the switch back on over the open map changed nothing. The close-time
+        // self-detach named it exactly: "matched=0 removed=0 tracked=5975" against
+        // "matched=908" on a healthy open. Only a map reopen brought them back.
+        const uint32_t vis_epoch = goblin::visibility_epoch();
+        if (vis_epoch != g_v3_seen_vis_epoch)
+        {
+            g_v3_seen_vis_epoch = vis_epoch;
+            g_v3_native.next_refresh_ms = now_ms + 200;
+            v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
+        }
+        else if (g_v3_native.pending_index >= g_v3_native.pending.size() &&
+                 now_ms >= g_v3_native.next_refresh_ms)
         {
             g_v3_native.next_refresh_ms = now_ms + 200;
             v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
@@ -2963,10 +3160,22 @@ namespace
                 const uint64_t heavy = live_count >= lightweight ? live_count - lightweight : 0;
                 // wrongCtx belongs next to failed: both answer "why are markers missing", and the
                 // counter was being incremented on every root-changed child while nothing read it.
+                uint64_t rt = 0, rs = 0, rd = 0, ri = 0;
+                goblin::gfx_probe::rm2_stats(rt, rs, rd, ri);
+                // The RM2 traffic goes on the HEALTHY line too, not only on the starved one: a
+                // number with nothing to compare it against says nothing, and the whole question
+                // is why one open gets 7877 sprite-171 executions and the next gets 10.
                 spdlog::info("[v3native] CATEGORIES READY: layer={} "
-                             "created={} failed={} wrongCtx={} parentCount={} inferredHeavy={}",
+                             "created={} failed={} (project={} charId={} noNode={} "
+                             "notMaterialized={} attach={}) wrongCtx={} "
+                             "parentCount={} inferredHeavy={}; "
+                             "RM2 this open: {} tags, {} sprite-171, refused {} no-screen / "
+                             "{} no-icons",
                              g_v3_native.layer, lightweight, g_v3_native.failed,
-                             g_v3_native.wrong_contexts, live_count, heavy);
+                             g_v3_native.failed_project, g_v3_native.failed_charid,
+                             g_v3_native.failed_nonode, g_v3_native.failed_material,
+                             g_v3_native.failed_attach,
+                             g_v3_native.wrong_contexts, live_count, heavy, rt, rs, rd, ri);
                 v3_seed_trace("at READY");
                 g_v3_native.completion_reported = true;
                 // The generation is fully built, so the PREVIOUS one's movie is certainly gone by
@@ -2981,7 +3190,8 @@ namespace
         }
 
         // A live RM2::Execute callback later in this frame consumes this budget.
-        // The timeline ctx is never retained here.
+        // The timeline ctx is never retained here. 96, i.e. two batches: raising it in step with
+        // a 1024 batch was part of the reverted 2026-08-05 experiment (see V3_FACTORY_BATCH).
         g_v3_native.frame_budget = 96;
     }
 
@@ -4249,30 +4459,39 @@ namespace
 
     // Which model row does this native item belong to? Reads the identity out of the
     // param row (magic + generation + index), so stale items simply fail the check.
+    // Validate-then-read (goblin_safemem.hpp), NOT a bare __try: this runs inside the
+    // engine's row-render path for EVERY item on a native form, ours or not, and an item
+    // whose param row has been freed is routine there. The __try version raised a steady
+    // ~10 Hz first-chance AV at the magic compare whenever such an item was on screen
+    // (ERSS-FG run 2026-08-05: 53 logged AVs at MapForGoblins+0x94c3a, each one walked
+    // through its whole exception filter) - the exact process-wide-event class the header
+    // documents.
     const goblin::nmenu::Row *model_row_of(uintptr_t item, size_t *out_index)
     {
         if (form_pool().empty())
             return nullptr;
-        const FakeParamRow *row = nullptr;
-        __try
-        {
-            row = *reinterpret_cast<FakeParamRow **>(item + 0x10);
-            if (!row || static_cast<uint32_t>(row->pad2) != kFormMagic)
-                return nullptr;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
+        uint64_t rowp = 0;
+        if (!goblin::safemem::copy(&rowp, reinterpret_cast<const void *>(item + 0x10),
+                                   sizeof(rowp)) ||
+            !rowp)
             return nullptr;
-        }
+        FakeParamRow local{};
+        if (!goblin::safemem::copy(&local, reinterpret_cast<const void *>(rowp), sizeof(local)))
+            return nullptr;
+        if (static_cast<uint32_t>(local.pad2) != kFormMagic)
+            return nullptr;
+        const FakeParamRow *row = reinterpret_cast<const FakeParamRow *>(rowp);
         // Which screen does this item belong to? Only the LIVE one may be drawn or acted on
         // from the model - a parent's items keep their own pool and their last-drawn text, and
         // rendering them against the child's page would show the wrong row.
+        // (pool_level_of is address arithmetic only; once the row is inside one of OUR pools
+        // the identity fields below are our own live memory - read via the validated copy.)
         const int level = pool_level_of(row);
         if (level < 0 || static_cast<size_t>(level) != g_form_depth)
             return nullptr;
-        if (static_cast<uint32_t>(row->pad3) != g_form_generation[level])
+        if (static_cast<uint32_t>(local.pad3) != g_form_generation[level])
             return nullptr; // an item left over from a previous build
-        const uint32_t tag = static_cast<uint32_t>(row->pad4);
+        const uint32_t tag = static_cast<uint32_t>(local.pad4);
         const size_t ix = tag >> 16;
         if (out_index)
             *out_index = ix;
@@ -7654,6 +7873,24 @@ namespace
                                             point.px, point.pz, mx, mz))
             {
                 ++g_v3_native.failed;
+                ++g_v3_native.failed_project;
+                // NOT OUR ARITHMETIC - the ENGINE's own converter declined this tile. Identified
+                // 2026-08-05 after `failed=1 (project=1)` showed up on 47 of 47 opens: it is
+                // always vanilla row 6000197, a Stake of Marika at area 42 grid (1,0), the only
+                // area-42 row in the profile using gridX=1 (every other one is 0, 2 or 3). We
+                // read the row live from WorldMapPointParam and hand the tile to the game's
+                // converter, which answers "cannot convert" - so the game's own data references a
+                // tile its map has no converter for. Skipping is the correct outcome: the only
+                // alternative would be to invent an offset and draw the icon in the wrong place,
+                // which is worse than one missing marker. Kept as a warning, not silenced, so a
+                // profile where this count is not 1 is still noticed.
+                static uint32_t s_proj_logged = 0;
+                if (s_proj_logged++ < 3)
+                    spdlog::warn("[v3native] engine converter declined this tile, marker skipped:"
+                                 " row={} area={} grid=({},{}) pos=({:.1f},{:.1f}) ring={}",
+                                 point.original_row_id & ~goblin::NATIVE_CLEARED_KEY_BIT,
+                                 point.area, point.gx, point.gz, point.px, point.pz,
+                                 (point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0);
                 continue;
             }
             const uint32_t char_id =
@@ -7661,6 +7898,7 @@ namespace
             if (char_id == 0)
             {
                 ++g_v3_native.failed;
+                ++g_v3_native.failed_charid;
                 continue;
             }
             // Rings from their own high band; markers from the normal one.
@@ -7681,8 +7919,13 @@ namespace
             const uintptr_t node = goblin::gfx_probe::create_native_icon_instance(
                 point.source_icon_id, depth, live_ctx, frame);
             bool ok = false;
+            // Which of the three post-request failures happened, for the counters at the end of
+            // the iteration: the logs are capped, the counters are not.
+            enum class FailWhy { None, NoNode, NotMaterialized, Attach };
+            FailWhy why = FailWhy::None;
             if (!v3_heap_ptr(node))
             {
+                why = FailWhy::NoNode;
                 static uint32_t s_no_node_logged = 0;
                 if (s_no_node_logged++ < 4)
                     spdlog::warn("[v3native] request produced no timeline node "
@@ -7709,6 +7952,7 @@ namespace
                 }
                 if (!s.held || !v3_heap_ptr(s.child))
                 {
+                    why = FailWhy::NotMaterialized;
                     static uint32_t s_uncaptured_logged = 0;
                     if (s_uncaptured_logged++ < 4)
                         spdlog::warn("[v3native] record not materialized by driver "
@@ -7766,9 +8010,12 @@ namespace
                                           g_v3_native.cur_fx * emph,
                                           g_v3_native.cur_fy * emph);
                     if (!positioned)
+                    {
+                        why = FailWhy::Attach;
                         spdlog::warn("[v3native] attach failed: seh=0x{:08X} "
                                      "parent=0x{:X} expected=0x{:X}",
                                      exc, child_parent, g_v3_native.parent);
+                    }
                     else
                         ok = true;
                 }
@@ -7834,6 +8081,13 @@ namespace
             else
             {
                 ++g_v3_native.failed;
+                switch (why)
+                {
+                case FailWhy::NoNode: ++g_v3_native.failed_nonode; break;
+                case FailWhy::NotMaterialized: ++g_v3_native.failed_material; break;
+                case FailWhy::Attach: ++g_v3_native.failed_attach; break;
+                default: break;
+                }
             }
             if (v3_heap_ptr(node))
                 goblin::gfx_probe::remove_native_icon_record(depth, live_ctx, frame);
@@ -7882,8 +8136,10 @@ namespace
         // cleared on detach, so a reused or detached block cannot fake it. Same test the anchor
         // paths already use - reconcile was the one per-frame engine mutation left outside it.
         {
+            // Gate BEFORE the vtable read, not after: v3_node_detached below does gate, but this
+            // read got there first and is the same per-frame dead-anchor case as the tick's.
             uint64_t pvt = 0;
-            if (!v3_read64(parent, pvt) || pvt == 0 ||
+            if (v3_node_unusable(parent) || !v3_read64(parent, pvt) || pvt == 0 ||
                 (g_v3_native.parent_vtable != 0 && pvt != g_v3_native.parent_vtable))
                 return;
             if (v3_node_detached(parent))
@@ -9107,13 +9363,172 @@ void goblin::stall_probe::v3_pin_build_end()
     corr = {};
 }
 
+namespace
+{
+    // 1 Hz while the map screen is up: our own per-frame cost, the factory's cost per pulse, and
+    // the safemem counter deltas, all in one line. Added for the 2026-08-05 frame-rate report -
+    // the map thread was visibly slow (29 factory pulses in 13 s on a first open, 3-10 on
+    // reopens) and nothing in the log could say where the time went. Map frames and pulses run
+    // on the same thread (the [v3] thread map lines), so plain fields are enough.
+    struct V3Perf
+    {
+        uint64_t window_ms = 0;
+        uint32_t frames = 0;
+        int64_t total_qpc = 0;
+        int64_t max_qpc = 0;
+        uint32_t pulses = 0;
+        int64_t pulse_qpc = 0;
+        uint64_t copies0 = 0, queries0 = 0, refused0 = 0;
+    };
+    V3Perf g_v3_perf;
+
+    int64_t v3_perf_now()
+    {
+        LARGE_INTEGER li;
+        QueryPerformanceCounter(&li);
+        return li.QuadPart;
+    }
+
+    int64_t v3_perf_freq()
+    {
+        static const int64_t f = [] {
+            LARGE_INTEGER li;
+            QueryPerformanceFrequency(&li);
+            return li.QuadPart ? li.QuadPart : 1;
+        }();
+        return f;
+    }
+
+    void v3_perf_snapshot_counters(V3Perf &p)
+    {
+        p.copies0 = goblin::safemem::g_copies.load(std::memory_order_relaxed);
+        p.queries0 = goblin::safemem::g_queries.load(std::memory_order_relaxed);
+        p.refused0 = goblin::safemem::g_refused.load(std::memory_order_relaxed);
+    }
+
+    // ── Map-stall sampler ────────────────────────────────────────────────────────────
+    // 2026-08-05, after the hot-path fixes: icons and steady FPS are back, but a COLD map
+    // open (real teardown + movie reload) still freezes the map thread for 2-4 s between
+    // the open command and the engine's build burst - a window where on_map_frame does not
+    // run, so v3perf cannot see it and our log is silent. The watcher samples the map
+    // thread's stack whenever the map-frame heartbeat has been silent >700 ms while the
+    // map phase says a dialog exists. The suspend lasts only long enough to copy the
+    // CONTEXT; unwinding and module-name resolution happen AFTER ResumeThread, so a thread
+    // parked inside the loader or the unwind tables can never deadlock us. For a
+    // multi-second stall the deep frames are stable after resume; the top may churn.
+    std::atomic<uint64_t> g_map_hb_ms{0};
+    std::atomic<uint32_t> g_map_hb_tid{0};
+
+    // POD-only frame so __try is legal; returns captured frame count.
+    int stall_capture_frames(HANDLE th, uintptr_t *out, int cap)
+    {
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (SuspendThread(th) == static_cast<DWORD>(-1))
+            return 0;
+        const BOOL got = GetThreadContext(th, &c);
+        ResumeThread(th);
+        if (!got)
+            return 0;
+        int n = 0;
+        __try
+        {
+            while (n < cap)
+            {
+                out[n++] = static_cast<uintptr_t>(c.Rip);
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+                if (!rf)
+                {
+                    // Leaf with no unwind data: one manual step, then stop if implausible.
+                    const uintptr_t ret = *reinterpret_cast<uintptr_t *>(c.Rsp);
+                    if (ret < 0x10000)
+                        break;
+                    c.Rip = ret;
+                    c.Rsp += 8;
+                    continue;
+                }
+                PVOID hd = nullptr;
+                DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &est, nullptr);
+                if (!c.Rip)
+                    break;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return n;
+    }
+
+    void stall_log_frame(int i, uintptr_t rip)
+    {
+        HMODULE m = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(rip), &m) &&
+            m)
+        {
+            char path[MAX_PATH] = {};
+            const char *name = path;
+            if (GetModuleFileNameA(m, path, MAX_PATH))
+            {
+                if (const char *b = strrchr(path, '\\'))
+                    name = b + 1;
+            }
+            spdlog::info("[stallcap]   #{:02} {}+0x{:X}", i, name,
+                         rip - reinterpret_cast<uintptr_t>(m));
+        }
+        else
+            spdlog::info("[stallcap]   #{:02} 0x{:X}", i, rip);
+    }
+
+    void v3_perf_note_frame(int64_t dt_qpc)
+    {
+        auto &p = g_v3_perf;
+        ++p.frames;
+        p.total_qpc += dt_qpc;
+        if (dt_qpc > p.max_qpc)
+            p.max_qpc = dt_qpc;
+        const uint64_t now = GetTickCount64();
+        if (p.window_ms == 0)
+        {
+            p.window_ms = now;
+            v3_perf_snapshot_counters(p);
+            return;
+        }
+        const uint64_t span = now - p.window_ms;
+        if (span < 1000)
+            return;
+        const int64_t f = v3_perf_freq();
+        const auto us = [f](int64_t q) { return q * 1000000 / f; };
+        spdlog::info("[v3perf] {} map frames / {} ms: ours {} us (avg {}, max {}); {} pulses "
+                     "{} us; safemem copies +{} lookups +{} refused +{}",
+                     p.frames, span, us(p.total_qpc),
+                     us(p.total_qpc / (p.frames ? p.frames : 1)), us(p.max_qpc), p.pulses,
+                     us(p.pulse_qpc),
+                     goblin::safemem::g_copies.load(std::memory_order_relaxed) - p.copies0,
+                     goblin::safemem::g_queries.load(std::memory_order_relaxed) - p.queries0,
+                     goblin::safemem::g_refused.load(std::memory_order_relaxed) - p.refused0);
+        p = V3Perf{};
+        p.window_ms = now;
+        v3_perf_snapshot_counters(p);
+    }
+}
+
 void goblin::stall_probe::on_map_frame()
 {
+    g_map_hb_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    g_map_hb_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    const int64_t perf_t0 = v3_perf_now();
+
     // Drive the category-by-category lightweight native-marker rollout.
     v3_native_tick();
 
     // Lever B: reconcile which markers are attached to the visible map window.
     v3_viewport_reconcile();
+
+    v3_perf_note_frame(v3_perf_now() - perf_t0);
 
     // A counter-scale pass for one transplanted child followed here: it read the child's matrix
     // through the vtable and divided out the map zoom. It was permanently disarmed - g_v3_scale_ready
@@ -9122,6 +9537,50 @@ void goblin::stall_probe::on_map_frame()
     // where the seed used to arm it: do not restore this without a reason to.
 }
 
+
+bool goblin::stall_probe::map_screen_alive()
+{
+    return v3_map_object_alive();
+}
+
+void goblin::stall_probe::sample_map_stall()
+{
+    const uint64_t hb = g_map_hb_ms.load(std::memory_order_relaxed);
+    const uint32_t tid = g_map_hb_tid.load(std::memory_order_relaxed);
+    if (!hb || !tid || tid == GetCurrentThreadId())
+        return;
+    // Phase 0 = no dialog: the heartbeat is EXPECTED silent (map closed), not a stall.
+    // 0xFF (unresolved) is sampled - an unknown phase must not hide a freeze.
+    if (g_map_phase.load(std::memory_order_acquire) == 0)
+        return;
+    const uint64_t age = GetTickCount64() - hb;
+    static uint64_t s_stall_hb = 0; // which heartbeat value this stall was keyed on
+    static int s_taken = 0;
+    if (age < 700)
+        return;
+    if (s_stall_hb != hb)
+    {
+        s_stall_hb = hb;
+        s_taken = 0;
+    }
+    // A few samples per stall are enough to name the culprit; a 20 s ceiling stops a
+    // stuck phase byte from turning this into a permanent per-tick suspend.
+    if (s_taken >= 3 || age > 20000)
+        return;
+    ++s_taken;
+    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                           FALSE, tid);
+    if (!th)
+        return;
+    uintptr_t frames[24] = {};
+    const int n = stall_capture_frames(th, frames, 24);
+    CloseHandle(th);
+    spdlog::info("[stallcap] map frame heartbeat silent {} ms (phase {}); map thread tid {} "
+                 "stack, {} frame(s):",
+                 age, g_map_phase.load(std::memory_order_relaxed), tid, n);
+    for (int i = 0; i < n; ++i)
+        stall_log_frame(i, frames[i]);
+}
 
 void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
 {
@@ -9135,7 +9594,10 @@ void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
             g_v3_pulse_unseeded.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        const int64_t perf_t0 = v3_perf_now();
         v3_native_factory_consume(ctx, static_cast<uint32_t>(frame));
+        ++g_v3_perf.pulses;
+        g_v3_perf.pulse_qpc += v3_perf_now() - perf_t0;
     }
     catch (const std::exception &e)
     {

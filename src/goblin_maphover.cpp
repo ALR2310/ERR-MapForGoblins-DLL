@@ -21,6 +21,7 @@
 //  in this file. The trailing note about native_reticle_row belongs to goblin_inject.hpp above.)
 #include "goblin_map_timing.hpp"
 #include "goblin_stall_probe.hpp"
+#include "goblin_safemem.hpp" // validate-then-read for the pin/dialog pointer checks
 #include "modutils.hpp"
 
 #include <spdlog/spdlog.h>
@@ -186,10 +187,11 @@ namespace
         return ok;
     }
 
+    // Validate-then-read (goblin_safemem.hpp): a pin/dialog pointer that has been freed is the
+    // normal case here, not the exceptional one.
     bool read_vt(void *obj, uintptr_t &out)
     {
-        __try { out = *reinterpret_cast<uintptr_t *>(obj); return true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        return goblin::safemem::copy(&out, obj, sizeof(out));
     }
 
     // ── our own hover panel ──────────────────────────────────────────────────────────

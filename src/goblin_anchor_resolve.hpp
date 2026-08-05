@@ -128,6 +128,54 @@ namespace goblin::anchor_resolve
         return out;
     }
 
+    // The memory-file class's own vptr, derived from its resolved constructor: the target of
+    // the last `lea rax,[rip+disp]` before the ctor's first real `call rel32` (a ctor writes
+    // its base vtables first and its own last, then calls into member construction).
+    //
+    // "First call" must NOT mean "first 0xE8 byte": on the supported exe the prologue's
+    // `mov rbp,r8` is 49 8B E8, and a scan that stopped on that operand byte ended before the
+    // first lea - the vtable derived as 0 on EVERY exe and the menu-movie transform silently
+    // served the stock movie. An 0xE8 counts as the call only when its rel32 target lands
+    // inside the first .text, which is where a ctor's first real call (a base ctor, operator
+    // new) always points; an operand byte's accidental "target" lands nowhere near it.
+    //
+    // Returns the vtable's RVA, 0 when it cannot be established. The caller still owes the
+    // pointer-level sanity (slot 0 must point back into .text) - that check depends on
+    // relocation state, so it stays with whoever owns the memory: the live module reads the
+    // RELOCATED pointer, the offline test translates the on-disk VA through ImageBase.
+    inline uint32_t derive_vtable_rva(const Image &im, uint32_t ctor_rva, uint32_t image_size)
+    {
+        if (!ctor_rva)
+            return 0;
+        // The scan window must lie inside .text, or the byte reads themselves walk off the map.
+        if (uint64_t(ctor_rva) + 0x110 > uint64_t(im.text_rva()) + im.text_len)
+            return 0;
+        const auto *p = reinterpret_cast<const uint8_t *>(im.base + ctor_rva);
+        int64_t last_lea = 0;
+        for (uint32_t i = 0; i + 7 <= 0x100; ++i)
+        {
+            if (p[i] == 0xE8)
+            {
+                int32_t rel = 0;
+                std::memcpy(&rel, p + i + 1, 4);
+                const int64_t tgt = int64_t(ctor_rva) + i + 5 + rel;
+                if (tgt >= int64_t(im.text_rva()) &&
+                    tgt < int64_t(im.text_rva()) + int64_t(im.text_len))
+                    break;
+            }
+            if (p[i] == 0x48 && p[i + 1] == 0x8D && p[i + 2] == 0x05)
+            {
+                int32_t disp = 0;
+                std::memcpy(&disp, p + i + 3, 4);
+                last_lea = int64_t(ctor_rva) + i + 7 + disp;
+                i += 6;
+            }
+        }
+        if (last_lea <= 0 || last_lea >= int64_t(image_size))
+            return 0;
+        return uint32_t(last_lea);
+    }
+
     // Fill out[0..n) with the live RVA of each table entry, 0 when it could not be trusted.
     inline Stats resolve_into(const Image &im, const TableEntry *tbl, size_t n, uint32_t *out)
     {

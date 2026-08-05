@@ -276,12 +276,14 @@ namespace
     // engine's own free() a buffer from a foreign heap - the v2.0.4 corruption shape. Resolved
     // once, on first use; 0 means no heap and the caller aborts injection.
     std::atomic<uint64_t> g_gfx_heap_slot{0};
-    std::atomic<bool> g_gfx_heap_slot_tried{false};
+    // call_once, not a tried-flag: with an exchange()d flag a second caller arriving DURING the
+    // first one's scan read the slot as still-0 and aborted its injection - a one-shot loss with
+    // no retry. call_once parks the latecomer until the scan has an answer.
+    std::once_flag g_gfx_heap_slot_once;
 
     uint64_t gfx_heap_slot()
     {
-        if (!g_gfx_heap_slot_tried.exchange(true, std::memory_order_acq_rel))
-        {
+        std::call_once(g_gfx_heap_slot_once, [] {
             uint64_t slot = 0;
             try
             {
@@ -300,7 +302,7 @@ namespace
                 spdlog::warn("[icons] Scaleform heap slot unresolved; engine-owned allocations "
                              "are off for this session");
             g_gfx_heap_slot.store(slot, std::memory_order_release);
-        }
+        });
         return g_gfx_heap_slot.load(std::memory_order_acquire);
     }
 

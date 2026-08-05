@@ -421,12 +421,17 @@ namespace
     {
         if (!panel)
             return false;
+        // On a build where the anchor could not be placed at() answers 0, and calling it would
+        // raise a first-chance AV here EVERY frame the map is open - exceptions other tools'
+        // filters see even though our SEH swallows them. Dead anchor = feature off, quietly.
+        auto p_place = reinterpret_cast<char (*)(void *, const float *)>(goblin::anchors::at(kPanelPosF));
+        if (!p_place)
+            return false;
         bool ok = false;
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<char (*)(void *, const float *)>(goblin::anchors::at(kPanelPosF))(
-                reinterpret_cast<uint8_t *>(panel) + 8, at);
+            p_place(reinterpret_cast<uint8_t *>(panel) + 8, at);
             ok = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -441,11 +446,13 @@ namespace
     {
         if (!panel)
             return;
+        auto p_visible = reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible));
+        if (!p_visible)
+            return;  // dead anchor - see popup_place
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible))(
-                reinterpret_cast<uint8_t *>(panel) + 8, show ? 1 : 0);
+            p_visible(reinterpret_cast<uint8_t *>(panel) + 8, show ? 1 : 0);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -498,10 +505,13 @@ namespace
             }
             return;
         }
+        auto p_visible = reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible));
+        if (!p_visible)
+            return;  // dead anchor - see popup_place
         ++goblin::guarded::depth;
         __try
         {
-            reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kPanelVisible))(w, 0);
+            p_visible(w, 0);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -519,6 +529,8 @@ namespace
         auto p_resolve = reinterpret_cast<void *(*)(void *, void *, const char *)>(goblin::anchors::at(kResolve));
         auto p_valid = reinterpret_cast<char (*)(void *)>(goblin::anchors::at(kProxyValid));
         auto p_dtor = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(kProxyDtor));
+        if (!p_resolve || !p_valid || !p_dtor)
+            return false;  // dead anchor - see popup_place
         bool ok = false;
         ++goblin::guarded::depth;
         __try
@@ -552,6 +564,9 @@ namespace
         auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(goblin::anchors::at(kSetPosI));
         auto p_settext =
             reinterpret_cast<void (*)(void *, const wchar_t *)>(goblin::anchors::at(kSetTextHtml));
+        auto p_color = reinterpret_cast<void (*)(void **, uint32_t)>(goblin::anchors::at(kSetTextColor));
+        if (!p_resolve || !p_valid || !p_dtor || !p_visible || !p_pos || !p_settext || !p_color)
+            return;  // dead anchor - see popup_place
         ++goblin::guarded::depth;
         __try
         {
@@ -583,8 +598,7 @@ namespace
                             // as alpha, so it must be 0xFFRRGGBB, not 0x00RRGGBB (that was the
                             // "grey" - fully transparent).
                             void *fldp = fld;
-                            reinterpret_cast<void (*)(void **, uint32_t)>(goblin::anchors::at(kSetTextColor))(
-                                &fldp, rgb);
+                            p_color(&fldp, rgb);
                         }
                     }
                     p_dtor(tb + 0x28);
@@ -612,6 +626,8 @@ namespace
         auto p_dtor = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(kProxyDtor));
         auto p_visible = reinterpret_cast<void (*)(void *, char)>(goblin::anchors::at(kSetVisible));
         auto p_pos = reinterpret_cast<void (*)(void *, int32_t, int32_t)>(goblin::anchors::at(kSetPosI));
+        if (!p_resolve || !p_valid || !p_dtor || !p_visible || !p_pos)
+            return;  // dead anchor - see popup_place
         ++goblin::guarded::depth;
         __try
         {
@@ -916,31 +932,37 @@ namespace
             using ResolveFn = void *(void *parent, void *out, const char *path);
             using ValidFn = char(void *proxy);
             using DtorFn = void(void *proxy);
-            auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-            auto p_valid = reinterpret_cast<ValidFn *>(goblin::anchors::at(0x733150));
-            auto p_dtor = reinterpret_cast<DtorFn *>(goblin::anchors::at(0xD7F850));
+            auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(kResolve));
+            auto p_valid = reinterpret_cast<ValidFn *>(goblin::anchors::at(kProxyValid));
+            auto p_dtor = reinterpret_cast<DtorFn *>(goblin::anchors::at(kProxyDtor));
             char found[3] = {};
-            __try
+            if (p_resolve && p_valid && p_dtor)
             {
-                void *root = reinterpret_cast<void *>(
-                    reinterpret_cast<uintptr_t>(map_area) - 0x27D8 + 0x120);
-                static const char *const kPaths[] = {"Body", "Body/PlaceName",
-                                                     "Body/PlaceName/State_0/Text_0/Text"};
-                for (int i = 0; i < 3; ++i)
+                __try
                 {
-                    uint8_t buf[0x60] = {};
-                    void *r = p_resolve(root, buf, kPaths[i]);
-                    found[i] = p_valid(r);
-                    p_dtor(buf + 0x28);
+                    void *root = reinterpret_cast<void *>(
+                        reinterpret_cast<uintptr_t>(map_area) - 0x27D8 + 0x120);
+                    static const char *const kPaths[] = {"Body", "Body/PlaceName",
+                                                         "Body/PlaceName/State_0/Text_0/Text"};
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        uint8_t buf[0x60] = {};
+                        void *r = p_resolve(root, buf, kPaths[i]);
+                        found[i] = p_valid(r);
+                        p_dtor(buf + 0x28);
+                    }
                 }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                }
+                spdlog::info("[maphover] map movie root via dialog+0x120: Body={} PlaceName={} "
+                             "line0={}",
+                             found[0] ? "yes" : "no", found[1] ? "yes" : "no",
+                             found[2] ? "yes" : "no");
             }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-            spdlog::info("[maphover] map movie root via dialog+0x120: Body={} PlaceName={} "
-                         "line0={}",
-                         found[0] ? "yes" : "no", found[1] ? "yes" : "no",
-                         found[2] ? "yes" : "no");
+            else
+                spdlog::info("[maphover] map movie root probe skipped: the proxy-resolve helpers "
+                             "were not placed on this build");
         }
 
         void *row = nullptr;

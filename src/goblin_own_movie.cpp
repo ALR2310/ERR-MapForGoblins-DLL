@@ -1344,6 +1344,12 @@ namespace
                              static_cast<uint32_t>(g_parse_bytes.size()), at) ||
             !move_ctx_total(ctx, delta))
         {
+            // Every rebuild step above has already logged by now, so WITHOUT this line a failure
+            // here reads like success minus its last line - which is how a derived-vtable bug
+            // stayed invisible for a whole test round. The movie parses once, so this says it once.
+            spdlog::warn("[ownmovie] '{}' was rebuilt but the parser could not be pointed at it "
+                         "(memory-file vtable {}) - the screen keeps the stock movie",
+                         name, memfile_vtable() ? "known" : "underived");
             o_tag_loop(movieData, ctx, arg3);
             return;
         }

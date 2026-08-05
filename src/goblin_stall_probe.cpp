@@ -323,6 +323,21 @@ namespace
     // real defect, but this is not its lever.
     constexpr size_t V3_FACTORY_BATCH = 48;
 
+    // How often the periodic snapshot+merge runs when nothing has asked for one. It was 200 ms,
+    // and that was 80% of everything an idle open map cost: measured on Convergence,
+    // `tick 27361 us, of which 5 merges cost 23409 us` in a one-second window - ~4.7 ms per
+    // merge, because each one rebuilds the whole 8425-row snapshot and re-runs the de-overlap
+    // spread (3.5 ms on its own) whether or not a single input changed.
+    //
+    // A USER ACTION DOES NOT WAIT FOR THIS. The master switch, a category, and the progress
+    // focus all bump goblin::visibility_epoch(), and the tick merges IMMEDIATELY on that - the
+    // epoch branch does not consult next_refresh_ms at all. What this cadence covers is state
+    // that changes with no notification of its own: collected pickups, boss flags, the player's
+    // own map. None of those can change while the world map is up, because the map is a menu and
+    // the player stands still inside it - so four fifths of an idle frame's cost was being spent
+    // to notice things that cannot happen while it is being spent.
+    constexpr uint64_t V3_IDLE_REFRESH_MS = 1000;
+
     // The staging array is NOT the batch: the pipeline keeps exactly one record in flight (see
     // v3_native_factory_consume, which arms slot 0 and finishes it before touching the next), so
     // this stays at one entry rather than sizing a thread_local by the batch.
@@ -558,6 +573,13 @@ namespace
         bool visible = false;
         bool attached = true; // lever B: currently linked into the marker parent (has a
                               // render node). Always true unless the viewport-window variant.
+        // Has the reconcile ever ATTACHED this child successfully? Splits the two reasons a
+        // marker can be missing from the display list, which need opposite fixes: never reached
+        // (the per-pass budget has not got to it yet) versus attached and lost again (the engine
+        // is dropping it back out, and re-attaching forever is pure waste). Convergence
+        // 2026-08-05 showed 4098 stragglers holding EXACTLY constant while every pass spent its
+        // full 1024-attach budget - that can only be the second case, and this flag proves it.
+        bool ever_attached = false;
         bool ref_held = false; // lever B: we kept an extra reference at build so this
                                // child survives being detached. Only children built with
                                // the viewport window ON have it -> only they may be
@@ -672,6 +694,8 @@ namespace
     std::atomic<uint32_t> g_v3_consume_nobudget{0};
     std::atomic<uint32_t> g_v3_consume_nosprite{0};
     std::atomic<uint32_t> g_v3_consume_busy{0};    // !seeded or re-entered while in_factory
+    std::atomic<uint32_t> g_v3_consume_hbwait{0};  // budget 0 but the map heartbeat is fresh:
+                                                   // bounced to wait for the tick refill
 
     void v3_pulse_counters_reset()
     {
@@ -681,6 +705,7 @@ namespace
         g_v3_consume_nobudget.store(0, std::memory_order_relaxed);
         g_v3_consume_nosprite.store(0, std::memory_order_relaxed);
         g_v3_consume_busy.store(0, std::memory_order_relaxed);
+        g_v3_consume_hbwait.store(0, std::memory_order_relaxed);
     }
     // g_v3_custom_child, g_v3_visual_state, V3VisualSnapshot and its publish flag lived here.
 
@@ -1011,6 +1036,87 @@ namespace
     // and this byte read 3 or 7 in every one of them. Gate B is the crash fix.
     // Last visibility epoch this manager has applied (goblin::visibility_epoch). Map thread only.
     uint32_t g_v3_seen_vis_epoch = 0;
+
+    // ── timing primitives + PER-OPEN cost ────────────────────────────────────────────────────
+    // Declared here, well above every user: the 1-second v3perf windows further down do not line
+    // up with map opens, so they cannot answer "does each open cost more than the last" - and that
+    // is exactly the question the Convergence report raised (2026-08-05: "the more opens, the
+    // worse the freeze"). This pair is reset on the open edge and reported at CATEGORIES READY.
+    int64_t v3_perf_now()
+    {
+        LARGE_INTEGER li;
+        QueryPerformanceCounter(&li);
+        return li.QuadPart;
+    }
+
+    int64_t v3_perf_freq()
+    {
+        static const int64_t f = [] {
+            LARGE_INTEGER li;
+            QueryPerformanceFrequency(&li);
+            return li.QuadPart ? li.QuadPart : 1;
+        }();
+        return f;
+    }
+
+    // Map-frame heartbeat: stamped by on_map_frame, read by the stall sampler AND by the
+    // factory's budget gate (which must know whether frames are actually arriving before it
+    // grants itself work outside one).
+    std::atomic<uint64_t> g_map_hb_ms{0};
+    std::atomic<uint32_t> g_map_hb_tid{0};
+
+    struct V3OpenCost
+    {
+        int64_t pulse_qpc = 0;
+        int64_t frame_qpc = 0;
+        uint32_t frames = 0;
+        uint32_t pulses = 0;
+        // The four stages inside a pulse, so a rising total can be attributed instead of guessed.
+        // Convergence, 2026-08-05: the factory went from 55-67 ms on the first opens to 112-169 ms
+        // by the thirtieth, with the pulse count identical (30789) - so the per-pulse cost itself
+        // grew ~2.5x. One number cannot say which stage grew; these four can.
+        // Where the PER-FRAME time goes while the map just sits open. Idle cost is ~32 ms/s at
+        // 8424 objects, against ~11 ms/s before this session's work, and the frame does exactly
+        // three things - so split them rather than guess which one grew.
+        int64_t tick_qpc = 0;    // v3_native_tick (emphasis pass, merges, liveness)
+        int64_t recon_qpc = 0;   // v3_viewport_reconcile (two full walks of every object)
+        int64_t proj_qpc = 0;    // mapproject::to_map
+        int64_t create_qpc = 0;  // create_native_icon_instance (tag Execute + node search)
+        int64_t mat_qpc = 0;     // the engine's record-materialization driver
+        int64_t attach_qpc = 0;  // attach into the parent + the transform write
+    };
+    V3OpenCost g_v3_open;
+
+    // The 1-second window. Declared here beside V3OpenCost for the same reason: the tick writes
+    // to it and the tick is defined well above the frame code that reports it.
+    struct V3Perf
+    {
+        uint64_t window_ms = 0;
+        uint32_t frames = 0;
+        int64_t total_qpc = 0;
+        int64_t max_qpc = 0;
+        uint32_t pulses = 0;
+        int64_t pulse_qpc = 0;
+        int64_t tick_qpc = 0;
+        int64_t recon_qpc = 0;
+        // The periodic snapshot+merge inside the tick: it rebuilds the whole marker snapshot
+        // (all ~8425 rows, plus the de-overlap pass) and merges it five times a second whether
+        // or not anything changed. Measured on its own because the tick is 27 of the 29 ms/s an
+        // idle map costs, and this is the only thing in it that touches every row.
+        int64_t merge_qpc = 0;
+        uint32_t merges = 0;
+        // The other two things inside the tick that touch children in bulk, split out because
+        // heavy tick windows survived the merge fix (Convergence: tick 118 ms/s against 1 merge
+        // = 5.8 ms) and the remainder was unattributed. The emphasis slice writes up to 192
+        // colour/matrix pairs a frame while dirty; the counter-zoom pass reapplies EVERY object
+        // in one frame whenever the zoom moves past its 0.3% deadband.
+        int64_t emph_qpc = 0;
+        uint32_t emph_writes = 0;
+        int64_t zoom_qpc = 0;
+        uint32_t zoom_passes = 0;
+        uint64_t copies0 = 0, queries0 = 0, refused0 = 0;
+    };
+    V3Perf g_v3_perf;
 
     std::atomic<uint8_t> g_map_phase{0xFF};   // last sampled raw byte: 0 / 1 / 3 / 7, 0xFF = unknown
     std::atomic<uint16_t> g_map_menu_id{0x3D};
@@ -1867,6 +1973,25 @@ namespace
         return v3_write_bytes(node + g_v3_cx_offset, cx, sizeof cx);
     }
 
+    // Read a child's matrix back through the engine's own getter. POD-only frame so the SEH is
+    // legal: this is a deliberate call into engine code, which no address check can pre-validate.
+    bool v3_matrix_readback(void *child, uint64_t get_addr, float *out8)
+    {
+        using GetMatrixFn = const float *(void *);
+        __try
+        {
+            const float *cur = reinterpret_cast<GetMatrixFn *>(get_addr)(child);
+            if (!cur)
+                return false;
+            memcpy(out8, cur, sizeof(float) * 8);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     bool v3_position_child(uintptr_t child, float map_x, float map_y,
                            float base_tx, float base_ty,
                            const float *basis = nullptr,
@@ -2357,6 +2482,32 @@ namespace
         if (g_v3_native.seeded &&
             g_v3_native.wrapper == wrapper && g_v3_native.parent == parent)
         {
+            // KEEP MANAGING IS ONLY LEGAL FOR A GENERATION THAT FINISHED. Carrying an
+            // unfinished one across a real open/close preserves the shortfall for as long as
+            // the anchor stays alive: the reopen reuses the movie, emits no burst, so nothing
+            // can rebuild, and the map keeps showing the fragment. Worse, the fragment is
+            // shaped: the seed sorts the player's OWN map's markers LAST so they draw on top,
+            // so a build that stopped early is missing exactly those - which is what the
+            // player sees ("only the dimmed, shrunken icons of other locations are there, the
+            // ones where I'm standing are gone, but their popups still work").
+            //
+            // Measured 2026-08-05 on Convergence: a generation stopped at 1968 of 8425, the
+            // next open logged NO seed and NO CATEGORIES READY at all, and the parent list
+            // held 2138 entries (354 the engine's + our 1784) for minutes while the map sat
+            // open. `completion_reported` is set only when CATEGORIES READY fires, so it is
+            // exactly the "this generation finished" bit; `g_map_screen_gone` is set only by
+            // the engine's phase byte reaching 0, so it is exactly "a real screen has come and
+            // gone since we anchored". Both together mean: rebuild rather than adopt.
+            if (!g_v3_native.completion_reported &&
+                g_map_screen_gone.load(std::memory_order_acquire))
+            {
+                spdlog::warn("[v3native] carrying an UNFINISHED generation ({} of {} built) "
+                             "into a new screen; dropping the anchor so the next burst can "
+                             "rebuild instead of leaving the map half-drawn",
+                             g_v3_native.objects.size(), g_v3_native.pending.size());
+                v3_drop_dead_anchor("unfinished generation", parent);
+                return false;
+            }
             g_seed_managing.fetch_add(1, std::memory_order_relaxed);
             return true; // same live session (incl. quick reopen) - keep managing
         }
@@ -2554,14 +2705,17 @@ namespace
     // Move a child that already exists. Costs exactly what showing or hiding one costs - a transform
     // written to the child - because that is all any of those do; nothing is created or destroyed, so
     // this is safe outside a build burst, which creating is not.
-    void v3_native_move(V3NativeObject &obj, float mx, float mz)
+    // Returns whether the position actually changed - a successful projection onto the same
+    // spot is a no-op, and callers that count "moved" must not count those.
+    bool v3_native_move(V3NativeObject &obj, float mx, float mz)
     {
-        if (!v3_heap_ptr(obj.child) || (mx == obj.map_x && mz == obj.map_z)) return;
+        if (!v3_heap_ptr(obj.child) || (mx == obj.map_x && mz == obj.map_z)) return false;
         obj.map_x = mx;
         obj.map_z = mz;
         if (obj.visible)
             v3_position_child(obj.child, mx, mz, obj.base_tx, obj.base_ty, obj.base_m,
                               v3_obj_fx(obj), v3_obj_fy(obj));
+        return true;
     }
 
     void v3_native_merge_snapshot(const std::vector<goblin::NativeMarkerPoint> &snapshot,
@@ -2673,8 +2827,11 @@ namespace
                                                mx, mz))
                 {
                     projected = true;
-                    v3_native_move(obj, mx, mz);
-                    if (ring) ++ring_moved;
+                    // Count rings that actually CHANGED position, not every successful
+                    // projection: 128 parked rings re-projecting onto their own spot printed
+                    // `moved=128` every merge and the "static map stays quiet" goal was gone.
+                    const bool did_move = v3_native_move(obj, mx, mz);
+                    if (ring && did_move) ++ring_moved;
                 }
                 else if (ring)
                 {
@@ -2763,12 +2920,23 @@ namespace
                          g_v3_native.layer, g_v3_native.observed_count,
                          snapshot.size(), visible_count,
                          g_v3_native.pending.size() - g_v3_native.pending_index);
-        // Print only when a ring did something, so a static map stays quiet.
-        if (ring_remapped || ring_moved || ring_unprojected)
-            spdlog::info("[v3ring] merge{}: seen={} visible={} onOtherMap={} remapped={} moved={} "
-                         "unprojected={}",
-                         initial ? " (seed)" : "", ring_seen, ring_visible, ring_other_map,
-                         ring_remapped, ring_moved, ring_unprojected);
+        // MARKER visibility belongs on this line too. It read rings only, and rings are all
+        // invisible unless a focus category is set - so "visible=0" said nothing about the icons
+        // and the log could not answer the one question asked of it: after the master switch goes
+        // back on over an open map, do the markers actually become visible again? (Convergence
+        // 2026-08-05: two opens seeded with `visible=0` because the switch was off, which is
+        // correct, and nothing in the log showed what happened after it was switched on.)
+        // markers= is the count the snapshot says SHOULD be on screen this merge.
+        static size_t s_last_markers = SIZE_MAX;
+        const bool markers_changed = visible_count != s_last_markers;
+        s_last_markers = visible_count;
+        // Print when a ring did something OR when the visible marker count moved, so a static
+        // map stays quiet but a visibility change never passes unrecorded.
+        if (ring_remapped || ring_moved || ring_unprojected || markers_changed)
+            spdlog::info("[v3ring] merge{}: markers={} | rings seen={} visible={} onOtherMap={} "
+                         "remapped={} moved={} unprojected={}",
+                         initial ? " (seed)" : "", visible_count, ring_seen, ring_visible,
+                         ring_other_map, ring_remapped, ring_moved, ring_unprojected);
     }
 
     void v3_native_tick()
@@ -2946,6 +3114,7 @@ namespace
         // objects whose factor actually changed are written, and the budget counts those.
         if (g_v3_native.emph_dirty)
         {
+            const int64_t t_e0 = v3_perf_now();
             constexpr size_t V3_EMPH_WRITES_PER_FRAME = 192;
             size_t written = 0;
             while (g_v3_native.emph_cursor < g_v3_native.objects.size() &&
@@ -2966,6 +3135,8 @@ namespace
                 g_v3_native.emph_dirty = false;
                 g_v3_native.emph_cursor = 0;
             }
+            g_v3_perf.emph_qpc += v3_perf_now() - t_e0;
+            g_v3_perf.emph_writes += static_cast<uint32_t>(written);
         }
 
         if (!g_v3_native.seeded)
@@ -3039,7 +3210,7 @@ namespace
                          // budget_regranted is NOT a block: it counts the pulses that arrived with
                          // an empty batch and were handed a fresh one. Reading it as a gate cost a
                          // whole diagnostic pass once.
-                         "blocked(driver/sprite/busy)={}/{}/{} budget_regranted={}",
+                         "blocked(driver/sprite/busy/hbwait)={}/{}/{}/{} budget_regranted={}",
                          g_v3_native.pending.size() - g_v3_native.pending_index,
                          goblin::gfx_probe::icons_injected(),
                          // The engine's phase byte, not map_dialog(): this field is read as
@@ -3052,6 +3223,7 @@ namespace
                          g_v3_consume_nodriver.load(std::memory_order_relaxed),
                          g_v3_consume_nosprite.load(std::memory_order_relaxed),
                          g_v3_consume_busy.load(std::memory_order_relaxed),
+                         g_v3_consume_hbwait.load(std::memory_order_relaxed),
                          g_v3_consume_nobudget.load(std::memory_order_relaxed));
             g_v3_native.pending_index = g_v3_native.pending.size();
         }
@@ -3069,14 +3241,20 @@ namespace
         if (vis_epoch != g_v3_seen_vis_epoch)
         {
             g_v3_seen_vis_epoch = vis_epoch;
-            g_v3_native.next_refresh_ms = now_ms + 200;
+            g_v3_native.next_refresh_ms = now_ms + V3_IDLE_REFRESH_MS;
+            const int64_t t_m0 = v3_perf_now();
             v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
+            g_v3_perf.merge_qpc += v3_perf_now() - t_m0;
+            ++g_v3_perf.merges;
         }
         else if (g_v3_native.pending_index >= g_v3_native.pending.size() &&
                  now_ms >= g_v3_native.next_refresh_ms)
         {
-            g_v3_native.next_refresh_ms = now_ms + 200;
+            g_v3_native.next_refresh_ms = now_ms + V3_IDLE_REFRESH_MS;
+            const int64_t t_m0 = v3_perf_now();
             v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
+            g_v3_perf.merge_qpc += v3_perf_now() - t_m0;
+            ++g_v3_perf.merges;
         }
 
         // Counter-zoom pass: our children ride the marker layer's parent
@@ -3135,10 +3313,13 @@ namespace
                                                      : g_v3_native.cur_fy - fy;
             if (dx > 0.003f * g_v3_native.cur_fx || dy > 0.003f * g_v3_native.cur_fy)
             {
+                const int64_t t_z0 = v3_perf_now();
                 g_v3_native.cur_fx = fx;
                 g_v3_native.cur_fy = fy;
                 for (auto &obj : g_v3_native.objects)
                     v3_native_reapply(obj);
+                g_v3_perf.zoom_qpc += v3_perf_now() - t_z0;
+                ++g_v3_perf.zoom_passes;
             }
         }
 
@@ -3176,6 +3357,23 @@ namespace
                              g_v3_native.failed_nonode, g_v3_native.failed_material,
                              g_v3_native.failed_attach,
                              g_v3_native.wrong_contexts, live_count, heavy, rt, rs, rd, ri);
+                // What THIS open actually cost us, in one line: the number that has to be watched
+                // when a profile freezes on open, and the only form in which "each open is worse
+                // than the last" can be confirmed or refuted.
+                {
+                    const int64_t f = v3_perf_freq();
+                    uint64_t sc = 0, si = 0, sw = 0, sl = 0;
+                    goblin::gfx_probe::scan_stats(sc, si, sw, sl);
+                    spdlog::info("[v3perf] open cost: factory {} ms over {} pulses; our frames "
+                                 "{} ms over {} frames; stages: project {} ms, create {} ms, "
+                                 "materialize {} ms, attach {} ms; node search: {} walks, {} "
+                                 "nodes total, worst {}, longest list {}",
+                                 g_v3_open.pulse_qpc * 1000 / f, g_v3_open.pulses,
+                                 g_v3_open.frame_qpc * 1000 / f, g_v3_open.frames,
+                                 g_v3_open.proj_qpc * 1000 / f, g_v3_open.create_qpc * 1000 / f,
+                                 g_v3_open.mat_qpc * 1000 / f, g_v3_open.attach_qpc * 1000 / f,
+                                 sc, si, sw, sl);
+                }
                 v3_seed_trace("at READY");
                 g_v3_native.completion_reported = true;
                 // The generation is fully built, so the PREVIOUS one's movie is certainly gone by
@@ -7557,7 +7755,10 @@ namespace
             // The OPEN edge, and the only place g_v3_map_closed is ever cleared. One writer per
             // direction: the engine's byte going non-zero means a dialog exists again.
             if (prev == 0 && raw != 0 && raw != 0xFF)
+            {
                 g_v3_map_closed.store(false, std::memory_order_release);
+                g_v3_open = V3OpenCost{}; // per-open cost accounting starts here
+            }
             // While the map is closed is exactly when the parked entry exists and the engine is
             // counting it down. One bounded walk per frame, read-only until the exact match.
             if (raw == 0)
@@ -7823,6 +8024,30 @@ namespace
             // the queue is not empty. That keeps the per-pulse work bounded exactly as before -
             // the loop below still stops at V3_FACTORY_BATCH - it only stops the build from
             // deadlocking when no frame boundary is coming.
+            // ...but ONLY when no frame boundary is actually coming. That condition used to be
+            // assumed; it is now measurable, because on_map_frame stamps a heartbeat. Pulses
+            // arrive far faster than frames on a big profile (Convergence: 30789 pulses against
+            // ~40 frames in the same second), so an unconditional self-grant let every pulse
+            // hand itself a batch and the per-frame cap stopped capping anything: the whole
+            // 8424-marker build landed inside one second, 293 ms of it in the factory, and the
+            // map ran that second at 14 fps instead of 55. Measured 2026-08-05, and it is the
+            // slowdown the player feels on open - not a stall (nothing is blocked long enough
+            // for [stallcap]), just a second of half-rate.
+            //
+            // With a live heartbeat the budget does its job again and the build spreads over the
+            // frames it was always meant to span. The starvation case the self-grant exists for
+            // is unchanged: if frames genuinely stop arriving - our own screen sitting over the
+            // map is enough - the heartbeat goes stale and the grant resumes.
+            const uint64_t hb = g_map_hb_ms.load(std::memory_order_relaxed);
+            const uint64_t hb_age = hb ? GetTickCount64() - hb : UINT64_MAX;
+            if (hb_age < 100)
+            {
+                // Frames are running; wait for the tick to refill the budget. Counted so that
+                // if a build ever starves in exactly this state (budget stuck at 0 with a live
+                // heartbeat), the queue-drop warning can name this gate.
+                g_v3_consume_hbwait.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             g_v3_consume_nobudget.fetch_add(1, std::memory_order_relaxed);
             g_v3_native.frame_budget = V3_FACTORY_BATCH;
         }
@@ -7869,8 +8094,11 @@ namespace
             const auto point = g_v3_native.pending[g_v3_native.pending_index++];
             --g_v3_native.frame_budget;
             float mx = 0.0f, mz = 0.0f;
-            if (!goblin::mapproject::to_map(point.area, point.gx, point.gz,
-                                            point.px, point.pz, mx, mz))
+            const int64_t t_proj0 = v3_perf_now();
+            const bool proj_ok = goblin::mapproject::to_map(point.area, point.gx, point.gz,
+                                                            point.px, point.pz, mx, mz);
+            g_v3_open.proj_qpc += v3_perf_now() - t_proj0;
+            if (!proj_ok)
             {
                 ++g_v3_native.failed;
                 ++g_v3_native.failed_project;
@@ -7916,8 +8144,10 @@ namespace
             s.map_x = mx;
             s.map_z = mz;
             g_v3_factory_active = 1;
+            const int64_t t_create0 = v3_perf_now();
             const uintptr_t node = goblin::gfx_probe::create_native_icon_instance(
                 point.source_icon_id, depth, live_ctx, frame);
+            g_v3_open.create_qpc += v3_perf_now() - t_create0;
             bool ok = false;
             // Which of the three post-request failures happened, for the counters at the end of
             // the iteration: the logs are capped, the counters are not.
@@ -7937,8 +8167,10 @@ namespace
                 s.node = node;
                 if (!s.held || !v3_heap_ptr(s.child))
                 {
+                    const int64_t t_mat0 = v3_perf_now();
                     const uint32_t mat_exc = v3_guarded_materialize(
                         live_ctx, static_cast<uintptr_t>(sprite));
+                    g_v3_open.mat_qpc += v3_perf_now() - t_mat0;
                     if (mat_exc)
                     {
                         static bool s_mat_exc_logged = false;
@@ -7979,6 +8211,7 @@ namespace
                         s.base_tx = s.base_tx * V3_BADGE_SCALE + V3_BADGE_OFF_X;
                         s.base_ty = s.base_ty * V3_BADGE_SCALE + V3_BADGE_OFF_Y;
                     }
+                    const int64_t t_att0 = v3_perf_now();
                     const uint32_t exc = v3_guarded_attach(g_v3_native.wrapper, s.child);
                     uint64_t child_parent = 0;
                     v3_read64(s.child + 0x38, child_parent);
@@ -8009,6 +8242,7 @@ namespace
                                           s.base_tx, s.base_ty, s.basis,
                                           g_v3_native.cur_fx * emph,
                                           g_v3_native.cur_fy * emph);
+                    g_v3_open.attach_qpc += v3_perf_now() - t_att0;
                     if (!positioned)
                     {
                         why = FailWhy::Attach;
@@ -8104,10 +8338,22 @@ namespace
     // movie is alive and rendering, so the freed render nodes recycle on normal frames
     // (async) - unlike the close-time lever C, whose nodes never get a reconcile pass.
     // A g_v3_vp_cursor "reserved for round-robin if needed" was declared here and never touched.
+    // Calls vs completed passes. The function has eight early returns, so a silent straggler log
+    // is ambiguous - it means either "nothing to report" or "we never got that far". These two
+    // counters tell those apart, and the tick reports a reconcile that stops completing while the
+    // map is open (which would freeze every detached marker in place, invisible).
+    uint64_t g_recon_calls = 0;
+    uint64_t g_recon_done = 0;
+
     void v3_viewport_reconcile()
     {
+        // The config-level gate does not count as a call: with kViewportWindow off
+        // (MFG_ATTACH_ALL_MARKERS=1) or the remove-at AOB unresolved, reconcile is not supposed
+        // to run at all, and counting those entries would make the stall reporter warn every
+        // 2 s about a pass that by construction never completes.
         if (!goblin::variants::kViewportWindow || !g_v3_remove_at)
             return;
+        ++g_recon_calls;
         if (!g_v3_native.seeded || g_v3_native.objects.empty() ||
             g_v3_map_closed.load(std::memory_order_relaxed))
             return;
@@ -8230,8 +8476,247 @@ namespace
                 v3_position_child(o.child, o.map_x, o.map_z, o.base_tx, o.base_ty,
                                   o.base_m, v3_obj_fx(o), v3_obj_fy(o));
                 o.attached = true;
+                o.ever_attached = true;
                 ++attached_now;
             }
+        }
+
+        // STRAGGLERS: markers the snapshot says are visible AND inside the window, yet not linked
+        // into the parent - i.e. exactly the reported symptom, "some icons draw, some do not, but
+        // the popup over the missing ones still works" (the popup reads the marker ROW, which is
+        // fine either way, so it proves nothing about the child). A straggler is normal for a
+        // frame or two while the budgets catch up; one that persists is the defect. Reported at
+        // most once a second, and only while non-zero, so a healthy map stays silent.
+        ++g_recon_done;
+        // DO WE STILL OWN WHAT WE THINK WE OWN? `attached` is written once, at the moment the
+        // engine accepted the child, and never re-checked. If the engine later evicts a child -
+        // and `InsertChildAtDepth` DOES evict whatever already sits at the depth being written -
+        // our record keeps saying "attached", the reconcile therefore skips it, and the marker is
+        // gone from the screen while its row still answers the hover popup. That is the reported
+        // symptom exactly, and it should hit Convergence hardest: its own container holds ~5620
+        // children against vanilla's ~1000, so there is far more to collide with. A rotating
+        // slice of 512 per audit keeps the cost flat; a full rotation takes obj_n/512 audits
+        // at 1 Hz (~17 s on Convergence's 8424), NOT one second - read the sampled counts
+        // accordingly. The cursor advances once per AUDIT, after all three sampled loops, so
+        // the eviction, matrix and render-node numbers in one report describe one slice.
+        // THE SAMPLING LOOPS BELOW ARE 1 Hz, NOT PER FRAME. They read engine memory and one of
+        // them calls the engine's own matrix getter; running them every pass while reporting
+        // once a second meant doing the work sixty times to print it once. Measured cost of that
+        // mistake on Convergence: our idle per-frame time went from ~7 ms/s to 27-64 ms/s with
+        // 18-23 ms single-frame spikes - a diagnostic that was itself the slowdown being
+        // diagnosed.
+        //
+        // The straggler scan further down is gated too, and the first attempt at this got that
+        // wrong: it was left per-pass on the reasoning that it "drives a decision", when in fact
+        // its only consumer is a warning. It is a third full walk of all 8424 objects every
+        // frame, and leaving it in put the idle cost UP - 53-88 ms/s against the 27-64 it was
+        // meant to cure, even though the per-frame spikes did fall. Its two-second persistence
+        // rule works just as well on one sample a second.
+        static uint64_t s_next_audit = 0;
+        const uint64_t audit_now = GetTickCount64();
+        const bool audit = audit_now >= s_next_audit;
+        if (audit)
+            s_next_audit = audit_now + 1000;
+
+        static size_t s_verify_cursor = 0;
+        size_t evicted = 0, checked = 0;
+        const size_t obj_n = g_v3_native.objects.size();
+        for (size_t n = 0; audit && obj_n && n < 512 && n < obj_n; ++n)
+        {
+            const V3NativeObject &o = g_v3_native.objects[(s_verify_cursor + n) % obj_n];
+            if (!o.attached || !v3_heap_ptr(o.child))
+                continue;
+            ++checked;
+            uint64_t cp = 0;
+            if (!v3_read64(o.child + 0x38, cp) || cp != parent)
+                ++evicted;
+        }
+
+        // ── THE RENDER CONTAINER, which is NOT the logical child list ────────────────────
+        // Everything we have checked so far - `attached`, the parent back-pointer, the straggler
+        // count - reads the LOGICAL list at parent+0xd8. Drawing walks a different structure: a
+        // child's render node lives at child+0x48 and knows its container at node+0x30. A child
+        // can sit correctly in the logical list, satisfy every check we have, and still never be
+        // drawn. Two independent audits landed here from opposite directions (2026-08-05): the
+        // render index is computed by scanning siblings BACKWARD, so it degrades with sibling
+        // count - Convergence has ~5620 engine children against vanilla's ~1000 - and the attach
+        // path writes child+0x2c = -1, which makes the engine give every one of our children the
+        // SAME render slot with only an incrementing sub-index to tell them apart.
+        //
+        // So: sample the child side (does a render node exist, does it know a container), and
+        // walk the parent's array for the shape of the slot assignment (the longest run of one
+        // repeated render slot, and the highest sub-index reached). Both bounded, once a second.
+        // ── READ THE TRANSFORM BACK ──────────────────────────────────────────────────────
+        // Everything structural has now been refuted by measurement: the child is in the logical
+        // list, under our parent, with a render node that knows its container. What has never
+        // been checked is the one thing that decides whether a correctly-parented child puts
+        // pixels on screen - the matrix actually sitting in it. We write it and trust the write.
+        //
+        // Read it back through the same vtable getter `v3_position_child` uses (slot +0x10) and
+        // classify: a collapsed 2x2 (m0/m5 ~ 0) draws nothing at any position, and a translation
+        // near the park coordinate means the child is still sitting where a hidden marker is put
+        // (V3_HIDDEN_MAP_POS * 20 twips) although our bookkeeping calls it visible. Both are
+        // silent today. Sampled with the same rotating cursor, so the cost stays flat.
+        size_t zero_scale = 0, parked_pos = 0, matrix_unreadable = 0;
+        {
+            using GetMatrixFn = const float *(void *);
+            for (size_t n = 0; audit && obj_n && n < 512 && n < obj_n; ++n)
+            {
+                const V3NativeObject &o = g_v3_native.objects[(s_verify_cursor + n) % obj_n];
+                if (!o.visible || !o.attached || !v3_heap_ptr(o.child))
+                    continue;
+                uint64_t vt = 0, get_addr = 0;
+                // Same dead-generation guard v3_position_child and v3_write_cxform carry: a child
+                // our own reference kept alive across a close, whose block the engine freed and
+                // reused, passes every heap check - and a get_addr harvested from such a block is
+                // not a function. The signature is already adopted by the time anything is
+                // attached, so a mismatch here is a dead generation, never a first child.
+                if (!v3_read64(o.child, vt) || vt == 0 ||
+                    (g_v3_native.child_vtable != 0 && vt != g_v3_native.child_vtable) ||
+                    !v3_read64(static_cast<uintptr_t>(vt) + 0x10, get_addr) ||
+                    !v3_heap_ptr(get_addr))
+                {
+                    ++matrix_unreadable;
+                    continue;
+                }
+                float m[8]{};
+                if (!v3_matrix_readback(reinterpret_cast<void *>(o.child), get_addr, m))
+                {
+                    ++matrix_unreadable;
+                    continue;
+                }
+                const float sx = m[0] < 0 ? -m[0] : m[0];
+                const float sy = m[5] < 0 ? -m[5] : m[5];
+                if (sx < 1e-4f && sy < 1e-4f)
+                    ++zero_scale;
+                // The park position is V3_HIDDEN_MAP_POS in map units, times the 20 twips the
+                // transform uses; anything within a screen of it is parked, not merely far away.
+                const float parked = V3_HIDDEN_MAP_POS * 20.0f;
+                if (m[3] < parked + 100000.0f && m[3] > parked - 100000.0f)
+                    ++parked_pos;
+            }
+        }
+
+        size_t no_render_node = 0, node_no_container = 0;
+        for (size_t n = 0; audit && obj_n && n < 512 && n < obj_n; ++n)
+        {
+            const V3NativeObject &o = g_v3_native.objects[(s_verify_cursor + n) % obj_n];
+            if (!o.attached || !v3_heap_ptr(o.child))
+                continue;
+            uint64_t rnode = 0;
+            if (!v3_read64(o.child + 0x48, rnode) || !v3_heap_ptr(rnode))
+            {
+                ++no_render_node;
+                continue;
+            }
+            uint64_t cont = 0;
+            if (!v3_read64(static_cast<uintptr_t>(rnode) + 0x30, cont) || !v3_heap_ptr(cont))
+                ++node_no_container;
+        }
+        // Rotate the slice once per audit, only now that every sampled loop has read it. The
+        // first version advanced here-and-earlier on EVERY reconcile pass (60 Hz against the
+        // loops' 1 Hz), so consecutive audits sampled pseudo-random slices instead of rotating,
+        // and the matrix/render loops ran one slice ahead of the eviction loop whose `checked`
+        // they were reported against.
+        if (audit && obj_n)
+            s_verify_cursor = (s_verify_cursor + 512) % obj_n;
+
+        size_t stragglers = 0, want = 0, lost = 0, unreachable = 0;
+        for (size_t i = 0; audit && i < g_v3_native.objects.size(); ++i)
+        {
+            const V3NativeObject &o = g_v3_native.objects[i];
+            if (in_window(o))
+            {
+                ++want;
+                if (!o.attached)
+                {
+                    ++stragglers;
+                    if (o.ever_attached)
+                        ++lost;          // we DID attach it; something took it back out
+                    if (!o.ref_held || !v3_heap_ptr(o.child))
+                        ++unreachable;   // phase 2 skips these, so they can never come back
+                }
+            }
+        }
+        // ONLY report a set that STAYS stuck. The first version logged the first non-zero count
+        // each second and so reported `4098 of 5122` over and over - which turned out to be
+        // 5122 - 1024, i.e. the FIRST pass after every seed, with the map being reopened every
+        // 2-3 seconds. That is the budget doing its job, not a defect, and the rate limit hid
+        // the passes that follow. A straggler set is normal for a few frames after a build; only
+        // one that survives two continuous seconds means the markers are never coming back.
+        static uint64_t s_straggler_since = 0;
+        static uint64_t s_next_view_log = 0;
+        const uint64_t now_view = GetTickCount64();
+
+        // Slot-assignment shape, once a second: one pass over the parent's array (stride 0x10,
+        // slot+8 = render slot, slot+0xc = sub-index). No pointer matching needed - if all our
+        // children really do land in one render slot, it shows up as a run of thousands of
+        // identical slot values with the sub-index climbing alongside.
+        {
+            // Same 1 Hz gate as the sampling above, so the numbers reported here and the work
+            // done to produce them always belong to the same pass.
+            if (audit)
+            {
+                uint64_t base = 0, cnt = 0;
+                if (v3_read64(parent + 0xd8, base) && v3_read64(parent + 0xe0, cnt) &&
+                    v3_heap_ptr(base) && cnt && cnt < 32768)
+                {
+                    uint32_t prev_slot = 0xFFFFFFFFu, run = 0, best_run = 0, max_sub = 0;
+                    const uint64_t walk = cnt < 16384 ? cnt : 16384;
+                    for (uint64_t i = 0; i < walk; ++i)
+                    {
+                        uint32_t slot = 0, sub = 0;
+                        const uintptr_t e = static_cast<uintptr_t>(base) + i * 0x10;
+                        if (!v3_read32(e + 8, slot) || !v3_read32(e + 0xc, sub))
+                            break;
+                        run = (slot == prev_slot) ? run + 1 : 1;
+                        prev_slot = slot;
+                        if (run > best_run)
+                            best_run = run;
+                        // Unassigned entries carry -1 as the sub-index; counting them pins the
+                        // metric at 4294967295 and hides every real value.
+                        if (sub != 0xFFFFFFFFu && sub > max_sub)
+                            max_sub = sub;
+                    }
+                    spdlog::info("[v3render] parent list {} entries; longest run of one render "
+                                 "slot = {}; highest sub-index = {}; of {} sampled children {} "
+                                 "have no render node, {} have one with no container; of the "
+                                 "VISIBLE sampled: {} collapsed to zero scale, {} still parked "
+                                 "offscreen, {} unreadable",
+                                 cnt, best_run, max_sub, checked, no_render_node,
+                                 node_no_container, zero_scale, parked_pos, matrix_unreadable);
+                }
+            }
+        }
+        // Report an eviction the moment it is seen: unlike a straggler set, this never resolves
+        // on its own - nothing re-checks these children, so they stay off screen until the map
+        // is rebuilt. Rate-limited only so a large sweep does not flood.
+        if (evicted)
+        {
+            static uint64_t s_next_evict_log = 0;
+            if (now_view >= s_next_evict_log)
+            {
+                s_next_evict_log = now_view + 2000;
+                spdlog::warn("[v3view] {} of {} sampled children we RECORD as attached are no "
+                             "longer under our parent - evicted after we linked them, and "
+                             "nothing re-checks them",
+                             evicted, checked);
+            }
+        }
+        // Only meaningful on an audit pass - off one, the counts above are all zero by design.
+        if (audit && !stragglers)
+            s_straggler_since = 0;
+        else if (audit && !s_straggler_since)
+            s_straggler_since = now_view;
+        if (audit && stragglers && s_straggler_since &&
+            now_view - s_straggler_since >= 2000 && now_view >= s_next_view_log)
+        {
+            s_next_view_log = now_view + 2000;
+            spdlog::warn("[v3view] {} of {} in-window markers have been unattached for {} ms "
+                         "({} were attached before and came back out, {} unreachable by phase 2);"
+                         " detached {} / attached {} this pass, budgets {}/{}",
+                         stragglers, want, now_view - s_straggler_since, lost, unreachable,
+                         det_objs.size(), attached_now, DETACH_BUDGET, ATTACH_BUDGET);
         }
     }
     // v3_try_matrix_batch had no callers anywhere in src/ - its only entry condition was set by the retired
@@ -9370,34 +9855,8 @@ namespace
     // the map thread was visibly slow (29 factory pulses in 13 s on a first open, 3-10 on
     // reopens) and nothing in the log could say where the time went. Map frames and pulses run
     // on the same thread (the [v3] thread map lines), so plain fields are enough.
-    struct V3Perf
-    {
-        uint64_t window_ms = 0;
-        uint32_t frames = 0;
-        int64_t total_qpc = 0;
-        int64_t max_qpc = 0;
-        uint32_t pulses = 0;
-        int64_t pulse_qpc = 0;
-        uint64_t copies0 = 0, queries0 = 0, refused0 = 0;
-    };
-    V3Perf g_v3_perf;
-
-    int64_t v3_perf_now()
-    {
-        LARGE_INTEGER li;
-        QueryPerformanceCounter(&li);
-        return li.QuadPart;
-    }
-
-    int64_t v3_perf_freq()
-    {
-        static const int64_t f = [] {
-            LARGE_INTEGER li;
-            QueryPerformanceFrequency(&li);
-            return li.QuadPart ? li.QuadPart : 1;
-        }();
-        return f;
-    }
+    // (V3Perf / g_v3_perf are declared with the timing primitives near the top: the tick feeds
+    //  them too, and it lives far above this point.)
 
     void v3_perf_snapshot_counters(V3Perf &p)
     {
@@ -9416,8 +9875,8 @@ namespace
     // CONTEXT; unwinding and module-name resolution happen AFTER ResumeThread, so a thread
     // parked inside the loader or the unwind tables can never deadlock us. For a
     // multi-second stall the deep frames are stable after resume; the top may churn.
-    std::atomic<uint64_t> g_map_hb_ms{0};
-    std::atomic<uint32_t> g_map_hb_tid{0};
+    // (g_map_hb_ms / g_map_hb_tid are declared with the timing primitives near the top - the
+    //  factory's budget gate reads the heartbeat too, and it lives far above this point.)
 
     // POD-only frame so __try is legal; returns captured frame count.
     int stall_capture_frames(HANDLE th, uintptr_t *out, int cap)
@@ -9485,6 +9944,8 @@ namespace
 
     void v3_perf_note_frame(int64_t dt_qpc)
     {
+        ++g_v3_open.frames;
+        g_v3_open.frame_qpc += dt_qpc;
         auto &p = g_v3_perf;
         ++p.frames;
         p.total_qpc += dt_qpc;
@@ -9502,10 +9963,14 @@ namespace
             return;
         const int64_t f = v3_perf_freq();
         const auto us = [f](int64_t q) { return q * 1000000 / f; };
-        spdlog::info("[v3perf] {} map frames / {} ms: ours {} us (avg {}, max {}); {} pulses "
-                     "{} us; safemem copies +{} lookups +{} refused +{}",
+        spdlog::info("[v3perf] {} map frames / {} ms: ours {} us (avg {}, max {}) = tick {} us + "
+                     "reconcile {} us (of the tick, {} merges cost {} us, emphasis {} us / {} "
+                     "writes, zoom reapply {} us / {} passes); {} pulses {} us; "
+                     "safemem copies +{} lookups +{} refused +{}",
                      p.frames, span, us(p.total_qpc),
-                     us(p.total_qpc / (p.frames ? p.frames : 1)), us(p.max_qpc), p.pulses,
+                     us(p.total_qpc / (p.frames ? p.frames : 1)), us(p.max_qpc),
+                     us(p.tick_qpc), us(p.recon_qpc), p.merges, us(p.merge_qpc), us(p.emph_qpc),
+                     p.emph_writes, us(p.zoom_qpc), p.zoom_passes, p.pulses,
                      us(p.pulse_qpc),
                      goblin::safemem::g_copies.load(std::memory_order_relaxed) - p.copies0,
                      goblin::safemem::g_queries.load(std::memory_order_relaxed) - p.queries0,
@@ -9516,6 +9981,37 @@ namespace
     }
 }
 
+namespace
+{
+    // A reconcile that stops completing while the map is up leaves every detached marker frozen
+    // out of the display list - invisible, though its row still answers the hover popup. That is
+    // silent by construction (the straggler line lives past the early returns), so the gap
+    // between calls and completed passes is reported here instead.
+    void v3_report_reconcile_stall()
+    {
+        static uint64_t s_next_ms = 0;
+        static uint64_t s_last_done = 0;
+        const uint64_t now = GetTickCount64();
+        // First call is the baseline: no window has elapsed yet, so "in 2 s" would be a lie
+        // (it fired on the very first map frame with `1 calls, 0 completed`).
+        if (s_next_ms == 0)
+        {
+            s_next_ms = now + 2000;
+            s_last_done = g_recon_done;
+            return;
+        }
+        if (now < s_next_ms)
+            return;
+        s_next_ms = now + 2000;
+        if (g_recon_done == s_last_done && g_recon_calls > g_recon_done)
+            spdlog::warn("[v3view] viewport reconcile has not completed a pass in 2 s while the "
+                         "map is open ({} calls, {} completed) - detached markers cannot come "
+                         "back until it does",
+                         g_recon_calls, g_recon_done);
+        s_last_done = g_recon_done;
+    }
+}
+
 void goblin::stall_probe::on_map_frame()
 {
     g_map_hb_ms.store(GetTickCount64(), std::memory_order_relaxed);
@@ -9523,10 +10019,18 @@ void goblin::stall_probe::on_map_frame()
     const int64_t perf_t0 = v3_perf_now();
 
     // Drive the category-by-category lightweight native-marker rollout.
+    const int64_t t_tick0 = v3_perf_now();
     v3_native_tick();
+    const int64_t t_tick1 = v3_perf_now();
+    g_v3_open.tick_qpc += t_tick1 - t_tick0;
+    g_v3_perf.tick_qpc += t_tick1 - t_tick0;
 
     // Lever B: reconcile which markers are attached to the visible map window.
     v3_viewport_reconcile();
+    const int64_t recon_dt = v3_perf_now() - t_tick1;
+    g_v3_open.recon_qpc += recon_dt;
+    g_v3_perf.recon_qpc += recon_dt;
+    v3_report_reconcile_stall();
 
     v3_perf_note_frame(v3_perf_now() - perf_t0);
 
@@ -9596,8 +10100,11 @@ void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
         }
         const int64_t perf_t0 = v3_perf_now();
         v3_native_factory_consume(ctx, static_cast<uint32_t>(frame));
+        const int64_t perf_dt = v3_perf_now() - perf_t0;
         ++g_v3_perf.pulses;
-        g_v3_perf.pulse_qpc += v3_perf_now() - perf_t0;
+        g_v3_perf.pulse_qpc += perf_dt;
+        ++g_v3_open.pulses;
+        g_v3_open.pulse_qpc += perf_dt;
     }
     catch (const std::exception &e)
     {
@@ -9765,6 +10272,27 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     // while a slow reopen gets a new parent, resets, reseeds, and looks fine. Dropping the anchor
     // as well means the next attach burst re-anchors through arm A at the seed floor, which is the
     // same path a first open takes.
+    // AN UNFINISHED BUILD MUST NOT HAND ITS ANCHOR TO THE NEXT OPEN. Keeping it is right for a
+    // generation that completed (see below): the next open reuses the container and the deferred
+    // seed re-validates it. But if this generation never reached CATEGORIES READY, keeping the
+    // anchor lets the next open adopt the same container and skip the fresh-anchor path - and
+    // since a reopen that reuses the movie emits no burst, there is nothing left to build the
+    // missing markers with. Measured 2026-08-05 on Convergence: a generation stopped at 1968 of
+    // 8425 and the map then sat open for minutes with no seed and no CATEGORIES READY at all,
+    // showing the fragment. The fragment is not random - the seed sorts the player's OWN map's
+    // markers LAST, so a short build is missing exactly the ones the player is standing among.
+    // Clearing the target here forces the next attach burst through arm A, the same path a first
+    // open takes, which is the one path guaranteed to have a whole pulse pool ahead of it.
+    if (!g_v3_native.completion_reported && !g_v3_native.objects.empty())
+    {
+        spdlog::warn("[v3native] generation ended UNFINISHED ({} of {} built); clearing the "
+                     "anchor so the next open rebuilds from scratch instead of adopting it",
+                     g_v3_native.objects.size(), g_v3_native.pending.size());
+        g_v3_target_parent.store(0, std::memory_order_relaxed);
+        g_v3_target_wrapper.store(0, std::memory_order_release);
+        g_v3_target_layer.store(-1, std::memory_order_relaxed);
+        g_v3_target_count.store(0, std::memory_order_relaxed);
+    }
     g_v3_native.seeded = false;
     g_v3_native.completion_reported = false;
     // KEEP THE ANCHOR. Only the generation is gone; the container it lived in usually is not.

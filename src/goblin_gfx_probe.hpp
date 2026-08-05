@@ -79,6 +79,13 @@ namespace goblin::gfx_probe
     // logged `refused 7803 no_screen`. The pulses were never scarce; we were discarding them.
     void rm2_stats(uint64_t &total, uint64_t &sprite171, uint64_t &no_screen, uint64_t &no_icons);
 
+    // How hard the node search in create_native_icon_instance had to work since the last reset:
+    // `calls` searches examining `iters` nodes in total, the worst single walk `max_walk`, and the
+    // longest display list encountered `max_list`. The `create` stage is the only part of a
+    // factory pulse whose cost grows across map opens, and this search is the only thing in it
+    // that can scale with the scene - these four numbers say whether it does.
+    void scan_stats(uint64_t &calls, uint64_t &iters, uint64_t &max_walk, uint64_t &max_list);
+
     // Have our icon frames been appended to the worldmap icon sprite for the current map load?
     // Nothing native can materialize before that, so it is the first gate to check when markers
     // do not appear.

@@ -321,6 +321,15 @@ namespace
     uint64_t g_sprite171_rm2_tags[SPRITE171_RM2_CAP]{};
     std::atomic<uint32_t> g_sprite171_rm2_count{0};
 
+    // How far the node search below has to walk. `create` is the only stage of a factory pulse
+    // whose cost grows across map opens (Convergence 2026-08-05: 18 ms -> 266 ms per open while
+    // materialize and attach stayed flat at 27 and 15), and the search is the only thing in it
+    // that can scale - so measure the walk instead of assuming it.
+    std::atomic<uint64_t> g_scan_iters{0};   // total nodes examined
+    std::atomic<uint64_t> g_scan_calls{0};   // searches performed
+    std::atomic<uint64_t> g_scan_max{0};     // longest single walk
+    std::atomic<uint64_t> g_scan_listmax{0}; // longest display list seen
+
     // RM2::Execute traffic for the current map open; reset at close (see rm2_stats).
     std::atomic<uint64_t> g_rm2_total{0};
     std::atomic<uint64_t> g_rm2_s171{0};
@@ -848,6 +857,28 @@ namespace
         return false;
     }
 
+    // SEH, NOT the validated copy, and deliberately so. This reads a STRING OF UNKNOWN LENGTH:
+    // the loop below asks for a block and shrinks when the block does not fit, which is exactly
+    // the shape validate-then-read cannot serve - `readable()` is all-or-nothing over the whole
+    // range, so a perfectly good short name near the end of a region is refused at every size.
+    // Converting this to the validated path (2026-08-05) retired 16 movie defs in one session
+    // after four failed probes each, and once the worldmap's def was retired its name could never
+    // be confirmed, so sprite-171 injection never ran: no icons at all, whole session. The
+    // storm this probe once caused is already bounded by that same retirement rule, which is
+    // what report 22 was fixed with - SEH plus retirement is the combination that works here.
+    bool seh_copy_bytes(void *dst, const void *src, size_t n)
+    {
+        __try
+        {
+            memcpy(dst, src, n);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     bool read_chars_at(uint64_t p, char *out, size_t cap)
     {
         if (!looks_heap(p))
@@ -856,7 +887,7 @@ namespace
         // of a page, where a full-length read would fault on the next one.
         size_t got = 0;
         for (size_t want = cap - 1; want >= 16; want /= 2)
-            if (safe_copy(out, (const void *)p, want))
+            if (seh_copy_bytes(out, (const void *)p, want))
             {
                 got = want;
                 break;
@@ -2188,8 +2219,11 @@ uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint1
         // moves 4096 -> 8192 with it: a legitimate list can pass 4096 late in a full
         // 7137-marker build, and the bound only exists to reject a garbage count.
         if (looks_heap(list) && count > 0 && count < 8192)
+        {
+            uint64_t walked = 0;
             for (uint64_t i = count; i-- > 0;)
             {
+                ++walked;
                 const uint64_t node = rq(list + i * 8);
                 if (looks_heap(node) && rd32(node + 0x14) == depth)
                 {
@@ -2197,6 +2231,19 @@ uintptr_t goblin::gfx_probe::create_native_icon_instance(int sourceIconId, uint1
                     break;
                 }
             }
+            g_scan_calls.fetch_add(1, std::memory_order_relaxed);
+            g_scan_iters.fetch_add(walked, std::memory_order_relaxed);
+            uint64_t prev = g_scan_max.load(std::memory_order_relaxed);
+            while (walked > prev &&
+                   !g_scan_max.compare_exchange_weak(prev, walked, std::memory_order_relaxed))
+            {
+            }
+            prev = g_scan_listmax.load(std::memory_order_relaxed);
+            while (count > prev &&
+                   !g_scan_listmax.compare_exchange_weak(prev, count, std::memory_order_relaxed))
+            {
+            }
+        }
     }
 
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -2266,8 +2313,22 @@ void goblin::gfx_probe::rm2_stats(uint64_t &total, uint64_t &sprite171, uint64_t
     no_icons = g_rm2_no_icons.load(std::memory_order_relaxed);
 }
 
+void goblin::gfx_probe::scan_stats(uint64_t &calls, uint64_t &iters, uint64_t &max_walk,
+                                   uint64_t &max_list)
+{
+    calls = g_scan_calls.load(std::memory_order_relaxed);
+    iters = g_scan_iters.load(std::memory_order_relaxed);
+    max_walk = g_scan_max.load(std::memory_order_relaxed);
+    max_list = g_scan_listmax.load(std::memory_order_relaxed);
+}
+
 void goblin::gfx_probe::v3_on_map_close()
 {
+    g_scan_calls.store(0, std::memory_order_relaxed);
+    g_scan_iters.store(0, std::memory_order_relaxed);
+    g_scan_max.store(0, std::memory_order_relaxed);
+    g_scan_listmax.store(0, std::memory_order_relaxed);
+
     // REPORT HERE, not only at CATEGORIES READY and the queue-drop warning. Those two fire only
     // when a build finishes or starves for five seconds, so the very opens worth measuring - the
     // ones the player closes after two or three seconds, which is exactly when a short burst was

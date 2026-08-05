@@ -639,6 +639,12 @@ namespace
         //  V3_ZOOM_EXP). last_dump_zoom and sample_logged below ARE live.)
         float last_dump_zoom = 0.0f; // last zoom the diagnostic probe logged at
         bool sample_logged = false;
+        // The native node the widget sampler last read, revalidated against the parent's
+        // display list each tick before use. Rediscovery (the slot scan with its per-node
+        // membership test) runs only when this is 0 or the node left the list: report 27
+        // measured the every-tick rediscovery at 480-540 us per map frame on that display
+        // list - each foreign candidate pays a FULL pass over all ~8.6k objects.
+        uint64_t sample_node = 0;
         // Location emphasis: the map the player stands in, resampled while the map is
         // open (fast travel and the map screen never coexist, but a reopen after a
         // move must not carry the old answer). 0 = unknown -> every marker plain.
@@ -2199,6 +2205,37 @@ namespace
             !v3_heap_ptr(base) || count == 0 || count > 65536)
             return false;
         const uint64_t scan = count < 24 ? count : 24;
+        // The node sampled last time, if it still sits in the scanned slots. Membership in
+        // the CURRENT list is the liveness test - a node that left it (teardown, layer
+        // retarget) must not be dereferenced, and a node still in it is the same real
+        // widget as last tick. This keeps the steady state at a few dozen qword reads;
+        // the discovery below, with its full-population membership test per candidate,
+        // runs only on the first tick and after the sampled node dies.
+        if (const uint64_t cached = g_v3_native.sample_node)
+        {
+            bool present = false;
+            for (uint64_t i = 0; i < scan && !present; ++i)
+            {
+                uint64_t node = 0;
+                present = v3_read64(base + i * 8, node) && node == cached;
+            }
+            if (present)
+            {
+                float m[8]{};
+                if (v3_read_matrix(static_cast<uintptr_t>(cached), m))
+                {
+                    const float sx = m[0] < 0.0f ? -m[0] : m[0];
+                    const float sy = m[5] < 0.0f ? -m[5] : m[5];
+                    if (sx > 0.0001f && sx < 1000.0f && sy > 0.0001f && sy < 1000.0f)
+                    {
+                        fx = sx;
+                        fy = sy;
+                        return true;
+                    }
+                }
+            }
+            g_v3_native.sample_node = 0; // left the list or unreadable: rediscover
+        }
         for (uint64_t i = 0; i < scan; ++i)
         {
             uint64_t node = 0;
@@ -2212,6 +2249,7 @@ namespace
             const float sy = m[5] < 0.0f ? -m[5] : m[5];
             if (sx > 0.0001f && sx < 1000.0f && sy > 0.0001f && sy < 1000.0f)
             {
+                g_v3_native.sample_node = node;
                 fx = sx;
                 fy = sy;
                 return true;
@@ -3316,8 +3354,16 @@ namespace
                 const int64_t t_z0 = v3_perf_now();
                 g_v3_native.cur_fx = fx;
                 g_v3_native.cur_fy = fy;
+                // Visible children only. A hidden child is parked offscreen, so its stale
+                // scale shows nowhere, and v3_native_set_visible writes the transform with
+                // the CURRENT v3_obj_fx/fy on show - it catches up the moment it matters.
+                // Writing all of them made every pass pay for the whole population
+                // (report 27: ~2.1 ms x 23-24 passes/s during a smooth zoom, mostly
+                // hidden/off-tab children), and each write is an engine change record,
+                // not a bare store.
                 for (auto &obj : g_v3_native.objects)
-                    v3_native_reapply(obj);
+                    if (obj.visible)
+                        v3_native_reapply(obj);
                 g_v3_perf.zoom_qpc += v3_perf_now() - t_z0;
                 ++g_v3_perf.zoom_passes;
             }

@@ -857,42 +857,26 @@ namespace
         return false;
     }
 
-    // SEH, NOT the validated copy, and deliberately so. This reads a STRING OF UNKNOWN LENGTH:
-    // the loop below asks for a block and shrinks when the block does not fit, which is exactly
-    // the shape validate-then-read cannot serve - `readable()` is all-or-nothing over the whole
-    // range, so a perfectly good short name near the end of a region is refused at every size.
-    // Converting this to the validated path (2026-08-05) retired 16 movie defs in one session
-    // after four failed probes each, and once the worldmap's def was retired its name could never
-    // be confirmed, so sprite-171 injection never ran: no icons at all, whole session. The
-    // storm this probe once caused is already bounded by that same retirement rule, which is
-    // what report 22 was fixed with - SEH plus retirement is the combination that works here.
-    bool seh_copy_bytes(void *dst, const void *src, size_t n)
-    {
-        __try
-        {
-            memcpy(dst, src, n);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
-    }
-
+    // Validated and CLAMPED, not shrink-on-fault. This reads a STRING OF UNKNOWN LENGTH, and two
+    // earlier shapes both failed at it:
+    //   * all-or-nothing `readable()` over the requested size (tried 2026-08-05) refused every
+    //     valid short name near the end of a region, retired the worldmap's own def, and cost a
+    //     whole session's icons;
+    //   * SEH shrink-on-fault answered that, but every garbage candidate then RAISED first-chance
+    //     exceptions - a process-wide event. Reports 22/27/28: tens of thousands per session, each
+    //     symbolized by ERSS-FG's vectored filter through single-threaded dbghelp, ending in heap
+    //     corruption. The per-def retirement bounded the total and the storm still ran for minutes.
+    // `readable_extent` serves exactly this shape: ask the OS what exists from p, copy that much
+    // and no more. A short name at a region's edge reads fine, an unmapped candidate is refused
+    // without an exception being raised.
     bool read_chars_at(uint64_t p, char *out, size_t cap)
     {
         if (!looks_heap(p))
             return false;
-        // Shrink on failure rather than giving up: a perfectly valid short string can sit near the end
-        // of a page, where a full-length read would fault on the next one.
-        size_t got = 0;
-        for (size_t want = cap - 1; want >= 16; want /= 2)
-            if (seh_copy_bytes(out, (const void *)p, want))
-            {
-                got = want;
-                break;
-            }
-        if (!got)
+        size_t got = goblin::safemem::readable_extent(reinterpret_cast<const void *>(p), cap - 1);
+        if (got < 16) // shorter than any name this probe accepts (the old floor, kept)
+            return false;
+        if (!goblin::safemem::copy(out, reinterpret_cast<const void *>(p), got))
             return false;
         out[got] = 0;
         size_t i = 0;

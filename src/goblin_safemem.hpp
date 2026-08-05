@@ -190,6 +190,34 @@ namespace goblin::safemem
     inline bool readable(const void *p, size_t n) { return range_ok(p, n, false); }
     inline bool writable(const void *p, size_t n) { return range_ok(p, n, true); }
 
+    // How many of the first max_n bytes at p are readable. 0 = none. This is the primitive for
+    // reads of UNKNOWN length (a string that may end anywhere): `readable()` is all-or-nothing
+    // over the whole requested range, so a perfectly good short string near the end of a region
+    // is refused at every requested size - the caller here CLAMPS the copy to what exists
+    // instead. Same region walk and cache as range_ok, same hop bound.
+    inline size_t readable_extent(const void *p, size_t max_n)
+    {
+        if (!p || max_n == 0)
+            return 0;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+        const uintptr_t b = a + max_n;
+        if (b < a)
+            return 0;
+        const uint64_t now = GetTickCount64();
+        uintptr_t at = a;
+        for (int hop = 0; hop < 4 && at < b; ++hop)
+        {
+            const Region *cached = cache_find(at, now);
+            const Region r = cached ? *cached : query_region(at, now);
+            if (!r.end || !r.read_ok)
+                break;
+            at = r.end;
+        }
+        if (at <= a)
+            return 0;
+        return static_cast<size_t>((at < b ? at : b) - a);
+    }
+
     // One line per minute at most, into the NORMAL log - not behind debug_logging. Both storms so
     // far were invisible to us and visible to a third party; a counter nobody can see is not
     // instrumentation. Called from copy() itself (an atomic load and a tick compare on the hot

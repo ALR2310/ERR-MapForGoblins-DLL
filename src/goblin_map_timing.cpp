@@ -137,10 +137,15 @@ void goblin::map_timing::setup()
         // removes the ~75ms close freeze) and gfx_probe::v3_on_map_close() (re-arms
         // creation for the next dialog). Only the capture() call is diagnostics. Do not
         // remove this hook while trimming logs.
+        // The tail used to end on the raw displacement of that `lea rax,[rip+..]`
+        // (B7 A3 16 02). A displacement is a different number on every build, so this hook -
+        // and with it every duty above - was found ONLY on the exe the mod was built from.
+        // Wildcarded and grown by four bytes instead: measured a single match on 2.6.2,
+        // 2.6.1, 2.6.0, 2.2.3 and 2.2.0 (scratch/compat_matrix.py).
         modutils::hook<DtorFn>(
             {.aob = "48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 30 "
                     "48 C7 45 F0 FE FF FF FF 48 89 9C 24 88 00 00 00 48 8B F1 48 8D 05 "
-                    "B7 A3 16 02"},
+                    "?? ?? ?? ?? 48 89 01 48"},
             wmd_dtor_detour, o_wmd_dtor);
         spdlog::info("[fastmap] fast map open ready");
     }

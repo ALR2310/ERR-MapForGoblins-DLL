@@ -397,9 +397,11 @@ SIGNATURES = [
     },
     {
         "name": "map_wmd_dtor_hook",
+        # Was ending on the raw rip-relative displacement B7 A3 16 02, which made it a
+        # 2.6.2-only pattern. Wildcarded + 4 bytes longer: single match on all five builds.
         "pattern": "48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 30 "
                    "48 C7 45 F0 FE FF FF FF 48 89 9C 24 88 00 00 00 48 8B F1 48 8D 05 "
-                   "B7 A3 16 02",
+                   "?? ?? ?? ?? 48 89 01 48",
         "slot": None,
         "critical": False,
         "refs": ["goblin_map_timing.cpp:177"],
@@ -550,7 +552,9 @@ SIGNATURES = [
     },
     {
         "name": "stallprobe_job_poll",
-        "pattern": "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 FB A6 08 01 85 C0 0F",
+        # Baked rel32 -> wildcard. Two byte-identical copies exist on every build; first-match
+        # picks the same code either way, so the AMBIGUOUS warning here is expected.
+        "pattern": "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 ?? ?? ?? ?? 85 C0 0F",
         "slot": None,
         "critical": False,
         "refs": ["goblin_stall_probe.cpp"],
@@ -625,14 +629,18 @@ SIGNATURES = [
     },
     {
         "name": "game_heap_alloc",
-        "pattern": "49 8B 00 4D 8B C8 4C 8B C2 48 8B D1 49 8B C9 48 FF 60 50 90 F3 41 0F 58 C7 "
-                   "FF C7 48 83 C3 08 F3 48 85 C9 74 41",
+        # The old pattern ran 18 bytes past the thunk's tail jump, into whatever the linker
+        # put next - so it existed only on 2.6.2. Cut to the thunk itself (6 instructions,
+        # ending on its `jmp qword ptr [rax+0x50]`). Two byte-identical copies then match on
+        # every build and the first is the documented one on all five.
+        "pattern": "49 8B 00 4D 8B C8 4C 8B C2 48 8B D1 49 8B C9 48 FF 60 50",
         "slot": None,
         "critical": False,
-        "refs": ["goblin_stall_probe.cpp"],
+        "refs": [],
         "note": "Game heap allocator thunk FUN_141eb9ed0(rcx=size, rdx=align, r8=allocObj) -> "
-                "allocObj->vtable[0x50](allocObj, size, align). Used to allocate an "
-                "OptionSettingTopDialog (0x18a0) for the Route A settings-over-map experiment. Dev proto.",
+                "allocObj->vtable[0x50](allocObj, size, align). Was used to allocate an "
+                "OptionSettingTopDialog (0x18a0) for the Route A settings-over-map experiment; "
+                "no source calls it today, the entry is kept as the documented address.",
     },
     {
         "name": "alloc_singleton_global",

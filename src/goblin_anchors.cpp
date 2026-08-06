@@ -103,8 +103,13 @@ namespace
                          "the menu-movie transform stays off this session");
         if (st.at_baked == kCount)
         {
-            spdlog::info("[anchors] all {} helpers verified where this build expects them",
-                         kCount);
+            // Note what carried the verdict, not just the verdict. "All present" used to be
+            // printed on the strength of a byte compare at each baked address, which a
+            // pattern shared by thousands of functions can pass by accident; {} identified
+            // says how many were pinned by a pattern that occurs exactly once.
+            spdlog::info("[anchors] all {} helpers verified where this build expects them "
+                         "({} identified by their own bytes)",
+                         kCount, st.pins);
             return;
         }
         // A different exe build than this DLL was made from. Name what could not be placed:
@@ -119,6 +124,8 @@ namespace
                      st.at_baked, st.rebased, st.min_shift, st.max_shift, st.dead,
                      st.order_dropped,
                      st.dead ? " - the features that need them stay off" : "");
+        spdlog::info("[anchors] {} identified by their own bytes, {} placed relative to "
+                     "those", st.pins, st.followers);
     }
 
     void ensure()
@@ -129,6 +136,11 @@ namespace
 
 namespace goblin::anchors
 {
+    void warm()
+    {
+        ensure();
+    }
+
     uintptr_t at(uint32_t baked_rva)
     {
         ensure();

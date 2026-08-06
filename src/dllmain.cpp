@@ -11,6 +11,7 @@
 #include "from/params.hpp"
 #include "modutils.hpp"
 
+#include "goblin_anchors.hpp"
 #include "goblin_collected.hpp"
 #include "goblin_config.hpp"
 #include "goblin_crashdiag.hpp" // the mod's own state, printed into every crash record
@@ -121,6 +122,7 @@ static void init_gfx_probe()        { goblin::gfx_probe::setup(); }
 static void init_maphover()         { goblin::maphover::setup(); }
 static void init_stall_probe()      { goblin::stall_probe::setup(); }
 static void init_worldmap_probe()   { goblin::worldmap_probe::setup(); }
+static void init_anchors()          { goblin::anchors::warm(); }
 
 static void safe_init_step(InitFn fn, const char *name)
 {
@@ -563,43 +565,75 @@ static void crash_write_dump(PEXCEPTION_POINTERS ep)
     wchar_t file[MAX_PATH];
     wsprintfW(file, L"%s\\MapForGoblins_%04d%02d%02d_%02d%02d%02d.dmp", dir, st.wYear, st.wMonth,
               st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // Resolved dynamically: dbghelp is not otherwise linked, and adding an import for it would
+    // change the import table this DLL's antivirus profile is sensitive to.
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    if (!dbg)
+        return;
+    using WriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+    auto write = reinterpret_cast<WriteDumpFn>(
+        reinterpret_cast<void *>(GetProcAddress(dbg, "MiniDumpWriteDump")));
+    if (!write)
+        return;
+    // MiniDumpWriteDump can FAULT rather than fail: on Wine its own worker thread AVs inside
+    // dbghelp, and that fault comes back round to the unhandled-exception filter, which asks
+    // for another dump. Report 32 caught the loop - 89 dbghelp records across nine sessions,
+    // one per second, burying the single real crash in each. The latch is raised BEFORE the
+    // call and lowered after, so an attempt that never returns leaves it raised and no second
+    // attempt is ever made in this process.
+    static volatile LONG s_dump_entered = 0;
+    if (InterlockedCompareExchange(&s_dump_entered, 1, 0) != 0)
+        return;
+    // The file is created only once there is something able to fill it - an empty .dmp next
+    // to the game is a worse answer than no .dmp at all.
     HANDLE h = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                            nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return;
-    // Resolved dynamically: dbghelp is not otherwise linked, and adding an import for it would
-    // change the import table this DLL's antivirus profile is sensitive to.
-    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
-    if (dbg)
+    struct
     {
-        using WriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
-        auto write = reinterpret_cast<WriteDumpFn>(
-            reinterpret_cast<void *>(GetProcAddress(dbg, "MiniDumpWriteDump")));
-        if (write)
-        {
-            struct
-            {
-                DWORD ThreadId;
-                PEXCEPTION_POINTERS ExceptionPointers;
-                BOOL ClientPointers;
-            } info{GetCurrentThreadId(), ep, FALSE};
-            constexpr int kNormal = 0x0000;
-            constexpr int kWithDataSegs = 0x0001;
-            constexpr int kWithIndirectlyReferencedMemory = 0x0040;
-            constexpr int kWithThreadInfo = 0x1000;
-            write(GetCurrentProcess(), GetCurrentProcessId(), h,
-                  kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory | kWithThreadInfo,
-                  &info, nullptr, nullptr);
-        }
-    }
+        DWORD ThreadId;
+        PEXCEPTION_POINTERS ExceptionPointers;
+        BOOL ClientPointers;
+    } info{GetCurrentThreadId(), ep, FALSE};
+    constexpr int kNormal = 0x0000;
+    constexpr int kWithDataSegs = 0x0001;
+    constexpr int kWithIndirectlyReferencedMemory = 0x0040;
+    constexpr int kWithThreadInfo = 0x1000;
+    write(GetCurrentProcess(), GetCurrentProcessId(), h,
+          kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory | kWithThreadInfo,
+          &info, nullptr, nullptr);
     CloseHandle(h);
+    InterlockedExchange(&s_dump_entered, 0);
 }
 
 static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
 {
-    crash_write_record("CRASH", ep->ExceptionRecord->ExceptionCode,
-                       reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress),
-                       ep->ExceptionRecord, ep->ContextRecord);
+    // Same budget the first-chance handler keeps, on its own counters: three records per
+    // distinct (code, address). Without it a filter that gets re-entered - by a fault our own
+    // dump attempt raised, or by a host that resumes execution after an unhandled one - writes
+    // the same line until the file is unreadable. Report 32: twelve to fifteen identical
+    // dbghelp records per session, the genuine crash sitting first and unremarked.
+    static volatile LONG64 s_keys[16] = {};
+    static volatile LONG s_hits[16] = {};
+    const auto code = ep->ExceptionRecord->ExceptionCode;
+    const auto fault = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    const LONG64 key =
+        static_cast<LONG64>((static_cast<uint64_t>(code) << 48) ^ (fault & 0xFFFFFFFFFFFFull));
+    int slot = -1;
+    for (int i = 0; i < 16; ++i)
+    {
+        const LONG64 seen = InterlockedCompareExchange64(&s_keys[i], key, 0);
+        if (seen == 0 || seen == key)
+        {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 || InterlockedIncrement(&s_hits[slot]) > 3)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    crash_write_record("CRASH", code, fault, ep->ExceptionRecord, ep->ContextRecord);
     crash_write_dump(ep);
     // Hand it on: whatever wrote the process dumps before still does.
     return EXCEPTION_CONTINUE_SEARCH;
@@ -715,6 +749,12 @@ static void setup_mod()
     catch (...) { /* a missing snapshot only costs the loop-break's best branch */ }
 
     safe_init_step(&init_modutils,    "modutils::initialize");
+
+    // Place the RVA anchors before anything can need one. The pass reads all of .text once
+    // (~50ms) and every consumer of an anchor is a render or hook path, so it is done here
+    // rather than lazily on whichever frame asks first. It also puts the "which exe build is
+    // this" verdict near the top of the log, where a player report can be read from it.
+    safe_init_step(&init_anchors,     "anchors::warm");
 
     // Arm + ENABLE the icon-injection hooks FIRST - before the params wait and before any other work. They
     // are passive (they fire when the worldmap movie loads its DefineSprite-171) and depend only on the

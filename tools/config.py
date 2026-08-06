@@ -87,6 +87,7 @@ REBORN_MOD_DIR = None       # Elden Ring Reborn overhaul's ME2 'mod' overlay dir
 GRACEBORNE_MOD_DIR = None   # Graceborne overhaul's ME3 'mod' overlay dir
 SMITHBOX_DIR = None
 DARKSCRIPT_RESOURCES = None  # path to <DarkScript3>/Resources/ (optional)
+EXE_DIR = None              # folder of alternate eldenring.exe builds (anchor rebase proof)
 
 _config_path = TOOLS_DIR / "config.ini"
 
@@ -141,6 +142,10 @@ if _config_path.exists():
     _ds = _cfg.get("paths", "darkscript_resources", fallback="").strip()
     if _ds:
         DARKSCRIPT_RESOURCES = Path(_ds)
+
+    _exes = _cfg.get("paths", "exe_dir", fallback="").strip()
+    if _exes:
+        EXE_DIR = Path(_exes)
 
 if GAME_DIR:
     OO2CORE_DLL = GAME_DIR / "oo2core_6_win64.dll"

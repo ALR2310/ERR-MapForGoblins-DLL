@@ -14,7 +14,14 @@ Exit codes:
      or the exe/config could not be read.
 
 Usage:
-  py tools/check_aobs.py [--json <path>] [--exe <path>]
+  py tools/check_aobs.py [--json <path>] [--exe <path>] [--all-exes]
+
+--all-exes additionally scans every OTHER eldenring.exe build in the registry
+(tools/known_exes.py, `exe_dir` in config.ini) and prints one row per signature that is
+not a single match everywhere. That is the compatibility question a downpatched player
+raises, and it is deliberately not part of the default build: it needs those exes on
+disk, and it takes about a minute. Run it before a release, together with
+scratch/run_anchor_test.py + scratch/anchor_truth.py for the RVA-anchor half.
 """
 import sys, io, struct, re, argparse
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -99,10 +106,42 @@ def emit_anchor_table_header():
         print(f"anchor table header refreshed -> {out}")
 
 
+def cross_build_matrix():
+    """Every signature against every exe build we hold. Returns the count of CRITICAL cells
+    that are not a single match - the only thing that can block a release here, since the
+    known ambiguous ones (identical twins) are documented at their entries."""
+    from known_exes import known_exes, text_section
+    exes = known_exes()
+    others = [e for e in exes if not e.is_target]
+    if not others:
+        print("\n(no other exe builds configured - set exe_dir in tools/config.ini)")
+        return 0
+    texts = {e.version: text_section(e.path)[0] for e in exes}
+    print(f"\nCross-build check: {len(SIGNATURES)} signatures x {len(exes)} builds")
+    print(f"  {'signature':<34}{'crit':>5}" + "".join(f"{e.version:>8}" for e in exes))
+    crit = 0
+    for sig in SIGNATURES:
+        rx = to_regex(sig["pattern"])
+        row = []
+        for e in exes:
+            n = len(rx.findall(texts[e.version]))
+            row.append("OK" if n == 1 else ("MISS" if n == 0 else f"x{n}"))
+        if all(v == "OK" for v in row):
+            continue
+        print(f"  {sig['name']:<34}{'yes' if sig['critical'] else '':>5}"
+              + "".join(f"{v:>8}" for v in row))
+        if sig["critical"]:
+            crit += sum(1 for v in row if v != "OK")
+    print(f"  ---- {crit} CRITICAL cells are not a single match")
+    return crit
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", help="write resolved RVAs to this JSON path")
     ap.add_argument("--exe", help="override eldenring.exe path (default: config game_dir)")
+    ap.add_argument("--all-exes", action="store_true",
+                    help="also scan every other exe build in the registry (slow)")
     args = ap.parse_args()
 
     # ---- Drift guard: every AOB literal in src/ must be in the signature list ----
@@ -210,6 +249,11 @@ def main():
         return 1
 
     emit_anchor_table_header()
+
+    if args.all_exes and cross_build_matrix():
+        print("A CRITICAL signature does not resolve on some other exe build - the mod would "
+              "be broken for players on it.")
+        return 1
 
     if critical_fail:
         print("BUILD-BLOCKING: a CRITICAL eldenring.exe signature is missing or ambiguous.")

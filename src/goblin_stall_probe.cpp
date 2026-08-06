@@ -1,6 +1,7 @@
 #include "goblin_stall_probe.hpp"
 #include "goblin_anchors.hpp" // every base+RVA engine helper resolves through this
 #include "goblin_config.hpp"
+#include "goblin_guarded.hpp" // faults we ask for must not be recorded as crashes
 
 #if MFG_STALL_PROFILER
 namespace goblin::watch { void request(uintptr_t address, unsigned long thread_id); }
@@ -9955,6 +9956,16 @@ namespace
     // (g_map_hb_ms / g_map_hb_tid are declared with the timing primitives near the top - the
     //  factory's budget gate reads the heartbeat too, and it lives far above this point.)
 
+    // Set once the unwind has faulted. A CAUGHT EXCEPTION IS NOT A FREE EXCEPTION: a
+    // first-chance AV is a process-wide event, and a third party's filter (ERSS-FG, and
+    // me3_mod_host too) answers it by running a ~39-frame dbghelp symbolization ON OUR
+    // FAULTING THREAD - dbghelp is single-threaded and churns the heap, which is how a
+    // guarded read of ours ends as heap corruption somebody else dies in. So this sampler
+    // gets what every faultable loop needs and the __try alone does not give: a poison path.
+    // One fault and it never runs again this session. Report 32 (ERSS-FG present, crash
+    // shortly after launch) is the second player report in this class.
+    std::atomic<bool> g_stallcap_poisoned{false};
+
     // POD-only frame so __try is legal; returns captured frame count.
     int stall_capture_frames(HANDLE th, uintptr_t *out, int cap)
     {
@@ -9967,6 +9978,14 @@ namespace
         if (!got)
             return 0;
         int n = 0;
+        bool faulted = false;
+        // Unwinding ANOTHER thread's stack cannot be pre-validated the way a read can: the
+        // thread was suspended mid-instruction and its unwind data may not describe the frame,
+        // so RtlVirtualUnwind is entitled to fault. The counter keeps OUR crash log from
+        // recording a fault we asked for (it was missing until report 32, which is why that
+        // log carries [EXCEPTION] ntdll+0x46F77 records). It does NOT make the fault private -
+        // nothing can - which is what the poison flag above is for.
+        ++goblin::guarded::depth;
         __try
         {
             while (n < cap)
@@ -9993,6 +10012,17 @@ namespace
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
+            faulted = true;
+        }
+        --goblin::guarded::depth; // reached on both paths
+        if (faulted)
+        {
+            g_stallcap_poisoned.store(true, std::memory_order_relaxed);
+            // At INFO and not behind debug_logging, for the reason the movie-def retire line
+            // is: this whole class ran for entire sessions with nothing in our own log, and
+            // was found only in somebody else's.
+            spdlog::info("[stallcap] stack sampling stopped for this session: the unwind "
+                         "faulted (expected on some hosts) and one fault is enough");
         }
         return n;
     }
@@ -10126,6 +10156,8 @@ bool goblin::stall_probe::map_screen_alive()
 
 void goblin::stall_probe::sample_map_stall()
 {
+    if (g_stallcap_poisoned.load(std::memory_order_relaxed))
+        return;
     const uint64_t hb = g_map_hb_ms.load(std::memory_order_relaxed);
     const uint32_t tid = g_map_hb_tid.load(std::memory_order_relaxed);
     if (!hb || !tid || tid == GetCurrentThreadId())
@@ -10544,6 +10576,31 @@ void goblin::stall_probe::setup()
     // in-game menu. Its menu half checks the mode itself.
     goblin::own_movie::install();
 
+    // CSMenuMan::updateTask. ABOVE the menu-mode gate, and it must stay there: this detour is
+    // the ONLY writer of the map phase byte, and the map phase is what starts a marker
+    // generation (it clears g_v3_map_closed on the open edge). It sat BELOW the gate until
+    // report 32, so `menu_render_mode = imgui` - the workaround we hand out for report 31 -
+    // also switched the markers off: measured in that player's log, 8 sessions with the map
+    // opened, phase stuck at 255, 0 factory pulses, no CATEGORIES READY, and the stall sampler
+    // firing on a heartbeat it had no phase to interpret. The two sessions that DID render
+    // markers were the two running in `native` mode. The detour gates its own in-game-menu half
+    // on native_menu_enabled(), so installing it always costs the imgui user nothing.
+    try
+    {
+        modutils::hook<MenuUpdateFn>(
+            {.aob = "48 8B C4 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 68 A1 "
+                    "48 81 EC 98 00 00 00 48 C7 45 A7 FE FF FF FF 0F 29 70 A8 "
+                    "0F 29 78 98 44 0F 29 40 88 44 0F 29 4C 24 50 44 0F 29 54 24 40 "
+                    "48 8B FA 48 8B D9 0F 57 FF F3 0F 10 05 ?? ?? ?? ?? 0F 2E C7 "
+                    "7A 16 75 14 B9 29 0A 00 00"},
+            menu_update_detour, o_menu_update);
+        spdlog::info("[menuprobe] CSMenuMan::updateTask hook armed");
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::warn("[menuprobe] updateTask hook unavailable: {}", e.what());
+    }
+
     if (!goblin::config::native_menu_enabled())
     {
         // menu_render_mode = imgui: everything from here down exists only to serve the IN-GAME menu
@@ -10591,26 +10648,6 @@ void goblin::stall_probe::setup()
     catch (const std::exception &e)
     {
         spdlog::warn("[action] input-action hook unavailable: {}", e.what());
-    }
-
-    // Menu-movie graphics probe hook: CSMenuMan::updateTask (v2.6.x 0x766980). The
-    // detour reads the active menu and (dev-only) tests solid-fill rendering on menu
-    // sprites. A miss just disables the probe. This is also the UI-thread beachhead
-    // the future native announce/dialogs will reuse.
-    try
-    {
-        modutils::hook<MenuUpdateFn>(
-            {.aob = "48 8B C4 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 68 A1 "
-                    "48 81 EC 98 00 00 00 48 C7 45 A7 FE FF FF FF 0F 29 70 A8 "
-                    "0F 29 78 98 44 0F 29 40 88 44 0F 29 4C 24 50 44 0F 29 54 24 40 "
-                    "48 8B FA 48 8B D9 0F 57 FF F3 0F 10 05 ?? ?? ?? ?? 0F 2E C7 "
-                    "7A 16 75 14 B9 29 0A 00 00"},
-            menu_update_detour, o_menu_update);
-        spdlog::info("[menuprobe] CSMenuMan::updateTask hook armed");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[menuprobe] updateTask hook unavailable: {}", e.what());
     }
 
     // FIVE HOOKS AND TWO AOB SCANS FOR THE F11 SETTINGS TAB WERE ARMED HERE UNTIL 2026-07-31:
@@ -10781,7 +10818,11 @@ void goblin::stall_probe::setup()
     try
     {
         modutils::hook<Fn4>(
-            {.aob = "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 FB A6 08 01 85 C0 0F"},
+            // The call's rel32 was baked in, so this was a 2.6.2-only pattern. Wildcarded it
+            // matches two places on every build, and both are byte-identical copies of the
+            // same poll (measured on 2.6.2/2.6.1/2.6.0/2.2.3/2.2.0), so the first-match rule
+            // lands on the same code either way.
+            {.aob = "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 ?? ?? ?? ?? 85 C0 0F"},
             jobpoll_detour, o_jobpoll);
         spdlog::info("[stallprobe] job-poll spy armed");
     }

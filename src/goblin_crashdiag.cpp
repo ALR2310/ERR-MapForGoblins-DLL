@@ -8,6 +8,10 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cwctype>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -285,6 +289,142 @@ int goblin::crashdiag::format_env(char *buf, int cap)
     len += hex64(buf + len, g_game_ts.load(std::memory_order_relaxed));
     buf[len++] = '\n';
     return len;
+}
+
+// ── the module inventory ────────────────────────────────────────────────────────────────────────
+namespace
+{
+    goblin::crashdiag::RawSink g_raw_sink = nullptr;
+
+    // VERSIONINFO of any loaded module, by the same signature scan resolve_game_build() uses on
+    // the exe. 0 when the module carries no version resource (plenty of mod DLLs do not).
+    uint64_t fixed_version_of(HMODULE m)
+    {
+        HRSRC res = FindResourceW(m, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+        if (!res)
+            return 0;
+        const DWORD size = SizeofResource(m, res);
+        HGLOBAL h = LoadResource(m, res);
+        if (!h || size < 16)
+            return 0;
+        const auto *p = static_cast<const uint32_t *>(LockResource(h));
+        if (!p)
+            return 0;
+        for (DWORD i = 0; i + 4 <= size / 4; ++i)
+            if (p[i] == 0xFEEF04BDu && (p[i + 1] & 0xFFFF0000u) == 0x00010000u)
+                return (static_cast<uint64_t>(p[i + 2]) << 32) | p[i + 3];
+        return 0;
+    }
+
+    uint32_t image_size_of(HMODULE m)
+    {
+        auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(m);
+        if (!m || dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return 0;
+        auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+            reinterpret_cast<const uint8_t *>(m) + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE ? nt->OptionalHeader.SizeOfImage : 0;
+    }
+
+    // The OS's own DLLs are noise - a hundred of them, identical on every machine. What matters is
+    // what ELSE somebody put in the process.
+    bool is_system_path(const std::wstring &lower)
+    {
+        static const wchar_t *dirs[] = {L"\\windows\\", L"\\system32\\", L"\\syswow64\\",
+                                        L"\\winsxs\\"};
+        for (const wchar_t *d : dirs)
+            if (lower.find(d) != std::wstring::npos)
+                return true;
+        return false;
+    }
+
+    using EnumModulesFn = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
+
+    EnumModulesFn resolve_enum_modules()
+    {
+        static EnumModulesFn fn = nullptr;
+        static bool tried = false;
+        if (!tried)
+        {
+            tried = true;
+            if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+                fn = reinterpret_cast<EnumModulesFn>(
+                    reinterpret_cast<void *>(GetProcAddress(k32, "K32EnumProcessModules")));
+        }
+        return fn;
+    }
+}
+
+void goblin::crashdiag::set_raw_sink(RawSink sink)
+{
+    g_raw_sink = sink;
+}
+
+void goblin::crashdiag::log_modules(const char *tag)
+{
+    EnumModulesFn enum_modules = resolve_enum_modules();
+    if (!enum_modules)
+        return;
+
+    std::vector<HMODULE> mods(512);
+    DWORD needed = 0;
+    if (!enum_modules(GetCurrentProcess(), mods.data(),
+                      static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed))
+        return;
+    const size_t count = needed / sizeof(HMODULE);
+    mods.resize(count < mods.size() ? count : mods.size());
+
+    std::vector<std::string> lines;
+    for (HMODULE m : mods)
+    {
+        wchar_t full[MAX_PATH] = {0};
+        if (!GetModuleFileNameW(m, full, MAX_PATH))
+            continue;
+        std::wstring lower(full);
+        for (auto &c : lower)
+            c = static_cast<wchar_t>(towlower(c));
+        if (is_system_path(lower))
+            continue;
+        const uint64_t v = fixed_version_of(m);
+        char buf[512];
+        // wsprintfA does not bound-check, and a file name is only bounded by MAX_PATH - so the
+        // one field that comes from outside gets clipped before it reaches the buffer.
+        std::string name = std::filesystem::path(full).filename().string();
+        if (name.size() > 96)
+            name.resize(96);
+        int len = wsprintfA(buf, "  %-32s v%u.%u.%u.%u base=", name.c_str(),
+                            static_cast<unsigned>((v >> 48) & 0xFFFF),
+                            static_cast<unsigned>((v >> 32) & 0xFFFF),
+                            static_cast<unsigned>((v >> 16) & 0xFFFF),
+                            static_cast<unsigned>(v & 0xFFFF));
+        len += hex64(buf + len, reinterpret_cast<uintptr_t>(m));
+        len += wsprintfA(buf + len, " size=");
+        len += hex64(buf + len, image_size_of(m));
+        lines.emplace_back(buf, static_cast<size_t>(len));
+    }
+
+    // The second pass exists to catch what loaded late; if nothing did, saying so once is enough.
+    static size_t s_last_count = 0;
+    if (!lines.empty() && lines.size() == s_last_count)
+        return;
+    s_last_count = lines.size();
+
+    char head[128];
+    const int head_len =
+        wsprintfA(head, "\n  [modules] %s: %u non-system\n", tag ? tag : "?",
+                  static_cast<unsigned>(lines.size()));
+    spdlog::info("[modules] {}: {} non-system", tag ? tag : "?", lines.size());
+    if (g_raw_sink)
+        g_raw_sink(head, head_len);
+    for (const auto &l : lines)
+    {
+        spdlog::info("{}", l);
+        if (g_raw_sink)
+        {
+            g_raw_sink(l.c_str(), static_cast<int>(l.size()));
+            g_raw_sink("\n", 1);
+        }
+    }
 }
 
 void goblin::crashdiag::memory(const char *tag, uint32_t tracked)

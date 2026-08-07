@@ -765,6 +765,11 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
         if (g_crash_file != INVALID_HANDLE_VALUE && len > 0)
             WriteFile(g_crash_file, hdr, static_cast<DWORD>(len), &wr, nullptr);
     }
+    // The module inventory goes into THIS file, not only the session log: reports arrive as the
+    // crash log alone often enough, and "which other mods were in the process" has been the first
+    // question of every conflict investigation we have run.
+    goblin::crashdiag::set_raw_sink(&crash_write);
+    goblin::crashdiag::log_modules("init");
     AddVectoredExceptionHandler(1, crash_veh);
     SetUnhandledExceptionFilter(crash_ueh);
 }
@@ -938,6 +943,7 @@ static void setup_mod()
     }
 
     bool first_read = true;
+    bool modules_rechecked = false;
     int prev_collected = -1, prev_kindling = -1;
     auto start = std::chrono::steady_clock::now();
     while (true)
@@ -947,6 +953,15 @@ static void setup_mod()
         auto elapsed = std::chrono::steady_clock::now() - start;
         bool fast_phase = elapsed < std::chrono::seconds(30);
         std::this_thread::sleep_for(fast_phase ? std::chrono::milliseconds(100) : std::chrono::seconds(2));
+
+        // Second and last inventory pass, once the frame-generation overlays and the other loader
+        // DLLs have finished arriving - at init they are simply not there yet. Writes nothing if
+        // the count is unchanged.
+        if (!fast_phase && !modules_rechecked)
+        {
+            modules_rechecked = true;
+            goblin::crashdiag::log_modules("t+30s");
+        }
 
         try
         {

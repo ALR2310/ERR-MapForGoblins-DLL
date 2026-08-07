@@ -64,6 +64,24 @@ namespace goblin::crashdiag
     // binaries produced it is not actionable. Returns bytes written.
     int format_env(char *buf, int cap);
 
+    // ── what else is loaded ─────────────────────────────────────────────────────────────────────
+    // Every module in the process except the system ones: name, version, base, size. Reports 12,
+    // 22, 28 and 33 all needed this and all of them had to get it out of a minidump - and a Proton
+    // player has no minidump at all, which is the reason the crash logger exists in the first
+    // place. Called from an ORDINARY thread (it allocates and formats freely); nothing new runs
+    // inside the exception handler.
+    //
+    // Called twice per session by design: once at init, so a crash in the first seconds still has
+    // it, and once about half a minute in, when the frame-generation overlays and the other
+    // mod-loader DLLs have finished arriving. The second pass writes nothing if the count has not
+    // changed. `tag` names the pass.
+    void log_modules(const char *tag);
+
+    // The crash file is dllmain's private handle, so the inventory is handed back through this
+    // instead of being duplicated there. Raw bytes, appended verbatim.
+    using RawSink = void (*)(const char *, int);
+    void set_raw_sink(RawSink sink);
+
     // ── probe 1: does anything accumulate? ──────────────────────────────────────────────────────
     // Commit charge and working set for this process; `tag` names the moment ("open" / "close").
     // Resolved through K32GetProcessMemoryInfo so the import table does not change. debug_logging.

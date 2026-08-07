@@ -624,7 +624,7 @@ enum : int
     kDumpWriteFailed = 6, // dbghelp itself refused
 };
 
-static int crash_write_dump(PEXCEPTION_POINTERS ep)
+static int crash_write_dump(PEXCEPTION_POINTERS ep, DWORD *gle_out)
 {
     wchar_t path[MAX_PATH];
     SYSTEMTIME st;
@@ -682,7 +682,16 @@ static int crash_write_dump(PEXCEPTION_POINTERS ep)
                           kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory |
                               kWithThreadInfo,
                           &info, nullptr, nullptr);
+    // Ask BEFORE CloseHandle - closing a handle overwrites the thread's last error.
+    if (!ok && gle_out)
+        *gle_out = GetLastError();
     CloseHandle(h);
+    // A refused write leaves the file it already created: 65 zero-byte MapForGoblins_*.dmp had
+    // piled up next to eldenring.exe by 2026-08-07, one per session, and every one of them reads
+    // as "the mod tried and produced nothing" to whoever finds it. The only file removed here is
+    // the one this function created seconds earlier and dbghelp declined to fill.
+    if (!ok)
+        DeleteFileW(file);
     InterlockedExchange(&s_dump_entered, 0);
     return ok ? kDumpOk : kDumpWriteFailed;
 }
@@ -713,12 +722,27 @@ static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
     if (slot < 0 || InterlockedIncrement(&s_hits[slot]) > 3)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    crash_write_record("CRASH", code, fault, ep->ExceptionRecord, ep->ContextRecord);
+    // A breakpoint is not a crash report. eldenring.exe 2.6.2 ends EVERY session with an unhandled
+    // int3 at exe+0xC57676 - CS::CSFreeListMemorySystem::quit (Havok) asserting that its list at
+    // +0x1280 is empty, from FD4TaskThreadLocalProcess's destructor. Proven the game's own on
+    // 2026-08-07 with a zero-natives control profile: same code, same address, same frames, and
+    // the only registers that differ are heap bases. Recording it as "CRASH" - now with our
+    // version and the player's whole module list under it - tells every player who simply quit the
+    // game that the mod killed it. So it keeps its record (a real assert mid-session must not go
+    // missing, and [state]'s up=/tOpen=/tClose= tell the two apart) and loses the label and the
+    // minidump.
+    const bool is_break = (code == static_cast<DWORD>(EXCEPTION_BREAKPOINT) ||
+                           code == static_cast<DWORD>(EXCEPTION_SINGLE_STEP));
+    crash_write_record(is_break ? "BREAK" : "CRASH", code, fault, ep->ExceptionRecord,
+                       ep->ContextRecord);
+    if (is_break)
+        return EXCEPTION_CONTINUE_SEARCH;
     // Written after the attempt, so the record says whether the .dmp beside it exists and, when it
-    // does not, which of the six reasons applied.
-    const int dump_rc = crash_write_dump(ep);
+    // does not, which of the six reasons applied plus what Windows said.
+    DWORD gle = 0;
+    const int dump_rc = crash_write_dump(ep, &gle);
     char tail[64];
-    crash_write(tail, wsprintfA(tail, "  [dump] rc=%d\n", dump_rc));
+    crash_write(tail, wsprintfA(tail, "  [dump] rc=%d gle=%u\n", dump_rc, gle));
     // Hand it on: whatever wrote the process dumps before still does.
     return EXCEPTION_CONTINUE_SEARCH;
 }

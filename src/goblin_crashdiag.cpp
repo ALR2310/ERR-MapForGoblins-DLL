@@ -112,6 +112,9 @@ namespace
     }
 
     // Hex without the CRT, for format_state (which can run inside an exception handler).
+    // Carries the "0x" prefix, the same as dllmain's crash_hex64. It did not until 2026-08-07,
+    // which put two formats in one record: `[regs] rax=0x1` next to `parent=1BC1E35D5A0`, and
+    // `gimg=5E01800` next to `base=0x7FFA377F0000` on the line above it.
     int hex64(char *buf, uint64_t v)
     {
         static const char digits[] = "0123456789ABCDEF";
@@ -123,6 +126,8 @@ namespace
             v >>= 4;
         } while (v && n < 16);
         int len = 0;
+        buf[len++] = '0';
+        buf[len++] = 'x';
         while (n)
             buf[len++] = tmp[--n];
         return len;

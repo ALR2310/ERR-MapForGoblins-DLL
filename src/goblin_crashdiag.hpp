@@ -37,6 +37,27 @@ namespace goblin::crashdiag
     // an exception handler. Returns bytes written.
     int format_state(char *buf, int cap);
 
+    // ── which game build we are running in ──────────────────────────────────────────────────────
+    // Report 33 cost a dump read just to learn that it was exe 2.6.2.0: our own log said nothing
+    // about the game at all, and the reporter had trimmed the [SESSION] banner away, so even the
+    // mod build was unknown from the log alone. Resolved ONCE on a normal thread at init and only
+    // read afterwards, so the crash writer formats cached numbers and never touches the PE image
+    // or a resource inside a handler.
+    //
+    // FileVersion is not enough on its own: a downpatched or repacked exe reports the same string
+    // as the stock one. SizeOfImage and TimeDateStamp are what actually identify a build - they
+    // are the pair the anchor resolver's behaviour follows.
+    void resolve_game_build();
+    uint64_t game_version();    // ms<<32 | ls, i.e. 2.6.2.0 -> 0x0002000600020000; 0 = unknown
+    uint32_t game_image_size(); // SizeOfImage of the running exe
+    uint32_t game_timestamp();  // its PE TimeDateStamp
+
+    // One "  [env] ..." line: this mod's version/profile/commit and the game build above. No heap,
+    // no CRT, safe from an exception handler. Written into EVERY crash record on purpose - reports
+    // arrive hand-trimmed to the interesting record, and a record that cannot say which two
+    // binaries produced it is not actionable. Returns bytes written.
+    int format_env(char *buf, int cap);
+
     // ── probe 1: does anything accumulate? ──────────────────────────────────────────────────────
     // Commit charge and working set for this process; `tag` names the moment ("open" / "close").
     // Resolved through K32GetProcessMemoryInfo so the import table does not change. debug_logging.

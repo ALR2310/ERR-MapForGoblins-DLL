@@ -382,6 +382,13 @@ static void crash_write_record(const char *label, DWORD code, uintptr_t fault,
     }
     line[len++] = '\n';
     crash_write(line, len);
+    // Which two binaries produced this record. Repeated per record, not only in the [SESSION]
+    // banner at the top of the file: report 33 arrived hand-trimmed to the single interesting
+    // record, so the banner was gone and neither the mod build nor the game build could be read
+    // out of the log at all - both had to be recovered from the minidump, which a Proton player
+    // does not have in the first place.
+    len = goblin::crashdiag::format_env(line, static_cast<int>(sizeof(line)));
+    crash_write(line, len);
     len = goblin::crashdiag::format_state(line, static_cast<int>(sizeof(line)));
     crash_write(line, len);
     if (ctx)
@@ -647,6 +654,11 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
                                                   dos->e_lfanew);
     g_self_size = nt->OptionalHeader.SizeOfImage;
 
+    // Read the game's own version/size/stamp now, on this ordinary thread, so that everything the
+    // crash writer prints later is a cached number - a handler must not be walking a resource
+    // directory while the process is going down.
+    goblin::crashdiag::resolve_game_build();
+
     g_crash_file = CreateFileW(log_file.wstring().c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -669,6 +681,11 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
         hdr[len++] = '\n';
         DWORD wr = 0;
         if (g_crash_file != INVALID_HANDLE_VALUE)
+            WriteFile(g_crash_file, hdr, static_cast<DWORD>(len), &wr, nullptr);
+        // ... and the game build right under it, so a file that never gets a crash record still
+        // says what it was running.
+        len = goblin::crashdiag::format_env(hdr, static_cast<int>(sizeof(hdr)));
+        if (g_crash_file != INVALID_HANDLE_VALUE && len > 0)
             WriteFile(g_crash_file, hdr, static_cast<DWORD>(len), &wr, nullptr);
     }
     AddVectoredExceptionHandler(1, crash_veh);
@@ -932,6 +949,23 @@ bool WINAPI DllMain(HINSTANCE dll_instance, unsigned int fdw_reason, void *lpv_r
         install_crash_logger(dll_instance, folder / "logs" / "MapForGoblins_crash.log");
 
         spdlog::info("Map For Goblins DLL v{} [{}] ({})", PROJECT_VERSION, BUILD_NAME, GIT_HASH);
+        {
+            // Which game build this session is. Everything the mod does is derived per exe build -
+            // the anchor resolver, the RVA table, the param layouts - so a report that does not
+            // name the exe leaves every one of those unverifiable. SizeOfImage and TimeDateStamp
+            // go with the version string because a repacked or downpatched exe keeps the string
+            // and changes those.
+            wchar_t exe_path[MAX_PATH] = {0};
+            GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+            const uint64_t v = goblin::crashdiag::game_version();
+            spdlog::info("Game: {} v{}.{}.{}.{} img=0x{:X} ts=0x{:X}",
+                         std::filesystem::path(exe_path).filename().string(),
+                         static_cast<unsigned>((v >> 48) & 0xFFFF),
+                         static_cast<unsigned>((v >> 32) & 0xFFFF),
+                         static_cast<unsigned>((v >> 16) & 0xFFFF),
+                         static_cast<unsigned>(v & 0xFFFF), goblin::crashdiag::game_image_size(),
+                         goblin::crashdiag::game_timestamp());
+        }
         goblin::load_config(folder / "MapForGoblins.ini");
 
         if (goblin::config::debugLogging)

@@ -2,6 +2,7 @@
 
 #include "goblin_config.hpp"
 #include "goblin_safemem.hpp" // validate-then-read for the survivor walk
+#include "version.h"          // PROJECT_VERSION / BUILD_NAME / GIT_HASH, for format_env
 
 #include <spdlog/spdlog.h>
 #include <windows.h>
@@ -21,6 +22,11 @@ namespace
     std::atomic<uint64_t> g_parent{0};
     std::atomic<uint64_t> g_wrapper{0};
     std::atomic<uint8_t> g_map_open{0};
+
+    // ── the running game build, resolved once ───────────────────────────────────────────────────
+    std::atomic<uint64_t> g_game_ver{0};
+    std::atomic<uint32_t> g_game_img{0};
+    std::atomic<uint32_t> g_game_ts{0};
 
     // ── probe 1 plumbing ────────────────────────────────────────────────────────────────────────
     // PROCESS_MEMORY_COUNTERS_EX without pulling in psapi.h, and resolved dynamically so the
@@ -146,6 +152,88 @@ int goblin::crashdiag::format_state(char *buf, int cap)
     buf[len++] = 't';
     buf[len++] = '=';
     len += hex64(buf + len, g_wrapper.load(std::memory_order_relaxed));
+    buf[len++] = '\n';
+    return len;
+}
+
+void goblin::crashdiag::resolve_game_build()
+{
+    HMODULE exe = GetModuleHandleW(nullptr);
+    if (!exe)
+        return;
+
+    // SizeOfImage and TimeDateStamp straight out of the loaded headers. These two are the honest
+    // build identity - they are what separates 2.6.2 from a repacked or downpatched 2.6.2, and a
+    // report whose anchors misbehaved is a report where these are the first numbers wanted.
+    auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe);
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+    {
+        auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+            reinterpret_cast<const uint8_t *>(exe) + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE)
+        {
+            g_game_img.store(nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
+            g_game_ts.store(nt->FileHeader.TimeDateStamp, std::memory_order_relaxed);
+        }
+    }
+
+    // FileVersion out of the image's own VERSIONINFO. The resource blob is walked for the
+    // VS_FIXEDFILEINFO signature rather than parsed structurally: the string tables in front of it
+    // vary by build and locale, and a search for one 32-bit constant cannot be tripped up by that.
+    // RT_VERSION is MAKEINTRESOURCE(16), i.e. the ANSI form unless the whole build is UNICODE -
+    // this one is not, so the type is spelled out rather than taken from the macro.
+    HRSRC res = FindResourceW(exe, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+    if (!res)
+        return;
+    const DWORD size = SizeofResource(exe, res);
+    HGLOBAL h = LoadResource(exe, res);
+    if (!h || size < 16)
+        return;
+    const auto *p = static_cast<const uint32_t *>(LockResource(h));
+    if (!p)
+        return;
+    for (DWORD i = 0; i + 4 <= size / 4; ++i)
+    {
+        if (p[i] != 0xFEEF04BDu || (p[i + 1] & 0xFFFF0000u) != 0x00010000u)
+            continue;
+        g_game_ver.store((static_cast<uint64_t>(p[i + 2]) << 32) | p[i + 3],
+                         std::memory_order_relaxed);
+        break;
+    }
+}
+
+uint64_t goblin::crashdiag::game_version()
+{
+    return g_game_ver.load(std::memory_order_relaxed);
+}
+
+uint32_t goblin::crashdiag::game_image_size()
+{
+    return g_game_img.load(std::memory_order_relaxed);
+}
+
+uint32_t goblin::crashdiag::game_timestamp()
+{
+    return g_game_ts.load(std::memory_order_relaxed);
+}
+
+int goblin::crashdiag::format_env(char *buf, int cap)
+{
+    if (cap < 256)
+        return 0;
+    int len = wsprintfA(buf, "  [env] mfg=%s %s %s game=", PROJECT_VERSION, BUILD_NAME, GIT_HASH);
+    const uint64_t v = g_game_ver.load(std::memory_order_relaxed);
+    if (v)
+        len += wsprintfA(buf + len, "%u.%u.%u.%u", static_cast<unsigned>((v >> 48) & 0xFFFF),
+                         static_cast<unsigned>((v >> 32) & 0xFFFF),
+                         static_cast<unsigned>((v >> 16) & 0xFFFF),
+                         static_cast<unsigned>(v & 0xFFFF));
+    else
+        buf[len++] = '?';
+    len += wsprintfA(buf + len, " gimg=");
+    len += hex64(buf + len, g_game_img.load(std::memory_order_relaxed));
+    len += wsprintfA(buf + len, " gts=");
+    len += hex64(buf + len, g_game_ts.load(std::memory_order_relaxed));
     buf[len++] = '\n';
     return len;
 }

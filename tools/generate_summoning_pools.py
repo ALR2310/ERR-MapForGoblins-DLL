@@ -123,7 +123,17 @@ def main():
 
     print(f"  {len(msb_pools)} unique MSB positions")
 
-    # Step 3: Match unresolved pools (overworld) to MSB by position
+    # Step 3: Match unresolved pools (overworld) to MSB by position.
+    #
+    # IN 3D, INCLUDING Y. Both coordinate sets are TILE-LOCAL, so local X/Z repeat from tile to
+    # tile and an X/Z-only distance can hand a pool to the wrong map by a fraction of a unit while
+    # missing the height by a kilometre. That is not hypothetical: SignPuddleParam row 670800 (the
+    # DLC pool in m61_46_41 at local y=329.7) beat m60_53_57's own pool by 0.257u in X/Z and was
+    # planted in the Mountaintops, 1292.564u below the real one - so that tile showed two pools,
+    # the phantom being the visible one, and the DLC tile showed none. Y separates them cleanly:
+    # the true match is exact (dY=0.000 for m60_53_57's own pool, dY=0.233 for the DLC one).
+    # Measured over the vanilla data: 3D changes the answer for that one pool and agrees with the
+    # old metric for the other 64.
     unresolved = [p for p in pools if not p['resolved']]
     resolved_count = 0
     for pool in unresolved:
@@ -131,8 +141,9 @@ def main():
         best_match = None
         for area, gx, gz, mx, my, mz, map_name in msb_pools:
             dx = pool['x'] - mx
+            dy = pool['y'] - my
             dz = pool['z'] - mz
-            dist = math.sqrt(dx*dx + dz*dz)
+            dist = math.sqrt(dx*dx + dy*dy + dz*dz)
             if dist < best_dist:
                 best_dist = dist
                 best_match = (area, gx, gz)

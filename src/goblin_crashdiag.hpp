@@ -33,6 +33,12 @@ namespace goblin::crashdiag
     void note_map_closed(uint32_t tracked);
     void note_generation(uint64_t parent, uint64_t wrapper);
 
+    // Called from the top of each thread we start. The crash record can then say whether the
+    // thread that died was one of ours or the game's - a question report 33 answered only after a
+    // full .pdata unwind of the dump, and a Proton player has no dump to unwind. Eight slots is
+    // more than the mod ever runs; an overflow simply stops registering, it never reallocates.
+    void note_own_thread();
+
     // One "[state] k=v ..." line into a caller-supplied buffer. No heap, no CRT, safe to call from
     // an exception handler. Returns bytes written.
     int format_state(char *buf, int cap);

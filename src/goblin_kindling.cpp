@@ -17,6 +17,7 @@
 //   4. Write `areaNo = 99` on collected rows, restore on respawned rows.
 
 #include "goblin_kindling.hpp"
+#include "goblin_crashdiag.hpp" // register this thread, so a crash record can say it was ours
 #include "goblin_map_data.hpp"
 #include "modutils.hpp"
 
@@ -381,6 +382,7 @@ static std::map<uint32_t, uintptr_t> discover_kindling_conds()
 
 static void worker_loop()
 {
+    goblin::crashdiag::note_own_thread();
     spdlog::info("[KINDLING] worker thread started");
     while (!g_worker_should_stop.load())
     {

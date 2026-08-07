@@ -23,6 +23,26 @@ namespace
     std::atomic<uint64_t> g_wrapper{0};
     std::atomic<uint8_t> g_map_open{0};
 
+    // ── when things happened ────────────────────────────────────────────────────────────────────
+    // "mapOpen=1" says the map was up; it does not say whether the crash landed one second into
+    // the open or twenty minutes in, and a tear-down race looks like neither. Ticks are stored
+    // raw and turned into ages only when a record is written.
+    const uint64_t g_t0 = GetTickCount64();
+    std::atomic<uint64_t> g_t_open{0};  // last completed map open
+    std::atomic<uint64_t> g_t_close{0}; // last map close
+
+    // ── our own threads ─────────────────────────────────────────────────────────────────────────
+    constexpr size_t OWN_TID_MAX = 8;
+    std::atomic<uint32_t> g_own_tids[OWN_TID_MAX] = {};
+
+    bool tid_is_ours(uint32_t tid)
+    {
+        for (size_t i = 0; i < OWN_TID_MAX; ++i)
+            if (g_own_tids[i].load(std::memory_order_relaxed) == tid)
+                return true;
+        return false;
+    }
+
     // ── the running game build, resolved once ───────────────────────────────────────────────────
     std::atomic<uint64_t> g_game_ver{0};
     std::atomic<uint32_t> g_game_img{0};
@@ -114,6 +134,20 @@ void goblin::crashdiag::note_map_open_completed(int layer, uint32_t created, uin
     g_failed.store(failed, std::memory_order_relaxed);
     g_tracked.store(tracked, std::memory_order_relaxed);
     g_map_open.store(1, std::memory_order_relaxed);
+    g_t_open.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
+void goblin::crashdiag::note_own_thread()
+{
+    const uint32_t tid = GetCurrentThreadId();
+    for (size_t i = 0; i < OWN_TID_MAX; ++i)
+    {
+        uint32_t empty = 0;
+        if (g_own_tids[i].compare_exchange_strong(empty, tid, std::memory_order_relaxed))
+            return;
+        if (empty == tid)
+            return; // already registered
+    }
 }
 
 void goblin::crashdiag::note_map_closed(uint32_t tracked)
@@ -121,6 +155,7 @@ void goblin::crashdiag::note_map_closed(uint32_t tracked)
     g_closes.fetch_add(1, std::memory_order_relaxed);
     g_tracked.store(tracked, std::memory_order_relaxed);
     g_map_open.store(0, std::memory_order_relaxed);
+    g_t_close.store(GetTickCount64(), std::memory_order_relaxed);
 }
 
 void goblin::crashdiag::note_generation(uint64_t parent, uint64_t wrapper)
@@ -134,7 +169,7 @@ int goblin::crashdiag::format_state(char *buf, int cap)
 {
     // wsprintfA is the only formatter safe here (no CRT, no heap) and it has no 64-bit specifier,
     // so pointers go through hex64 by hand - the same reason dllmain's crash writer does.
-    if (cap < 220)
+    if (cap < 384)
         return 0;
     int len = wsprintfA(buf, "  [state] opens=%u closes=%u gen=%u tracked=%u created=%u failed=%u "
                              "layer=%d mapOpen=%u parent=",
@@ -152,6 +187,20 @@ int goblin::crashdiag::format_state(char *buf, int cap)
     buf[len++] = 't';
     buf[len++] = '=';
     len += hex64(buf + len, g_wrapper.load(std::memory_order_relaxed));
+
+    // Ages, in seconds, of the three moments that decide how to read everything above: how long
+    // the session ran, and how long ago the map last opened and last closed. "-1" = never
+    // happened. A crash a second after a close is a tear-down race; the same record twenty
+    // minutes after one is not, and until now the two were indistinguishable.
+    const uint64_t now = GetTickCount64();
+    const uint64_t t_open = g_t_open.load(std::memory_order_relaxed);
+    const uint64_t t_close = g_t_close.load(std::memory_order_relaxed);
+    const uint32_t tid = GetCurrentThreadId();
+    len += wsprintfA(buf + len, " up=%us tOpen=%ds tClose=%ds tid=%u own=%u",
+                     static_cast<unsigned>((now - g_t0) / 1000),
+                     t_open ? static_cast<int>((now - t_open) / 1000) : -1,
+                     t_close ? static_cast<int>((now - t_close) / 1000) : -1, tid,
+                     tid_is_ours(tid) ? 1u : 0u);
     buf[len++] = '\n';
     return len;
 }

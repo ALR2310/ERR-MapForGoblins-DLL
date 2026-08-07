@@ -391,6 +391,40 @@ static void crash_write_record(const char *label, DWORD code, uintptr_t fault,
     crash_write(line, len);
     len = goblin::crashdiag::format_state(line, static_cast<int>(sizeof(line)));
     crash_write(line, len);
+    // What the touched address actually IS. The states are four different bugs and they were all
+    // arriving as the same line: FREE means the allocation is gone (use-after-free or a wild
+    // pointer), COMMIT at a tiny offset means a null-ish struct base, RESERVE means a stack guard
+    // page, and a VirtualQuery that answers nothing at all means the address is not even canonical.
+    // Report 33 is the last of those - the record said `read 0xFFFFFFFFFFFFFFFF`, and establishing
+    // that this meant "one bit flipped in a pointer" took a minidump the reporter happened to have.
+    // VirtualQuery is safe here for the same reason the rest of this path is: no heap, no CRT.
+    if (rec && code == static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION) && rec->NumberParameters >= 2)
+    {
+        const auto addr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+        MEMORY_BASIC_INFORMATION mbi{};
+        len = wsprintfA(line, "  [mem] ");
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi))
+        {
+            len += wsprintfA(line + len, "st=%s pr=",
+                             mbi.State == MEM_COMMIT    ? "COMMIT"
+                             : mbi.State == MEM_RESERVE ? "RESERVE"
+                             : mbi.State == MEM_FREE    ? "FREE"
+                                                        : "?");
+            len += crash_hex64(line + len, mbi.Protect);
+            len += wsprintfA(line + len, " ty=");
+            len += crash_hex64(line + len, mbi.Type);
+            len += wsprintfA(line + len, " base=");
+            len += crash_hex64(line + len, reinterpret_cast<uintptr_t>(mbi.AllocationBase));
+            len += wsprintfA(line + len, " size=");
+            len += crash_hex64(line + len, static_cast<uint64_t>(mbi.RegionSize));
+        }
+        else
+        {
+            len += wsprintfA(line + len, "st=NONE"); // not canonical, or not in this address space
+        }
+        line[len++] = '\n';
+        crash_write(line, len);
+    }
     if (ctx)
     {
         len = wsprintfA(line, "  [regs] rax=");
@@ -409,6 +443,28 @@ static void crash_write_record(const char *label, DWORD code, uintptr_t fault,
         len += crash_hex64(line + len, ctx->R8);
         len += wsprintfA(line + len, " r9=");
         len += crash_hex64(line + len, ctx->R9);
+        line[len++] = '\n';
+        crash_write(line, len);
+        // The other half. Eight of sixteen registers were being dropped, and which half holds the
+        // corrupted value is not ours to choose: report 33 happened to fault on r8 and was
+        // readable, but the same record with the bad pointer in r13 would have said nothing.
+        // rsp/rbp come along because they are what separates a stack overflow from a wild write.
+        len = wsprintfA(line, "  [regs2] rsp=");
+        len += crash_hex64(line + len, ctx->Rsp);
+        len += wsprintfA(line + len, " rbp=");
+        len += crash_hex64(line + len, ctx->Rbp);
+        len += wsprintfA(line + len, " r10=");
+        len += crash_hex64(line + len, ctx->R10);
+        len += wsprintfA(line + len, " r11=");
+        len += crash_hex64(line + len, ctx->R11);
+        len += wsprintfA(line + len, " r12=");
+        len += crash_hex64(line + len, ctx->R12);
+        len += wsprintfA(line + len, " r13=");
+        len += crash_hex64(line + len, ctx->R13);
+        len += wsprintfA(line + len, " r14=");
+        len += crash_hex64(line + len, ctx->R14);
+        len += wsprintfA(line + len, " r15=");
+        len += crash_hex64(line + len, ctx->R15);
         line[len++] = '\n';
         crash_write(line, len);
     }
@@ -553,14 +609,29 @@ static LONG NTAPI crash_veh(PEXCEPTION_POINTERS ep)
 // module data sections (our state) and WithIndirectlyReferencedMemory adds what the registers and
 // stacks point at (the object that faulted). Deliberately NOT WithFullMemory: this process carries
 // about 12 GB of commit and nobody can upload that.
-static void crash_write_dump(PEXCEPTION_POINTERS ep)
+// Returns why it did or did not produce a file. Every one of the exits below used to be a bare
+// `return`, so "there is no .dmp next to the game" covered five different causes and none of them
+// were in the log - the 0-byte-dump and dbghelp-loop defects both had to be inferred from what was
+// missing. The value goes into the record as `[dump] rc=N`.
+enum : int
+{
+    kDumpOk = 0,
+    kDumpNoPath = 1,      // the exe path could not be read, so there is nowhere to write
+    kDumpNoDbgHelp = 2,   // dbghelp.dll would not load (common under Proton/Wine)
+    kDumpNoEntry = 3,     // it loaded but MiniDumpWriteDump is not in it
+    kDumpReentered = 4,   // a previous attempt in this process faulted or never returned
+    kDumpNoFile = 5,      // the file could not be created (permissions, read-only game folder)
+    kDumpWriteFailed = 6, // dbghelp itself refused
+};
+
+static int crash_write_dump(PEXCEPTION_POINTERS ep)
 {
     wchar_t path[MAX_PATH];
     SYSTEMTIME st;
     GetLocalTime(&st);
     const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (!n || n >= MAX_PATH)
-        return;
+        return kDumpNoPath;
     wchar_t dir[MAX_PATH];
     lstrcpynW(dir, path, MAX_PATH);
     for (int i = static_cast<int>(lstrlenW(dir)) - 1; i >= 0; --i)
@@ -576,12 +647,12 @@ static void crash_write_dump(PEXCEPTION_POINTERS ep)
     // change the import table this DLL's antivirus profile is sensitive to.
     HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
     if (!dbg)
-        return;
+        return kDumpNoDbgHelp;
     using WriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
     auto write = reinterpret_cast<WriteDumpFn>(
         reinterpret_cast<void *>(GetProcAddress(dbg, "MiniDumpWriteDump")));
     if (!write)
-        return;
+        return kDumpNoEntry;
     // MiniDumpWriteDump can FAULT rather than fail: on Wine its own worker thread AVs inside
     // dbghelp, and that fault comes back round to the unhandled-exception filter, which asks
     // for another dump. Report 32 caught the loop - 89 dbghelp records across nine sessions,
@@ -590,13 +661,13 @@ static void crash_write_dump(PEXCEPTION_POINTERS ep)
     // attempt is ever made in this process.
     static volatile LONG s_dump_entered = 0;
     if (InterlockedCompareExchange(&s_dump_entered, 1, 0) != 0)
-        return;
+        return kDumpReentered;
     // The file is created only once there is something able to fill it - an empty .dmp next
     // to the game is a worse answer than no .dmp at all.
     HANDLE h = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                            nullptr);
     if (h == INVALID_HANDLE_VALUE)
-        return;
+        return kDumpNoFile;
     struct
     {
         DWORD ThreadId;
@@ -607,11 +678,13 @@ static void crash_write_dump(PEXCEPTION_POINTERS ep)
     constexpr int kWithDataSegs = 0x0001;
     constexpr int kWithIndirectlyReferencedMemory = 0x0040;
     constexpr int kWithThreadInfo = 0x1000;
-    write(GetCurrentProcess(), GetCurrentProcessId(), h,
-          kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory | kWithThreadInfo,
-          &info, nullptr, nullptr);
+    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), h,
+                          kNormal | kWithDataSegs | kWithIndirectlyReferencedMemory |
+                              kWithThreadInfo,
+                          &info, nullptr, nullptr);
     CloseHandle(h);
     InterlockedExchange(&s_dump_entered, 0);
+    return ok ? kDumpOk : kDumpWriteFailed;
 }
 
 static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
@@ -641,7 +714,11 @@ static LONG WINAPI crash_ueh(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_SEARCH;
 
     crash_write_record("CRASH", code, fault, ep->ExceptionRecord, ep->ContextRecord);
-    crash_write_dump(ep);
+    // Written after the attempt, so the record says whether the .dmp beside it exists and, when it
+    // does not, which of the six reasons applied.
+    const int dump_rc = crash_write_dump(ep);
+    char tail[64];
+    crash_write(tail, wsprintfA(tail, "  [dump] rc=%d\n", dump_rc));
     // Hand it on: whatever wrote the process dumps before still does.
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -756,6 +833,9 @@ static void manual_hide_hotkey_loop()
 
 static void setup_mod()
 {
+    // This thread also runs the refresh loop at the bottom of the function for the rest of the
+    // session, so it is the one most likely to be holding a fault of ours.
+    goblin::crashdiag::note_own_thread();
     // FIRST, before anything else takes time: record DXGI's own swapchain-creation entry points.
     // They are only worth having while the factory vtable is still pristine, and this thread starts
     // ~1.3 s ahead of a co-loaded frame-generation overlay's hooks (measured, report 21), whereas
@@ -827,19 +907,22 @@ static void setup_mod()
     if (goblin::config::enableMarkerDump)
     {
         goblin::markers::set_output_path(g_mod_folder / "logs" / "MapForGoblins_markers.log");
-        std::thread(goblin::markers::hotkey_loop).detach();
+        std::thread([] { goblin::crashdiag::note_own_thread();
+                         goblin::markers::hotkey_loop(); }).detach();
         spdlog::info("Marker dump hotkey: VK 0x{:X}", goblin::config::markerDumpKey);
     }
 
     if (goblin::config::enableToggleHotkey)
     {
-        std::thread(goblin::toggle_hotkey_loop).detach();
+        std::thread([] { goblin::crashdiag::note_own_thread();
+                         goblin::toggle_hotkey_loop(); }).detach();
         spdlog::info("Icon toggle hotkey: VK 0x{:X}", goblin::config::toggleInjectionKey);
     }
 
     if (goblin::config::enableManualHide)
     {
-        std::thread(manual_hide_hotkey_loop).detach();
+        std::thread([] { goblin::crashdiag::note_own_thread();
+                         manual_hide_hotkey_loop(); }).detach();
         spdlog::info("Manual marker-hide hotkey: VK 0x{:X}", goblin::config::hideMarkerKey);
     }
 
@@ -849,7 +932,8 @@ static void setup_mod()
     // so the overlay's master switch works even if the toggle hotkey is disabled.
     if (goblin::config::enableToggleHotkey || goblin::config::menuEnabled)
     {
-        std::thread(goblin::menu_auto_toggle_loop).detach();
+        std::thread([] { goblin::crashdiag::note_own_thread();
+                         goblin::menu_auto_toggle_loop(); }).detach();
         spdlog::info("Icon-state watcher started (icons EXPANDED always; master show/hide via hotkey or overlay)");
     }
 

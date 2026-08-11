@@ -52,6 +52,13 @@ reborn_mod_dir =
 # other overlays). Example: C:\Games\Graceborne\GRACEBORNE\mod
 graceborne_mod_dir =
 
+# Optional: path to the Throne ER overhaul's ME2 overlay dir (the 'TL' folder next
+# to modengine2_launcher.exe, containing regulation.bin, map/, event/, msg/), for the
+# throne build profile (build.bat ... --throne). game_dir must also be set and
+# UXM-unpacked (partial overlay -> staged merged-over-vanilla, same as the other
+# overlays). Example: C:\Games\ThroneER\TL
+throne_mod_dir =
+
 # Optional: path to SmithBox install (only needed by some research scripts
 # under tools/_*.py — not required by the core build pipeline).
 # Example: C:\Tools\Smithbox_2_1_2_2016_02_16_a

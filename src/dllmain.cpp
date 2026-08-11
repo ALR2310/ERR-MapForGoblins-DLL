@@ -79,6 +79,14 @@ static void safe_apply_category_visibility_seh()
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
+    // Announce it. Every caller of this wrapper has just decided that what should be on screen
+    // changed - a pickup, a focus that emptied out, a category rewrite - and the rows are already
+    // written. Saying so lets the map tick merge on its next frame; without it the change was
+    // invisible until the tick's own periodic re-snapshot happened to run, which is why that poll
+    // had to be frequent and therefore expensive. Outside the __try on purpose: it must also fire
+    // on the path where the guarded call faulted partway, or the tick would keep showing rows
+    // that no longer match the params.
+    goblin::note_visibility_changed();
 }
 
 static void safe_gfx_tick_seh()

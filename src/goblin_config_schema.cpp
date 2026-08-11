@@ -92,7 +92,8 @@ namespace goblin::config
     uint32_t markerDumpKey = 0x78; // VK_F9
     bool enableManualHide = true;
     uint32_t hideMarkerKey = 0x2E; // VK_DELETE
-    uint16_t hideMarkerGamepad = 0x0200; // XINPUT_GAMEPAD_RIGHT_SHOULDER (RB)
+    uint16_t hideMarkerGamepad = 0;      // unbound; RB (the old default) is the map's own
+                                         // tab-switch button, so it fired on every layer switch
     bool enableHoverInfo = true;
     bool enableToggleHotkey = true;
     uint32_t toggleInjectionKey = 0x79; // VK_F10
@@ -338,8 +339,8 @@ namespace
                   "Let you hide individual markers: hover a marker on the world map and press\nhide_marker_key to hide it. Hidden markers persist across sessions; un-hide them\nfrom the in-game menu (Hidden markers section)."),
                 IniEntry{"hide_marker_key", IniType::VkKey, &cfg::hideMarkerKey, "Delete",
                          "Key that hides the map marker currently under the cursor. Default: Delete.", false, nullptr},
-                IniEntry{"hide_marker_gamepad", IniType::GamepadMask, &cfg::hideMarkerGamepad, "RB",
-                         "Gamepad button that hides the map marker under the cursor (same as\nhide_marker_key). Tokens joined with '+'. Set it to 'none' to unbind - RB is\nalso the map's own tab-switch button, so on a pad it is easy to hit by\naccident. Default: RB.", false, nullptr},
+                IniEntry{"hide_marker_gamepad", IniType::GamepadMask, &cfg::hideMarkerGamepad, "none",
+                         "Gamepad button that hides the map marker under the cursor (same as\nhide_marker_key). Tokens joined with '+'. Unbound by default: every free\nmap button is taken by the game (RB, the old default, is the map's own\ntab-switch button, so it fired on every layer switch). Default: none.", false, nullptr},
                 B("hover_info", enableHoverInfo, "true",
                   "Show a small passive panel (top-left) while the world map is open and the\ncursor is over a marker: the marker's name and its height relative to you\n(\"N units above/below\"). Never captures input."),
             }},

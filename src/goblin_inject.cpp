@@ -1628,6 +1628,23 @@ static void refresh_deoverlap(int layer)
 
     static Occupancy occ;  // kept across refreshes to hold its buckets; cleared here
     for (auto &kv : occ.cells) kv.second.clear();
+    // Lit graces reserve their spot FIRST. Once a grace is discovered our own grace marker
+    // hides (baked_dis1 = the grace's lit flag) and the game stands its NATIVE clickable pin
+    // there - built from BonfireWarpParam, not from any WMP row we could move, and it wins
+    // the hover, so a marker left under it is invisible AND unreachable. Non-clickable native
+    // marks (cave/church/tunnel WMP rows) are deliberately NOT reserved: our icons draw above
+    // those and should stay put.
+    size_t native_seeded = 0;
+    for (const CategoryRow &cr : g_category_rows)
+    {
+        if (cr.cat != Category::WorldGraces || cr.native_layer != layer) continue;
+        if (cr.native_area == 99) continue;
+        if (cr.baked_dis1 == 0 || !goblin::flag_is_set(cr.baked_dis1)) continue;
+        const uint64_t tile = (static_cast<uint64_t>(cr.native_area) << 40) |
+                              (static_cast<uint64_t>(cr.native_gx) << 20) | cr.native_gz;
+        occ.take(tile, cr.real_px, cr.real_pz, cr.real_px, cr.real_pz);
+        ++native_seeded;
+    }
     size_t moved = 0, crowded = 0;
     for (size_t i = 0; i < g_category_rows.size(); ++i)
     {
@@ -1674,8 +1691,8 @@ static void refresh_deoverlap(int layer)
     {
         if (s_said == 0) s_said = 1;
         spdlog::info("[deoverlap] layer {}: {} of {} markers visible, {} of them had company, {} moved "
-                     "aside, in {} us (spacing {}u)",
-                     layer, shown, g_category_rows.size(), crowded, moved, us, kMinDist);
+                     "aside, {} lit graces reserved, in {} us (spacing {}u)",
+                     layer, shown, g_category_rows.size(), crowded, moved, native_seeded, us, kMinDist);
     }
 }
 
@@ -2335,6 +2352,11 @@ uint32_t goblin::visibility_epoch()
     return g_visibility_epoch.load(std::memory_order_acquire);
 }
 
+void goblin::note_visibility_changed()
+{
+    g_visibility_epoch.fetch_add(1, std::memory_order_release);
+}
+
 void goblin::reapply_live_settings()
 {
     g_visibility_epoch.fetch_add(1, std::memory_order_release);
@@ -2350,8 +2372,15 @@ void goblin::reapply_live_settings()
 
 void goblin::set_icons_hidden(bool hidden)
 {
-    g_icons_user_disabled.store(hidden);
+    const bool was = g_icons_user_disabled.exchange(hidden);
     g_visibility_epoch.fetch_add(1, std::memory_order_release);
+    // SAY SO. This is the master switch - it decides whether the player sees any marker at all,
+    // it is reachable from three places (the F10 hotkey, the overlay checkbox, the native menu's
+    // first row), and until 2026-08-07 it flipped in complete silence. A log then read exactly
+    // like a broken build: "CATEGORIES READY created=0", no icons on the map, and nothing
+    // anywhere saying a human had switched them off. That cost a diagnosis round trip.
+    if (was != hidden)
+        spdlog::info("[icons] master switch -> {}", hidden ? "OFF (user)" : "ON (user)");
 }
 bool goblin::icons_hidden() { return g_icons_user_disabled.load(); }
 

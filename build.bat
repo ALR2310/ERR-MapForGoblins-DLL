@@ -29,7 +29,7 @@ set "VS_PATH=%VS_INSTALL%\Common7\Tools\VsDevCmd.bat"
 
 REM Build profile (flag may be in any position). Default = ERR when no flag.
 REM Flags: --vanilla --err --convergence2 --convergence3 --erte --goldenage --goldenage361
-REM        --vins --reborn --graceborne. Each profile scopes its own
+REM        --vins --reborn --graceborne --throne. Each profile scopes its own
 REM        data/<p>, src/generated_<p>, builds/build-<p>, releases/pre-release-<p>
 REM        (err uses the unsuffixed data/, src/generated, builds/build). MFG_PROFILE
 REM        is exported so build_pipeline.py + config.py pick the data source.
@@ -42,6 +42,7 @@ echo %*| findstr /i /c:"--goldenage" >nul && set "MFG_PROFILE=goldenage"
 echo %*| findstr /i /c:"--vins" >nul && set "MFG_PROFILE=vins"
 echo %*| findstr /i /c:"--reborn" >nul && set "MFG_PROFILE=reborn"
 echo %*| findstr /i /c:"--graceborne" >nul && set "MFG_PROFILE=graceborne"
+echo %*| findstr /i /c:"--throne" >nul && set "MFG_PROFILE=throne"
 REM --goldenage361 must come LAST: findstr /c:"--goldenage" above also matches it,
 REM so this line overwrites MFG_PROFILE=goldenage back to goldenage361 when 361 is passed.
 echo %*| findstr /i /c:"--goldenage361" >nul && set "MFG_PROFILE=goldenage361"
@@ -111,6 +112,12 @@ if "%MFG_PROFILE%"=="graceborne" set "PKG_PREFIX=Graceborne"
 if "%MFG_PROFILE%"=="graceborne" set "SNAP_DIR=%SCRIPT_DIR%releases\pre-release-graceborne"
 if "%MFG_PROFILE%"=="graceborne" set "DISP_PROFILE=graceborne"
 if "%MFG_PROFILE%"=="graceborne" set "README_SRC=%SCRIPT_DIR%assets\README_graceborne.txt"
+if "%MFG_PROFILE%"=="throne" set "BUILD_DIR=%SCRIPT_DIR%builds\build-throne"
+if "%MFG_PROFILE%"=="throne" set "GEN_SUBDIR=generated_throne"
+if "%MFG_PROFILE%"=="throne" set "PKG_PREFIX=ThroneER"
+if "%MFG_PROFILE%"=="throne" set "SNAP_DIR=%SCRIPT_DIR%releases\pre-release-throne"
+if "%MFG_PROFILE%"=="throne" set "DISP_PROFILE=throne"
+if "%MFG_PROFILE%"=="throne" set "README_SRC=%SCRIPT_DIR%assets\README_throne.txt"
 echo [PROFILE] %DISP_PROFILE%  build=%BUILD_DIR%  gen=%GEN_SUBDIR%
 REM --skip-shared: caller (tools\build_all.py orchestrator) already ran gen_shared
 REM once; skip it here so parallel per-profile builds don't race on src\generated_shared.

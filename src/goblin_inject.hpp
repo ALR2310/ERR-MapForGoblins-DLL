@@ -234,6 +234,17 @@ namespace goblin
     // the periodic refresh is deliberately gated on a spent queue and this is not.
     uint32_t visibility_epoch();
 
+    // Same bump, for a caller that has ALREADY rewritten the rows and only needs the tick to
+    // notice. The background watcher is the one: it compares the collected/kindling counts every
+    // two seconds and re-applies category visibility on a change, but it used to do that
+    // silently, so the only thing that ever picked the change up was the tick's periodic
+    // re-snapshot. That poll cost 4.3 ms of one map frame EVERY second (measured on
+    // convergence3, 8425 rows, 2026-08-07) to look for something it usually could not find -
+    // in single-player the world is paused while the map is up, so nothing can be collected at
+    // all. With this the change announces itself, the tick merges on the next frame instead of
+    // up to a second later, and the poll drops to a rare safety net.
+    void note_visibility_changed();
+
     // Codex-toast ids, allocated DYNAMICALLY at runtime above the live max so they
     // never collide with an overhaul's / another mod's tutorial content (same
     // principle as the marker textId remap). Two independent id spaces:

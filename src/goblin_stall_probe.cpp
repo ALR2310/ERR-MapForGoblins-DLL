@@ -338,6 +338,23 @@ namespace
     // own map. None of those can change while the world map is up, because the map is a menu and
     // the player stands still inside it - so four fifths of an idle frame's cost was being spent
     // to notice things that cannot happen while it is being spent.
+    // STAYS AT 1000. Raising it to 10000 on 2026-08-07 looked right on paper and on three of the
+    // four numbers - the 4.3 ms merge left one map frame in every second, the worst steady frame
+    // fell from 4.5 ms to 1.5 ms, the open got cheaper - and the tester reported the stutter had
+    // got WORSE. He was right and the instrument was not measuring the thing he was feeling.
+    //
+    // What the poll also does, which nothing here recorded, is keep v3_viewport_reconcile's
+    // inputs fresh. Measured across both runs, steady seconds only: reconcile cost 3402 us/s with
+    // the 1 Hz poll and 4669 us/s (+37%) with a 10 s one, because a stale snapshot makes the
+    // window pass re-decide more per frame - and every extra attach/detach is engine work we do
+    // not time at all. Reconcile is the movement path, so the regression lands exactly where he
+    // was looking: scrolling the map with W+D, once per second, independent of zoom and of how
+    // many icons are on screen (this pass walks every tracked object, not the visible ones).
+    //
+    // So the merge is not pure cost. Making it rarer is not the lever; making it CHEAP is, or
+    // removing reconcile's dependency on a freshly rebuilt snapshot. Do not raise this again
+    // without an instrument that can see a scrolling map - the per-frame max cannot, because
+    // reconcile is spread across frames rather than spiking in one.
     constexpr uint64_t V3_IDLE_REFRESH_MS = 1000;
 
     // The staging array is NOT the batch: the pipeline keeps exactly one record in flight (see
@@ -8590,9 +8607,25 @@ namespace
         // frame, and leaving it in put the idle cost UP - 53-88 ms/s against the 27-64 it was
         // meant to cure, even though the per-frame spikes did fall. Its two-second persistence
         // rule works just as well on one sample a second.
-        static uint64_t s_next_audit = 0;
+        // DEBUG ONLY since 2026-08-07. Everything this flag gates is diagnostics - three sampling
+        // loops of 512 objects each (one of them calling GetMatrix through the child's vtable), a
+        // walk of ALL tracked objects for the straggler counts, and a walk of the parent's child
+        // array of up to 16384 entries at TWO guarded reads apiece. Nothing downstream acts on any
+        // of it; the counters feed spdlog and nothing else, and the pass that does the real work
+        // (detach, then attach) has already run above.
+        //
+        // It was running in shipping builds, once a second, for the whole time the map was open,
+        // and it is the stutter two players reported (34, 35) and the tester reproduced: hold W+D
+        // over the open map and a hitch lands once per second of movement. Their three
+        // observations pin it - the rate does not follow the zoom, does not follow how many icons
+        // are on screen (these loops walk every tracked object and the engine's whole child list,
+        // not the visible ones), and it needs the map to be MOVING. That last one fits the
+        // parent-list walk in particular: `break` on the first unreadable entry makes an idle,
+        // settled list cheap and a churning one expensive, because while scrolling the entries
+        // stay valid all the way to the end. Observed list sizes in those logs: 1011 to 7903.
         const uint64_t audit_now = GetTickCount64();
-        const bool audit = audit_now >= s_next_audit;
+        static uint64_t s_next_audit = 0;
+        const bool audit = goblin::config::debugLogging && audit_now >= s_next_audit;
         if (audit)
             s_next_audit = audit_now + 1000;
 

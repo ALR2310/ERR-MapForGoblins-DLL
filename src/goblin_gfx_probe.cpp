@@ -2169,6 +2169,89 @@ void *goblin::gfx_probe::game_aligned_alloc(size_t bytes)
     return p;
 }
 
+namespace
+{
+    // DLNew.cpp helpers (see dl_alloc_like in the header). find_owner = the exe's own
+    // owning-allocator-by-address lookup, the same one operator delete calls before it falls
+    // back; its result is a DLKR::DLAllocator* whose vtable is +0x48 allocate(size),
+    // +0x50 allocateAligned(size, align), +0x68 deallocate(ptr).
+    using DlFindOwnerFn = void *(*)(const void *ptr);
+    std::atomic<uint64_t> g_dl_find_owner{0};
+    std::atomic<bool> g_dl_find_owner_tried{false};
+
+    void resolve_dl_find_owner()
+    {
+        if (g_dl_find_owner_tried.exchange(true, std::memory_order_relaxed)) return;
+        try
+        {
+            // The lookup function's own prologue is a generic singleton-getter shape (4 identical
+            // matches - the report-31 class of mistake), so the pattern is its UNIQUE caller
+            // instead: the slice of DLNew's operator delete around `call <lookup>`, anchored by
+            // the DLNew.cpp line-100 assert setup (8D 50 64) and the vtable free dispatch
+            // (41 FF 50 68). The callee address comes out of the call's rel32.
+            void *m = modutils::scan<void>(
+                {.aob = "48 8B 5F 20 48 C7 47 20 00 00 00 00 48 8B 7C 24 38 48 85 DB 75 26 "
+                        "48 8B CE E8 ?? ?? ?? ?? 48 8B D8 48 85 C0 75 16 4C 8D 05 ?? ?? ?? ?? "
+                        "8D 50 64 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 4C 8B 03 48 8B D6 "
+                        "48 8B CB 41 FF 50 68",
+                 .relative_offsets = {{0x1A, 0x1E}}});
+            g_dl_find_owner.store((uint64_t)m, std::memory_order_relaxed);
+            spdlog::info("[dlalloc] owner lookup ready @ 0x{:X}", (uint64_t)m);
+        }
+        catch (const std::exception &e)
+        {
+            spdlog::warn("[dlalloc] owner lookup unavailable ({}); handed-over buffers stay on "
+                         "the fallback allocator", e.what());
+        }
+    }
+
+    // The engine call can fault on a garbage neighbor; keep both steps under SEH and let the
+    // caller fall back. Plain functions - no C++ objects may live in a __try frame.
+    void *seh_dl_find_owner(DlFindOwnerFn fn, const void *neighbor)
+    {
+        __try { return fn(neighbor); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+    void *seh_dl_allocate_aligned(void *alc, size_t bytes)
+    {
+        __try
+        {
+            using AllocAlignedFn = void *(*)(void *self, size_t size, size_t align);
+            auto *vtbl = *reinterpret_cast<AllocAlignedFn **>(alc);
+            return vtbl[0x50 / 8](alc, bytes, 16);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+}
+
+void *goblin::gfx_probe::dl_alloc_like(const void *neighbor, size_t bytes)
+{
+    if (!neighbor || !bytes) return nullptr;
+    resolve_dl_find_owner();
+    const uint64_t f = g_dl_find_owner.load(std::memory_order_relaxed);
+    if (!f) return nullptr;
+    void *alc = seh_dl_find_owner(reinterpret_cast<DlFindOwnerFn>(f), neighbor);
+    if (!alc)
+    {
+        spdlog::info("[dlalloc] no arena owns neighbor 0x{:X} - caller falls back",
+                     (uint64_t)neighbor);
+        return nullptr;
+    }
+    void *p = seh_dl_allocate_aligned(alc, bytes);
+    if (!p || (reinterpret_cast<uintptr_t>(p) & 15) != 0)
+    {
+        // A misaligned result would mean the vtable layout guess is wrong for this build -
+        // refuse it (we cannot free it, but one leaked block beats a corrupted release).
+        spdlog::warn("[dlalloc] arena 0x{:X} refused/misaligned ({} bytes -> 0x{:X}) - "
+                     "caller falls back", (uint64_t)alc, bytes, (uint64_t)p);
+        return nullptr;
+    }
+    memset(p, 0, bytes);
+    spdlog::info("[dlalloc] {} bytes served by the arena owning 0x{:X} (allocator 0x{:X})",
+                 bytes, (uint64_t)neighbor, (uint64_t)alc);
+    return p;
+}
+
 void *goblin::gfx_probe::game_alloc(size_t bytes)
 {
     resolve_game_malloc();

@@ -285,7 +285,27 @@ SIGNATURES = [
                 "itself. A plain _malloc_base buffer has no back-pointer there, so the engine fed the "
                 "XOR-encoded _HEAP_ENTRY to RtlFreeHeap and the process died with 0xC0000374 on ten of "
                 "ten quits (traced 2026-08-04). Distinct from game_crt_malloc, which stays correct for "
-                "the Scaleform tag objects - nothing ever frees those.",
+                "the Scaleform tag objects - nothing ever frees those. Since 2026-08-12 this is the "
+                "FALLBACK: dl_owner_lookup below is tried first (reports 25/27/28/37).",
+    },
+    {
+        "name": "dl_owner_lookup",
+        "pattern": "48 8B 5F 20 48 C7 47 20 00 00 00 00 48 8B 7C 24 38 48 85 DB 75 26 "
+                   "48 8B CE E8 ?? ?? ?? ?? 48 8B D8 48 85 C0 75 16 4C 8D 05 ?? ?? ?? ?? "
+                   "8D 50 64 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 4C 8B 03 48 8B D6 "
+                   "48 8B CB 41 FF 50 68",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_gfx_probe.cpp"],
+        "note": "Slice of DLNew's operator delete (v2.6.2 0x1EBA020) around `call <owning-allocator "
+                "lookup>` (0x1EC5DE0 resolved via the call's rel32, offsets {0x1A,0x1E}); anchored by "
+                "the DLNew.cpp line-100 assert setup (8D 50 64) and the vtable free (41 FF 50 68). The "
+                "lookup's own prologue is a generic singleton-getter shape (4 matches) - do NOT pattern "
+                "it directly. dl_alloc_like() allocates handed-over buffers (expanded WMP/TutorialParam "
+                "tables, PlaceName FMG) from the arena owning the ORIGINAL buffer, so the DL range "
+                "lookup succeeds at release and the mod-host-SUBSTITUTED fallback allocator is never "
+                "consulted (me3_mod_host AV / ME2 0xC0000374, reports 25/27/28/37). Non-critical: on a "
+                "miss the callers fall back to game_crt_aligned_malloc (status quo).",
     },
     # ---- Hooks that used to be hardcoded RVAs (report 20) - a wrong address CORRUPTS CODE ----
     {

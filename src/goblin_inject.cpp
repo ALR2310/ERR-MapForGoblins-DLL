@@ -847,7 +847,15 @@ void goblin::inject_map_entries()
     //
     // Keep replacing the pointer and keep the +0x10 wrapper - the engine tolerates a foreign buffer
     // perfectly well, it just frees it its own way. Only the allocator was wrong.
-    allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
+    //
+    // 2026-08-12 (reports 25/27/28/37): under a mod host the fallback free is SUBSTITUTED, and the
+    // host's free faults on a pointer it never issued (me3_mod_host AV / ME2 0xC0000374). First
+    // choice is therefore the arena that owns the ORIGINAL param buffer - then the DL range lookup
+    // succeeds and the substituted fallback is never consulted. game_aligned_alloc stays as the
+    // fallback (correct unhosted - the traced _aligned_free path).
+    allocation = goblin::gfx_probe::dl_alloc_like(old_param_file, total_alloc);
+    if (!allocation)
+        allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
     if (!allocation)
     {
         spdlog::error("alloc failed ({} bytes) - the game's aligned allocator is unavailable, so "
@@ -1277,9 +1285,12 @@ bool goblin::inject_tutorial_popup_rows()
     size_t param_file_size = wrapper_row_loc_end;
     size_t total_alloc = WRAPPER_HEADER + param_file_size;
 
-    // Same ownership contract as the marker table above - see the note there. TutorialParam has no
-    // ini toggle, so before this fix it made the crash unavoidable on every single exit.
-    auto *allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
+    // Same ownership contract as the marker table above - see the note there (incl. the
+    // 2026-08-12 arena-first rule). TutorialParam has no ini toggle, so before this fix it made
+    // the crash unavoidable on every single exit.
+    auto *allocation = goblin::gfx_probe::dl_alloc_like(old_file, total_alloc);
+    if (!allocation)
+        allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
     if (!allocation)
     {
         spdlog::error("[TOAST] alloc failed ({} bytes) for TutorialParam expansion - the game's "

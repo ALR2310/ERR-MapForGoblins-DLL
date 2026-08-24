@@ -31,6 +31,21 @@ namespace goblin::gfx_probe
     // Scaleform tag objects are not (nothing frees those).
     void *game_aligned_alloc(size_t bytes);
 
+    // PREFERRED over game_aligned_alloc for any buffer HANDED INTO AN ENGINE SLOT the engine
+    // later releases through DLNew's operator delete (the expanded WMP/TutorialParam tables,
+    // the PlaceName FMG). That delete asks the DL range table who owns the pointer and only
+    // falls back to the _aligned_free-compatible allocator when NO arena claims it - and a mod
+    // host (ME3's mod host, ModEngine2) substitutes exactly that fallback object, whose free
+    // then walks ITS metadata for a pointer it never issued: AV in me3_mod_host (reports
+    // 25/27/28/37) / delayed 0xC0000374 under ME2. Allocating from the arena that owns
+    // `neighbor` (the ORIGINAL buffer we are replacing) makes the range lookup SUCCEED, so the
+    // release never reaches the substituted fallback - symmetric under every host, including a
+    // host that substituted the arena allocator itself (then IT served this allocation too).
+    // 16-aligned, zeroed. Returns null when the owner cannot be resolved or refuses the size;
+    // the caller then falls back to game_aligned_alloc (the status quo: correct unhosted,
+    // broken only under a substituted fallback).
+    void *dl_alloc_like(const void *neighbor, size_t bytes);
+
     /// A movie's own file name, read from the definition its load context points at (ctx+0x38). This is
     /// how a parse is told apart from another movie's: the field reads the same whether the file came
     /// out of an archive or out of a mod's folder. false = no name could be established, and a caller

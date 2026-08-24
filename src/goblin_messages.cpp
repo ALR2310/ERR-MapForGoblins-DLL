@@ -374,9 +374,16 @@ static bool patch_fmg_in_memory(uint8_t *fmg_ptr, uint8_t **slot_ptr,
     // The v2.0.5 switch to the game's malloc neither caused this nor made it worse - the defect was
     // never about WHICH heap, it was about the missing _aligned_malloc back-pointer.
     //
-    // There is no fallback any more, deliberately. Any other allocator here is a guaranteed crash at
-    // shutdown; not expanding the FMG costs some marker names and nothing else.
-    fmg_allocation = goblin::gfx_probe::game_aligned_alloc(new_file_size);
+    // There is no fallback past these two, deliberately. Any other allocator here is a guaranteed
+    // crash at shutdown; not expanding the FMG costs some marker names and nothing else.
+    //
+    // 2026-08-12 (reports 25/27/28/37): a mod host SUBSTITUTES the fallback allocator this comment
+    // describes, and the host's free faults on our _aligned_malloc pointer (me3_mod_host AV / ME2
+    // 0xC0000374 - the "menu deaths"). First choice is now the arena that owns the ORIGINAL FMG
+    // buffer: the DL range lookup then succeeds and the substituted fallback is never consulted.
+    fmg_allocation = goblin::gfx_probe::dl_alloc_like(fmg_ptr, new_file_size);
+    if (!fmg_allocation)
+        fmg_allocation = goblin::gfx_probe::game_aligned_alloc(new_file_size);
     if (!fmg_allocation)
     {
         spdlog::error("[FMG] aligned alloc unavailable ({} bytes) - expansion skipped so the "

@@ -37,116 +37,131 @@ stops at the function's end. ANCHOR_KIND below records the outcome per anchor:
 
 ANCHORS = [
     # ---- clip / text primitives (goblin_stall_probe.cpp draw + caption helpers) ----
-    {"name": "clip_resolve_child", "rva": 0x74A2F0,
+    {"name": "clip_resolve_child", "rva": 0x74B140,
      "bytes": "4C 89 44 24 18 4C 89 4C 24 20 55 53 56 57 41 56 41 57 48",
      "used": "draw_our_row / set_form_captions / prepare_form_layout / draw_row_icon"},
-    {"name": "clip_set_text_html", "rva": 0x74A000,
+    {"name": "clip_set_text_html", "rva": 0x74AE50,
      "bytes": "40 53 48 83 EC 20 48 8B 09 48 8B DA 48 8B 01 FF 50 08",
      "used": "draw_our_row / set_form_captions (SetText with isHtml=1)"},
-    {"name": "clip_set_visible", "rva": 0x733340,
+    {"name": "clip_set_visible", "rva": 0x734190,
      "bytes": "40 53 48 83 EC 20 48 8B 01 0F B6 DA FF 50 08 8B",
      "used": "draw_our_row / prepare_form_layout / draw_row_icon"},
-    {"name": "clip_is_valid", "rva": 0x733150,
+    {"name": "clip_is_valid", "rva": 0x733FA0,
      "bytes": "48 83 EC 28 48 8B 01 FF 10 F6",
      "used": "every resolve site (guards a missing clip)"},
-    {"name": "clip_set_gray", "rva": 0x7331E0,
+    {"name": "clip_set_gray", "rva": 0x734030,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 0F B6 FA 48 8B D9 FF 50",
      "used": "row style (Grayout frame)"},
-    {"name": "clip_set_scale", "rva": 0x733280,
+    {"name": "clip_set_scale", "rva": 0x7340D0,
      "bytes": "40 53 48 81 EC 90 00 00 00 48 C7 44 24 20 FE FF FF FF 0F 29 B4 24 80 00 "
                "00 00 0F",
      "used": "draw_row_bar_clip (experimental graphic bar)"},
-    {"name": "clip_goto_frame_name", "rva": 0x7499E0,
+    {"name": "clip_goto_frame_name", "rva": 0x74A830,
      "bytes": "48 89 54 24 10 48 83 EC 28 48 8B 09 48 8B 01 FF 50 08 8B 48 20 81 E1 8F "
                "00 00 00 83 F9 02 72 1A",
      "used": "row style frames Normal/Grayout/PadCategory"},
-    {"name": "clip_goto_frame_num", "rva": 0x749980,
+    {"name": "clip_goto_frame_num", "rva": 0x74A7D0,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 09 8B",
      "used": "prepare_form_layout (BG wide panel) / draw_row_icon (icon frame)"},
-    {"name": "clip_proxy_dtor", "rva": 0xD7F850,
+    {"name": "clip_proxy_dtor", "rva": 0xD81590,
      "bytes": "48 89 4C 24 08 53 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 8D 05 ?? ?? "
                "?? ?? 48 89 01 48 8D 59 08 8B",
      "used": "every resolve site (releases the proxy)"},
 
     # ---- row list machinery (the hooks + the rebuild path) ----
-    {"name": "menu_row_build_dispatch", "rva": 0x868590,
+    {"name": "menu_row_build_dispatch", "rva": 0x869580,
      "bytes": "44 0F BE 42 08",
      "used": "build_items_detour hook + refresh_form_view"},
-    {"name": "menu_row_render", "rva": 0x8674E0,
+    {"name": "menu_row_render", "rva": 0x8684D0,
      "bytes": "48 8B C4 55 57 41 56 48 8D 68 A1 48 81 EC E0 00 00 00 48 C7 45 8F FE FF "
                "FF FF 48 89 58 18",
      "used": "row_render_detour hook (item vt+0x8)"},
-    {"name": "menu_row_decide", "rva": 0x9411A0,
+    {"name": "menu_row_decide", "rva": 0x942340,
      "bytes": "48 8B C4 55 41 54 41 55 41 56 41 57 48 8D A8 38 FD",
      "used": "form_decide_detour hook"},
-    {"name": "menu_view_refresh", "rva": 0x942690,
+    {"name": "menu_view_refresh", "rva": 0x943830,
      "bytes": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48 8B F1 48 8D 91",
      "used": "refresh_form_view"},
-    {"name": "menu_row_vec_clear", "rva": 0x868F20,
+    {"name": "menu_row_vec_clear", "rva": 0x869F10,
      "bytes": "4C 89 44 24 18 56 57 48 83 EC 28 49 8B C1 48 8B FA 48 8B F1 4C 3B 41 08 "
                "75 1D 48 3B 41 10 75 17 E8 ?? ?? ?? ?? 48 8B 44 24 50 48 89 07 48 8B C7 "
                "48 83 C4 28 5F 5E C3 4C 3B C0 74 6D 48 8B 56 10 33 C9 44 0F B6 C9 48 89 "
                "5C 24 40 48 8B C8 48 89 6C 24 48 4C 89 74 24 20 E8 ?? ?? ?? ?? 48 8B 6E "
                "10 4C 8B F0 48 8B D8 48 3B C5 74 18 0F 1F 40 00 4C",
      "used": "build_our_form_items"},
-    {"name": "menu_row_vec_append", "rva": 0x868FE0,
+    {"name": "menu_row_vec_append", "rva": 0x869FD0,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8B FA 48 8B 49 10 48 3B D1 73 "
                "4B 48 8B 43 08 48 3B C2 77 42 48 2B F8 48 B8 67 66 66 66 66 66 66 66 48 "
                "F7 EF 48 8B FA 48 C1 FF 05",
      "used": "build_our_form_items"},
-    {"name": "menu_row_item_ctor", "rva": 0x866F80,
+    {"name": "menu_row_item_ctor", "rva": 0x867F70,
      "bytes": "48 89 4C 24 08 53 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 8B C2 48 8B "
                "D9 48 8D 0D ?? ?? ?? ?? 48 89 0B 48 8D 0D ?? ?? ?? ?? 48 89 0B 44",
      "used": "build_our_form_items (real row item)"},
-    {"name": "menu_row_item_empty", "rva": 0x8686C0,
+    {"name": "menu_row_item_empty", "rva": 0x8696B0,
      "bytes": "48 89 4C 24 08 53 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 8B D9 C7 44 "
                "24 20 00 00 00 00 E8 ?? ?? ?? ?? 90 C7 44 24 20 01 00 00 00 48 8B C3 48 "
                "83 C4 30 5B C3",
      "used": "build_our_form_items (right-column filler)"},
-    {"name": "grid_cursor_get", "rva": 0x739E20,
+    {"name": "grid_cursor_get", "rva": 0x73AC70,
      # The whole function is these 7 bytes; anything past the ret is the next build's padding
      # and killed the match on 2.6.0/2.2.3 (the body itself sat at the cluster shift on both).
      "bytes": "8B 81 D4 00 00 00 C3",
      "used": "selected_model_index (GridControl cursor)"},
 
+    # ---- the snapshot-slot class, for its VTABLE ----
+    # v3_child_releasable identifies a child's timeline snapshot slot by its vtable. That vtable
+    # lives in .rdata, so no byte pattern reaches it and the class carries no RTTI either - it was
+    # a baked address, correct on 2.6.2/2.6.1/2.6.0 and WRONG on 2.7.0, 2.2.3 and 2.2.0, which
+    # silently disabled the generation release and leaked the Scaleform arena until the engine
+    # panicked. These two slot FUNCTIONS are code, so the resolver finds them anywhere; the vtable
+    # is then the one place in .rdata where both sit at their own slot index (goblin_anchors.cpp,
+    # vtable_with). Verified on all six builds by scratch/verify_slot_layout_all.py.
+    {"name": "snapshot_slot_vt_fn4", "rva": 0x11FA7F0,
+     "bytes": "48 8B C4 48 89 58 08 48 89 78 10 55 48 8D 68 A1 48 81 EC A0",
+     "used": "v3_child_releasable (snapshot-slot vtable, slot 4)"},
+    {"name": "snapshot_slot_vt_fn6", "rva": 0x11CDEA0,
+     "bytes": "49 3B D0 0F 84 ?? ?? ?? ?? 48 8B C4",
+     "used": "v3_child_releasable (snapshot-slot vtable, slot 6)"},
+
     # ---- screen open / job plumbing ----
-    {"name": "keyconfig_form_build", "rva": 0x8078F0,
+    {"name": "keyconfig_form_build", "rva": 0x808770,
      "bytes": "4C 8B DC 53 48 81 EC B0 00 00 00 49 C7 43 88 FE FF FF FF 48 8B 05 ?? ?? "
                "?? ?? 48 33 C4 48 89 84 24 A0 00 00 00 48 8B D9 49 89 4B 90 C7 44 24 20 "
                "00 00 00 00 49 C7 43 E0 00 00 00 00 49 8D 43 A8 49 89 43 98 49 8D 43 A8 "
                "48 89 44 24 30 48 8D 05 ?? ?? ?? ?? 49 89 43 A8 48 8D 05 ?? ?? ?? ?? 49 "
                "89 43 A8 45 88 43 B0 49 8D 43 A8 49 89 43 E0 C7 44 24 30 08",
      "used": "open_keyconfig_form (movie 02_160 job)"},
-    {"name": "job_ref_convert_a", "rva": 0x7A7E30,
+    {"name": "job_ref_convert_a", "rva": 0x7A8CB0,
      "bytes": "4C 8B DC 49 89 53 10 53 56 57 48 83 EC 70",
      "used": "open_keyconfig_form ref chain"},
-    {"name": "job_ref_convert_b", "rva": 0x7A7B60,
+    {"name": "job_ref_convert_b", "rva": 0x7A89E0,
      "bytes": "48 89 54 24 10 53 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 8B DA C7 44 "
                "24 20 00 00 00 00 48 8B 09 48 89",
      "used": "open_keyconfig_form ref chain"},
-    {"name": "job_holder_store_seq", "rva": 0x7A9250,
+    {"name": "job_holder_store_seq", "rva": 0x7AA0D0,
      "bytes": "48 89 54 24 10 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 40 "
                "48 8B FA 48 8B D9 48 8B 0A 48 85 C9 74 28 48 8D 44 24 50 48 89 44 24 58 "
                "48 89 4C 24 50 48 83 C1 08 E8 ?? ?? ?? ?? 90 48 8D 4B 08",
      "used": "open_keyconfig_form (sequence slot +0x10)"},
-    {"name": "job_holder_store_child", "rva": 0x7A9460,
+    {"name": "job_holder_store_child", "rva": 0x7AA2E0,
      "bytes": "4C 89 44 24 18 48 89 54 24 10 56 57 41 56 48 83 EC 30 48 C7 44 24 28",
      "used": "open_keyconfig_form (child slot +0xA28)"},
     # The two refcount thunks are one instruction each; bytes past the ret are data that
     # changes per build. The exe holds many byte-identical copies of each - any copy is
     # semantically the same call, so a nearest-match rebase is always safe for these.
-    {"name": "refcount_addref", "rva": 0x1EBA1C0,
+    {"name": "refcount_addref", "rva": 0x1EBBFC0,
      "bytes": "B8 01 00 00 00 F0 0F C1 01 C3",
      "used": "job ref dance"},
-    {"name": "refcount_unref", "rva": 0x1EBA200,
+    {"name": "refcount_unref", "rva": 0x1EBC000,
      "bytes": "83 C8 FF F0 0F C1 01 C3",
      "used": "job ref dance / release_job_ref"},
-    {"name": "list_row_path_build", "rva": 0x736FC0,
+    {"name": "list_row_path_build", "rva": 0x737E10,
      "bytes": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 90 FE FF FF FF 49 89 5B 20 48 "
                "8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 80 00 00 00 48 8B FA 48 8B D9 49 "
                "89 53 98 C7 44 24 20 00 00 00 00 45",
      "used": "row_path_detour (gives the slot index for row icons)"},
-    {"name": "clip_set_pos", "rva": 0x733230,
+    {"name": "clip_set_pos", "rva": 0x734080,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 41 8B D8 8B FA FF 50 08 8B 48 20 "
                "81 E1 8F 00 00 00 83 F9 02 72 16",
      "used": "draw_row_icon (shifts the icon strip)"},
@@ -159,7 +174,7 @@ ANCHORS = [
     # Not called - it is the constructor whose body DEFINES the memory-file layout the transform
     # relies on (+0x18 buffer, +0x20 size, +0x24 position, +0x08 refcount). If these bytes stop
     # matching, re-read the layout before trusting the transform.
-    {"name": "memory_file_ctor", "rva": 0xCE7BB0,
+    {"name": "memory_file_ctor", "rva": 0xCE9280,
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 "
                "48 89 6C 24 50 48 89 74 24 58 41 8B F1 49",
      "used": "own_movie: source of the memory-file field offsets"},
@@ -172,21 +187,21 @@ ANCHORS = [
     # build time and it is exactly what a future patch-break investigation would want if that module
     # is ever built back in. The `used` fields below therefore describe the module's INTENDED
     # consumers, not live call sites.
-    {"name": "rawimage_create", "rva": 0x11489B0,
+    {"name": "rawimage_create", "rva": 0x114A7B0,
      "bytes": "89 54 24 10 89 4C 24 08 56 57 41 54",
      "used": "sfimage::create_resource (Render::RawImage::Create)"},
-    {"name": "image_resource_ctor", "rva": 0xD5FEE0,
+    {"name": "image_resource_ctor", "rva": 0xD61C20,
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 "
                "49 8B C0 48 8B DA 48 8B F9 45",
      "used": "sfimage::create_resource (CS::ScaleformImageResource)"},
-    {"name": "draw_image_into_clip", "rva": 0xD81640,
+    {"name": "draw_image_into_clip", "rva": 0xD83380,
      "bytes": "48 8B C4 48 89 50 10 56 57 41 54 41 56 41 57 48 83 EC 60 48 C7 40 98",
      "used": "sfimage::draw_into"},
     # sfimage::ensure_child_clip no longer CALLS this: it dispatches through the value's own
     # ObjectInterface vtable (slot 29), which is correct for either VM. The anchor stays so
     # that a patch shifting the interface layout is still caught - if these bytes ever stop
     # matching, re-derive the slot index before trusting the icon path.
-    {"name": "create_empty_movie_clip_as3", "rva": 0x10DFDA0,
+    {"name": "create_empty_movie_clip_as3", "rva": 0x10E1BA0,
      "bytes": "4C 8B DC 55 56 41 56 41 57 48 8B",
      "used": "sfimage: expected occupant of ObjectInterface vtable slot 29"},
 
@@ -195,55 +210,55 @@ ANCHORS = [
     # the bytes at the baked address once at startup and, on a shifted exe (downpatch, future
     # patch), re-finds each anchor by its bytes near the shift its neighbours resolved at. These
     # eleven were called as raw literals with no anchor at all until today's sweep.
-    {"name": "form_update_heartbeat", "rva": 0x93F540,
+    {"name": "form_update_heartbeat", "rva": 0x9406E0,
      "bytes": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 98 FE FF FF FF 49 89 5B 20",
      "used": "form_update_detour hook (dialog liveness heartbeat)"},
-    {"name": "clip_set_pos_i", "rva": 0x7331A0,
+    {"name": "clip_set_pos_i", "rva": 0x733FF0,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 41 8B D8 8B FA FF 50 08 8B 48 20 "
                "81 E1 8F 00 00 00 83 F9 02 72 0D",
      "used": "maphover own-tip (plain proxy setPosition, int pair; prologue identical to "
              "clip_set_pos - the resolver's shift prior is what tells them apart)"},
-    {"name": "panel_set_visible", "rva": 0x735A60,
+    {"name": "panel_set_visible", "rva": 0x7368B0,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 0F B6 DA 48 8B F9 38 51 69",
      "used": "maphover game-popup wrapper show/hide"},
-    {"name": "panel_set_pos_f", "rva": 0x7356E0,
+    {"name": "panel_set_pos_f", "rva": 0x736530,
      "bytes": "40 53 48 83 EC 30 F3 0F 10 49",
      "used": "maphover game-popup wrapper position (float pair)"},
-    {"name": "clip_set_text_color", "rva": 0x74A1D0,
+    {"name": "clip_set_text_color", "rva": 0x74B020,
      "bytes": "89 54 24 10 48 83 EC 28 48 8B 09 48 8B 01 FF 50 08 8B 48 20 81 E1 8F 00 "
                "00 00 83 F9 02 72 2D",
      "used": "maphover own-tip text colour"},
-    {"name": "caption_text_ctor", "rva": 0x760970,
+    {"name": "caption_text_ctor", "rva": 0x7617C0,
      "bytes": "48 89 4C 24 08 53 48 83 EC 40 48 C7 44 24 38 FE FF FF FF 48 8B D9 C7 44 "
                "24 30 00 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 44 24 60 48 8D 05 ?? ?? ?? "
                "?? 48 89 44 24 20 4C 8D 0D ?? ?? ?? ?? 44 8B C2 48 8D 54 24 60 E8 ?? ?? "
                "?? ?? 90 C7 44 24 30 01 00 00 00 48 8B C3 48 83 C4 40 5B C3",
      "used": "set_form_captions (engine text-value ctor)"},
-    {"name": "caption_register", "rva": 0x744540,
+    {"name": "caption_register", "rva": 0x745390,
      "bytes": "40 53 55 56 57 48 81 EC 88 01 00 00 48 C7",
      "used": "set_form_captions (register the text value on the movie)"},
-    {"name": "caption_pack", "rva": 0x745170,
+    {"name": "caption_pack", "rva": 0x745FC0,
      "bytes": "48 89 54 24 10 53 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 8B DA C7 44 "
                "24 20 00 00 00 00 48 83 C1 40",
      "used": "set_form_captions (pack the entry for the caption slot)"},
     # One-instruction holder tests: bytes past the ret are the next build's padding (the
     # grid_cursor_get lesson), so these patterns stop at the ret.
-    {"name": "job_holder_test_seq", "rva": 0x7A9230,
+    {"name": "job_holder_test_seq", "rva": 0x7AA0B0,
      "bytes": "48 83 79 30 00 75 09",
      "used": "open_screen (is the sequence slot free)"},
-    {"name": "job_holder_test_child", "rva": 0x7A9200,
+    {"name": "job_holder_test_child", "rva": 0x7AA080,
      "bytes": "83 39 01 0F 97",
      "used": "open_screen (is the child slot busy)"},
     # The two functions the input-trigger vtable check reads OUT OF a candidate vtable
     # (vt[0] and vt+0x38): anchoring the functions keeps that content compare working on a
     # shifted exe with no data-address anchor. trigger_vt_slot0_fn is truncated before a
     # call rel32 whose displacement is build-specific.
-    {"name": "trigger_vt_slot0_fn", "rva": 0x7342B0,
+    {"name": "trigger_vt_slot0_fn", "rva": 0x735100,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 48 8B F8 48 85 DB "
                "74 19 4C 8B 03 33 D2 48 8B CB 41 FF 50 08 4C 8B 07 48 8B D3 48 8B CF 41 "
                "FF 50 68 48 8B 5C 24 30 48 83 C4 20 5F C3",
      "used": "find_input_trigger (vt[0] content compare)"},
-    {"name": "trigger_vt_slot7_fn", "rva": 0x745BD0,
+    {"name": "trigger_vt_slot7_fn", "rva": 0x746A20,
      "bytes": "40 57 48 81 EC D0 08 00 00 48 C7 44 24 20 FE FF FF FF 48 89 9C 24 E0 08 "
                "00 00 48 8B F9 48 81",
      "used": "find_input_trigger (vt+0x38 content compare)"},
@@ -284,6 +299,8 @@ ANCHOR_KIND = {
     "menu_row_item_ctor": "pin",
     "menu_row_item_empty": "follower",
     "grid_cursor_get": "follower",
+    "snapshot_slot_vt_fn4": "pin",
+    "snapshot_slot_vt_fn6": "pin",
     "keyconfig_form_build": "pin",
     "job_ref_convert_a": "pin",
     "job_ref_convert_b": "pin",

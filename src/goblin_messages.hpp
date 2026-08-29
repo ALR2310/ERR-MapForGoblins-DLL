@@ -30,6 +30,12 @@ namespace goblin
     /// names that the game falls back to but our expanded base buffer omits.
     const wchar_t *lookup_text_dlc(int32_t id);
 
+    /// The resolution the GAME performs: base buffer first (via remap_textid, so an
+    /// offset-encoded key finds our injected string), then the DLC layers. Use this for
+    /// anything SHOWN to the player - lookup_text() alone silently returns nothing for a
+    /// DLC-layer-only id, and the caller then displays its English fallback.
+    const wchar_t *lookup_text_any(int32_t id);
+
     /// Collision-proof textId remap. setup_messages() copies every injected
     /// string into PlaceName at a FRESH id allocated contiguously ABOVE the
     /// runtime max PlaceName id (dynamically sized bands, never a fixed range),

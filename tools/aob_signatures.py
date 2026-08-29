@@ -200,6 +200,8 @@ SIGNATURES = [
     },
     {
         "name": "gfx_adddisp",
+        "retired":
+            "the AddDisplayObject hook was removed; nothing scans for this any more",
         "pattern": "4C 89 4C 24 20 4C 89 44 24 18 55 53 41 54 41 55 41 56 41 57 "
                    "48 8D 6C 24 F9",
         "slot": None,
@@ -384,6 +386,11 @@ SIGNATURES = [
     # ---- Kindling per-spirit liveness (niche feature) - non-critical ----
     {
         "name": "kindling_distance_vft",
+        "retired":
+            "replaced by RTTI (goblin_kindling.cpp resolves .?AVEcTestDistance@CS@@ by name). "
+            "The pattern was unique only because it ran past the function ret into padding, so "
+            "it MISSED on 2.6.1/2.2.3/2.2.0 and silently switched spirit tracking off there; "
+            "trimmed to the function itself it matches 4 times on every build.",
         "pattern": "48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 01 F6 C2 01 74 ?? "
                    "BA 40 00 00 00 E8 ?? ?? ?? ?? 90 48 8B C3 48 83 C4 30 5B C3 90 78 ??",
         "slot": (3, 7),
@@ -572,6 +579,10 @@ SIGNATURES = [
     },
     {
         "name": "stallprobe_job_poll",
+        "ambiguous_ok":
+            "two byte-identical copies of the same poll on every build, and the scan is "
+            "compiled only under MFG_STALL_PROFILER - first match lands on the same code either "
+            "way",
         # Baked rel32 -> wildcard. Two byte-identical copies exist on every build; first-match
         # picks the same code either way, so the AMBIGUOUS warning here is expected.
         "pattern": "48 83 EC 28 48 8B 09 48 85 C9 74 16 48 83 C1 10 E8 ?? ?? ?? ?? 85 C0 0F",
@@ -626,6 +637,8 @@ SIGNATURES = [
     },
     {
         "name": "map_subdialog_job_step",
+        "retired":
+            "no scan for this pattern is left in src/",
         "pattern": "4C 89 44 24 18 55 53 56 57 41 54 41 56 41 57 48 8D 6C 24 D9 "
                    "48 81 EC A0 00 00 00 48 C7 45 A7 FE FF FF FF 4D 8B F0 4C 8B",
         "slot": None,
@@ -649,6 +662,8 @@ SIGNATURES = [
     },
     {
         "name": "game_heap_alloc",
+        "retired":
+            "no refs and no scan in src/ - never had a consumer",
         # The old pattern ran 18 bytes past the thunk's tail jump, into whatever the linker
         # put next - so it existed only on 2.6.2. Cut to the thunk itself (6 instructions,
         # ending on its `jmp qword ptr [rax+0x50]`). Two byte-identical copies then match on
@@ -664,6 +679,8 @@ SIGNATURES = [
     },
     {
         "name": "alloc_singleton_global",
+        "retired":
+            "no scan for this pattern is left in src/",
         "pattern": "4C 8B 05 ?? ?? ?? ?? 4C 89 40 18 8D 53 08 B9 A0 18 00 00",
         "slot": None,
         "critical": False,
@@ -689,6 +706,8 @@ SIGNATURES = [
     },
     {
         "name": "gfx_placeobject2_exec",
+        "retired":
+            "dev-only Path-A experiment; no scan left in src/ (matched 47 places)",
         "pattern": "48 89 5C 24 08 57 48 83 EC 20 8B DA 48 8B F9 E8 ?? ?? ?? ?? "
                    "F6 C3 01 74 0D BA 10 00 00 00",
         "slot": None,

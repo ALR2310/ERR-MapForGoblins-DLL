@@ -9,6 +9,7 @@ exist → skip. Otherwise re-run script and update cache.
 Cache: data/.build_cache.json
 Override: --force <stage_name> | --force-all
 """
+import re
 import sys, os, json, hashlib, subprocess, time
 from pathlib import Path
 
@@ -520,9 +521,38 @@ def active_stages():
     return STAGES
 
 
+def check_source_completeness():
+    """Are the DLC maps actually there? A partial UXM unpack loses them SILENTLY.
+
+    The Realm of Shadow lives in map areas m20..m28 and m61. Nothing downstream notices their
+    absence: the extractors simply find fewer files, every stage succeeds, and the bake comes
+    out ~1260 markers lighter with no warning anywhere. That is the same shape of failure this
+    project keeps getting bitten by - a missing input that produces a smaller, confident answer
+    instead of an error.
+
+    A warning, not a hard stop: a deliberate no-DLC build is somebody's business, and the point
+    is that it can no longer happen by accident.
+    """
+    if not MSB_DIR.is_dir():
+        return
+    dlc = [p for p in MSB_DIR.iterdir()
+           if re.match(r'm(2[0-8]|61)_', p.name)]
+    base = [p for p in MSB_DIR.iterdir()
+            if re.match(r'm(1[0-9]|3[0-9]|60)_', p.name)]
+    if base and not dlc:
+        print('=' * 78)
+        print('WARNING: no Realm of Shadow maps (m20..m28, m61) in')
+        print(f'  {MSB_DIR}')
+        print('The bake will come out roughly 1260 markers short and nothing else will say so.')
+        print('A UXM unpack must include the files from DLC.bdt as well as the base archives.')
+        print('=' * 78)
+    elif dlc:
+        print(f'source check: {len(base)} base + {len(dlc)} Realm of Shadow map file(s)')
+
 def main():
     args = sys.argv[1:]
     force_all = '--force-all' in args
+    check_source_completeness()
     force_stages = set()
     for i, a in enumerate(args):
         if a == '--force' and i + 1 < len(args):

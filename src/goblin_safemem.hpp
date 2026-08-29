@@ -59,6 +59,13 @@ namespace goblin::safemem
     inline std::atomic<uint64_t> g_late_faults{0};  // the race net actually fired (expected: 0)
     inline std::atomic<uint64_t> g_queries{0};      // VirtualQuery calls, i.e. cache misses
     inline std::atomic<uint64_t> g_copies{0};       // total copy() calls - the hot-path volume
+    // TIME spent inside VirtualQuery, in QueryPerformanceCounter ticks. The call COUNT was
+    // always logged and always looked harmless; the cost per call was the thing nobody could
+    // see. On this author's machine a single VirtualQuery measured 2+ ms in the TwoHandToggle
+    // mod, and on one tester's 4.4-4.7 ms - roughly 40x normal, consistent with a memory-API
+    // filter (an anti-virus). Three calls a second is therefore not "nothing next to a
+    // syscall per read"; it is a visible hitch. Report this alongside the count.
+    inline std::atomic<uint64_t> g_query_qpc{0};
 
     inline bool prot_readable(DWORD p)
     {
@@ -92,9 +99,16 @@ namespace goblin::safemem
 
     // A cached verdict is a snapshot of something the game changes under us, so it expires. The
     // late-fault net catches a positive verdict going stale the hard way; the TTL bounds how long
-    // one can keep costing that net. One second means at most a handful of VirtualQuery calls per
-    // second per thread for the hot regions, which is nothing next to a syscall per read.
-    constexpr uint64_t kTtlMs = 1000;
+    // one can keep costing that net.
+    //
+    // FIVE seconds, not one. At one second the map tick's two liveness checks fell off the cache
+    // every single second and the refresh cost 8-10 ms IN ONE FRAME - measured on ERR 2.3.2.2,
+    // where the per-second `head` total matched the worst frame to within 20 us, every window.
+    // That is a syscall on a render path whose price nobody had measured: VirtualQuery has to
+    // take the process address-space lock, and while the game streams it waits there. The same
+    // number was found the same way in the TwoHandToggle mod (see its notes), where raising this
+    // TTL to five seconds and counting the milliseconds was what closed the CPU story.
+    constexpr uint64_t kTtlMs = 5000;
     // Eight, not four. The hot caller is the per-frame marker walk: thousands of reads per frame,
     // alternating between the game's heap regions and our own stack. If the working set of regions
     // exceeds the slots, round-robin eviction turns every read back into a VirtualQuery - a syscall
@@ -123,7 +137,13 @@ namespace goblin::safemem
         MEMORY_BASIC_INFORMATION mbi{};
         g_queries.fetch_add(1, std::memory_order_relaxed);
         Region r{};
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi)) != sizeof(mbi))
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        const SIZE_T got = VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi));
+        QueryPerformanceCounter(&t1);
+        g_query_qpc.fetch_add(static_cast<uint64_t>(t1.QuadPart - t0.QuadPart),
+                              std::memory_order_relaxed);
+        if (got != sizeof(mbi))
             return r; // r.end == 0: not a queryable address at all
         r.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
         r.end = r.base + mbi.RegionSize;

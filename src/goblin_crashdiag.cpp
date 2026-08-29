@@ -555,52 +555,75 @@ namespace
     uint64_t g_arena_lo = 0, g_arena_hi = 0, g_arena_cap = 0;
     uint64_t g_arena_last_free = 0;
 
+    // Find the manager by WHAT IT IS, not by where it was.
+    //
+    // This used to read a baked exe+0x3D87350, measured on 2.6.2. That address is wrong on 1.17
+    // and on 2.2.x, so the one instrument that would have shown the Scaleform arena filling up
+    // was blind on exactly the builds where the arena filled (the DL_PANIC player report). The
+    // probe already carries a strong validator - a capacity in the right order of magnitude with
+    // free <= cap - so use it as the search key: walk the pointer-sized words of the writable
+    // data sections, treat each as a candidate manager, and accept the ONE whose chain validates.
+    // Reads are guarded; a candidate that faults is simply not it.
+    uintptr_t arena_scan(uint64_t &out_cap, uint64_t &out_free, uint64_t &out_lo, uint64_t &out_hi)
+    {
+        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!exe)
+            return 0;
+        const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe);
+        const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(exe + dos->e_lfanew);
+        const auto *sec = IMAGE_FIRST_SECTION(nt);
+        uintptr_t found = 0;
+        unsigned hits = 0;
+        for (unsigned s = 0; s < nt->FileHeader.NumberOfSections && hits < 2; ++s, ++sec)
+        {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE))
+                continue;                              // singleton slots live in writable data
+            const uintptr_t begin = exe + sec->VirtualAddress;
+            const size_t len = sec->Misc.VirtualSize;
+            for (size_t off = 0; off + 8 <= len && hits < 2; off += 8)
+            {
+                uint64_t mgr = 0, inner = 0;
+                if (!probe_read64(begin + off, mgr) || mgr < 0x10000 || (mgr & 7))
+                    continue;
+                if (!probe_read64(static_cast<uintptr_t>(mgr) + 8, inner) || inner < 0x10000 ||
+                    (inner & 7))
+                    continue;
+                const uintptr_t impl = static_cast<uintptr_t>(inner) + 0x28;
+                uint64_t cap = 0, free_bytes = 0, lo = 0, hi = 0;
+                if (!probe_read64(impl + 0x00, cap) || !probe_read64(impl + 0x08, free_bytes))
+                    continue;
+                if (cap < 0x04000000 || cap > 0x20000000 || free_bytes > cap)
+                    continue;
+                probe_read64(impl + 0x38, lo);
+                probe_read64(impl + 0x48, hi);
+                ++hits;
+                found = impl;
+                out_cap = cap; out_free = free_bytes; out_lo = lo; out_hi = hi;
+                spdlog::info("[arena] manager slot found at exe+0x{:X} (capacity {} MiB)",
+                             (uint64_t)(begin + off - exe), cap / (1024 * 1024));
+            }
+        }
+        if (hits != 1)
+        {
+            spdlog::info("[arena] disabled: {} candidate manager(s) in writable data - "
+                         "not guessing between them", hits);
+            return 0;
+        }
+        return found;
+    }
+
     uintptr_t arena_resolve()
     {
         if (g_arena_tried) return g_arena;
         g_arena_tried = true;
-        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        if (!exe) return 0;
         // Every refusal below SAYS SO. The first version returned 0 in silence, and two whole test
         // runs produced no [arena] line at all with no way to tell "the probe is not in this build"
         // from "the probe could not resolve" - a diagnostic that cannot report its own failure is
         // worse than none.
-        uint64_t mgr = 0, inner = 0;
-        if (!probe_read64(exe + 0x3D87350, mgr) || mgr < 0x10000)
-        {
-            spdlog::info("[arena] disabled: manager slot at exe+0x3D87350 reads 0x{:X}", mgr);
-            return 0;
-        }
-        if (!probe_read64(static_cast<uintptr_t>(mgr) + 8, inner) || inner < 0x10000)
-        {
-            spdlog::info("[arena] disabled: manager+8 reads 0x{:X} (manager 0x{:X})", inner, mgr);
-            return 0;
-        }
-        const uintptr_t impl = static_cast<uintptr_t>(inner) + 0x28;
-        uint64_t cap = 0, lo = 0, hi = 0, free_bytes = 0;
-        if (!probe_read64(impl + 0x00, cap) || !probe_read64(impl + 0x08, free_bytes) ||
-            !probe_read64(impl + 0x38, lo) || !probe_read64(impl + 0x48, hi))
-        {
-            spdlog::info("[arena] disabled: impl 0x{:X} not readable", impl);
-            return 0;
-        }
-        // Every one of these has to hold at once. Any single coincidence is cheap; all of them
-        // together are not, and getting this wrong would print confident nonsense.
-        // Validate on capacity and free ONLY. The first version also demanded a low/high pair at
-        // +0x38/+0x48, and a live run proved that wrong: cap read 0x9FFF900 - 167,770,368, the exact
-        // arena capacity measured in the full dump - and free read a sane 0x57F2F20, while lo and hi
-        // both read the same value, i.e. the bounds are simply not at those offsets. Two correct
-        // fields plus one wrong assumption should not disable a read-only probe.
-        //
-        // The bounds were only ever used to walk the free-block tree, so that walk now sanity-checks
-        // its own pointers instead.
-        if (cap < 0x04000000 || cap > 0x20000000 || free_bytes > cap)
-        {
-            spdlog::info("[arena] disabled: impl 0x{:X} cap=0x{:X} free=0x{:X} lo=0x{:X} hi=0x{:X}"
-                         " - layout does not validate",
-                         impl, cap, free_bytes, lo, hi);
-            return 0;
-        }
+        uint64_t cap = 0, free_bytes = 0, lo = 0, hi = 0;
+        const uintptr_t impl = arena_scan(cap, free_bytes, lo, hi);
+        if (!impl)
+            return 0;                       // arena_scan said why
         g_arena = impl;
         g_arena_lo = lo;
         g_arena_hi = hi;

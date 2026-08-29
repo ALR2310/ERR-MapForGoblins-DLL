@@ -16,6 +16,7 @@
 //      both confirmed by the 2026-05-29 multi-angle research workflow.)
 //   4. Write `areaNo = 99` on collected rows, restore on respawned rows.
 
+#include "goblin_anchors.hpp" // EcTestDistance vtable, by RTTI name
 #include "goblin_kindling.hpp"
 #include "goblin_crashdiag.hpp" // register this thread, so a crash record can say it was ours
 #include "goblin_map_data.hpp"
@@ -177,13 +178,20 @@ static uintptr_t kindling_resolve(const char *aob)
     return reinterpret_cast<uintptr_t>(modutils::scan<void>({
         .aob = aob, .relative_offsets = {{3, 7}}}));
 }
-// EcTestDistance vftable (was RVA 0x2A5BB90) - the constructor's primary vtable
-// store. Used to validate per-spirit cond objects ([cond+0] == this vtable).
+// EcTestDistance vftable. Used to validate per-spirit cond objects ([cond+0] == this vtable).
+//
+// Found by the class's own RTTI name, not by an AOB. The AOB that stood here matched its
+// constructor's vtable store - a body FOUR other classes share verbatim - and was unique only
+// because the pattern ran past the function's `ret` into the padding and the first bytes of
+// whatever followed. That is accidental: on 2.6.1, 2.2.3 and 2.2.0 the tail differed, the scan
+// found nothing, and spirit tracking silently switched itself off on those builds (the caller
+// bows out on a 0). Trimming the pattern to the function's own bytes makes it match 4 times on
+// every build, so there is no honest AOB here. The class name is exact and moves with nothing:
+// resolved uniquely on all six builds (0x2A5EC00 on 2.7.0, 0x2A5BB90 on 2.6.x, 0x2A5BB70 on
+// 2.2.x) - see scratch/vtable_by_rtti.py.
 static uintptr_t distance_vft()
 {
-    static uintptr_t s = kindling_resolve(
-        "48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 01 F6 C2 01 74 ?? "
-        "BA 40 00 00 00 E8 ?? ?? ?? ?? 90 48 8B C3 48 83 C4 30 5B C3 90 78 ??");
+    static uintptr_t s = goblin::anchors::vtable_of(".?AVEcTestDistance@CS@@");
     return s;
 }
 // WorldSfxMan singleton slot (was RVA 0x3D6F5F8) - "game world loaded"

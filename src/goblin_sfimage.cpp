@@ -1,5 +1,7 @@
 #include "goblin_sfimage.hpp"
 
+#include "goblin_anchors.hpp" // the named RVA of every engine helper called below
+
 #include <spdlog/spdlog.h>
 
 #include <cstring>
@@ -14,9 +16,9 @@ namespace
     // Verified by decompile: allocates a 0x68-byte object, installs the RawImage vtable and
     // allocates one pixel buffer per mip level; plane records are 0x20 bytes and match the
     // SDK's Render::ImagePlane exactly (Width, Height, Pitch, DataSize, pData).
-    constexpr uintptr_t kRawImageCreate = 0x11489B0;
-    constexpr uintptr_t kImageResourceCtor = 0xD5FEE0; // (shell, name, image, flags)
-    constexpr uintptr_t kDrawImageInto = 0xD81640;     // (sfv, ImageResource**, float rect[4], 0)
+    constexpr goblin::AnchorId kRawImageCreate = goblin::AnchorId::rawimage_create;
+    constexpr goblin::AnchorId kImageResourceCtor = goblin::AnchorId::image_resource_ctor; // (shell, name, image, flags)
+    constexpr goblin::AnchorId kDrawImageInto = goblin::AnchorId::draw_image_into_clip;     // (sfv, ImageResource**, float rect[4], 0)
     // How to reach the GFx::Value behind a resolved clip proxy, and where its fields sit.
     //
     // The proxy is NOT a GFx::Value: the engine's own helpers all start with
@@ -112,7 +114,7 @@ namespace
     };
 
     // POD-only worker: build the image and copy the pixels in.
-    void *make_raw_image(uintptr_t b, int width, int height, const uint8_t *rgba)
+    void *make_raw_image(int width, int height, const uint8_t *rgba)
     {
         using CreateFn = void *(uint32_t format, int32_t mips, const RawCreateArgs *size,
                                 uint32_t use, void *heap, uint32_t arena, void *sync);
@@ -120,7 +122,7 @@ namespace
         __try
         {
             RawCreateArgs size{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
-            img = reinterpret_cast<CreateFn *>(b + kRawImageCreate)(kImageR8G8B8A8, 1, &size, 0,
+            img = reinterpret_cast<CreateFn *>(goblin::anchors::at(kRawImageCreate))(kImageR8G8B8A8, 1, &size, 0,
                                                                    nullptr, 0, nullptr);
             if (!img)
                 return nullptr;
@@ -144,7 +146,7 @@ namespace
         }
     }
 
-    void *wrap_resource(uintptr_t b, const wchar_t *name, void *img)
+    void *wrap_resource(const wchar_t *name, void *img)
     {
         __try
         {
@@ -158,7 +160,7 @@ namespace
             if (!shell)
                 return nullptr;
             using ResCtorFn = void *(void *shell, const wchar_t *name, void *image, uint32_t f);
-            return reinterpret_cast<ResCtorFn *>(b + kImageResourceCtor)(shell, name, img, 1);
+            return reinterpret_cast<ResCtorFn *>(goblin::anchors::at(kImageResourceCtor))(shell, name, img, 1);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -195,14 +197,13 @@ void *goblin::sfimage::create_resource(const wchar_t *name, int width, int heigh
 {
     if (width <= 0 || height <= 0 || !rgba)
         return nullptr;
-    const uintptr_t b = base();
-    void *img = make_raw_image(b, width, height, rgba);
+    void *img = make_raw_image(width, height, rgba);
     if (!img)
     {
         spdlog::warn("[sfimage] could not build a {}x{} image", width, height);
         return nullptr;
     }
-    void *res = wrap_resource(b, name ? name : L"MFG", img);
+    void *res = wrap_resource(name ? name : L"MFG", img);
     if (!res)
     {
         spdlog::warn("[sfimage] could not wrap the image as a resource");

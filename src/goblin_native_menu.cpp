@@ -1307,8 +1307,8 @@ namespace
         {
             const auto &h = g_hidden_view[i];
             // Same three parts the overlay's Hidden tab shows: item, where it was, category.
-            const wchar_t *name = goblin::lookup_text(h.textId);
-            const wchar_t *where = h.region > 0 ? goblin::lookup_text(h.region) : nullptr;
+            const wchar_t *name = goblin::lookup_text_any(h.textId);
+            const wchar_t *where = h.region > 0 ? goblin::lookup_text_any(h.region) : nullptr;
             const auto cat = static_cast<goblin::generated::Category>(h.cat);
             const char *ckey = goblin::category_config_key(cat);
             std::wstring label = name && *name ? name : L"?";

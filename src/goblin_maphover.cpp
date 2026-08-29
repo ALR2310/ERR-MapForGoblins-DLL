@@ -206,8 +206,8 @@ namespace
     // game, but it needs a pin, and our markers have none - so the same formula is applied inline
     // (`out = zoom * v - pan` over WorldMapArea +0x380 / +0x378 / +0x37C). The converter's address
     // is therefore NOT called from here; only its arithmetic is reused.
-    constexpr uintptr_t kSetVisible = 0x733340;
-    constexpr uintptr_t kSetPosI = 0x7331A0;
+    constexpr goblin::AnchorId kSetVisible = goblin::AnchorId::clip_set_visible;
+    constexpr goblin::AnchorId kSetPosI = goblin::AnchorId::clip_set_pos_i;
     // ── the game's own wrappers are a different type from a resolved proxy ───────────
     // A path lookup hands back a PLAIN proxy: the object itself, and the two primitives above take it
     // directly. The popup and each of its lines are a RICH wrapper that embeds such a proxy at +8 and
@@ -216,15 +216,15 @@ namespace
     // so touching one of those objects through its inner proxy instead would leave the memory lying,
     // and the game's own next write would be dropped as redundant. That is why the popup is shown
     // with kPanelVisible and placed with kPanelPosF, never with the two primitives above.
-    constexpr uintptr_t kPanelVisible = 0x735A60;  // FUN_140735A60(wrapper, 0|1)
-    constexpr uintptr_t kPanelPosF = 0x7356E0;     // FUN_1407356E0(wrapper, float[2])
-    constexpr uintptr_t kSetTextHtml = 0x74A000;
-    constexpr uintptr_t kResolve = 0x74A2F0;
-    constexpr uintptr_t kProxyValid = 0x733150;
-    constexpr uintptr_t kProxyDtor = 0xD7F850;
+    constexpr goblin::AnchorId kPanelVisible = goblin::AnchorId::panel_set_visible;  // FUN_140735A60(wrapper, 0|1)
+    constexpr goblin::AnchorId kPanelPosF = goblin::AnchorId::panel_set_pos_f;     // FUN_1407356E0(wrapper, float[2])
+    constexpr goblin::AnchorId kSetTextHtml = goblin::AnchorId::clip_set_text_html;
+    constexpr goblin::AnchorId kResolve = goblin::AnchorId::clip_resolve_child;
+    constexpr goblin::AnchorId kProxyValid = goblin::AnchorId::clip_is_valid;
+    constexpr goblin::AnchorId kProxyDtor = goblin::AnchorId::clip_proxy_dtor;
     // Text colour. These fields are html=0, so markup is not an option here - unlike the menu,
     // where the same job is done with a <font> tag.
-    constexpr uintptr_t kSetTextColor = 0x74A1D0;
+    constexpr goblin::AnchorId kSetTextColor = goblin::AnchorId::clip_set_text_color;
     constexpr int kTipLines = 8;
     constexpr const char *kTipPanel = "MfgTip";
     constexpr const char *kBannerPanel = "MfgBanner";

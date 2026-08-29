@@ -56,6 +56,13 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 // helper can never block on a lock the paused thread holds.
 namespace
 {
+    // The engine classes whose vtable identity these probes check. Looked up by RTTI name at
+    // runtime (goblin::anchors::vtable_of) because a vtable lives in .rdata, where a byte
+    // anchor has nothing to match - a baked address only ever matched one game build.
+    constexpr const char *kVtAutoHideCtrl = ".?AVCSFeAutoHideCtrl@CS@@";
+    constexpr const char *kVtKeyConfigDialog = ".?AVKeyConfigDialog@CS@@";
+    constexpr const char *kVtWorldMapDialog = ".?AVWorldMapDialog@CS@@";
+
     std::atomic<bool> g_running{false};
 
     // ── pin-registration cost counters ──────────────────────────────────
@@ -1139,7 +1146,25 @@ namespace
         uint32_t emph_writes = 0;
         int64_t zoom_qpc = 0;
         uint32_t zoom_passes = 0;
-        uint64_t copies0 = 0, queries0 = 0, refused0 = 0;
+        // The tick SPLIT INTO ITS FOUR PARTS, because the three counters above never added up:
+        // measured on ERR 2026-08-28, an idle map cost 26 ms of tick per second with ONE merge
+        // worth 2.4 ms, emphasis 0 and zoom 0 - and a single frame in that second took 24 ms,
+        // which is a visible hitch at 60 fps. 21 of those milliseconds had no counter at all,
+        // so the next round would have been another guess. These four partition the whole
+        // function; emph/merge/zoom above stay as sub-measures inside them.
+        int64_t head_qpc = 0;   // entry -> the emphasis section (drain, retarget, liveness)
+        // head came back as 8-10 ms/s of an 11-20 ms tick while holding about ten machine
+        // operations, so it is split again rather than argued about: the liveness gate (two
+        // safemem range checks + three guarded reads) against everything after it. head_max is
+        // per-FRAME, because "8 ms spread over 58 frames" and "8 ms in one frame" are different
+        // defects and a per-second total cannot tell them apart.
+        int64_t head_gate_qpc = 0;
+        int64_t head_rest_qpc = 0;
+        int64_t head_max_qpc = 0;
+        int64_t emphsec_qpc = 0;// the emphasis section -> the refresh gate (includes emph_qpc)
+        int64_t mergesec_qpc = 0;// the refresh gate itself (includes merge_qpc)
+        int64_t tail_qpc = 0;   // everything after it (includes zoom_qpc)
+        uint64_t copies0 = 0, queries0 = 0, refused0 = 0, vq_qpc0 = 0;
     };
     V3Perf g_v3_perf;
 
@@ -1530,6 +1555,53 @@ namespace
     uint64_t g_vt_sfmgr = 0;
     uint64_t g_vt_swfplayer = 0;
 
+    // Candidate slots for the movie-manager singleton, built once.
+    //
+    // This chain used to start at a baked exe+0x3D83148, measured on 2.6.2 - wrong on 1.17 and on
+    // 2.2.x, where the probe then read a stranger, failed its own checks and disarmed after 600
+    // frames without ever saying why. There is no need to bake it: the walk below ends in an EXACT
+    // test - a node whose player points at the very movie we just released against - so the slot
+    // that produces a match IS the right slot, and the wrong ones simply never match. Collect the
+    // structurally plausible candidates once, then let that test pick.
+    std::vector<uintptr_t> g_park_slots;
+    bool g_park_slots_built = false;
+    uintptr_t g_park_slot = 0;          // learned once a walk actually matched
+
+    void v3_park_build_slots()
+    {
+        if (g_park_slots_built) return;
+        g_park_slots_built = true;
+        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!exe) return;
+        const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe);
+        const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(exe + dos->e_lfanew);
+        const auto *sec = IMAGE_FIRST_SECTION(nt);
+        for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec)
+        {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE))
+                continue;
+            const uintptr_t begin = exe + sec->VirtualAddress;
+            for (size_t off = 0; off + 8 <= sec->Misc.VirtualSize; off += 8)
+            {
+                uint64_t outer = 0, mgr = 0, mvt = 0, node = 0;
+                if (!v3_read64(begin + off, outer) || !v3_heap_ptr(outer) || (outer & 7))
+                    continue;
+                if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr) ||
+                    (mgr & 7))
+                    continue;
+                if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt))
+                    continue;
+                if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node))
+                    continue;
+                g_park_slots.push_back(begin + off);
+                if (g_park_slots.size() >= 64)
+                    break;               // more than this is not a shortlist, it is noise
+            }
+        }
+        spdlog::info("[v3park] {} candidate manager slot(s); the parked-entry match picks one",
+                     g_park_slots.size());
+    }
+
     void v3_park_expire_tick()
     {
         const uintptr_t want = g_park_target.load(std::memory_order_relaxed);
@@ -1542,17 +1614,20 @@ namespace
             g_park_frames = 0;
             return;
         }
-        const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        if (!exe) return;
+        v3_park_build_slots();
+        // Try the slot that matched before; failing that, every candidate. The loop below ends on
+        // an exact movie-pointer match, so a wrong candidate costs one short walk and nothing else.
+        for (size_t cand = 0; cand < (g_park_slot ? 1u : g_park_slots.size()); ++cand)
+        {
+        const uintptr_t slot_addr = g_park_slot ? g_park_slot : g_park_slots[cand];
         uint64_t outer = 0, mgr = 0, mvt = 0;
-        if (!v3_read64(exe + 0x3D83148, outer) || !v3_heap_ptr(outer)) return;
-        if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr)) return;
-        if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt)) return;
-        if (g_vt_sfmgr == 0) g_vt_sfmgr = mvt;
-        else if (mvt != g_vt_sfmgr) return;   // not the object we learned; refuse rather than guess
+        if (!v3_read64(slot_addr, outer) || !v3_heap_ptr(outer)) continue;
+        if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr)) continue;
+        if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt)) continue;
+        if (g_park_slot && g_vt_sfmgr && mvt != g_vt_sfmgr) continue;  // the object we learned moved
 
         uint64_t node = 0;
-        if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node)) return;
+        if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node)) continue;
         const uint64_t head = node;
         for (int hop = 0; hop < 16; ++hop)
         {
@@ -1564,6 +1639,10 @@ namespace
                 (g_vt_swfplayer == 0 || pvt == g_vt_swfplayer))
             {
                 if (g_vt_swfplayer == 0) g_vt_swfplayer = pvt;   // learn it from the exact match
+                // This candidate produced an exact movie match, so it IS the manager slot.
+                // Remember it and stop scanning on later ticks.
+                g_park_slot = slot_addr;
+                g_vt_sfmgr = mvt;
                 const float expired = -1.0f;
                 if (v3_write_bytes(static_cast<uintptr_t>(node) + 0x18, &expired, sizeof expired))
                 {
@@ -1576,10 +1655,11 @@ namespace
                 return;
             }
             uint64_t next = 0;
-            if (!v3_read64(static_cast<uintptr_t>(node), next) || !v3_heap_ptr(next)) return;
+            if (!v3_read64(static_cast<uintptr_t>(node), next) || !v3_heap_ptr(next)) break;
             node = next;
-            if (node == head) return;   // circular list, one lap done
+            if (node == head) break;   // circular list, one lap done
         }
+        }   // candidate slots
     }
 
     // ── the world map's CURRENT movie, read every frame without an attachMovie burst ────────────
@@ -1633,7 +1713,44 @@ namespace
     // The slot test checks the slot's VTABLE, not merely that it is non-null. Measured over the
     // 50,825 children in the full dump: 8,946 null slots, 11,366 correct, and 29,801 carrying the
     // WRONG vtable - every one of which sails through a plain null check.
-    constexpr uint64_t V3_SLOT_VTABLE_RVA = 0x2CB9EF0;
+    // The snapshot-slot class's vtable, found at runtime by two of its own anchored slot
+    // functions. It used to be baked as exe+0x2CB9EF0 - correct on 2.6.2/2.6.1/2.6.0 and WRONG on
+    // 2.7.0, 2.2.3 and 2.2.0, where every child then failed the pre-test, the whole generation
+    // leaked at every map close, and the fixed 160 MiB Scaleform arena eventually could not serve
+    // the engine a 0x110-byte request: DL_PANIC (player report, 1.17, 2026-08-28). The class has
+    // no RTTI, so vtable_of cannot name it; its slot FUNCTIONS are code and the resolver finds
+    // those anywhere. Layout verified unchanged on all six builds - every virtual function
+    // identical instruction-for-instruction and reading the same field offsets
+    // (scratch/verify_slot_layout_all.py), so the rest of the walk below stands.
+    uint64_t v3_slot_vtable()
+    {
+        return goblin::anchors::vtable_with(goblin::AnchorId::snapshot_slot_vt_fn4, 4,
+                                            goblin::AnchorId::snapshot_slot_vt_fn6, 6);
+    }
+
+    // The snapshot-slot vtable this child reports, or 0 if the walk does not hold up. Split out of
+    // v3_child_releasable so the close-time survey below can ASK what the live value is without
+    // acting on it. Everything here is a struct OFFSET, which a rebase does not move; the one
+    // ADDRESS in the chain is the vtable the caller compares against.
+    uint64_t v3_child_slot_vtable(uintptr_t child, uintptr_t movie)
+    {
+        uint64_t root = 0, owner = 0;
+        if (!v3_read64(child + 0x20, root) || !v3_heap_ptr(root)) return 0;
+        if (!v3_read64(static_cast<uintptr_t>(root) + 0x10, owner) ||
+            owner != static_cast<uint64_t>(movie))
+            return 0;
+        uint64_t entry = 0;
+        if (!v3_read64(child + 0x48, entry) || !v3_heap_ptr(entry)) return 0;
+        const uint64_t page = entry & ~0xFFFull;
+        const uint64_t off = entry - page;
+        if (off < 0x30 || ((off - 0x30) % 0x48) != 0) return 0;
+        uint64_t tbl = 0, slot = 0, svt = 0;
+        if (!v3_read64(page + 0x20, tbl) || !v3_heap_ptr(tbl)) return 0;
+        if (!v3_read64(tbl + 0x28 + ((off - 0x30) / 0x48) * 8, slot) || !v3_heap_ptr(slot))
+            return 0;
+        if (!v3_read64(static_cast<uintptr_t>(slot), svt)) return 0;
+        return svt;
+    }
 
     bool v3_child_releasable(uintptr_t child, uint64_t expect_vtable, uintptr_t movie)
     {
@@ -1658,7 +1775,10 @@ namespace
         if (!v3_read64(page + 0x20, tbl) || !v3_heap_ptr(tbl)) return false;
         if (!v3_read64(tbl + 0x28 + ((off - 0x30) / 0x48) * 8, slot) || !v3_heap_ptr(slot))
             return false;
-        if (!v3_read64(static_cast<uintptr_t>(slot), svt) || svt != exe + V3_SLOT_VTABLE_RVA)
+        const uint64_t want = v3_slot_vtable();
+        if (!want)
+            return false;   // cannot identify the class on this build - refuse, never guess
+        if (!v3_read64(static_cast<uintptr_t>(slot), svt) || svt != want)
             return false;
         return true;
     }
@@ -3008,6 +3128,17 @@ namespace
         v3_note_thread("v3_native_tick (map frame)");
         v3_check_owner("v3_native_tick");
 
+        // Running split of this function (see V3Perf). A mark attributes everything since the
+        // previous one; the early returns below simply leave their last segment unattributed,
+        // which is correct - those are the frames that did nothing.
+        const int64_t t_head0 = v3_perf_now();
+        int64_t t_mark = t_head0;
+        const auto mark = [&t_mark](int64_t &into) {
+            const int64_t n = v3_perf_now();
+            into += n - t_mark;
+            t_mark = n;
+        };
+
         // Return the previous generation's children to the heap, a slice per frame. This runs
         // before the early returns below on purpose: an abandoned generation must drain even
         // on frames where the current target does not validate, which is exactly the window a
@@ -3032,6 +3163,7 @@ namespace
             !v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != parent ||
             !v3_read64(parent + 0xe0, live_count))
             return;
+        mark(g_v3_perf.head_gate_qpc);
         if (g_v3_target_layer.load(std::memory_order_relaxed) < 0)
             g_v3_target_layer.store(layer, std::memory_order_relaxed);
 
@@ -3093,6 +3225,14 @@ namespace
                          g_v3_native.layer, layer, g_v3_native.objects.size());
             g_v3_native.layer = layer;
             g_v3_native.next_refresh_ms = 0;
+        }
+
+        mark(g_v3_perf.head_rest_qpc);
+        {
+            const int64_t d = t_mark - t_head0;
+            g_v3_perf.head_qpc += d;
+            if (d > g_v3_perf.head_max_qpc)
+                g_v3_perf.head_max_qpc = d;
         }
 
         // ── Location emphasis, from here on ─────────────────────────────────────────────
@@ -3294,6 +3434,7 @@ namespace
         // turning the switch back on over the open map changed nothing. The close-time
         // self-detach named it exactly: "matched=0 removed=0 tracked=5975" against
         // "matched=908" on a healthy open. Only a map reopen brought them back.
+        mark(g_v3_perf.emphsec_qpc);
         const uint32_t vis_epoch = goblin::visibility_epoch();
         if (vis_epoch != g_v3_seen_vis_epoch)
         {
@@ -3313,6 +3454,7 @@ namespace
             g_v3_perf.merge_qpc += v3_perf_now() - t_m0;
             ++g_v3_perf.merges;
         }
+        mark(g_v3_perf.mergesec_qpc);
 
         // Counter-zoom pass: our children ride the marker layer's parent
         // transform 1:1 (nothing engine-side updates non-widget children).
@@ -3456,6 +3598,7 @@ namespace
         // The timeline ctx is never retained here. 96, i.e. two batches: raising it in step with
         // a 1024 batch was part of the reverted 2026-08-05 experiment (see V3_FACTORY_BATCH).
         g_v3_native.frame_budget = 96;
+        mark(g_v3_perf.tail_qpc);
     }
 
     // Dev-only (debug_logging) one-shot: prove a SOLID-color fill renders with no
@@ -3807,7 +3950,7 @@ namespace
     {
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         using TextCtorFn = void(void *, uint32_t);
-        auto p_text = reinterpret_cast<TextCtorFn *>(goblin::anchors::at(0x760970));
+        auto p_text = reinterpret_cast<TextCtorFn *>(goblin::anchors::at(goblin::AnchorId::caption_text_ctor));
         std::memset(out, 0, 0x88);
         p_text(out + 0x8, static_cast<uint32_t>(self->a));
         p_text(out + 0x48, static_cast<uint32_t>(self->b));
@@ -3859,7 +4002,7 @@ namespace
                                         reinterpret_cast<void *>(&gamefn_type),
                                         reinterpret_cast<void *>(&gamefn_destroy)};
         using RegisterFn = void(void *, void *, void *, void *);
-        auto p_reg = reinterpret_cast<RegisterFn *>(goblin::anchors::at(0x744540));
+        auto p_reg = reinterpret_cast<RegisterFn *>(goblin::anchors::at(goblin::AnchorId::caption_register));
         struct InputSpec
         {
             GameFnHolder trig;
@@ -4102,8 +4245,8 @@ namespace
             const uintptr_t f = reinterpret_cast<uintptr_t>(*g_feman_slot);
             if (!v3_heap_ptr(f))
                 return 0;
-            const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-            if (*reinterpret_cast<uintptr_t *>(f + 0x4E70) != base + 0x2A9CC50)
+            const uintptr_t vt_ctrl = goblin::anchors::vtable_of(kVtAutoHideCtrl);
+            if (!vt_ctrl || *reinterpret_cast<uintptr_t *>(f + 0x4E70) != vt_ctrl)
                 return 0; // layout moved - do not touch anything
             return f;
         }
@@ -4433,15 +4576,16 @@ namespace
                              : *reinterpret_cast<int8_t *>(feman + 0x78));
             const uintptr_t c = feman + 0x4E70;
             // Trust nothing: the vtable must still be the class we identified, or the offsets moved.
-            // The comparison address is a .rdata vtable, which no byte anchor can follow, so on an
-            // exe build other than this one it simply will not match and the probe bows out - which
-            // is the correct answer there anyway, since the struct offsets around it are unverified.
+            // The address is a .rdata vtable, which no byte anchor can follow, so it is found by
+            // the class's own RTTI name instead - that works on every build, where a baked address
+            // matched on exactly one.
             const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            const uintptr_t want = goblin::anchors::vtable_of(kVtAutoHideCtrl);
             const uintptr_t vt = *reinterpret_cast<uintptr_t *>(c);
-            if (vt != base + 0x2A9CC50)
+            if (!want || vt != want)
             {
-                spdlog::info("[autohide] {}: ctrl vt is exe+0x{:X}, expected exe+0x2A9CC50 - layout moved",
-                             when, vt > base ? vt - base : 0);
+                spdlog::info("[autohide] {}: ctrl vt is exe+0x{:X}, expected exe+0x{:X} - layout moved",
+                             when, vt > base ? vt - base : 0, want > base ? want - base : 0);
                 return;
             }
             int busy = 0;
@@ -4515,7 +4659,7 @@ namespace
 #endif
             g_hud_orig_job = *reinterpret_cast<void **>(base_menu + 0x10);
             if (v3_heap_ptr(reinterpret_cast<uintptr_t>(g_hud_orig_job)))
-                reinterpret_cast<void (*)(void *)>(goblin::anchors::at(0x1EBA1C0))(
+                reinterpret_cast<void (*)(void *)>(goblin::anchors::at(goblin::AnchorId::refcount_addref))(
                     reinterpret_cast<uint8_t *>(g_hud_orig_job) + 8);
             else
                 g_hud_orig_job = nullptr;
@@ -4643,12 +4787,12 @@ namespace
             // EXPERIMENT: restore the HUD menu's own sequence-slot job, which the diff shows is a
             // DIFFERENT object after our screen than before. Uses the engine's own slot setter (0x7A9250,
             // which takes its own reference) and then drops the reference we held.
-            const uintptr_t base_x = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
             void *now_job = *reinterpret_cast<void **>(base_menu + 0x10);
             if (g_hud_orig_job)
             {
                 void *held = g_hud_orig_job;
-                reinterpret_cast<void (*)(void *, void *)>(base_x + 0x7A9250)(
+                reinterpret_cast<void (*)(void *, void *)>(
+                    goblin::anchors::at(goblin::AnchorId::job_holder_store_seq))(
                     reinterpret_cast<void *>(base_menu + 0x10), &held);
                 spdlog::info("[hud] restored the HUD menu's sequence-slot job 0x{:X} (was 0x{:X}) - "
                              "experiment", (uint64_t)g_hud_orig_job, (uint64_t)now_job);
@@ -4814,9 +4958,9 @@ namespace
     // POD-only: fill found[i] with "does the row have this child clip".
     void probe_row_clips_raw(uintptr_t base, void *rowProxy, char *found)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         __try
         {
             for (size_t i = 0; i < kRowClipCount; ++i)
@@ -4869,12 +5013,12 @@ namespace
     void draw_our_row(uintptr_t base, void *rowProxy, const char *styleFrame,
                       const wchar_t *label, const wchar_t *value, bool plate)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_frame = reinterpret_cast<GotoFrameFn *>(goblin::anchors::at(0x7499E0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_text_html));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_frame = reinterpret_cast<GotoFrameFn *>(goblin::anchors::at(goblin::AnchorId::clip_goto_frame_name));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         __try
         {
             p_visible(rowProxy, 1);
@@ -4929,10 +5073,10 @@ namespace
             using AppendFn = void(void *, void *);
             using NormalCtorFn = void *(void *out, void *listCtx, uint32_t kind, const void *row);
             using EmptyCtorFn = void *(void *out);
-            auto p_clear = reinterpret_cast<ClearFn *>(goblin::anchors::at(0x868F20));
-            auto p_append = reinterpret_cast<AppendFn *>(goblin::anchors::at(0x868FE0));
-            auto p_normal = reinterpret_cast<NormalCtorFn *>(goblin::anchors::at(0x866F80));
-            auto p_empty = reinterpret_cast<EmptyCtorFn *>(goblin::anchors::at(0x8686C0));
+            auto p_clear = reinterpret_cast<ClearFn *>(goblin::anchors::at(goblin::AnchorId::menu_row_vec_clear));
+            auto p_append = reinterpret_cast<AppendFn *>(goblin::anchors::at(goblin::AnchorId::menu_row_vec_append));
+            auto p_normal = reinterpret_cast<NormalCtorFn *>(goblin::anchors::at(goblin::AnchorId::menu_row_item_ctor));
+            auto p_empty = reinterpret_cast<EmptyCtorFn *>(goblin::anchors::at(goblin::AnchorId::menu_row_item_empty));
             uint8_t scratch[8] = {};
             p_clear(vec, scratch, *reinterpret_cast<uintptr_t *>(obj + 0x10),
                     *reinterpret_cast<uintptr_t *>(obj + 0x18));
@@ -4976,11 +5120,13 @@ namespace
     // stack lists, and the player's own key-binding screen uses the very same builder.
     uintptr_t keyconfig_dialog_of(uintptr_t listObj)
     {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const uintptr_t want = goblin::anchors::vtable_of(kVtKeyConfigDialog);
+        if (!want)
+            return 0;
         __try
         {
             const uintptr_t cand = listObj - 0x1268;
-            if (*reinterpret_cast<uintptr_t *>(cand) == base + 0x2B0AC40)
+            if (*reinterpret_cast<uintptr_t *>(cand) == want)
                 return cand;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -5028,10 +5174,10 @@ namespace
         if (!dlg)
             return;
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         __try
         {
             void *root = reinterpret_cast<void *>(dlg + 0x120);
@@ -5066,10 +5212,10 @@ namespace
     {
         if (!dlg)
             return;
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         bool root_done = false;
         __try
@@ -5109,7 +5255,7 @@ namespace
                 // appears. Its own FadeOut later still works - the engine starts that itself.
                 using GotoAndStopFn = void(void *proxy, const char *label);
                 if (on)
-                    reinterpret_cast<GotoAndStopFn *>(goblin::anchors::at(0x7499E0))(
+                    reinterpret_cast<GotoAndStopFn *>(goblin::anchors::at(goblin::AnchorId::clip_goto_frame_name))(
                         reinterpret_cast<uint8_t *>(root) + 0x18, kSettledLabel);
             }
             // ONLY if the root would not take it. Walking the named clips instead is not
@@ -5347,9 +5493,9 @@ namespace
     // engine can resolve from the movie root.
     void probe_icon_paths_raw(uintptr_t base, const char *const *paths, size_t count, char *found)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
         if (!dlg)
             return;
@@ -5445,9 +5591,9 @@ namespace
 
     void build_slot_table(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         int found = 0;
         __try
         {
@@ -5506,12 +5652,12 @@ namespace
     void draw_row_icon(uintptr_t base, int32_t slot, const char *ini_key,
                       void *rowProxy = nullptr)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         using SetFrameNumFn = void(void *proxy, int frame);
-        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(0x749980));
+        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(goblin::AnchorId::clip_goto_frame_num));
         // One-shot: report whether a brand-new spliced clip name resolves at all - that
         // answers the long-standing question and tells us if icons can work this way.
         static std::atomic<int> s_reported{0};
@@ -5607,7 +5753,7 @@ namespace
                 if (ok)
                     // From the origin now: the strip's placement carries no matrix (so nothing
                     // resets it) and the row offset ICON_X/ICON_Y is baked into the strip itself.
-                    reinterpret_cast<SetPosFn *>(goblin::anchors::at(0x733230))(
+                    reinterpret_cast<SetPosFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_pos))(
                         r, -frame * goblin::menu_icon_tags::ICON_CELL_PX, 0);
                 else
                     note("MfgIcon did not resolve in the row", slot, frame);
@@ -5640,9 +5786,9 @@ namespace
     int draw_row_slider_raw(uintptr_t base, uintptr_t dlg, int32_t slot, int cell,
                             void *rowProxy)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         using SetPosFn = void(void *proxy, int32_t x, int32_t y);
         char path[96];
         void *root = reinterpret_cast<void *>(dlg + 0x120);
@@ -5671,7 +5817,7 @@ namespace
             }
             if (p_valid(r))
             {
-                reinterpret_cast<SetPosFn *>(goblin::anchors::at(0x733230))(
+                reinterpret_cast<SetPosFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_pos))(
                     r, -cell * goblin::menu_icon_tags::SLIDER_CELL_PITCH_PX, 0);
                 applied = cell;
             }
@@ -5826,7 +5972,7 @@ namespace
         {
             using CursorFn = uint32_t(void *grid);
             using ItemAtFn = void *(void *viewList, uint32_t index);
-            const uint32_t index = reinterpret_cast<CursorFn *>(goblin::anchors::at(0x739E20))(
+            const uint32_t index = reinterpret_cast<CursorFn *>(goblin::anchors::at(goblin::AnchorId::grid_cursor_get))(
                 reinterpret_cast<void *>(dlg + 0xa38));
             void *viewList = reinterpret_cast<void *>(dlg + 0x1268);
             const uintptr_t vvt = *reinterpret_cast<uintptr_t *>(viewList);
@@ -5907,10 +6053,10 @@ namespace
     void set_form_captions(uintptr_t base, uintptr_t dlg, const wchar_t *title,
                            const wchar_t *hint)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_text_html));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         __try
         {
@@ -5947,12 +6093,12 @@ namespace
 
     void prepare_form_layout(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         using SetFrameNumFn = void(void *proxy, int frame);
-        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(0x749980));
+        auto p_framenum = reinterpret_cast<SetFrameNumFn *>(goblin::anchors::at(goblin::AnchorId::clip_goto_frame_num));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         static const char *const kHide[] = {
             "SelectKey/Win64", "SelectKey/PS4",  "SelectKey/PS5",     "SelectKey/XboxOne",
@@ -6045,7 +6191,7 @@ namespace
         {
             using PackFn = void *(uintptr_t entry, void *outPack);
             uint8_t pack[0x90] = {};
-            void *p = reinterpret_cast<PackFn *>(goblin::anchors::at(0x745170))(entry, pack);
+            void *p = reinterpret_cast<PackFn *>(goblin::anchors::at(goblin::AnchorId::caption_pack))(entry, pack);
             if (!p)
                 return false;
             // pack layout (cmdlist RE): DLString name @+0x8 - inline buffer unless long.
@@ -6091,11 +6237,11 @@ namespace
     // never behaves like a row the cursor can land on.
     void paint_right_panel(uintptr_t base, uintptr_t dlg)
     {
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
-        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(0x733340));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_text_html));
+        auto p_visible = reinterpret_cast<SetVisibleFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_visible));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         for (int n = 0; n < 11; ++n)
         {
@@ -6196,10 +6342,10 @@ namespace
                 _snwprintf_s(fallback, _TRUNCATE, L"%s", label);
             tip = fallback;
         }
-        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(0x74A2F0));
-        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(0x74A000));
-        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(0x733150));
-        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(0xD7F850));
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_settext = reinterpret_cast<SetTextFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_text_html));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
         __try
         {
@@ -6315,9 +6461,9 @@ namespace
             using RebuildFn = void(void *viewList, void *mgr);
             using RefreshFn = void(void *dlg);
             // The HOOKED builder, so our rows are the ones rebuilt.
-            reinterpret_cast<RebuildFn *>(goblin::anchors::at(0x868590))(reinterpret_cast<void *>(dlg + 0x1268),
+            reinterpret_cast<RebuildFn *>(goblin::anchors::at(goblin::AnchorId::menu_row_build_dispatch))(reinterpret_cast<void *>(dlg + 0x1268),
                                                           reinterpret_cast<void *>(dlg + 0x1290));
-            reinterpret_cast<RefreshFn *>(goblin::anchors::at(0x942690))(reinterpret_cast<void *>(dlg));
+            reinterpret_cast<RefreshFn *>(goblin::anchors::at(goblin::AnchorId::menu_view_refresh))(reinterpret_cast<void *>(dlg));
             // The refresh leaves the grid's item count at the PREVIOUS page's value, so the
             // list is only walkable up to that many items. Restate it from what the rebuild
             // actually landed - after the refresh, never before: writing it first is what let
@@ -6761,7 +6907,7 @@ namespace
     {
         if (!obj)
             return;
-        auto p_unref = reinterpret_cast<int (*)(void *)>(goblin::anchors::at(0x1EBA200));
+        auto p_unref = reinterpret_cast<int (*)(void *)>(goblin::anchors::at(goblin::AnchorId::refcount_unref));
         if (p_unref(reinterpret_cast<uint8_t *>(obj) + 8) == 1)
             (*reinterpret_cast<void (**)(void *)>(*reinterpret_cast<void **>(obj)))(obj);
     }
@@ -6784,7 +6930,7 @@ namespace
         void *area = goblin::maphover::map_dialog();
         if (!area)
             return 0;
-        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const uintptr_t want = goblin::anchors::vtable_of(kVtWorldMapDialog);
         const uintptr_t cand = reinterpret_cast<uintptr_t>(area) - 0x27D8;
         uintptr_t vt = 0;
         __try
@@ -6795,7 +6941,7 @@ namespace
         {
             return 0;
         }
-        return (vt == base + 0x2B2D7D8) ? cand : 0;
+        return (want && vt == want) ? cand : 0;
     }
 
 
@@ -6869,7 +7015,7 @@ namespace
     // 0x7B into keyconfig_form_build, and that anchor is the thing that gets re-found on a
     // different exe build. Writing a byte at an absolute address that moved would patch a
     // random instruction. Verified: 0x80796B - 0x8078F0 = 0x7B.
-    constexpr uint32_t kFormDescKindFn = 0x8078F0; // anchor: keyconfig_form_build
+    constexpr goblin::AnchorId kFormDescKindFn = goblin::AnchorId::keyconfig_form_build; // anchor: keyconfig_form_build
     constexpr uintptr_t kFormDescKindInFn = 0x7B;
 
     // Returns the previous value, or 0 if the patch could not be applied.
@@ -6946,9 +7092,9 @@ namespace
             const uintptr_t vt = *reinterpret_cast<uintptr_t *>(win);
             if (!v3_heap_ptr(vt) && vt < base)
                 return false;
-            if (*reinterpret_cast<uintptr_t *>(vt) != goblin::anchors::at(0x7342B0))
+            if (*reinterpret_cast<uintptr_t *>(vt) != goblin::anchors::at(goblin::AnchorId::trigger_vt_slot0_fn))
                 return false;
-            if (*reinterpret_cast<uintptr_t *>(vt + 0x38) != goblin::anchors::at(0x745BD0))
+            if (*reinterpret_cast<uintptr_t *>(vt + 0x38) != goblin::anchors::at(goblin::AnchorId::trigger_vt_slot7_fn))
                 return false;
             // The sequence holder must read as a DLRefPtr: empty, or something on the heap.
             const uint64_t held = *reinterpret_cast<uint64_t *>(win + 0x10);
@@ -7150,9 +7296,9 @@ namespace
         {
             void *slotA = nullptr, *slotB = nullptr, *slotC = nullptr;
             auto p_keycfg =
-                reinterpret_cast<void *(*)(void **, void *, uint8_t)>(goblin::anchors::at(0x8078F0));
-            auto p_conv1 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(0x7A7E30));
-            auto p_conv2 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(0x7A7B60));
+                reinterpret_cast<void *(*)(void **, void *, uint8_t)>(goblin::anchors::at(goblin::AnchorId::keyconfig_form_build));
+            auto p_conv1 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(goblin::AnchorId::job_ref_convert_a));
+            auto p_conv2 = reinterpret_cast<void *(*)(void *, void **)>(goblin::anchors::at(goblin::AnchorId::job_ref_convert_b));
             // OWNER: win+0x50, what the game's own key-binding opener passes; the pushed path
             // uses the menu's own +0x10 the way F11's settings screen does.
             void *owner = reinterpret_cast<void *>(host + (pushed ? 0x10 : 0x50));
@@ -7180,7 +7326,7 @@ namespace
                 // conversion chain returns the address of the last slot), so slotC reads back as
                 // 0 afterwards - which is also why the release below is a no-op rather than a
                 // double free. Record the job BEFORE the store, or the log shows 0x0.
-                auto p_addref = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(0x1EBA1C0));
+                auto p_addref = reinterpret_cast<void (*)(void *)>(goblin::anchors::at(goblin::AnchorId::refcount_addref));
                 g_screens.back().job = reinterpret_cast<uintptr_t>(slotC);
                 if (pushed)
                 {
@@ -7212,7 +7358,7 @@ namespace
                     // hud_snapshot_take - an unowned +1 on an engine-owned object - and it is worth
                     // fixing even though this branch is rarely taken now (over the map the slot is
                     // usually held by the map's own job sequence, so we push instead).
-                    auto p_seq = reinterpret_cast<void (*)(void *, void *)>(goblin::anchors::at(0x7A9250));
+                    auto p_seq = reinterpret_cast<void (*)(void *, void *)>(goblin::anchors::at(goblin::AnchorId::job_holder_store_seq));
                     p_seq(reinterpret_cast<void *>(host + 0x10), r);
                 }
                 release_job_ref(base, slotC);
@@ -7481,7 +7627,7 @@ namespace
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         __try
         {
-            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(0x7A9230))(
+            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(goblin::AnchorId::job_holder_test_seq))(
                        reinterpret_cast<void *>(win + 0x10)) != 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -7550,7 +7696,7 @@ namespace
         __try
         {
             uint64_t held = *reinterpret_cast<uint64_t *>(win + 0x1E8);
-            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(0x7A9200))(&held) != 0;
+            return reinterpret_cast<char (*)(void *)>(goblin::anchors::at(goblin::AnchorId::job_holder_test_child))(&held) != 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -9974,6 +10120,7 @@ namespace
         p.copies0 = goblin::safemem::g_copies.load(std::memory_order_relaxed);
         p.queries0 = goblin::safemem::g_queries.load(std::memory_order_relaxed);
         p.refused0 = goblin::safemem::g_refused.load(std::memory_order_relaxed);
+        p.vq_qpc0 = goblin::safemem::g_query_qpc.load(std::memory_order_relaxed);
     }
 
     // ── Map-stall sampler ────────────────────────────────────────────────────────────
@@ -10105,15 +10252,21 @@ namespace
         const auto us = [f](int64_t q) { return q * 1000000 / f; };
         spdlog::info("[v3perf] {} map frames / {} ms: ours {} us (avg {}, max {}) = tick {} us + "
                      "reconcile {} us (of the tick, {} merges cost {} us, emphasis {} us / {} "
-                     "writes, zoom reapply {} us / {} passes); {} pulses {} us; "
-                     "safemem copies +{} lookups +{} refused +{}",
+                     "writes, zoom reapply {} us / {} passes); tick split: head {} (gate {} + "
+                     "rest {}, worst frame {}) + emph {} + refresh {} + tail {} us; {} pulses {} us; "
+                     "safemem copies +{} lookups +{} ({} us in VirtualQuery) refused +{}",
                      p.frames, span, us(p.total_qpc),
                      us(p.total_qpc / (p.frames ? p.frames : 1)), us(p.max_qpc),
                      us(p.tick_qpc), us(p.recon_qpc), p.merges, us(p.merge_qpc), us(p.emph_qpc),
-                     p.emph_writes, us(p.zoom_qpc), p.zoom_passes, p.pulses,
-                     us(p.pulse_qpc),
+                     p.emph_writes, us(p.zoom_qpc), p.zoom_passes,
+                     us(p.head_qpc), us(p.head_gate_qpc), us(p.head_rest_qpc),
+                     us(p.head_max_qpc), us(p.emphsec_qpc), us(p.mergesec_qpc), us(p.tail_qpc),
+                     p.pulses, us(p.pulse_qpc),
                      goblin::safemem::g_copies.load(std::memory_order_relaxed) - p.copies0,
                      goblin::safemem::g_queries.load(std::memory_order_relaxed) - p.queries0,
+                     us(static_cast<int64_t>(
+                         goblin::safemem::g_query_qpc.load(std::memory_order_relaxed) -
+                         p.vq_qpc0)),
                      goblin::safemem::g_refused.load(std::memory_order_relaxed) - p.refused0);
         p = V3Perf{};
         p.window_ms = now;
@@ -10368,6 +10521,41 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
         // (exe+0x1136C9B reading [movie+0x5338], and the entry-release virtual call in
         // exe+0x11578F0) resolve through it.
         const uintptr_t movie = v3_movie_now();
+
+        // SURVEY, no action taken. On game 1.17 every child fails the pre-test and the whole
+        // generation leaks (player log 2026-08-28: "0 released ... 7189 unsafe(pre-test)" on
+        // every close, then DL_PANIC once the fixed 160 MiB Scaleform arena could not serve a
+        // 0x110-byte request). The single ADDRESS in the chain was measured on 2.6.2 and could
+        // not match there; it is resolved at runtime now (v3_slot_vtable). This survey stays as
+        // the field check on that: 7189 independent children agreeing on one vtable pointer, and
+        // that pointer being the resolved one, is what says the walk holds on this build. A low
+        // agreement rate would say it does not, whatever the offline verification concluded.
+        {
+            uint64_t top = 0;
+            uint32_t top_n = 0, walked = 0, distinct = 0;
+            std::unordered_map<uint64_t, uint32_t> tally;
+            for (auto &o : g_v3_native.objects)
+            {
+                if (!o.ref_held || !v3_heap_ptr(o.child))
+                    continue;
+                const uint64_t svt = v3_child_slot_vtable(o.child, movie);
+                if (!svt)
+                    continue;
+                ++walked;
+                const uint32_t n = ++tally[svt];
+                if (n > top_n) { top_n = n; top = svt; }
+            }
+            distinct = static_cast<uint32_t>(tally.size());
+            const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            spdlog::info("[v3slotvt] survey: {} of {} children walked, {} distinct vtable(s); "
+                         "top exe+0x{:X} on {} of them ({}%); resolved expectation exe+0x{:X} - {}",
+                         walked, g_v3_native.objects.size(), distinct,
+                         (top && exe && top > exe) ? top - exe : 0, top_n,
+                         walked ? top_n * 100 / walked : 0,
+                         (v3_slot_vtable() && exe) ? v3_slot_vtable() - exe : 0,
+                         (top && v3_slot_vtable() && top == v3_slot_vtable()) ? "MATCHES"
+                                                                             : "does NOT match");
+        }
         for (auto &o : g_v3_native.objects)
         {
             if (!o.ref_held || !v3_heap_ptr(o.child) || vt == 0)
@@ -10705,10 +10893,10 @@ void goblin::stall_probe::setup()
     // an unproven prologue address is not worth a cosmetic dev feature.
     {
         const bool anchored = goblin::anchors::all_ok();
-        const uintptr_t a_build = anchored ? goblin::anchors::at(0x868590) : 0;
-        const uintptr_t a_render = anchored ? goblin::anchors::at(0x8674E0) : 0;
-        const uintptr_t a_decide = anchored ? goblin::anchors::at(0x9411A0) : 0;
-        const uintptr_t a_update = anchored ? goblin::anchors::at(0x93F540) : 0;
+        const uintptr_t a_build = anchored ? goblin::anchors::at(goblin::AnchorId::menu_row_build_dispatch) : 0;
+        const uintptr_t a_render = anchored ? goblin::anchors::at(goblin::AnchorId::menu_row_render) : 0;
+        const uintptr_t a_decide = anchored ? goblin::anchors::at(goblin::AnchorId::menu_row_decide) : 0;
+        const uintptr_t a_update = anchored ? goblin::anchors::at(goblin::AnchorId::form_update_heartbeat) : 0;
         if (a_build && a_render && a_decide && a_update)
         {
             modutils::hook(reinterpret_cast<void *>(a_build),

@@ -367,7 +367,7 @@ void goblin::progress::rebuild()
     for (auto &rp : regions)
         if (rp.place_name_id > 0)
         {
-            const wchar_t *w = goblin::lookup_text(rp.place_name_id);
+            const wchar_t *w = goblin::lookup_text_any(rp.place_name_id);
             std::string loc = wide_to_utf8(w);
             if (!loc.empty()) rp.name = std::move(loc);
         }

@@ -2,6 +2,9 @@
 
 #include <cstdint>
 
+// The anchor each call site wants, by name. The RVA never leaves the table.
+#include "generated_shared/goblin_anchor_ids.hpp"
+
 // Runtime resolution of the RVA anchors (tools/rva_anchors.py, generated into
 // generated_shared/goblin_anchor_table.hpp by tools/check_aobs.py).
 //
@@ -24,9 +27,14 @@ namespace goblin::anchors
     // cost off a frame and to get the "[anchors]" verdict into the log early.
     void warm();
 
-    // Live VA for a baked anchor RVA, 0 when that anchor is dead on this exe.
+    // Live VA of an anchor, 0 when that anchor is dead on this exe.
     // The first call resolves the whole table (thread-safe, once).
-    uintptr_t at(uint32_t baked_rva);
+    //
+    // Keyed by NAME, never by address. When at() took the baked RVA as its key, re-baking the
+    // table onto a new game build changed every key at once: no entry matched, at() answered 0,
+    // and every anchored call site called address 0. Nothing in the sources carries an address
+    // any more, so that cannot recur.
+    uintptr_t at(AnchorId id);
 
     // Every anchor resolved (possibly rebased). The gate for arming anything that
     // calls or hooks anchored addresses.
@@ -37,4 +45,19 @@ namespace goblin::anchors
     // 0 when the ctor is dead or the derivation fails; own_movie then simply never
     // matches a File and the transform stays off - a safe degradation.
     uintptr_t memfile_vtable();
+
+    // The VA of a class's vtable, found by its RTTI name, 0 when it is not there or the name
+    // is ambiguous. Pass the decorated name exactly as the exe spells it, e.g.
+    // ".?AVWorldMapDialog@CS@@". Cached per name pointer, so pass a string literal.
+    //
+    // A vtable address cannot be anchored by bytes - it lives in .rdata and holds addresses.
+    // Baking one instead pins the check that uses it to a single game build, which is how the
+    // map menu lost its host on 1.17. The RTTI name does not move.
+    uintptr_t vtable_of(const char *decorated_name);
+
+    // A vtable found by the CODE it points at: the one place in .rdata where both anchored
+    // functions sit at their own slot index. For classes RTTI cannot name - the Scaleform ones -
+    // and the replacement for baking such an address, which is only ever right on the build it
+    // was measured on. 0 when it is absent or ambiguous. Cached per (anchor, slot) pair.
+    uintptr_t vtable_with(AnchorId a, unsigned slot_a, AnchorId b, unsigned slot_b);
 }

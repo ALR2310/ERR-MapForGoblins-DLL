@@ -1052,6 +1052,30 @@ void goblin::setup_messages()
         g_placename_dlc_slots[0] = (329 < count2) ? sub[329] : nullptr;
         g_placename_dlc_slots[1] = (429 < count2) ? sub[429] : nullptr;
 
+        // A DLC slot the runtime never initialised can hold a STALE pointer that
+        // access-violates on the first read (seen under ERR's loader). Probe each one ONCE
+        // here, under SEH, and drop the bad ones - so lookup_text_dlc() below is a plain
+        // read like lookup_text(), safe to call from the progress rebuild every half second
+        // rather than only from the manual marker dump.
+        for (int i = 0; i < 2; ++i)
+        {
+            uint8_t *f = g_placename_dlc_slots[i];
+            if (!f)
+                continue;
+            std::function<int()> job = [&]() -> int
+            {
+                const uint32_t grp = *reinterpret_cast<uint32_t *>(f + 0x0C);
+                const uint32_t str = *reinterpret_cast<uint32_t *>(f + 0x10);
+                return (grp > 0 && grp < 100000 && str > 0 && str < 1000000) ? 1 : 0;
+            };
+            if (seh_call(&seh_run_job_thunk, &job) != 1)
+            {
+                spdlog::info("[FMG] PlaceName layer slot {} did not read back as a usable "
+                             "table - skipping that layer", i == 0 ? 329 : 429);
+                g_placename_dlc_slots[i] = nullptr;
+            }
+        }
+
 #ifdef MFG_VANILLA
         // The game resolves PlaceName through the DLC layers FIRST (slots 429,
         // 329) and falls back to base slot 19. Ids that live only in a DLC
@@ -1421,6 +1445,18 @@ static const wchar_t *fmg_lookup_in(uint8_t *fmg, int32_t id)
 const wchar_t *goblin::lookup_text(int32_t id)
 {
     return fmg_lookup_in(g_expanded_placename_fmg, id);
+}
+
+const wchar_t *goblin::lookup_text_any(int32_t id)
+{
+    // The order the GAME resolves a PlaceName in: our expanded base buffer (which carries
+    // every id the base game has, plus our injected strings at their remapped ids), then the
+    // DLC layers. Without the second half, every location that exists only in the DLC layer -
+    // all nine Land of Shadow regions, for one - falls back to the English label baked into
+    // the source, whatever language the player is running.
+    if (const wchar_t *s = lookup_text(remap_textid(id)))
+        return s;
+    return lookup_text_dlc(id);
 }
 
 const wchar_t *goblin::lookup_text_dlc(int32_t id)

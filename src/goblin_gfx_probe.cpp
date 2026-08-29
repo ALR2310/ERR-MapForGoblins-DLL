@@ -828,6 +828,7 @@ namespace
     }
 
     uint64_t locate_sprite171();  // fwd decl (defined below): worldmap sprite-171 by charId+frameCount
+    bool sprite171_shape_ok(uint64_t sd);  // fwd decl: the charId+frame-array test both routes use
 
     // A g_movie_swapped counter for the retired Path B buffer swap stood here with a four-line note
     // about validating that mechanism with an identity copy. Single occurrence, and the mechanism it
@@ -1736,9 +1737,36 @@ namespace
                 g_moviedef.store(md, std::memory_order_relaxed);
         }
         void *res = o_lookup(rcx, charId, r8);
-        // A Path-A milestone log stood here: for each distinct charId in our injected range, print
-        // whether the char-dict lookup resolved it. It was gated on g_ms_watch_cid, which nothing
-        // ever set, so it never printed a line.
+        // LAST RESORT, and the only route that survives arriving late.
+        //
+        // Everything else keys off the sprite-171 LOAD: the ctor hook records each sprite as it is
+        // constructed and the loader hook then picks the worldmap's out of that ring. Both need the
+        // movie to be parsed AFTER our hooks are armed. It is not always: on one ERR launch (me3
+        // 0.12.1, 2026-08-28) 02_120_worldmap was already parsed when we got there, the ring held no
+        // worldmap-shaped 171, the load fired once and never again, and the whole session ran with
+        // invisible markers - the log said "no worldmap-shaped 171 ... was in the ctor ring". The very
+        // next launch was fine, which is what a race looks like.
+        //
+        // This hook does not depend on that timing at all: it is the engine resolving a charId in a
+        // movie's own dictionary, and it fires when the movie is INSTANCED. Whatever it hands back for
+        // charId 171 IS the parsed sprite, however long ago it was parsed. Guarded three ways: only
+        // when the normal path has not already injected (so a healthy session never reaches this
+        // code), only when the movie's name does not rule it out, and only when the object passes the
+        // same shape test the ring scan uses.
+        if (charId == 171 && res && !g_qmark_injected.load(std::memory_order_relaxed))
+        {
+            const uint64_t sd = (uint64_t)res;
+            const uint64_t md = (uint64_t)rcx - OFF_MOVIEDEF_DICT;
+            if (looks_heap(md) && ctx_is_worldmap(md) != 0 && sprite171_shape_ok(sd))
+            {
+                const uint32_t fcnt = rd32(sd + OFF_FRAMECOUNT);
+                g_qmark_injected.store(true, std::memory_order_relaxed);
+                spdlog::info("[gfxprobe] sprite 171 (frameCount={}) taken from the movie's own "
+                             "dictionary - its load was missed, so the icons go in here instead",
+                             fcnt);
+                seh_inject_sprite171(sd, md, fcnt);
+            }
+        }
         return res;
     }
 
@@ -1801,27 +1829,31 @@ namespace
     //    scanning for the most-recent charId==171 specifically fixes that race.)
     // Movie-based identity isn't usable here: injection must run at LOAD, before the render-time
     // charId-171 lookup (lookup_detour) reveals the worldmap movie. Returns 0 if none seen yet.
+    // Does this object look like the WORLDMAP's sprite 171 rather than some other movie's
+    // 1-frame decorative one? charId + a frame array whose count agrees with frameCount. This is
+    // the only discriminator that works when the movie's name cannot be read, so both the ctor-ring
+    // scan and the dictionary fallback below judge a candidate by exactly this.
+    bool sprite171_shape_ok(uint64_t sd)
+    {
+        if (!looks_heap(sd))
+            return false;
+        if (rd32(sd + OFF_CHARID) != 171)
+            return false;
+        uint32_t fc = rd32(sd + OFF_FRAMECOUNT);
+        if (fc <= 1 || fc > 1000000) // 1-frame decorative 171 (not the icon sprite) / garbage
+            return false;
+        uint64_t data = rq(sd + OFF_FRAMEARR_DATA);
+        uint32_t cnt = rd32(sd + OFF_FRAMEARR_COUNT);
+        return looks_heap(data) && cnt == fc;
+    }
+
     uint64_t locate_sprite171()
     {
         unsigned head = g_idx.load(std::memory_order_relaxed); // total ctors; head-1 = most recent slot
         unsigned n = head < (unsigned)RING ? head : (unsigned)RING; // scan only written slots (no underflow)
         for (unsigned back = 1; back <= n; ++back)
-        {
-            uint64_t sd = (uint64_t)g_sprites[(head - back) % RING];
-            if (!looks_heap(sd))
-                continue;
-            if (rd32(sd + OFF_CHARID) != 171)
-                continue;
-            uint32_t fc = rd32(sd + OFF_FRAMECOUNT);
-            if (fc <= 1 || fc > 1000000) // 1-frame decorative 171 (not the icon sprite) / garbage
-                continue;
-            // sanity: frame array present and self-consistent
-            uint64_t data = rq(sd + OFF_FRAMEARR_DATA);
-            uint32_t cnt = rd32(sd + OFF_FRAMEARR_COUNT);
-            if (!looks_heap(data) || cnt != fc)
-                continue;
-            return sd;
-        }
+            if (sprite171_shape_ok((uint64_t)g_sprites[(head - back) % RING]))
+                return (uint64_t)g_sprites[(head - back) % RING];
         return 0;
     }
 

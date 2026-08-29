@@ -1000,8 +1000,8 @@ static void draw_hidden_tab()
         if (ckey) draw_row_icon(ckey);  // category icon + SameLine
         const char *cname = ckey ? tr::entry_label(ckey, lang) : "?";
         char name[256], loc[256];
-        to_utf8(goblin::lookup_text(h.textId), name, sizeof name);
-        to_utf8(h.region > 0 ? goblin::lookup_text(h.region) : nullptr, loc, sizeof loc);
+        to_utf8(goblin::lookup_text_any(h.textId), name, sizeof name);
+        to_utf8(h.region > 0 ? goblin::lookup_text_any(h.region) : nullptr, loc, sizeof loc);
         // "Item - Location  (Category)"; fall back gracefully when a part is unresolved.
         if (name[0] && loc[0])
             ImGui::TextWrapped("%s  -  %s  (%s)", name, loc, cname);

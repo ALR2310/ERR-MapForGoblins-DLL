@@ -393,8 +393,11 @@ def load_boss_flag_pieces(goods_id):
 
 
 def main():
-    rune_items = json.load(open(DATA_DIR / "rune_pieces.json"))
-    ember_items = json.load(open(DATA_DIR / "ember_pieces.json"))
+    # The FINAL lists from the finalize_pieces stage - the raw extract after whatever
+    # placement pass ran there. Read these, never the raw extract, so the two never
+    # disagree about what this build ships.
+    rune_items = json.load(open(DATA_DIR / "rune_pieces_final.json"))
+    ember_items = json.load(open(DATA_DIR / "ember_pieces_final.json"))
     print(f"Loaded AEG099 pieces: {len(rune_items)} Rune, {len(ember_items)} Ember")
 
     rune_boss = load_boss_flag_pieces(800010)

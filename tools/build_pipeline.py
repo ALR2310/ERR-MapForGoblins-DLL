@@ -58,7 +58,8 @@ GENERATED_CPP = config.GENERATED_DIR   # src/generated or src/generated_vanilla
 # Stages that only make sense for the ERR mod (their source assets/items do
 # not exist in vanilla). Dropped from the vanilla pipeline.
 ERR_ONLY_STAGES = {'generate_pieces_massedit', 'generate_kindling_spirits',
-                   'extract_rune_positions', 'extract_itemlot_csv'}
+                   'extract_rune_positions', 'extract_itemlot_csv',
+                   'finalize_pieces'}
 
 MENU_MSGBND = ERR_MOD / 'msg' / 'engus' / 'menu_dlc02.msgbnd.dcx'
 
@@ -188,6 +189,20 @@ STAGES = [
           script='extract_rune_positions.py',
           also_scripts=['config.py']),
 
+    # ERR-only: the final pass over the extracted piece positions before the massedit
+    # bake. Runs the optional local refinement hook (tools/local/, untracked and
+    # machine-specific); a stock checkout has no hook and the positions pass through
+    # unchanged. The hook's own inputs live outside the tree, so they are not listed:
+    # their mtimes say nothing the stage could depend on.
+    Stage('finalize_pieces',
+          inputs=[DATA / 'rune_pieces.json',
+                  DATA / 'ember_pieces.json',
+                  MSB_DIR, EVENT_DIR],
+          outputs=[DATA / 'rune_pieces_final.json',
+                   DATA / 'ember_pieces_final.json'],
+          script='finalize_pieces.py',
+          also_scripts=['config.py']),
+
     # ERR-only: ItemLotParam_map CSV dump (consumed by generate_pieces_massedit).
     Stage('extract_itemlot_csv',
           inputs=[REGULATION, config.PARAMDEF_DIR],
@@ -276,7 +291,9 @@ STAGES = [
 
     Stage('generate_pieces_massedit',
           inputs=[DATA / 'ItemLotParam_map.csv',
-                  DATA / 'grace_position_index.json'],
+                  DATA / 'grace_position_index.json',
+                  DATA / 'rune_pieces_final.json',
+                  DATA / 'ember_pieces_final.json'],
           outputs=[MASSEDIT_OUT / 'Reforged - Rune Pieces.MASSEDIT',
                    MASSEDIT_OUT / 'Reforged - Ember Pieces.MASSEDIT',
                    MASSEDIT_OUT / 'Reforged - Rune Pieces_slots.json',

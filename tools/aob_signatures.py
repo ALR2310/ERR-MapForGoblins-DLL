@@ -415,6 +415,19 @@ SIGNATURES = [
         "refs": ["goblin_map_timing.cpp:151"],
     },
     {
+        # The TWIN of map_callsite_dispatcher: the handler directly above it calls the same
+        # refresh fn with a byte-identical sequence except the tail restores rbx from +0x38
+        # (the main site restores from +0x30). Optional at runtime: a build without it keeps
+        # the single-site Patch D skip.
+        "name": "map_callsite_dispatcher_twin",
+        "pattern": "48 8B 89 18 01 00 00 E8 ?? ?? ?? ?? 33 D2 48 8B CF E8 ?? ?? ?? ?? "
+                   "BA 01 00 00 00 48 8B CF E8 ?? ?? ?? ?? BA 03 00 00 00 48 8B CF "
+                   "E8 ?? ?? ?? ?? 48 8B 5C 24 38 B0 01",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_map_timing.cpp"],
+    },
+    {
         "name": "map_refresh_hook",
         "pattern": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 20 "
                    "48 8B D9 48 8B 50 10 48 8B",

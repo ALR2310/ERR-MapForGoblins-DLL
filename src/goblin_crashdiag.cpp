@@ -677,3 +677,82 @@ void goblin::crashdiag::arena(const char *tag)
                  (g_arena_cap - free_bytes) / (1024 * 1024), free_bytes / 1024, delta / 1024,
                  largest / 1024, live);
 }
+
+// ---- first-chance fault counter --------------------------------------------------------------
+// See the header for why this exists. The handler runs on EVERY exception in the process, so it
+// does a range compare and two relaxed atomics and nothing else - no formatting, no locks, no
+// reads through the faulting pointer. It never handles anything.
+namespace
+{
+    uintptr_t g_self_lo = 0, g_self_hi = 0;
+    std::atomic<uint64_t> g_faults{0};
+    // The busiest faulting sites, as module-relative addresses. A tiny fixed table: a read loop
+    // that stalls the game faults from one or two places, and those are the ones worth naming.
+    struct FaultSite { std::atomic<uint32_t> rva; std::atomic<uint32_t> hits; };
+    FaultSite g_sites[8];
+
+    LONG CALLBACK count_fault(EXCEPTION_POINTERS *info)
+    {
+        const uintptr_t at = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+        if (at >= g_self_lo && at < g_self_hi)
+        {
+            g_faults.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t rva = static_cast<uint32_t>(at - g_self_lo);
+            for (auto &s : g_sites)
+            {
+                const uint32_t have = s.rva.load(std::memory_order_relaxed);
+                if (have == rva)
+                {
+                    s.hits.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                if (have == 0)
+                {
+                    uint32_t expect = 0;
+                    if (s.rva.compare_exchange_strong(expect, rva, std::memory_order_relaxed))
+                    {
+                        s.hits.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;   // count only; never handle, never alter the chain
+    }
+}
+
+void goblin::crashdiag::arm_fault_counter()
+{
+    if (g_self_lo)
+        return;
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&count_fault), &self) || !self)
+        return;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(self);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(
+        reinterpret_cast<const uint8_t *>(self) + dos->e_lfanew);
+    g_self_lo = reinterpret_cast<uintptr_t>(self);
+    g_self_hi = g_self_lo + nt->OptionalHeader.SizeOfImage;
+    AddVectoredExceptionHandler(1, count_fault);   // first, so nothing can hide a fault from us
+}
+
+std::string goblin::crashdiag::fault_report()
+{
+    const uint64_t n = g_faults.exchange(0, std::memory_order_relaxed);
+    if (n == 0)
+        return {};
+    std::string where;
+    for (auto &s : g_sites)
+    {
+        const uint32_t rva = s.rva.load(std::memory_order_relaxed);
+        const uint32_t hits = s.hits.exchange(0, std::memory_order_relaxed);
+        if (rva && hits)
+            where += (where.empty() ? "" : ", ") + std::string("mod+0x") +
+                     [&] { char b[16]; _snprintf_s(b, sizeof b, _TRUNCATE, "%X", rva); return std::string(b); }() +
+                     " x" + std::to_string(hits);
+    }
+    return "first-chance faults raised by our own reads: " + std::to_string(n) +
+           (where.empty() ? std::string() : " (" + where + ")");
+}

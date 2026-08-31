@@ -8,8 +8,12 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 #include <intrin.h> // _ReturnAddress
 
@@ -44,23 +48,112 @@ namespace
     DtorFn *o_wmd_dtor = nullptr;
 
     uintptr_t g_map_callsite = 0; // ret addr of the map's per-marker refresh call
+    // The TWIN of that call: the [opentime] histogram (2026-08-31, ERR 2.3.3.0) showed a
+    // steady second stream of relayout calls during every open - x115 per open, x1152 in a
+    // heavy scroll window - and the exe has exactly three call sites into the refresh fn.
+    // This one is a handler directly above the known dispatcher, byte-identical except the
+    // final `mov rbx,[rsp+0x38]` (the known one restores from +0x30). Same skip, same
+    // reasoning; 0 when the pattern is absent, which only costs the extra skip.
+    uintptr_t g_map_callsite_twin = 0;
+    // The thin wrapper just before the refresh fn (state update + refresh + post-set). Its
+    // OWN return address says nothing about who asked, so the histogram unwraps one level:
+    // with its `push rdi; sub rsp,0x20` frame the wrapper's caller sits at +0x30 above our
+    // return-address slot. Diagnostics only - never a skip decision.
+    uintptr_t g_wrapper_ra = 0;
     std::atomic<uint64_t> g_last_mapsite_ms{0}; // last map-site refresh call (burst detect)
+
+    // The open-latency probe (printed by stall_probe at seed READY as [opentime]): when
+    // the user feels the open slow down, the logs must say WHOSE time it is. t0 is the
+    // first map-site relayout call after silence; the split between map-site calls
+    // (skipped by Patch D) and refresh calls arriving from any OTHER return address is
+    // the direct test for a second, unskipped call site.
+    std::atomic<uint64_t> g_open_t0{0};
+    std::atomic<uint64_t> g_site_calls{0};
+    std::atomic<uint64_t> g_site_skipped{0};
+    std::atomic<uint64_t> g_other_calls{0};
+
+    // WHO the other-site calls are: a tiny top-N histogram of their return addresses,
+    // reset at each burst start. This is the piece that tells an uncovered MAP relayout
+    // path (one hot RA next to the known call site) apart from ordinary non-map UI
+    // traffic (a spread of small counts). Eight slots; anything past them lands in the
+    // overflow bucket, which staying at 0 is itself information.
+    struct OtherSite
+    {
+        std::atomic<uintptr_t> ra{0};
+        std::atomic<uint64_t> n{0};
+    };
+    std::array<OtherSite, 8> g_other_sites{};
+    std::atomic<uint64_t> g_other_overflow{0};
+
+    void note_other_site(uintptr_t ra)
+    {
+        for (auto &s : g_other_sites)
+        {
+            uintptr_t cur = s.ra.load(std::memory_order_relaxed);
+            if (cur == 0)
+            {
+                if (s.ra.compare_exchange_strong(cur, ra, std::memory_order_relaxed))
+                    cur = ra; // claimed the slot; fall through to count
+                // cur now holds whoever owns the slot (us or a racing caller)
+            }
+            if (cur == ra)
+            {
+                s.n.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        g_other_overflow.fetch_add(1, std::memory_order_relaxed);
+    }
 
     void *refresh_detour(void *a, void *b, void *c, void *d)
     {
         uintptr_t ret = (uintptr_t)_ReturnAddress();
-        if (ret == g_map_callsite) // the map's per-marker build call (other UI left as-is)
+        // the map's per-marker build calls (other UI left as-is)
+        if (ret == g_map_callsite || (g_map_callsite_twin && ret == g_map_callsite_twin))
         {
             // Burst start = first map-site call after >2s of silence = a map (re)open
             // or in-place rebuild pass. Profile it when debug_logging is on.
             uint64_t now = GetTickCount64();
             uint64_t prev = g_last_mapsite_ms.exchange(now, std::memory_order_relaxed);
             if (now - prev > 2000)
+            {
                 goblin::stall_probe::capture("map-open build", 1500);
+                g_open_t0.store(now, std::memory_order_relaxed);
+                g_site_calls.store(0, std::memory_order_relaxed);
+                g_site_skipped.store(0, std::memory_order_relaxed);
+                g_other_calls.store(0, std::memory_order_relaxed);
+                for (auto &s : g_other_sites)
+                {
+                    s.ra.store(0, std::memory_order_relaxed);
+                    s.n.store(0, std::memory_order_relaxed);
+                }
+                g_other_overflow.store(0, std::memory_order_relaxed);
+            }
+            g_site_calls.fetch_add(1, std::memory_order_relaxed);
 
             // Skip the per-marker relayout on the map path, every pass (Patch D).
             if (goblin::variants::kFastMapOpen)
+            {
+                g_site_skipped.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
+            }
+        }
+        else if (g_open_t0.load(std::memory_order_relaxed) != 0)
+        {
+            g_other_calls.fetch_add(1, std::memory_order_relaxed);
+            if (g_wrapper_ra && ret == g_wrapper_ra)
+            {
+                // Unwrap the wrapper: charge its CALLER, read from our own stack (the
+                // wrapper's frame is push rdi + 0x20). A wrong offset merely puts a junk
+                // address in a diagnostic histogram.
+                const uintptr_t caller = *reinterpret_cast<const uintptr_t *>(
+                    reinterpret_cast<const char *>(_AddressOfReturnAddress()) + 0x30);
+                note_other_site(caller);
+            }
+            else
+            {
+                note_other_site(ret);
+            }
         }
         return o_refresh(a, b, c, d);
     }
@@ -90,6 +183,62 @@ namespace
         goblin::gfx_probe::v3_on_map_close();
         return ret;
     }
+}
+
+uint64_t goblin::map_timing::open_burst_t0()
+{
+    return g_open_t0.load(std::memory_order_relaxed);
+}
+
+std::string goblin::map_timing::open_other_sites()
+{
+    struct Row
+    {
+        uintptr_t ra;
+        uint64_t n;
+    };
+    Row rows[8];
+    size_t cnt = 0;
+    for (auto &s : g_other_sites)
+    {
+        const uintptr_t ra = s.ra.load(std::memory_order_relaxed);
+        const uint64_t n = s.n.load(std::memory_order_relaxed);
+        if (ra && n)
+            rows[cnt++] = {ra, n};
+    }
+    std::sort(rows, rows + cnt, [](const Row &a, const Row &b) { return a.n > b.n; });
+    const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::string out;
+    char buf[64];
+    for (size_t i = 0; i < cnt; ++i)
+    {
+        if (!out.empty())
+            out += ", ";
+        if (exe && rows[i].ra >= exe)
+            snprintf(buf, sizeof buf, "exe+0x%llX x%llu",
+                     static_cast<unsigned long long>(rows[i].ra - exe),
+                     static_cast<unsigned long long>(rows[i].n));
+        else
+            snprintf(buf, sizeof buf, "0x%llX x%llu",
+                     static_cast<unsigned long long>(rows[i].ra),
+                     static_cast<unsigned long long>(rows[i].n));
+        out += buf;
+    }
+    const uint64_t over = g_other_overflow.load(std::memory_order_relaxed);
+    if (over)
+    {
+        snprintf(buf, sizeof buf, ", +%llu past the 8 slots",
+                 static_cast<unsigned long long>(over));
+        out += buf;
+    }
+    return out.empty() ? "none" : out;
+}
+
+void goblin::map_timing::open_counters(uint64_t &site, uint64_t &skipped, uint64_t &other)
+{
+    site = g_site_calls.load(std::memory_order_relaxed);
+    skipped = g_site_skipped.load(std::memory_order_relaxed);
+    other = g_other_calls.load(std::memory_order_relaxed);
 }
 
 void goblin::map_timing::on_map_frame()
@@ -123,6 +272,51 @@ void goblin::map_timing::setup()
     {
         spdlog::warn("[fastmap] map call site not found ({}); fast map open off", e.what());
         return;
+    }
+
+    // The twin dispatcher's call into the same refresh fn (see the histogram note at the
+    // top): byte-identical to the site above except it restores rbx from +0x38. Optional -
+    // a build without it just keeps the single-site skip.
+    try
+    {
+        uintptr_t m2 = reinterpret_cast<uintptr_t>(modutils::scan<void>(
+            {.aob = "48 8B 89 18 01 00 00 E8 ?? ?? ?? ?? 33 D2 48 8B CF E8 ?? ?? ?? ?? "
+                    "BA 01 00 00 00 48 8B CF E8 ?? ?? ?? ?? BA 03 00 00 00 48 8B CF "
+                    "E8 ?? ?? ?? ?? 48 8B 5C 24 38 B0 01"}));
+        g_map_callsite_twin = m2 + 0x0C;
+        spdlog::info("[fastmap] twin call site resolved @ 0x{:X}", m2);
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::info("[fastmap] no twin call site on this build ({}); single-site skip",
+                     e.what());
+    }
+
+    // The wrapper's return address, for the histogram's one-level unwrap. Found from the
+    // refresh fn itself (scanned BEFORE the hook overwrites its first bytes): the one
+    // direct call into it within the 0x60 bytes just above it.
+    try
+    {
+        const uintptr_t fn = reinterpret_cast<uintptr_t>(modutils::scan<void>(
+            {.aob = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 20 "
+                    "48 8B D9 48 8B 50 10 48 8B"}));
+        for (uintptr_t p = fn - 0x60; p + 5 <= fn; ++p)
+        {
+            if (*reinterpret_cast<const uint8_t *>(p) != 0xE8)
+                continue;
+            const int32_t rel = *reinterpret_cast<const int32_t *>(p + 1);
+            if (p + 5 + static_cast<intptr_t>(rel) == static_cast<intptr_t>(fn))
+            {
+                g_wrapper_ra = p + 5;
+                break;
+            }
+        }
+        if (g_wrapper_ra)
+            spdlog::info("[fastmap] wrapper return address resolved @ 0x{:X}", g_wrapper_ra);
+    }
+    catch (const std::exception &)
+    {
+        // no unwrap; the histogram then shows the wrapper's own address, which is still data
     }
 
     try

@@ -15,6 +15,7 @@ namespace goblin::watch { void request(uintptr_t address, unsigned long thread_i
 //  same generated header - for MAP_ICON_TAGS, whose last user in this file was icon_resource_for.)
 #include "generated_shared/goblin_menu_icon_tags.hpp"
 #include "goblin_maphover.hpp"
+#include "goblin_map_timing.hpp" // the [opentime] probe's burst t0 + relayout counters
 #include "goblin_mapproject.hpp"
 #include "goblin_gfx_probe.hpp"
 #include "goblin_collected.hpp" // read_player_map_id() for the location emphasis
@@ -1550,6 +1551,11 @@ namespace
     // dangerous part would be touching a freed node, so the node is re-validated inside the same
     // guarded block immediately before the store, and the identity test is an exact pointer match
     // against the movie we just released against, which cannot match another menu's player.
+    // When the world map's dialog byte last went non-zero (the OPEN edge), for the
+    // [opentime] line: it splits the user's "the map takes long to open" into the
+    // engine's dialog->relayout-burst stretch and the burst->READY build we already time.
+    std::atomic<uint64_t> g_open_dialog_ms{0};
+
     std::atomic<uintptr_t> g_park_target{0};   // the movie whose parked entry we want expired
     uint32_t g_park_frames = 0;
     uint64_t g_vt_sfmgr = 0;
@@ -1563,16 +1569,111 @@ namespace
     // test - a node whose player points at the very movie we just released against - so the slot
     // that produces a match IS the right slot, and the wrong ones simply never match. Collect the
     // structurally plausible candidates once, then let that test pick.
-    std::vector<uintptr_t> g_park_slots;
-    bool g_park_slots_built = false;
+    std::vector<uintptr_t> g_park_slots;      // written by the scan thread, then published
+    std::atomic<bool> g_park_slots_built{false}; // release-stored AFTER g_park_slots is final
+    std::atomic<bool> g_park_scan_started{false};
     uintptr_t g_park_slot = 0;          // learned once a walk actually matched
 
-    void v3_park_build_slots()
+    // ── park-probe reads: validate-then-read, with NEGATIVE verdicts cached ─────────────────────
+    //
+    // The scan below and the per-frame walk dereference values that are ROUTINELY dead: the scan
+    // is a blind pass over writable .data (most plausible-looking words are garbage), and the walk
+    // is armed at map close, which is exactly when the marker heap is released. v3_read64's SEH is
+    // the wrong primitive for a routine fault: our __except swallows it, but the first-chance
+    // exception is served to every exception filter in the process first, and two residents
+    // (measured 2026-08-31, vanilla profile) walk a full stack per event at ~70 ms each - a
+    // handful of faults per frame and the session never recovers. So ask the OS first. The general
+    // safemem cache cannot be used here because it refuses to store negative verdicts (a cached
+    // "no" would blind marker creation); a park probe is the opposite trade - a stale "no" delays
+    // one candidate by a TTL, a fault costs the whole session. One VirtualQuery covers a region,
+    // and garbage values overwhelmingly land in a few huge free regions, so the cache stays small.
+    struct ParkRegion
     {
-        if (g_park_slots_built) return;
-        g_park_slots_built = true;
+        uintptr_t base = 0, end = 0;
+        uint64_t stamp = 0;
+        bool ok = false;
+    };
+    constexpr uint64_t kParkTtlMs = 1000;
+    // The cache is an argument, not a global: the one-shot scan runs on its OWN thread (see
+    // v3_park_scan_worker) while the tick keeps probing with this one, and sharing the slots
+    // between them would be the unlocked-shared-state class all over again.
+    struct ParkRegionCache
+    {
+        std::array<ParkRegion, 32> r{};
+        unsigned victim = 0;
+    };
+    ParkRegionCache g_park_cache; // the map tick's own; touched by no other thread
+
+    bool park_point_ok(ParkRegionCache &c, uintptr_t a, uint64_t now)
+    {
+        ParkRegion *slot = nullptr;
+        for (auto &r : c.r)
+            if (r.end && a >= r.base && a < r.end)
+            {
+                if (now - r.stamp <= kParkTtlMs)
+                    return r.ok;
+                slot = &r; // stale entry for this region: refresh in place
+                break;
+            }
+        MEMORY_BASIC_INFORMATION mbi{};
+        ParkRegion r{};
+        r.stamp = now;
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof mbi) == sizeof mbi)
+        {
+            r.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            r.end = r.base + mbi.RegionSize;
+            r.ok = mbi.State == MEM_COMMIT && goblin::safemem::prot_readable(mbi.Protect);
+        }
+        else
+        {
+            r.base = a & ~0xFFFull; // not a queryable address at all: remember the page as a "no"
+            r.end = r.base + 0x1000;
+        }
+        if (!slot)
+            slot = &c.r[c.victim++ % c.r.size()];
+        *slot = r;
+        return r.ok;
+    }
+
+    // The read every park HEAP probe goes through (slot words in the exe's own writable sections
+    // are committed by definition and keep the plain read). The SEH inside v3_read64 stays as the
+    // net for a region unmapped between the check and the read; it is no longer the routine path.
+    bool park_read64(ParkRegionCache &c, uintptr_t addr, uint64_t &out)
+    {
+        const uint64_t now = GetTickCount64();
+        if (!park_point_ok(c, addr, now) || !park_point_ok(c, addr + 7, now))
+        {
+            out = 0;
+            return false;
+        }
+        return v3_read64(addr, out);
+    }
+
+    // The one-shot scan body. Runs on its OWN thread, never on a frame: measured 2026-08-31,
+    // the same pass cost 260 ms on the vanilla install and 3.07 s on the ERR one (whatever
+    // .data holds decides how many words survive the prefilter, and each cache-missed probe
+    // pays a VirtualQuery, which this machine has measured at 2+ ms under a memory-API
+    // filter) - and 3 s on the map tick is exactly the "freeze on first map close" report.
+    void v3_park_scan_worker()
+    {
+        const uint64_t t0 = GetTickCount64();
+        std::vector<uintptr_t> found;
+        ParkRegionCache cache; // this thread's own; the tick keeps g_park_cache to itself
         const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        if (!exe) return;
+        // The manager is not anonymous: the chain is a static slot -> CS::CSScaleformImp -> +8 ->
+        // CS::CSScaleformSystem, so filter by those two vtables, resolved by RTTI name (never
+        // baked - the slot itself moved 0x4070 between builds, the names do not). This matters
+        // because the purely structural filter is hopeless at shortlist scale: replayed over the
+        // 2026-08-31 hang dump it admits 22714 .data words and the real slot ranks 9857th, so any
+        // cap that keeps the walk affordable also guarantees the real slot is never in the list -
+        // the walk then disarms empty, the parked entry survives, and a quick reopen reuses the
+        // parked movie with no burst: the map comes up with no icons. The vtable filter admitted
+        // exactly ONE candidate on that dump: the real slot. When RTTI resolution fails we keep
+        // the structural shortlist as the degraded path, cap and all.
+        const uintptr_t vt_sys = exe ? goblin::anchors::vtable_of(".?AVCSScaleformSystem@CS@@") : 0;
+        const uintptr_t vt_imp = exe ? goblin::anchors::vtable_of(".?AVCSScaleformImp@CS@@") : 0;
+        if (exe)
+        {
         const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe);
         const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(exe + dos->e_lfanew);
         const auto *sec = IMAGE_FIRST_SECTION(nt);
@@ -1583,29 +1684,62 @@ namespace
             const uintptr_t begin = exe + sec->VirtualAddress;
             for (size_t off = 0; off + 8 <= sec->Misc.VirtualSize; off += 8)
             {
-                uint64_t outer = 0, mgr = 0, mvt = 0, node = 0;
+                uint64_t outer = 0, ovt = 0, mgr = 0, mvt = 0, node = 0;
                 if (!v3_read64(begin + off, outer) || !v3_heap_ptr(outer) || (outer & 7))
                     continue;
-                if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr) ||
-                    (mgr & 7))
+                if (!park_read64(cache, static_cast<uintptr_t>(outer) + 8, mgr) ||
+                    !v3_heap_ptr(mgr) || (mgr & 7))
                     continue;
-                if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt))
+                if (!park_read64(cache, static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt))
                     continue;
-                if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node))
-                    continue;
-                g_park_slots.push_back(begin + off);
-                if (g_park_slots.size() >= 64)
+                if (vt_sys)
+                {
+                    if (mvt != vt_sys)
+                        continue;
+                    if (vt_imp && (!park_read64(cache, static_cast<uintptr_t>(outer), ovt) ||
+                                   ovt != vt_imp))
+                        continue;
+                }
+                else
+                {
+                    // Degraded structural-only path. mgr+0xD00 (the parked list head) may be
+                    // legitimately empty on the real manager, so this test lives only here.
+                    if (!park_read64(cache, static_cast<uintptr_t>(mgr) + 0xD00, node) ||
+                        !v3_heap_ptr(node))
+                        continue;
+                }
+                found.push_back(begin + off);
+                if (found.size() >= 64)
                     break;               // more than this is not a shortlist, it is noise
             }
         }
-        spdlog::info("[v3park] {} candidate manager slot(s); the parked-entry match picks one",
-                     g_park_slots.size());
+        }
+        g_park_slots = std::move(found); // the tick reads this only after the release below
+        g_park_slots_built.store(true, std::memory_order_release);
+        spdlog::info("[v3park] {} candidate manager slot(s) ({} vtable filter) in {} ms off-frame; "
+                     "the parked-entry match picks one",
+                     g_park_slots.size(), vt_sys ? "by" : "NO", GetTickCount64() - t0);
+    }
+
+    // Non-blocking launcher: called from the map-open edge (so the scan finishes while the map
+    // is still being looked at) and again from the expire tick as the net for a close that
+    // arrives before any open ever ticked. Never costs the calling frame more than an exchange.
+    void v3_park_build_slots()
+    {
+        if (g_park_slots_built.load(std::memory_order_acquire)) return;
+        if (g_park_scan_started.exchange(true)) return;
+        std::thread(v3_park_scan_worker).detach();
     }
 
     void v3_park_expire_tick()
     {
         const uintptr_t want = g_park_target.load(std::memory_order_relaxed);
         if (!want) return;
+        v3_park_build_slots();
+        // No frame is charged while the scan thread is still running: on a machine where the
+        // scan outlives 600 frames the walk would otherwise disarm before its list ever existed.
+        if (!g_park_slots_built.load(std::memory_order_acquire))
+            return;
         if (++g_park_frames > 600)   // ~10 s of frames: the entry is not there, stop looking
         {
             g_park_target.store(0, std::memory_order_relaxed);
@@ -1614,7 +1748,6 @@ namespace
             g_park_frames = 0;
             return;
         }
-        v3_park_build_slots();
         // Try the slot that matched before; failing that, every candidate. The loop below ends on
         // an exact movie-pointer match, so a wrong candidate costs one short walk and nothing else.
         for (size_t cand = 0; cand < (g_park_slot ? 1u : g_park_slots.size()); ++cand)
@@ -1622,19 +1755,24 @@ namespace
         const uintptr_t slot_addr = g_park_slot ? g_park_slot : g_park_slots[cand];
         uint64_t outer = 0, mgr = 0, mvt = 0;
         if (!v3_read64(slot_addr, outer) || !v3_heap_ptr(outer)) continue;
-        if (!v3_read64(static_cast<uintptr_t>(outer) + 8, mgr) || !v3_heap_ptr(mgr)) continue;
-        if (!v3_read64(static_cast<uintptr_t>(mgr), mvt) || !v3_heap_ptr(mvt)) continue;
+        if (!park_read64(g_park_cache, static_cast<uintptr_t>(outer) + 8, mgr) ||
+            !v3_heap_ptr(mgr)) continue;
+        if (!park_read64(g_park_cache, static_cast<uintptr_t>(mgr), mvt) ||
+            !v3_heap_ptr(mvt)) continue;
         if (g_park_slot && g_vt_sfmgr && mvt != g_vt_sfmgr) continue;  // the object we learned moved
 
         uint64_t node = 0;
-        if (!v3_read64(static_cast<uintptr_t>(mgr) + 0xD00, node) || !v3_heap_ptr(node)) continue;
+        if (!park_read64(g_park_cache, static_cast<uintptr_t>(mgr) + 0xD00, node) ||
+            !v3_heap_ptr(node)) continue;
         const uint64_t head = node;
         for (int hop = 0; hop < 16; ++hop)
         {
             uint64_t player = 0, pvt = 0, pmovie = 0;
-            if (v3_read64(static_cast<uintptr_t>(node) + 0x10, player) && v3_heap_ptr(player) &&
-                v3_read64(static_cast<uintptr_t>(player), pvt) && v3_heap_ptr(pvt) &&
-                v3_read64(static_cast<uintptr_t>(player) + 0x18, pmovie) &&
+            if (park_read64(g_park_cache, static_cast<uintptr_t>(node) + 0x10, player) &&
+                v3_heap_ptr(player) &&
+                park_read64(g_park_cache, static_cast<uintptr_t>(player), pvt) &&
+                v3_heap_ptr(pvt) &&
+                park_read64(g_park_cache, static_cast<uintptr_t>(player) + 0x18, pmovie) &&
                 pmovie == static_cast<uint64_t>(want) &&
                 (g_vt_swfplayer == 0 || pvt == g_vt_swfplayer))
             {
@@ -1646,16 +1784,25 @@ namespace
                 const float expired = -1.0f;
                 if (v3_write_bytes(static_cast<uintptr_t>(node) + 0x18, &expired, sizeof expired))
                 {
-                    spdlog::info("[v3park] expired the parked entry for movie 0x{:X} "
-                                 "(node 0x{:X}, {} frames) - the next open rebuilds and bursts",
-                                 want, node, g_park_frames);
+                    // The FIRST expiry of a session always prints (the one-line proof the
+                    // mechanism is alive on this build); the per-close repeats only under
+                    // debug_logging - they said the same thing a hundred times per session.
+                    static bool s_reported_once = false;
+                    if (!s_reported_once || goblin::config::debugLogging)
+                    {
+                        s_reported_once = true;
+                        spdlog::info("[v3park] expired the parked entry for movie 0x{:X} "
+                                     "(node 0x{:X}, {} frames) - the next open rebuilds and bursts",
+                                     want, node, g_park_frames);
+                    }
                     g_park_target.store(0, std::memory_order_relaxed);
                     g_park_frames = 0;
                 }
                 return;
             }
             uint64_t next = 0;
-            if (!v3_read64(static_cast<uintptr_t>(node), next) || !v3_heap_ptr(next)) break;
+            if (!park_read64(g_park_cache, static_cast<uintptr_t>(node), next) ||
+                !v3_heap_ptr(next)) break;
             node = next;
             if (node == head) break;   // circular list, one lap done
         }
@@ -3582,6 +3729,19 @@ namespace
                                  sc, si, sw, sl);
                 }
                 v3_seed_trace("at READY");
+                if (goblin::config::debugLogging) // per-open diagnostics, not shipping chatter
+                {
+                    const uint64_t dlg = g_open_dialog_ms.load(std::memory_order_relaxed);
+                    const uint64_t t0 = goblin::map_timing::open_burst_t0();
+                    uint64_t site = 0, skipped = 0, other = 0;
+                    goblin::map_timing::open_counters(site, skipped, other);
+                    const uint64_t now_ms = GetTickCount64();
+                    spdlog::info("[opentime] dialog->burst {} ms, dialog->ready {} ms; map-site "
+                                 "relayout calls {} (skipped {}), other-site since burst {}: {}",
+                                 (dlg && t0 >= dlg) ? t0 - dlg : 0,
+                                 dlg ? now_ms - dlg : 0, site, skipped, other,
+                                 goblin::map_timing::open_other_sites());
+                }
                 g_v3_native.completion_reported = true;
                 // The generation is fully built, so the PREVIOUS one's movie is certainly gone by
                 // now: this is the moment its sampled children answer whether they outlived it.
@@ -5400,10 +5560,11 @@ namespace
             {
             }
             g_form_landed = static_cast<uint32_t>(landed);
-            spdlog::info("[form] rows built: {} (page {}, list=0x{:X}) - landed {} items, grid "
-                         "count={} cols={} rows={}",
-                         form_pool().size(), goblin::nmenu::current_page(), obj, landed, g_count,
-                         g_cols, g_rows);
+            if (goblin::config::debugLogging) // one line per menu-page build: debug chatter
+                spdlog::info("[form] rows built: {} (page {}, list=0x{:X}) - landed {} items, "
+                             "grid count={} cols={} rows={}",
+                             form_pool().size(), goblin::nmenu::current_page(), obj, landed,
+                             g_count, g_cols, g_rows);
         }
         else
         {
@@ -7999,6 +8160,12 @@ namespace
             {
                 g_v3_map_closed.store(false, std::memory_order_release);
                 g_v3_open = V3OpenCost{}; // per-open cost accounting starts here
+                g_open_dialog_ms.store(GetTickCount64(), std::memory_order_relaxed);
+                // Prewarm the park shortlist on a background thread while the map is being
+                // looked at, so the close that arms the walk finds it already built. Launched
+                // here rather than at init because the Scaleform manager slot must be populated,
+                // and an open map proves it is.
+                v3_park_build_slots();
             }
             // While the map is closed is exactly when the parked entry exists and the engine is
             // counting it down. One bounded walk per frame, read-only until the exact match.
@@ -8538,8 +8705,12 @@ namespace
                     g_v3_native.objects.size();
                 g_v3_native.objects.push_back(obj);
                 const size_t created = g_v3_native.objects.size();
-                if (created == 1 || created % 256 == 0 ||
-                    g_v3_native.pending_index >= g_v3_native.pending.size())
+                // The COMPLETION line always prints (one per rebuild, the field-report
+                // anchor for "markers vanished mid-session"); the start/progress ticks
+                // only under debug_logging - a highlight-toggling session emitted 114
+                // start lines and they all said the same thing (2026-08-31).
+                if (g_v3_native.pending_index >= g_v3_native.pending.size() ||
+                    ((created == 1 || created % 256 == 0) && goblin::config::debugLogging))
                     spdlog::info("[v3native] category progress: created={}/{} "
                                  "failed={} lastRow={}{} srcIconId={} "
                                  "map=({:.1f},{:.1f})",

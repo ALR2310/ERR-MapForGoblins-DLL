@@ -23,6 +23,7 @@
 //                 into memory the engine has already taken back".
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace goblin::crashdiag
 {
@@ -117,4 +118,22 @@ namespace goblin::crashdiag
     // committed, whether the first qword is still that vtable, and what the reference count reads.
     // Read-only and SEH-guarded throughout. debug_logging.
     void probe_survivors();
+
+    // ---- first-chance fault counter -------------------------------------------------------
+    // How many first-chance exceptions does OUR OWN code raise, and from where?
+    //
+    // A raw `__try` around a read that faults does not "swallow" anything: the fault is a real
+    // first-chance exception, published to every vectored handler in the process before our
+    // __except ever sees it. That is the whole reason goblin_safemem exists. But 130+ raw __try
+    // sites remain, and NOTHING has ever counted what they emit - so when a frame-generation
+    // overlay installs a filter that runs dbghelp on every first-chance exception, a read loop of
+    // ours turns into a stall nobody can attribute.
+    //
+    // This is that missing instrument: a vectored handler registered FIRST that only counts, and
+    // always returns EXCEPTION_CONTINUE_SEARCH, so the behaviour of every existing handler is
+    // unchanged. It attributes a fault to us when the faulting instruction lies inside our module.
+    void arm_fault_counter();
+    // Faults raised from inside our module since the last call, plus the busiest faulting sites as
+    // module-relative addresses. Empty string when there were none. Clears the window.
+    std::string fault_report();
 }

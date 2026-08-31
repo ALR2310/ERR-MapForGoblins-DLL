@@ -767,6 +767,10 @@ static void install_crash_logger(HINSTANCE dll_instance, std::filesystem::path l
     // crash writer prints later is a cached number - a handler must not be walking a resource
     // directory while the process is going down.
     goblin::crashdiag::resolve_game_build();
+    // Count what our own guarded reads publish. Costs a range compare per process exception
+    // and answers a question nothing in this mod could answer before: whether a read loop of
+    // ours is feeding another DLL's first-chance filter.
+    goblin::crashdiag::arm_fault_counter();
 
     g_crash_file = CreateFileW(log_file.wstring().c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
@@ -994,6 +998,11 @@ static void setup_mod()
             modules_rechecked = true;
             goblin::crashdiag::log_modules("t+30s");
         }
+
+        // Faults our own reads raised since the last poll. Printed whether or not the map is
+        // open - the map being CLOSED is exactly the window that had no instrument at all.
+        if (std::string faults = goblin::crashdiag::fault_report(); !faults.empty())
+            spdlog::warn("[faults] {}", faults);
 
         try
         {

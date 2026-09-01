@@ -114,7 +114,9 @@ if "%MFG_PROFILE%"=="graceborne" set "DISP_PROFILE=graceborne"
 if "%MFG_PROFILE%"=="graceborne" set "README_SRC=%SCRIPT_DIR%assets\README_graceborne.txt"
 if "%MFG_PROFILE%"=="throne" set "BUILD_DIR=%SCRIPT_DIR%builds\build-throne"
 if "%MFG_PROFILE%"=="throne" set "GEN_SUBDIR=generated_throne"
-if "%MFG_PROFILE%"=="throne" set "PKG_PREFIX=ThroneER"
+REM Package prefix is the MOD's name, minus the colon - "Dark Moon: Throne" cannot be a
+REM Windows path. The profile id stays `throne` (build dirs, generated_throne, the --throne flag).
+if "%MFG_PROFILE%"=="throne" set "PKG_PREFIX=DarkMoonThrone"
 if "%MFG_PROFILE%"=="throne" set "SNAP_DIR=%SCRIPT_DIR%releases\pre-release-throne"
 if "%MFG_PROFILE%"=="throne" set "DISP_PROFILE=throne"
 if "%MFG_PROFILE%"=="throne" set "README_SRC=%SCRIPT_DIR%assets\README_throne.txt"

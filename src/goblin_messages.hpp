@@ -47,6 +47,16 @@ namespace goblin
     /// WorldMapPointParam row AFTER setup_messages() has run. Identity until then.
     int32_t remap_textid(int32_t encoded);
 
+    /// The reverse of remap_textid: a FRESH id (as read back from a live row) -> the
+    /// offset-encoded key it was allocated for. Identity for ids we never allocated.
+    int32_t unremap_textid(int32_t fresh);
+
+    /// The ENGLISH name for an offset-encoded item key (the baked ITEM_NAME_FALLBACK table)
+    /// or a +900M enemy-name key (ENEMY_NAMES, engus column), independent of the game's
+    /// language. nullptr when the table has no entry (raw PlaceName location ids, the
+    /// anonymous-loot label, enemy names on the err profile).
+    const wchar_t *lookup_text_english(int32_t encoded);
+
     /// Diagnostic (debug_logging only): warns once per slot if the engine ever replaces a
     /// MsgRepository slot we patched. Cheap; call it from any periodic tick.
     void check_patched_slots();

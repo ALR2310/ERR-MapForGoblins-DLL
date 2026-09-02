@@ -74,7 +74,19 @@
         "MenuPressPad": "Appuyez sur un bouton de manette...",
         "MenuUnbind": "Supprimer le raccourci",
         "MapPanelOffset": "Position des panneaux de carte",
-        "MapPanelOffsetTip": "Ou se placent l'infobulle du marqueur et la banniere de focus sur la carte. 100 est le coin prevu, 0 le centre. Au-dela de 100, ils vont plus a gauche. Effet immediat."
+        "MapPanelOffsetTip": "Ou se placent l'infobulle du marqueur et la banniere de focus sur la carte. 100 est le coin prevu, 0 le centre. Au-dela de 100, ils vont plus a gauche. Effet immediat.",
+        "TabSearch": "Recherche",
+        "SearchHint": "Tapez une partie du nom d'un objet - dans votre langue ou en anglais. Cochez les resultats voulus et affichez-les seuls sur la carte.",
+        "SearchNoResults": "Aucun resultat",
+        "SearchMatches": "%d trouves dans %d regions",
+        "SearchTruncated": "Les %d premiers sont affiches - tapez plus de lettres",
+        "SearchShowAll": "Afficher tous les resultats sur la carte",
+        "SearchPickAll": "Tout cocher",
+        "SearchClearPicks": "Tout decocher",
+        "SearchCollected": "recupere",
+        "SearchFocusSubject": "resultats coches (%d)",
+        "SearchClearField": "Effacer",
+        "SearchTypeHere": "Tapez le nom d'un objet..."
     },
     "toasts": {
         "MapIconsOn": "Icônes de carte : ACTIVÉES",
@@ -196,6 +208,7 @@
         "hover_info": "Infos au survol",
         "menu_render_mode": "Type de menu",
         "hide_marker_gamepad": "Bouton de masquage",
+        "search_hide_collected": "Non recuperes seulement",
         "map_panel_offset_percent": "Position des panneaux de carte"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "Touche qui masque le marqueur de carte sous le curseur.",
         "hover_info": "Carte ouverte, affiche à GAUCHE un petit panneau indiquant de combien le marqueur\nsous le curseur est au-dessus ou en dessous de vous. Son nom n'y est pas répété :\nla fenêtre du jeu l'affiche déjà.",
         "hide_marker_gamepad": "Bouton de manette qui masque le marqueur sous le curseur (comme la touche de masquage).",
+        "search_hide_collected": "Recherche d'objets : n'afficher que les marqueurs pas encore recuperes. Desactive = tout afficher, les recuperes sont marques.",
         "map_panel_offset_percent": "Ou se placent l'infobulle du marqueur et la banniere de focus sur la carte. 100 est le coin prevu, 0 le centre. Au-dela de 100, ils vont plus a gauche. Effet immediat."
     }
 }

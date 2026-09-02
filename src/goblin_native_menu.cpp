@@ -16,6 +16,8 @@
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp" // lookup_text() names the hidden markers
 #include "goblin_progress.hpp"
+#include "goblin_search.hpp"   // the item-search page
+#include "goblin_overlay.hpp"  // text_layout_tag: the layout the search page types with
 #include "generated_shared/goblin_overlay_icons.hpp"
 
 #include <spdlog/spdlog.h>
@@ -710,9 +712,9 @@ namespace
     // enabled/disabled rule and the action cannot drift apart.
     void action_clear_focus()
     {
-        if (goblin::focus_category() < 0)
+        if (goblin::focus_category() < 0 && !goblin::focus_rows_active())
             return; // nothing isolated - the row is shown greyed out in that state
-        goblin::set_focus_category(-1);
+        goblin::set_focus_category(-1); // clears the search-pick focus as well
         goblin::reapply_live_settings();
     }
 
@@ -721,7 +723,7 @@ namespace
     // "disabled" costs no new row kind and confirming it does nothing.
     void push_clear_focus_row()
     {
-        const bool active = goblin::focus_category() >= 0;
+        const bool active = goblin::focus_category() >= 0 || goblin::focus_rows_active();
         Row r;
         if (active)
         {
@@ -1028,7 +1030,7 @@ namespace
                 // top level instead of only inside the page that set it.
                 // Both marks, not one: the red text reads at a glance, and the plate is the same
                 // background the isolated category itself wears, so the two screens agree.
-                const bool filtering = goblin::focus_category() >= 0;
+                const bool filtering = goblin::focus_category() >= 0; // the search row marks its own filter
                 prog.label = filtering
                                  ? hold(colored(wide(tr::tr(tr::TextId::TabProgress, mlang())), kColFocus))
                                  : text(tr::TextId::TabProgress);
@@ -1044,6 +1046,27 @@ namespace
                 _snwprintf_s(hc, _TRUNCATE, L"%zu  >", goblin::manual_hidden_count());
                 hid.value = hold(hc);
                 push(hid);
+
+                Row srch;
+                srch.kind = RowKind::SubPage;
+                srch.page_id = goblin::nmenu::kPageSearch;
+                // Red + plate while the picks isolate the map, the way the Progress row marks a
+                // category filter: the filter is visible from the top level.
+                const bool picking = goblin::focus_rows_active();
+                srch.label = picking
+                                 ? hold(colored(wide(tr::tr(tr::TextId::TabSearch, mlang())), kColFocus))
+                                 : text(tr::TextId::TabSearch);
+                srch.plate = picking;
+                const size_t npick = goblin::search::pick_count();
+                if (npick)
+                {
+                    wchar_t sc[24];
+                    _snwprintf_s(sc, _TRUNCATE, L"%zu  >", npick);
+                    srch.value = hold(sc);
+                }
+                else
+                    srch.value = hold(L">");
+                push(srch);
             }
         }
         // About last: version and the links, the least-used page but the one a bug report needs.
@@ -1333,6 +1356,195 @@ namespace
         }
     }
 
+    // ── item search page ─────────────────────────────────────────────────────────────
+    // The typed text lives here (the host feeds it, see search_type); the matching and the
+    // pick set live in goblin::search, shared with the overlay's Search tab, so picks made in
+    // one menu show in the other.
+    std::wstring g_search_text;
+    std::vector<goblin::search::Hit> g_search_view; // the hits the page lists, in row order
+    // The form pool holds kFormPoolMax native items, two per visual row; the page's fixed rows
+    // take a dozen. Past this many hits the page asks for more letters instead of overflowing
+    // the pool.
+    constexpr size_t kSearchMaxRows = 200;
+
+    std::wstring html_escape(const std::wstring &s)
+    {
+        std::wstring o;
+        o.reserve(s.size());
+        for (wchar_t c : s)
+        {
+            if (c == L'&') o += L"&amp;";
+            else if (c == L'<') o += L"&lt;";
+            else if (c == L'>') o += L"&gt;";
+            else o += c;
+        }
+        return o;
+    }
+
+    std::string narrow(const std::wstring &w)
+    {
+        std::string s;
+        if (w.empty()) return s;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        if (n > 0)
+        {
+            s.resize(static_cast<size_t>(n));
+            WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+        }
+        return s;
+    }
+
+    void action_search_clear() { g_search_text.clear(); }
+    // Picks apply to the map the moment they change (goblin::search): "show all found" simply
+    // ticks every hit, "clear picks" lifts the filter.
+    void action_search_show_all()
+    {
+        const auto res_p = goblin::search::query(narrow(g_search_text));
+        const auto &res = *res_p;
+        std::vector<uint64_t> keys;
+        keys.reserve(res.total);
+        for (const auto &g : res.groups)
+            for (const auto &h : g.hits) keys.push_back(h.key);
+        if (keys.empty()) return;
+        goblin::search::pick_many(keys, true);
+    }
+    void action_search_clear_picks() { goblin::search::clear_picks(); }
+    void action_search_toggle_pick()
+    {
+        if (!g_active_row) return;
+        const size_t ix = static_cast<size_t>(g_active_row->page_id);
+        if (ix >= g_search_view.size()) return;
+        const uint64_t key = g_search_view[ix].key;
+        goblin::search::set_picked(key, !goblin::search::is_picked(key));
+    }
+
+    void build_search()
+    {
+        g_title = hold(wide(tr::tr(tr::TextId::TabSearch, mlang())));
+
+        // The text row. Typed text with a caret; the placeholder when empty. This row is where
+        // the host listens for keys: with the cursor on it, letters type; below it they are the
+        // game's own menu keys again.
+        // An Action row with no action: it gets the ordinary row frame and the cursor highlight
+        // (an Info row sits on the Grayout plate and never looks selected), and confirming it
+        // does nothing.
+        Row field;
+        field.kind = RowKind::Action;
+        if (g_search_text.empty())
+            field.label = hold(colored(wide(tr::tr(tr::TextId::SearchTypeHere, mlang())), kColOff));
+        else
+            field.label = hold(colored(html_escape(g_search_text), kColValue) + L"_");
+        field.help = hold(wide(tr::tr(tr::TextId::SearchHint, mlang())));
+        // The value column names the layout the keys translate with ("EN" / "RU"); Alt+Shift,
+        // Ctrl+Shift or Win+Space cycles it while the cursor is on this row.
+        field.value = hold(colored(goblin::overlay::text_layout_tag(), kColOff));
+        push(field);
+
+        Row clr;
+        clr.kind = RowKind::Action;
+        clr.label = text(tr::TextId::SearchClearField);
+        clr.action = &action_search_clear;
+        push(clr);
+        if (const goblin::IniEntry *e = entry_for_key("search_hide_collected"))
+            push_entry_row(*e, nullptr); // "only uncollected" toggle (an ordinary schema row)
+
+        const auto res_p = goblin::search::query(narrow(g_search_text)); // immutable snapshot
+        const auto &res = *res_p;
+        const size_t npick = goblin::search::pick_count();
+
+        // Status line.
+        {
+            Row st;
+            st.kind = RowKind::Info;
+            if (g_search_text.empty())
+                st.label = text(tr::TextId::SearchHint);
+            else if (res.total == 0)
+                st.label = text(tr::TextId::SearchNoResults);
+            else
+            {
+                char buf[160];
+                _snprintf_s(buf, sizeof buf, _TRUNCATE, tr::tr(tr::TextId::SearchMatches, mlang()),
+                            static_cast<int>(res.total), static_cast<int>(res.groups.size()));
+                st.label = hold(wide(buf));
+            }
+            push(st);
+        }
+
+        // Actions.
+        {
+            Row sa;
+            sa.kind = RowKind::Action;
+            sa.label = res.total ? text(tr::TextId::SearchShowAll)
+                                 : hold(colored(wide(tr::tr(tr::TextId::SearchShowAll, mlang())), kColOff));
+            sa.action = &action_search_show_all;
+            push(sa);
+            Row cp;
+            cp.kind = RowKind::Action;
+            cp.label = npick ? text(tr::TextId::SearchClearPicks)
+                             : hold(colored(wide(tr::tr(tr::TextId::SearchClearPicks, mlang())), kColOff));
+            cp.action = &action_search_clear_picks;
+            push(cp);
+        }
+        // (No "reset filter" row here: with picks applied live, "clear picks" IS the reset.)
+
+        // Matches, grouped by region: a caption row per region, then one toggle-pick row per
+        // hit. The red plate marks a picked row (the same plate the isolated category wears).
+        g_search_view.clear();
+        if (res.total == 0)
+            return;
+        const auto done = goblin::hidden_marker_original_ids();
+        size_t listed = 0;
+        bool truncated = res.truncated;
+        for (const auto &g : res.groups)
+        {
+            if (listed >= kSearchMaxRows) { truncated = true; break; }
+            Row hdr;
+            hdr.kind = RowKind::Info;
+            wchar_t cnt[32];
+            _snwprintf_s(cnt, _TRUNCATE, L" (%zu)", g.hits.size());
+            hdr.label = hold(colored(html_escape(wide(g.region_name.c_str())) + cnt, kColValue));
+            push(hdr);
+            for (const auto &h : g.hits)
+            {
+                if (listed >= kSearchMaxRows) { truncated = true; break; }
+                const bool picked = goblin::search::is_picked(h.key);
+                Row r;
+                r.kind = RowKind::Action;
+                r.page_id = static_cast<int32_t>(g_search_view.size());
+                r.action = &action_search_toggle_pick;
+                r.plate = picked;
+                r.label = hold(html_escape(wide(h.name.c_str())));
+                // The pick state lives in the value column, worded and coloured like a toggle row
+                // (On / Off); a collected marker carries its tag in front of it.
+                std::wstring val = colored(wide(tr::tr(picked ? tr::TextId::ValueOn : tr::TextId::ValueOff, mlang())),
+                                           picked ? kColOn : kColOff);
+                if (done.count(h.key))
+                    val = colored(wide(tr::tr(tr::TextId::SearchCollected, mlang())), kColOff) + L"  " + val;
+                r.value = hold(std::move(val));
+                const auto cat = static_cast<goblin::generated::Category>(h.cat);
+                if (const char *ckey = goblin::category_config_key(cat))
+                {
+                    r.icon_id = icon_for_key(ckey);
+                    r.ini_key = ckey;
+                    r.help = hold(wide(tr::entry_label(ckey, mlang())));
+                }
+                push(r);
+                g_search_view.push_back(h);
+                ++listed;
+            }
+        }
+        if (truncated)
+        {
+            Row more;
+            more.kind = RowKind::Info;
+            char buf[160];
+            _snprintf_s(buf, sizeof buf, _TRUNCATE, tr::tr(tr::TextId::SearchTruncated, mlang()),
+                        static_cast<int>(listed));
+            more.label = hold(colored(wide(buf), kColOff));
+            push(more);
+        }
+    }
+
     // ── value page: the choices behind one Enum entry ────────────────────────────────
     void build_value()
     {
@@ -1483,6 +1695,8 @@ namespace
             build_about();
         else if (g_page == goblin::nmenu::kPageValue)
             build_value();
+        else if (g_page == goblin::nmenu::kPageSearch)
+            build_search();
         else if (g_page == goblin::nmenu::kPageRebind)
             build_rebind();
         else if (g_page >= goblin::nmenu::kPageRegionBase)
@@ -1775,6 +1989,23 @@ bool goblin::nmenu::navigate_back()
     build_current();
     return true;
 }
+
+bool goblin::nmenu::search_active() { return g_page == kPageSearch; }
+
+void goblin::nmenu::search_type(wchar_t c)
+{
+    if (c < 0x20 || g_search_text.size() >= 64) return;
+    g_search_text.push_back(c);
+}
+
+bool goblin::nmenu::search_backspace()
+{
+    if (g_search_text.empty()) return false;
+    g_search_text.pop_back();
+    return true;
+}
+
+void goblin::nmenu::search_clear() { g_search_text.clear(); }
 
 bool goblin::nmenu::rebind_pending()
 {

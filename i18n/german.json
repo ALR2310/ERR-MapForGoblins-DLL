@@ -74,7 +74,19 @@
         "MenuPressPad": "Drücke eine Gamepad-Taste...",
         "MenuUnbind": "Belegung entfernen",
         "MapPanelOffset": "Position der Kartenfelder",
-        "MapPanelOffsetTip": "Wo Marker-Tooltip und Fokusbanner auf dem Kartenbildschirm sitzen. 100 ist die vorgesehene Ecke, 0 die Mitte. Ueber 100 rueckt sie weiter nach links. Wirkt sofort."
+        "MapPanelOffsetTip": "Wo Marker-Tooltip und Fokusbanner auf dem Kartenbildschirm sitzen. 100 ist die vorgesehene Ecke, 0 die Mitte. Ueber 100 rueckt sie weiter nach links. Wirkt sofort.",
+        "TabSearch": "Suche",
+        "SearchHint": "Gib einen Teil des Gegenstandsnamens ein - in deiner Sprache oder auf Englisch. Markiere die gewuenschten Treffer und zeige nur sie auf der Karte.",
+        "SearchNoResults": "Nichts gefunden",
+        "SearchMatches": "%d gefunden in %d Regionen",
+        "SearchTruncated": "Die ersten %d werden angezeigt - gib mehr Buchstaben ein",
+        "SearchShowAll": "Alle Treffer auf der Karte zeigen",
+        "SearchPickAll": "Alle markieren",
+        "SearchClearPicks": "Markierungen aufheben",
+        "SearchCollected": "eingesammelt",
+        "SearchFocusSubject": "Suchmarkierungen (%d)",
+        "SearchClearField": "Leeren",
+        "SearchTypeHere": "Gegenstandsnamen eingeben..."
     },
     "toasts": {
         "MapIconsOn": "Kartensymbole: AN",
@@ -196,6 +208,7 @@
         "hover_info": "Marker-Info beim Überfahren",
         "menu_render_mode": "Menütyp",
         "hide_marker_gamepad": "Ausblenden-Knopf",
+        "search_hide_collected": "Nur nicht Eingesammeltes",
         "map_panel_offset_percent": "Position der Kartenfelder"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "Taste, die den Kartenmarker unter dem Cursor ausblendet.",
         "hover_info": "Zeigt bei offener Karte LINKS ein kleines Feld damit, wie weit die Markierung unter\ndem Zeiger über oder unter Ihnen liegt. Der Name wird nicht wiederholt - das\neigene Popup des Spiels zeigt ihn bereits.",
         "hide_marker_gamepad": "Gamepad-Knopf zum Ausblenden des Markers unter dem Cursor (wie die Ausblenden-Taste).",
+        "search_hide_collected": "Gegenstandssuche: nur noch nicht eingesammelte Marker auflisten. Aus = alles auflisten, Eingesammeltes wird markiert.",
         "map_panel_offset_percent": "Wo Marker-Tooltip und Fokusbanner auf dem Kartenbildschirm sitzen. 100 ist die vorgesehene Ecke, 0 die Mitte. Ueber 100 rueckt sie weiter nach links. Wirkt sofort."
     }
 }

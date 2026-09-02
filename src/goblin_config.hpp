@@ -200,6 +200,7 @@ namespace goblin
         extern uint32_t hideMarkerKey;  // Win32 VK_* code (default VK_DELETE = 0x2E)
         extern uint16_t hideMarkerGamepad;  // XINPUT_GAMEPAD_* mask (default RB = 0x0200)
         extern bool enableHoverInfo;
+        extern bool searchHideCollected; // item search lists only uncollected markers
 
         // ERSC-hosting workaround: hotkey toggles WorldMapPointParam +
         // PlaceName FMG between vanilla and expanded states. Press before

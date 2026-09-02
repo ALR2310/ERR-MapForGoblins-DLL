@@ -74,7 +74,19 @@
         "MenuPressPad": "Press a gamepad button...",
         "MenuUnbind": "Unbind",
         "MapPanelOffset": "地圖面板位置",
-        "MapPanelOffsetTip": "標記提示與聚焦橫幅在地圖畫面上的位置。100 為原本設計的位置，0 為中央，大於 100 則更靠左。立即生效。"
+        "MapPanelOffsetTip": "標記提示與聚焦橫幅在地圖畫面上的位置。100 為原本設計的位置，0 為中央，大於 100 則更靠左。立即生效。",
+        "TabSearch": "搜尋",
+        "SearchHint": "輸入物品名稱的一部分 - 可用你的語言或英文。勾選需要的結果，然後只在地圖上顯示它們。",
+        "SearchNoResults": "未找到",
+        "SearchMatches": "找到 %d 項，分佈於 %d 個區域",
+        "SearchTruncated": "僅顯示前 %d 項 - 請輸入更多文字",
+        "SearchShowAll": "在地圖上顯示全部結果",
+        "SearchPickAll": "全部勾選",
+        "SearchClearPicks": "清除勾選",
+        "SearchCollected": "已收集",
+        "SearchFocusSubject": "搜尋勾選 (%d)",
+        "SearchClearField": "清空",
+        "SearchTypeHere": "輸入物品名稱..."
     },
     "toasts": {
         "MapIconsOn": "地圖圖示：開啟",
@@ -196,6 +208,7 @@
         "hover_info": "懸停標記資訊",
         "menu_render_mode": "選單類型",
         "hide_marker_gamepad": "隱藏標記按鍵",
+        "search_hide_collected": "僅未收集",
         "map_panel_offset_percent": "地圖面板位置"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "隱藏游標下方地圖標記的按鍵。",
         "hover_info": "開啟地圖時，在左側顯示一個小面板，說明游標下的標記比你高多少或低多少。\n其名稱不再重複顯示——遊戲內建的彈出視窗已經顯示了。",
         "hide_marker_gamepad": "隱藏游標下方地圖標記的手把按鍵（與隱藏鍵相同）。",
+        "search_hide_collected": "物品搜尋：只列出尚未收集的標記。關閉 = 列出全部，已收集的會標註。",
         "map_panel_offset_percent": "標記提示與聚焦橫幅在地圖畫面上的位置。100 為原本設計的位置，0 為中央，大於 100 則更靠左。立即生效。"
     }
 }

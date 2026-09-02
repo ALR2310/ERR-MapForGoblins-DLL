@@ -802,7 +802,8 @@ namespace
         void *root =
             reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(map_area) - 0x27D8 + 0x120);
         const int cat = goblin::focus_category();
-        if (cat < 0)
+        const bool picks = goblin::focus_rows_active(); // the search tab's pick set
+        if (cat < 0 && !picks)
         {
             if (g_have_own_tip)
                 tip_root(base, root, kBannerPanel, false, 0, 0);
@@ -813,8 +814,9 @@ namespace
         }
         // Line 1: what is being shown. Category name from its ini key (the same label the menu
         // and the overlay use), region name from the progress snapshot.
-        const char *ckey =
-            goblin::category_config_key(static_cast<goblin::generated::Category>(cat));
+        const char *ckey = cat >= 0
+            ? goblin::category_config_key(static_cast<goblin::generated::Category>(cat))
+            : nullptr;
         char utf8[320] = {};
         const int32_t reg_id = goblin::focus_region();
         // One name copied under the progress lock - iterating the shared table from this thread would
@@ -829,8 +831,13 @@ namespace
                     goblin::i18n::tr(goblin::i18n::TextId::ProgressShowingOnly));
         MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wl[0], 320);
         char subject[320] = {};
-        _snprintf_s(subject, sizeof(subject), _TRUNCATE, "%s - %s",
-                    ckey ? goblin::i18n::entry_label(ckey) : "?", reg_name);
+        if (picks)
+            _snprintf_s(subject, sizeof(subject), _TRUNCATE,
+                        goblin::i18n::tr(goblin::i18n::TextId::SearchFocusSubject),
+                        static_cast<int>(goblin::focus_rows_count()));
+        else
+            _snprintf_s(subject, sizeof(subject), _TRUNCATE, "%s - %s",
+                        ckey ? goblin::i18n::entry_label(ckey) : "?", reg_name);
         MultiByteToWideChar(CP_UTF8, 0, subject, -1, wl[1], 320);
         // Line 2: how to clear it - the hint names the menu's own Reset row.
         char hint[320] = {};

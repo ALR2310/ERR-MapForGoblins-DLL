@@ -52,6 +52,7 @@
 #include "goblin_maphover.hpp" // back 2026-08-01: map_dialog() gates the pad combo's grace window
 #include "goblin_messages.hpp"   // lookup_text() for marker names in the menu
 #include "goblin_progress.hpp"
+#include "goblin_search.hpp"     // item search tab
 #include "modutils.hpp" // hook GetRawInputData (menu input-leak block)
 
 #include <spdlog/spdlog.h>
@@ -69,6 +70,7 @@
 #include <cmath>
 #include <thread>
 #include <vector>
+#include <unordered_set>
 #include <commdlg.h> // GetOpenFileNameW (WIN32_LEAN_AND_MEAN excludes it from windows.h)
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -881,6 +883,149 @@ static void text_disabled_wrapped(const char *s)
     ImGui::PopStyleColor();
 }
 
+// ── Search tab: find markers by item name (player's language + English at once), tick the
+// ones wanted, show only those on the map (the pick focus, goblin::set_focus_rows). ──
+static char g_search_buf[128] = {};
+
+static void draw_search_tab()
+{
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+    goblin::progress::rebuild_if_stale(ImGui::GetTime()); // region names for the result groups
+
+    // The text field, focused when the tab first shows so typing starts at once.
+    static bool s_focus_field = true;
+    if (s_focus_field) { ImGui::SetKeyboardFocusHere(); s_focus_field = false; }
+    const char *clear_lbl = tr::tr(tr::TextId::SearchClearField, lang);
+    const ImGuiStyle &st = ImGui::GetStyle();
+    ImGui::SetNextItemWidth(-(ImGui::CalcTextSize(clear_lbl).x + st.FramePadding.x * 2.0f + st.ItemSpacing.x));
+    ImGui::InputTextWithHint("##searchq", tr::tr(tr::TextId::SearchTypeHere, lang),
+                             g_search_buf, sizeof g_search_buf);
+    ImGui::SameLine();
+    if (ImGui::Button(clear_lbl)) { g_search_buf[0] = '\0'; s_focus_field = true; }
+    {
+        // The layout the typed keys translate with; Alt+Shift / Ctrl+Shift / Win+Space cycles it.
+        char tag[16] = {};
+        WideCharToMultiByte(CP_UTF8, 0, goblin::overlay::text_layout_tag(), -1, tag, sizeof tag, nullptr, nullptr);
+        if (tag[0]) { ImGui::SameLine(); ImGui::TextDisabled("[%s]", tag); }
+    }
+
+    const auto res_p = goblin::search::query(g_search_buf); // immutable snapshot
+    const auto &res = *res_p;
+    const size_t npick = goblin::search::pick_count();
+
+    {
+        bool only = goblin::config::searchHideCollected;
+        if (ImGui::Checkbox(tr::entry_label("search_hide_collected", lang), &only))
+            goblin::config::searchHideCollected = only; // saved with the ini on close; query() re-runs
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+            ImGui::SetTooltip("%s", tr::entry_comment("search_hide_collected", "", lang));
+    }
+    if (g_search_buf[0] == '\0')
+        text_disabled_wrapped(tr::tr(tr::TextId::SearchHint, lang));
+    else if (res.total == 0)
+        text_disabled_wrapped(tr::tr(tr::TextId::SearchNoResults, lang));
+    else
+    {
+        ImGui::Text(tr::tr(tr::TextId::SearchMatches, lang),
+                    static_cast<int>(res.total), static_cast<int>(res.groups.size()));
+        if (res.truncated)
+        {
+            char t[160];
+            std::snprintf(t, sizeof t, tr::tr(tr::TextId::SearchTruncated, lang),
+                          static_cast<int>(goblin::search::kMaxHits));
+            text_disabled_wrapped(t);
+        }
+    }
+
+    // Actions. Picks apply to the map the moment they change (goblin::search), so there is no
+    // "show" step: "show all found" ticks every hit, "clear picks" lifts the filter.
+    {
+        ImGui::BeginDisabled(res.total == 0);
+        if (ImGui::Button(tr::tr(tr::TextId::SearchShowAll, lang)))
+        {
+            std::vector<uint64_t> keys;
+            keys.reserve(res.total);
+            for (const auto &g : res.groups)
+                for (const auto &h : g.hits) keys.push_back(h.key);
+            goblin::search::pick_many(keys, true);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(npick == 0);
+        if (ImGui::Button(tr::tr(tr::TextId::SearchClearPicks, lang)))
+            goblin::search::clear_picks();
+        ImGui::EndDisabled();
+    }
+    if (goblin::focus_rows_active())
+    {
+        char subj[96];
+        std::snprintf(subj, sizeof subj, tr::tr(tr::TextId::SearchFocusSubject, lang),
+                      static_cast<int>(goblin::focus_rows_count()));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.78f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s %s", tr::tr(tr::TextId::ProgressShowingOnly, lang), subj);
+        ImGui::PopStyleColor();
+        // (no reset button here: "clear picks" above IS the reset)
+    }
+    ImGui::Separator();
+
+    // Results grouped by region. A collected / hidden marker gets a dim tag; that state is read
+    // at most once a second (it walks every row's flags, like the Progress tab).
+    static std::unordered_set<uint64_t> s_done;
+    static double s_done_t = -10.0;
+    if (res.total && ImGui::GetTime() - s_done_t > 1.0)
+    {
+        s_done = goblin::hidden_marker_original_ids();
+        s_done_t = ImGui::GetTime();
+    }
+    // Group open/closed state is per query: new letters mean a new result set, so the tree
+    // starts over (small sets open, large ones collapsed).
+    uint32_t qhash = 2166136261u;
+    for (const char *c = g_search_buf; *c; ++c) qhash = (qhash ^ static_cast<uint8_t>(*c)) * 16777619u;
+    const bool open_all = res.total <= 60;
+
+    ImGui::BeginChild("##searchscroll", ImVec2(0, 0), ImGuiChildFlags_NavFlattened);
+    ImGui::PushID(static_cast<int>(qhash));
+    for (const auto &g : res.groups)
+    {
+        ImGui::PushID(g.region);
+        ImGui::SetNextItemOpen(open_all, ImGuiCond_Once);
+        char hdr[320];
+        std::snprintf(hdr, sizeof hdr, "%s (%d)###grp", g.region_name.c_str(), static_cast<int>(g.hits.size()));
+        const bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_None);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr::tr(tr::TextId::SearchPickAll, lang)))
+        {
+            std::vector<uint64_t> keys;
+            keys.reserve(g.hits.size());
+            for (const auto &h : g.hits) keys.push_back(h.key);
+            goblin::search::pick_many(keys, true);
+        }
+        if (open)
+        {
+            for (const auto &h : g.hits)
+            {
+                ImGui::PushID(reinterpret_cast<const void *>(static_cast<uintptr_t>(h.key)));
+                bool p = goblin::search::is_picked(h.key);
+                if (ImGui::Checkbox("##pick", &p)) goblin::search::set_picked(h.key, p);
+                ImGui::SameLine();
+                const auto cat = static_cast<goblin::generated::Category>(h.cat);
+                if (const char *ckey = goblin::category_config_key(cat)) draw_row_icon(ckey); // + SameLine
+                ImGui::AlignTextToFramePadding();
+                if (s_done.count(h.key))
+                    ImGui::TextDisabled("%s  (%s)", h.name.c_str(), tr::tr(tr::TextId::SearchCollected, lang));
+                else
+                    ImGui::TextUnformatted(h.name.c_str());
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+    ImGui::EndChild();
+}
+
 // ── Hidden-markers tab: markers the user hid manually (hover + hide_marker_key) ──
 // Lists each with per-item Unhide + an Unhide-all button; changes apply live + persist.
 // Shows the localized item name + location (from the row's baked textId/region), NOT the
@@ -1109,6 +1254,21 @@ void draw_progress_tab()
             goblin::reapply_live_settings();
         }
     }
+    else if (goblin::focus_rows_active())
+    {
+        // The search tab's pick set is isolating the map: say so here too, with the same reset.
+        char subj[96];
+        std::snprintf(subj, sizeof subj, tr::tr(tr::TextId::SearchFocusSubject, lang),
+                      static_cast<int>(goblin::focus_rows_count()));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.78f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s %s", tr::tr(tr::TextId::ProgressShowingOnly, lang), subj);
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton(tr::tr(tr::TextId::ProgressFocusClear, lang)))
+        {
+            goblin::set_focus_category(-1);
+            goblin::reapply_live_settings();
+        }
+    }
     ImGui::EndChild();
     ImGui::Separator();
 
@@ -1272,8 +1432,8 @@ void draw_settings_window()
     {
         const bool lb = (g_pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
         const bool rb = (g_pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
-        if (rb && !prev_rb) { cur_tab = (cur_tab + 1) % 5; forced_tab = cur_tab; }
-        if (lb && !prev_lb) { cur_tab = (cur_tab + 4) % 5; forced_tab = cur_tab; }
+        if (rb && !prev_rb) { cur_tab = (cur_tab + 1) % 6; forced_tab = cur_tab; }
+        if (lb && !prev_lb) { cur_tab = (cur_tab + 5) % 6; forced_tab = cur_tab; }
         prev_lb = lb; prev_rb = rb;
     }
     auto tab_flag = [&](int i) {
@@ -1292,14 +1452,24 @@ void draw_settings_window()
         if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabSettings, lang), nullptr, tab_flag(0))) { draw_settings_tab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabProgress, lang), nullptr, tab_flag(1))) { draw_progress_tab(); ImGui::EndTabItem(); }
         {
+            // Search tab title carries the pick count once anything is picked, e.g. "Search (12)".
+            char stab[64];
+            const size_t npick = goblin::search::pick_count();
+            if (npick)
+                std::snprintf(stab, sizeof stab, "%s (%zu)###tabsearch", tr::tr(tr::TextId::TabSearch, lang), npick);
+            else
+                std::snprintf(stab, sizeof stab, "%s###tabsearch", tr::tr(tr::TextId::TabSearch, lang));
+            if (ImGui::BeginTabItem(stab, nullptr, tab_flag(2))) { draw_search_tab(); ImGui::EndTabItem(); }
+        }
+        {
             // Hidden-markers tab title carries the live count, e.g. "Hidden (3)".
             char htab[64];
             std::snprintf(htab, sizeof htab, "%s (%zu)###tabhidden",
                           tr::tr(tr::TextId::TabHidden, lang), goblin::manual_hidden_count());
-            if (ImGui::BeginTabItem(htab, nullptr, tab_flag(2))) { draw_hidden_tab(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(htab, nullptr, tab_flag(3))) { draw_hidden_tab(); ImGui::EndTabItem(); }
         }
-        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabDebug, lang),    nullptr, tab_flag(3))) { draw_debug_tab();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabAbout, lang),    nullptr, tab_flag(4))) { draw_about_tab();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabDebug, lang),    nullptr, tab_flag(4))) { draw_debug_tab();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabAbout, lang),    nullptr, tab_flag(5))) { draw_about_tab();    ImGui::EndTabItem(); }
 
         ImGui::EndTabBar();
     }
@@ -1742,6 +1912,72 @@ void feed_nav_keyboard()
             if (down)
                 g_last_input.store(0, std::memory_order_relaxed); // keyboard active
         }
+    }
+}
+
+// Polled TEXT entry for the in-swapchain backend. We never hold focus, so no WM_CHAR ever
+// reaches ImGui and feed_nav_keyboard covers only the nav keys. The game reads typed text the
+// same way we do here (a keyboard-state snapshot translated per key); we use ToUnicodeEx with
+// the GAME thread's layout, so a Cyrillic or accented layout types its own letters, not the
+// US ones. Characters are produced only while a text field is active (io.WantTextInput); the
+// editing keys and modifiers are fed whenever the menu is up. The raw-input hook already keeps
+// every key away from the game while the menu is open, so typing cannot move the player.
+static void feed_text_keyboard(HWND game)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    struct KeyMap { int vk; ImGuiKey key; };
+    static const KeyMap edit[] = {
+        {VK_BACK, ImGuiKey_Backspace}, {VK_DELETE, ImGuiKey_Delete},
+        {VK_HOME, ImGuiKey_Home},      {VK_END, ImGuiKey_End},
+        {VK_SHIFT, ImGuiMod_Shift},    {VK_CONTROL, ImGuiMod_Ctrl},
+        {'A', ImGuiKey_A}, {'C', ImGuiKey_C}, {'V', ImGuiKey_V}, {'X', ImGuiKey_X}, // Ctrl+A/C/V/X
+    };
+    static bool prev[sizeof(edit) / sizeof(edit[0])] = {};
+    for (size_t i = 0; i < sizeof(edit) / sizeof(edit[0]); ++i)
+    {
+        const bool down = kd(edit[i].vk);
+        if (down != prev[i])
+        {
+            io.AddKeyEvent(edit[i].key, down);
+            prev[i] = down;
+            if (down) g_last_input.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    // Per-key repeat clock: 0 = up; else the tick at which the next repeat fires.
+    static uint64_t s_next[256] = {};
+    // Only while the GAME is the foreground window: GetAsyncKeyState is global, and an alt-tabbed
+    // player typing into another program must not type into our field too.
+    DWORD fg_pid = 0;
+    if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &fg_pid);
+    if (!io.WantTextInput || kd(VK_CONTROL) || fg_pid != GetCurrentProcessId())
+    {
+        for (auto &t : s_next) t = 0;
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    (void)game;
+    goblin::overlay::text_layout_poll(); // Alt+Shift etc. cycle OUR layout (the game's thread never switches)
+    const HKL layout = reinterpret_cast<HKL>(goblin::overlay::text_layout());
+    BYTE ks[256] = {};
+    if (kd(VK_SHIFT)) ks[VK_SHIFT] = 0x80;
+    if (kd(VK_RMENU)) { ks[VK_CONTROL] = 0x80; ks[VK_MENU] = 0x80; ks[VK_RMENU] = 0x80; } // AltGr
+    if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] = 1;
+    for (int vk = VK_SPACE; vk <= VK_OEM_102; ++vk)
+    {
+        if (!goblin::overlay::text_key(vk)) continue;
+        if (!kd(vk)) { s_next[vk] = 0; continue; }
+        if (s_next[vk] == 0) s_next[vk] = now + 400;      // first press: emit now, repeat after 400 ms
+        else if (now < s_next[vk]) continue;
+        else s_next[vk] = now + 40;                        // then every 40 ms
+        wchar_t out[8] = {};
+        const UINT sc = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC, layout);
+        // Bit 2 = do not disturb the keyboard state (dead keys) - Windows 10 1607+; older
+        // systems ignore the flag.
+        const int n = ToUnicodeEx(static_cast<UINT>(vk), sc, ks, out, 8, 1u << 2, layout);
+        for (int i = 0; i < n; ++i)
+            if (out[i] >= 0x20) io.AddInputCharacterUTF16(static_cast<ImWchar16>(out[i]));
+        if (n > 0) g_last_input.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -2260,13 +2496,35 @@ static void render_frame(bool draw)
 using GetRawInputData_t = UINT(WINAPI *)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 GetRawInputData_t o_GetRawInputData = nullptr;
 
+// Native-menu text capture (goblin::overlay::set_text_capture): mute only the typeable keys.
+std::atomic<bool> g_text_capture{false};
+
 UINT WINAPI hk_GetRawInputData(HRAWINPUT hri, UINT cmd, LPVOID data, PUINT size, UINT hsz)
 {
     UINT r = o_GetRawInputData(hri, cmd, data, size, hsz);
     // Only touch the actual data fetch (data != null); leave the size query alone.
-    if (g_menu_open.load() && data && cmd == RID_INPUT && r != static_cast<UINT>(-1))
+    const bool menu = g_menu_open.load();
+    const bool capture = !menu && g_text_capture.load(std::memory_order_relaxed);
+    if ((menu || capture) && data && cmd == RID_INPUT && r != static_cast<UINT>(-1))
     {
         RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(data);
+        if (capture)
+        {
+            // The native search page is typing: swallow the letters, digits, space, punctuation
+            // and Backspace; everything else (Enter, Escape, arrows, the mouse) stays the game's.
+            if (ri->header.dwType == RIM_TYPEKEYBOARD)
+            {
+                const int vk = ri->data.keyboard.VKey;
+                if (vk == VK_BACK || goblin::overlay::text_key(vk))
+                {
+                    ri->data.keyboard.MakeCode = 0;
+                    ri->data.keyboard.VKey = 0;
+                    ri->data.keyboard.Message = WM_NULL;
+                    ri->data.keyboard.Flags = RI_KEY_BREAK;
+                }
+            }
+            return r;
+        }
         if (ri->header.dwType == RIM_TYPEMOUSE)
         {
             ri->data.mouse.lLastX = 0;
@@ -2765,6 +3023,7 @@ static void sc2_frontend_loop()
 
         sc2_feed_mouse(game);
         feed_nav_keyboard();
+        feed_text_keyboard(game); // typed characters for the search field (polled, focus-free)
         feed_gamepad();
         if (open) { poll_rebind_keyboard(); process_rebind(); }
 
@@ -3014,6 +3273,100 @@ void teardown()
 } // namespace
 
 bool goblin::overlay::key_down(int vk) { return kd(vk); }
+
+void goblin::overlay::set_text_capture(bool on)
+{
+    if (g_text_capture.exchange(on, std::memory_order_relaxed) != on)
+        spdlog::debug("[OVERLAY] native text capture {}", on ? "on" : "off");
+}
+
+bool goblin::overlay::text_key(int vk)
+{
+    return vk == VK_SPACE || (vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') ||
+           (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE) || (vk >= VK_OEM_1 && vk <= VK_OEM_3) ||
+           (vk >= VK_OEM_4 && vk <= VK_OEM_8) || vk == VK_OEM_102;
+}
+
+// ── the text feeds' keyboard layout (see the header) ──
+static std::atomic<uintptr_t> g_text_hkl{0};
+static wchar_t g_text_tag[8] = L"";
+
+static void text_layout_set(HKL hkl)
+{
+    g_text_hkl.store(reinterpret_cast<uintptr_t>(hkl), std::memory_order_relaxed);
+    wchar_t code[8] = L"";
+    const LANGID lang = LOWORD(reinterpret_cast<uintptr_t>(hkl));
+    if (GetLocaleInfoW(MAKELCID(lang, SORT_DEFAULT), LOCALE_SISO639LANGNAME, code, 8) > 0)
+        CharUpperW(code);
+    wcscpy_s(g_text_tag, code);
+}
+
+void *goblin::overlay::text_layout()
+{
+    uintptr_t cur = g_text_hkl.load(std::memory_order_relaxed);
+    if (!cur)
+    {
+        // Seed from the game window's thread - the layout the player had when the game started.
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        const DWORD tid = fg ? GetWindowThreadProcessId(fg, &pid) : 0;
+        text_layout_set(GetKeyboardLayout(pid == GetCurrentProcessId() ? tid : 0));
+        cur = g_text_hkl.load(std::memory_order_relaxed);
+    }
+    return reinterpret_cast<void *>(cur);
+}
+
+const wchar_t *goblin::overlay::text_layout_tag()
+{
+    (void)text_layout();
+    return g_text_tag;
+}
+
+bool goblin::overlay::text_layout_poll()
+{
+    static bool prev = false;
+    bool switched = false;
+    const bool shift = kd(VK_SHIFT), alt = kd(VK_MENU), ctrl = kd(VK_CONTROL);
+    const bool win = kd(VK_LWIN) || kd(VK_RWIN);
+    const bool combo = (shift && (alt || ctrl)) || (win && kd(VK_SPACE));
+    if (combo && !prev)
+    {
+        HKL raw[32] = {};
+        const int nraw = GetKeyboardLayoutList(32, raw);
+        // ONE layout per language. A system often carries a second variant of the same language
+        // (an IME or a custom layout, HKL high word 0xF0xx - seen 2026-09-02: 0xF0C00419 next to
+        // 0x04190419), and cycling onto it types nothing useful. Prefer the standard layout of
+        // each language (high word == language id), else the first variant listed.
+        HKL list[32] = {};
+        int n = 0;
+        for (int i = 0; i < nraw; ++i)
+        {
+            const auto v = reinterpret_cast<uintptr_t>(raw[i]);
+            const WORD lang = LOWORD(v);
+            const bool standard = HIWORD(static_cast<DWORD>(v)) == lang;
+            int at = -1;
+            for (int k = 0; k < n; ++k)
+                if (LOWORD(reinterpret_cast<uintptr_t>(list[k])) == lang) { at = k; break; }
+            if (at < 0) list[n++] = raw[i];
+            else if (standard) list[at] = raw[i];
+        }
+        const auto cur = reinterpret_cast<HKL>(text_layout());
+        if (n > 1)
+        {
+            int idx = -1;
+            for (int i = 0; i < n; ++i)
+                if (LOWORD(reinterpret_cast<uintptr_t>(list[i])) == LOWORD(reinterpret_cast<uintptr_t>(cur)))
+                { idx = i; break; }
+            const HKL next = list[(idx + 1) % n];
+            text_layout_set(next);
+            switched = true;
+            spdlog::info("[search] layout -> 0x{:X} (pick {} of {} languages, {} installed)",
+                         reinterpret_cast<uintptr_t>(next), (idx + 1) % n, n, nraw);
+        }
+    }
+    prev = combo;
+    return switched;
+}
 
 void *goblin::overlay::native_hover_row() { return native_hover_row_impl(); }
 

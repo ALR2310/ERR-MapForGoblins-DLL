@@ -36,4 +36,23 @@ namespace goblin::overlay
     // them - this is the equivalent focus test. Thread-safe (no ImGui state);
     // also used by the manual-hide hotkey thread.
     void *native_hover_row();
+
+    // Text capture for the NATIVE menu's search page. While on, the raw-input hook that mutes
+    // the game's keyboard during the overlay menu mutes only the TYPEABLE keys (letters, digits,
+    // space, punctuation, Backspace), so the typed letters stop being the game's own menu keys
+    // (E, Q, WASD...) while Enter, Escape and the arrows still drive the native screen. The
+    // native-menu host sets it while the cursor sits on the search page's text row.
+    void set_text_capture(bool on);
+    // Is this virtual key one the text capture claims? Shared by both text feeds.
+    bool text_key(int vk);
+
+    // The keyboard layout the text feeds translate with. The game's window never handles the
+    // OS layout-switch request, so its thread stays on whatever layout it started with (seen
+    // 2026-09-02: 0x04090409 on both threads after Alt+Shift). So the switch is ours: poll()
+    // edge-detects Alt+Shift / Ctrl+Shift / Win+Space and cycles through the installed layouts;
+    // layout() is the current pick (seeded from the game window's thread); tag() is its
+    // two-letter language code ("EN", "RU") for the text row. Call poll() only while typing.
+    bool text_layout_poll();  // true when this call switched the layout
+    void *text_layout();  // an HKL (void* keeps <windows.h> out of this header)
+    const wchar_t *text_layout_tag();
 }

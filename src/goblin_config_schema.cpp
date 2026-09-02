@@ -91,6 +91,7 @@ namespace goblin::config
     bool enableMarkerDump = false;
     uint32_t markerDumpKey = 0x78; // VK_F9
     bool enableManualHide = true;
+    bool searchHideCollected = true;
     uint32_t hideMarkerKey = 0x2E; // VK_DELETE
     uint16_t hideMarkerGamepad = 0;      // unbound; RB (the old default) is the map's own
                                          // tab-switch button, so it fired on every layer switch
@@ -341,6 +342,9 @@ namespace
                          "Key that hides the map marker currently under the cursor. Default: Delete.", false, nullptr},
                 IniEntry{"hide_marker_gamepad", IniType::GamepadMask, &cfg::hideMarkerGamepad, "none",
                          "Gamepad button that hides the map marker under the cursor (same as\nhide_marker_key). Tokens joined with '+'. Unbound by default: every free\nmap button is taken by the game (RB, the old default, is the map's own\ntab-switch button, so it fired on every layer switch). Default: none.", false, nullptr},
+                B("search_hide_collected", searchHideCollected, "true",
+                  "Item search (menu / overlay): list only markers not yet collected. Off = list\n"
+                  "everything, collected ones tagged. Default: true."),
                 B("hover_info", enableHoverInfo, "true",
                   "Show a small passive panel (top-left) while the world map is open and the\ncursor is over a marker: the marker's name and its height relative to you\n(\"N units above/below\"). Never captures input."),
             }},

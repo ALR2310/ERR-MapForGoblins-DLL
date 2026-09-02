@@ -95,6 +95,19 @@ namespace goblin::i18n
         MenuPressPad,     // same screen, entered from a gamepad-combo entry
         MenuUnbind,       // clears a binding outright (a pad button has no "Escape")
         MenuKeepCurrent,
+        // Item search (overlay Search tab + native search page).
+        TabSearch,
+        SearchHint,
+        SearchNoResults,
+        SearchMatches,      // "%d found in %d regions"
+        SearchTruncated,    // "showing the first %d - type more letters"
+        SearchShowAll,      // "Show all found on map"
+        SearchPickAll,      // per region group
+        SearchClearPicks,
+        SearchCollected,    // tag on a result already collected / hidden
+        SearchFocusSubject, // after "Showing only:" - "search picks (%d)"
+        SearchClearField,
+        SearchTypeHere,     // native menu: the text row's empty-field placeholder
     };
 
     enum class ToastId

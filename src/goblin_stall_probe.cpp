@@ -6792,8 +6792,49 @@ namespace
     std::atomic<int> g_action_log_left{0};
     constexpr int kActionLogCap = 60;
 
+    // The search page is typing (cursor on its text row): set by poll_search every tick. While it
+    // is, Backspace and Q are text keys, not "one step back" - the predicate below answers "no
+    // Back here" for them. Escape keeps closing the screen, so nobody is trapped on the page.
+    std::atomic<bool> g_search_typing{false};
+
+    // While typing, a press of a TYPEABLE key (letters, digits, space, punctuation, Backspace) is
+    // text, whatever action the game maps it to - Q/Backspace = Back, E = confirm, W/S = move.
+    // A navigation key (Escape, Enter, Tab, arrows) held at the same time means the player is
+    // driving the menu, and every action passes. Pad input is untouched (no key is down).
+    // The game snapshots its input once per frame and asks the predicate later, so a quick tap can
+    // be UP again by the time the question comes - and the letter then walked the cursor or backed
+    // out (the "typing suddenly stops" report, 2026-09-02). A press is therefore remembered for
+    // kTypedLatchMs by whoever sees it (this predicate or the tick's key scan).
+    constexpr uint64_t kTypedLatchMs = 250;
+    std::atomic<uint64_t> g_last_typed_ms{0};
+
+    bool typed_key_held()
+    {
+        static const int nav[] = {VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT};
+        for (int vk : nav)
+            if (GetAsyncKeyState(vk) & 0x8000) return false;
+        const uint64_t now = GetTickCount64();
+        bool down = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
+        for (int vk = VK_SPACE; !down && vk <= VK_OEM_102; ++vk)
+            if (goblin::overlay::text_key(vk) && (GetAsyncKeyState(vk) & 0x8000)) down = true;
+        if (down)
+        {
+            g_last_typed_ms.store(now, std::memory_order_relaxed);
+            return true;
+        }
+        return now - g_last_typed_ms.load(std::memory_order_relaxed) <= kTypedLatchMs;
+    }
+    std::atomic<int> g_typing_log_left{0}; // diagnostic: a few predicate queries per typing session
+
     char action_test_detour(void *input, uint32_t action, void *state)
     {
+        if (g_search_typing.load(std::memory_order_relaxed) && typed_key_held())
+        {
+            const char orig = o_action_test ? o_action_test(input, action, state) : 0;
+            if (orig && g_typing_log_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+                spdlog::info("[action] typing: action 0x{:X} would fire on a typed key - denied", action);
+            return 0;
+        }
         const char r = o_action_test ? o_action_test(input, action, state) : 0;
         if (g_action_log_until.load(std::memory_order_relaxed) &&
             GetTickCount64() <= g_action_log_until.load(std::memory_order_relaxed) &&
@@ -7689,6 +7730,110 @@ namespace
         }
     }
 
+    // ── typed text for the search page ───────────────────────────────────────────────
+    // Same shape as the rebind capture: the screen's command vector knows nothing about
+    // letters, so they are read physically, translated through this thread's (the game's)
+    // keyboard layout and handed to the model. ONLY while the list cursor sits on the page's
+    // text row (visual row 0 = flat cursor 0/1): there the typeable keys are muted for the game
+    // through the overlay's raw-input hook (set_text_capture), so "e" types an e instead of
+    // confirming; one row down they are the game's menu keys again. Held = repeat, like a
+    // text field: 400 ms, then every 40 ms.
+    uint64_t g_search_next[256] = {}; // per key: 0 = up, else when the held key fires again
+
+    void poll_search(const Screen &top)
+    {
+        bool typing = goblin::nmenu::search_active() && !goblin::nmenu::rebind_pending();
+        if (typing)
+        {
+            const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
+            typing = dlg != 0 && read_list_pos(dlg).cursor < 2;
+        }
+        if (typing)
+        {
+            // Only while the GAME is the foreground window: the key reads are global, and an
+            // alt-tabbed player typing elsewhere must not type in here.
+            DWORD fg_pid = 0;
+            if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &fg_pid);
+            typing = fg_pid == GetCurrentProcessId();
+        }
+        goblin::overlay::set_text_capture(typing);
+        g_search_typing.store(typing, std::memory_order_relaxed); // action_test_detour: typed keys are text
+        // The game's window never handles the OS layout switch (both threads stayed 0x04090409
+        // after Alt+Shift, 2026-09-02), so the layout is OUR pick: the overlay module cycles it on
+        // the usual hotkeys and both text feeds translate with it.
+        const bool layout_switched = typing && goblin::overlay::text_layout_poll();
+        const HKL layout = reinterpret_cast<HKL>(goblin::overlay::text_layout());
+        static bool s_was_typing = false;
+        // Armed only once every typeable key is up: the page is opened BY a key press (E), and
+        // that press must not become the first letter - the same rule the rebind page uses.
+        static bool s_armed = false;
+        if (typing && !s_was_typing)
+        {
+            s_armed = false;
+            g_typing_log_left.store(12, std::memory_order_relaxed);
+            spdlog::info("[search] typing on (native page), layout=0x{:X}",
+                         reinterpret_cast<uintptr_t>(layout));
+        }
+        s_was_typing = typing;
+        if (!typing)
+        {
+            for (auto &t : g_search_next) t = 0;
+            return;
+        }
+        if (!s_armed)
+        {
+            bool any = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
+            for (int vk = VK_SPACE; !any && vk <= VK_OEM_102; ++vk)
+                if (goblin::overlay::text_key(vk) && (GetAsyncKeyState(vk) & 0x8000)) any = true;
+            if (any) return;
+            s_armed = true;
+        }
+        const uint64_t now = GetTickCount64();
+        BYTE ks[256] = {};
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) ks[VK_SHIFT] = 0x80;
+        if (GetAsyncKeyState(VK_RMENU) & 0x8000) { ks[VK_CONTROL] = 0x80; ks[VK_MENU] = 0x80; ks[VK_RMENU] = 0x80; }
+        if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] = 1;
+        const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool changed = layout_switched; // the text row shows the layout tag - redraw it at once
+        for (int vk = VK_BACK; vk <= VK_OEM_102; ++vk)
+        {
+            if (vk != VK_BACK && !goblin::overlay::text_key(vk)) continue;
+            if (!(GetAsyncKeyState(vk) & 0x8000)) { g_search_next[vk] = 0; continue; }
+            g_last_typed_ms.store(now, std::memory_order_relaxed); // the latch typed_key_held reads
+            if (g_search_next[vk] == 0) g_search_next[vk] = now + 400;
+            else if (now < g_search_next[vk]) continue;
+            else g_search_next[vk] = now + 40;
+            if (vk == VK_BACK)
+            {
+                changed |= goblin::nmenu::search_backspace();
+                continue;
+            }
+            if (ctrl) continue; // a shortcut, not a character
+            wchar_t out[8] = {};
+            const UINT sc = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC, layout);
+            const int n = ToUnicodeEx(static_cast<UINT>(vk), sc, ks, out, 8, 1u << 2, layout);
+            if (g_typing_log_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+                spdlog::info("[search] key 0x{:X} sc 0x{:X} hkl 0x{:X} -> n={} U+{:04X}", vk, sc,
+                             reinterpret_cast<uintptr_t>(layout), n, n > 0 ? static_cast<unsigned>(out[0]) : 0u);
+            for (int i = 0; i < n; ++i)
+                if (out[i] >= 0x20)
+                {
+                    goblin::nmenu::search_type(out[i]);
+                    changed = true;
+                }
+        }
+        if (!changed) return;
+        const uintptr_t dlg = g_form_dialog.load(std::memory_order_acquire);
+        if (dlg)
+        {
+            // Same freshness rule as the rebind poller: the model is ours, the engine-side row
+            // rebuild only while the dialog is still ticking.
+            build_form_rows();
+            if (safe_to_call_engine(top, GetTickCount64()))
+                refresh_form_view(dlg);
+        }
+    }
+
     // ── left/right stepping for Slider rows ──────────────────────────────────────────
     // The screen's own input cannot deliver this: up/down is the grid's internal logic (not
     // a window command) and no command with a D-pad Left/Right action id is registered on
@@ -8045,7 +8190,11 @@ namespace
             }
         }
         if (!menu_open())
+        {
+            goblin::overlay::set_text_capture(false); // the search page cannot be up any more
+            g_search_typing.store(false, std::memory_order_relaxed);
             return;
+        }
         const Screen &top = g_screens.back();
         if (!top.dlg)
             return; // still coming up
@@ -8061,6 +8210,7 @@ namespace
         if (safe_to_call_engine(top, GetTickCount64()))
             paint_help_line();
         poll_rebind();
+        poll_search(top);
         poll_slider(top);
         arm_action_log_on_escape();
         // ── the strips, EVERY frame ──────────────────────────────────────────────────
@@ -11022,15 +11172,13 @@ void goblin::stall_probe::setup()
         spdlog::warn("[menuicons] row-slot hook unavailable: {}", e.what());
     }
 
-    // Input-action predicate hook: names the action ESC produces. Inert unless armed (see
-    // action_test_detour); a miss only costs that diagnostic.
-    // Diagnostic only, and it sits in a path called several times per frame - so it is installed
-    // ONLY when debug logging is on. Its finding is already recorded in the docs; it stays because the
-    // same instrument answers "which action is this?" for any future menu work.
+    // Input-action predicate hook. Was a diagnostic (names the action ESC produces, inert unless
+    // armed); since 2026-09-02 it is LIVE: while the search page's text row is being typed into,
+    // it answers "no Back" for a Backspace or Q press (see action_test_detour), so those keys
+    // erase a character instead of leaving the page. Installed always; the per-call cost is one
+    // relaxed atomic load on the way to the original.
     try
     {
-        if (!goblin::config::debugLogging)
-            throw std::runtime_error("debug logging off - action probe not installed");
         modutils::hook<ActionTestFn>(
             {.aob = "4C 8B DC 48 81 EC 88 00 00 00 49 C7 43 98 FE FF FF FF 49 8D 43 B0 49 89 43 20 "
                     "41 89 53 18 41 0F B6 00"},

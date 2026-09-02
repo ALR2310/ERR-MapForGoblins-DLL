@@ -91,6 +91,7 @@ struct CategoryRow
     int32_t baked_text1;     // textId1 as baked (restored when focus removes a fabricated label)
     bool baked_notext;       // isEnableNoText as baked (restored after focus force-show)
     bool focus_text;         // true while focus fabricated a label on a textless row
+    bool picked;             // member of the search-pick focus set (set_focus_rows)
     uint8_t native_area;
     uint8_t native_layer;
     uint16_t native_gx;
@@ -141,6 +142,21 @@ static bool native_category_migrated(Category cat)
 // + apply_focus_highlight).
 static int g_focus_category = -1;
 static int32_t g_focus_region = -1;
+// The second focus shape: an explicit pick set (the item search). While on, the per-row
+// `picked` flag replaces the (category, region) test everywhere the focus is consulted.
+static std::atomic<bool> g_focus_pick{false};
+static std::atomic<size_t> g_focus_pick_count{0};
+// Marker labels changed (live-loot relabel / settings re-apply): the search index rebuilds.
+static std::atomic<uint32_t> g_label_epoch{1};
+
+static inline bool focus_active() { return g_focus_pick.load() || g_focus_category >= 0; }
+// ONE definition of "this row is in the active focus", for both shapes. `focus` is the
+// caller's snapshot of g_focus_category (kept so the loops read it once).
+static inline bool row_in_focus(const CategoryRow &cr, int focus)
+{
+    if (g_focus_pick.load(std::memory_order_relaxed)) return cr.picked;
+    return focus >= 0 && static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region;
+}
 
 // ---- Manual per-marker hide (hover + hotkey; managed in the overlay) --------
 // A user can hide an individual marker by hovering it on the map and pressing the
@@ -490,11 +506,51 @@ void goblin::set_focus_category(int category_or_negative, int32_t region_place_i
 {
     g_focus_category = category_or_negative;
     g_focus_region = (category_or_negative < 0) ? -1 : region_place_id;
+    // A category focus and a pick focus are exclusive: setting (or clearing) one drops the other.
+    if (g_focus_pick.exchange(false))
+    {
+        for (auto &cr : g_category_rows) cr.picked = false;
+        g_focus_pick_count.store(0);
+    }
     spdlog::info("[focus] set category={} region={}", g_focus_category, g_focus_region);
 }
 
 int goblin::focus_category() { return g_focus_category; }
 int32_t goblin::focus_region() { return g_focus_region; }
+
+void goblin::set_focus_rows(const std::vector<uint64_t> &original_row_ids)
+{
+    g_focus_category = -1;
+    g_focus_region = -1;
+    std::unordered_set<uint64_t> want(original_row_ids.begin(), original_row_ids.end());
+    size_t n = 0;
+    for (auto &cr : g_category_rows)
+    {
+        cr.picked = cr.original_row_id != 0 && want.count(cr.original_row_id) != 0;
+        if (cr.picked) ++n;
+    }
+    g_focus_pick_count.store(n);
+    g_focus_pick.store(n > 0);
+    spdlog::info("[focus] set picks: {} requested, {} matched", original_row_ids.size(), n);
+}
+
+bool goblin::focus_rows_active() { return g_focus_pick.load(); }
+size_t goblin::focus_rows_count() { return g_focus_pick_count.load(); }
+
+std::vector<goblin::SearchRow> goblin::search_row_snapshot()
+{
+    std::vector<SearchRow> out;
+    out.reserve(g_category_rows.size());
+    for (const auto &cr : g_category_rows)
+    {
+        if (!cr.p || cr.original_row_id == 0) continue;
+        out.push_back(SearchRow{cr.original_row_id, cr.p->textId1, cr.region_id,
+                                static_cast<uint8_t>(cr.cat)});
+    }
+    return out;
+}
+
+uint32_t goblin::label_epoch() { return g_label_epoch.load(std::memory_order_acquire); }
 
 // Focus label pass. The on-map highlight itself is a NATIVE pooled child - a marker child
 // carrying HIGHLIGHT_ICON_ID, emitted from native_marker_snapshot (NATIVE_RING_POOL, see the
@@ -512,8 +568,7 @@ void goblin::apply_focus_highlight()
     for (auto &cr : g_category_rows)
     {
         if (!cr.p) continue;
-        const bool focused = focus >= 0 && static_cast<int>(cr.cat) == focus &&
-                             cr.region_id == g_focus_region;
+        const bool focused = row_in_focus(cr, focus);
         const bool shown = focused && !collected::is_row_collected(cr.row_id) &&
                            !kindling::is_row_collected(cr.row_id);
 
@@ -558,9 +613,10 @@ void goblin::apply_focus_highlight()
             cr.focus_text = false;
         }
     }
-    if (focus >= 0)
-        spdlog::info("[focus] apply: cat={} region={} shown={} forced={} (rows={})",
-                     focus, g_focus_region, n_shown, n_forced, g_category_rows.size());
+    if (focus_active())
+        spdlog::info("[focus] apply: cat={} region={} picks={} shown={} forced={} (rows={})",
+                     focus, g_focus_region, g_focus_pick_count.load(), n_shown, n_forced,
+                     g_category_rows.size());
 }
 
 // World position of a row, from its live param (grid tile + local offset). The
@@ -601,7 +657,7 @@ std::vector<goblin::HighlightPoint> goblin::focus_highlight_points()
 {
     std::vector<HighlightPoint> out;
     const int focus = g_focus_category;
-    if (focus < 0) return out;
+    if (!focus_active()) return out;
     // A ring has to land ON its icon, so it reads the display positions the icons were drawn at. This
     // is also called from INSIDE the snapshot, which has just refreshed them for this layer - so it
     // refreshes only when nothing has answered for this layer yet, instead of repeating the pass.
@@ -614,7 +670,7 @@ std::vector<goblin::HighlightPoint> goblin::focus_highlight_points()
     {
         auto &cr = g_category_rows[idx];
         if (!cr.p) continue;
-        if (static_cast<int>(cr.cat) != focus || cr.region_id != g_focus_region) continue;
+        if (!row_in_focus(cr, focus)) continue;
         // A ring exists for exactly the icons being DRAWN, and reads the same answer they did: this is
         // the visibility the refresh above computed, not a second nearly-identical test. The old test
         // here missed the eventFlagId gate, so a marker the engine does not draw could still be ringed
@@ -657,7 +713,7 @@ std::unordered_set<uint64_t> goblin::hidden_marker_original_ids()
 
 bool goblin::prune_focus_if_empty()
 {
-    if (g_focus_category < 0) return false;
+    if (!focus_active()) return false;
     if (!focus_highlight_points().empty()) return false;  // still something to show
     set_focus_category(-1);
     return true;
@@ -1449,9 +1505,8 @@ void goblin::apply_category_visibility()
         // eligible (ignoring its show_* toggle); otherwise the normal per-category
         // toggle applies. Both paths still hide collected rows, so what remains
         // visible is the uncollected markers of that category in that region.
-        const bool eligible =
-            (focus >= 0) ? (static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region)
-                         : is_category_enabled(cr.cat);
+        const bool eligible = focus_active() ? row_in_focus(cr, focus)
+                                             : is_category_enabled(cr.cat);
         bool show = eligible &&
                     !collected::is_row_collected(cr.row_id) &&
                     !kindling::is_row_collected(cr.row_id) &&
@@ -1605,9 +1660,7 @@ static bool native_row_visible(const CategoryRow &cr, int layer, int focus)
 {
     if (!cr.p || cr.original_row_id == 0 || !native_category_migrated(cr.cat)) return false;
     if (cr.native_layer != layer) return false;
-    const bool eligible = (focus >= 0)
-                              ? (static_cast<int>(cr.cat) == focus && cr.region_id == g_focus_region)
-                              : is_category_enabled(cr.cat);
+    const bool eligible = focus_active() ? row_in_focus(cr, focus) : is_category_enabled(cr.cat);
     if (!eligible) return false;
     if (cr.p->eventFlagId != 0 && !goblin::flag_is_set(cr.p->eventFlagId)) return false;
     return !native_row_hidden(cr) && !row_group2_gate_off(cr.p);
@@ -2371,6 +2424,7 @@ void goblin::note_visibility_changed()
 void goblin::reapply_live_settings()
 {
     g_visibility_epoch.fetch_add(1, std::memory_order_release);
+    g_label_epoch.fetch_add(1, std::memory_order_release); // apply_loot_settings may relabel
     apply_category_visibility();           // show_* categories (+ focus isolation)
     apply_kill_display();                  // hide_killed_bosses
     apply_loot_settings();                 // anonymous_loot + live_loot_icons/labels/flags
@@ -2736,6 +2790,7 @@ void goblin::refresh_loot_from_itemlot()
     spdlog::info("[LIVE-LOOT] {} hide-flags, {} relabels set from live ItemLotParam "
                  "({} lots not found, {} no flag, {} lot-backed total)",
                  updated, relabeled, not_found, no_flag, g_lot_backed_rows.size());
+    g_label_epoch.fetch_add(1, std::memory_order_release);
 }
 
 // WorldMapPointParam state owner. Since the 16-align fix in inject_map_entries

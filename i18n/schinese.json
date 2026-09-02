@@ -74,7 +74,19 @@
         "MenuPressPad": "Press a gamepad button...",
         "MenuUnbind": "Unbind",
         "MapPanelOffset": "地图面板位置",
-        "MapPanelOffsetTip": "标记提示与聚焦横幅在地图界面上的位置。100 为原本设计的位置，0 为中央，大于 100 则更靠左。立即生效。"
+        "MapPanelOffsetTip": "标记提示与聚焦横幅在地图界面上的位置。100 为原本设计的位置，0 为中央，大于 100 则更靠左。立即生效。",
+        "TabSearch": "搜索",
+        "SearchHint": "输入物品名称的一部分 - 可用你的语言或英文。勾选需要的结果，然后只在地图上显示它们。",
+        "SearchNoResults": "未找到",
+        "SearchMatches": "找到 %d 项，分布于 %d 个区域",
+        "SearchTruncated": "仅显示前 %d 项 - 请输入更多文字",
+        "SearchShowAll": "在地图上显示全部结果",
+        "SearchPickAll": "全部勾选",
+        "SearchClearPicks": "清除勾选",
+        "SearchCollected": "已收集",
+        "SearchFocusSubject": "搜索勾选 (%d)",
+        "SearchClearField": "清空",
+        "SearchTypeHere": "输入物品名称..."
     },
     "toasts": {
         "MapIconsOn": "地图图标：开启",
@@ -196,6 +208,7 @@
         "hover_info": "标记悬停信息",
         "menu_render_mode": "菜单类型",
         "hide_marker_gamepad": "隐藏标记按键",
+        "search_hide_collected": "仅未收集",
         "map_panel_offset_percent": "地图面板位置"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "隐藏光标下方地图标记的按键。",
         "hover_info": "打开地图时，在左侧显示一个小面板，说明光标下的标记比你高多少或低多少。\n其名称不再重复显示——游戏自带的弹窗已经显示了。",
         "hide_marker_gamepad": "隐藏光标下方地图标记的手柄按键（与隐藏键相同）。",
+        "search_hide_collected": "物品搜索：只列出尚未收集的标记。关闭 = 列出全部，已收集的会标注。",
         "map_panel_offset_percent": "标记提示与聚焦横幅在地图界面上的位置。100 为原本设计的位置，0 为中央，大于 100 则更靠左。立即生效。"
     }
 }

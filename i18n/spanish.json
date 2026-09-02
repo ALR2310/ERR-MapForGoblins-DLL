@@ -74,7 +74,19 @@
         "MenuPressPad": "Pulsa un botón del mando...",
         "MenuUnbind": "Quitar asignación",
         "MapPanelOffset": "Posicion de los paneles del mapa",
-        "MapPanelOffsetTip": "Donde se situan la informacion del marcador y el banner de foco en el mapa. 100 es la esquina prevista, 0 el centro. Por encima de 100 se desplazan mas a la izquierda. Se aplica al instante."
+        "MapPanelOffsetTip": "Donde se situan la informacion del marcador y el banner de foco en el mapa. 100 es la esquina prevista, 0 el centro. Por encima de 100 se desplazan mas a la izquierda. Se aplica al instante.",
+        "TabSearch": "Buscar",
+        "SearchHint": "Escribe parte del nombre de un objeto - en tu idioma o en ingles. Marca los resultados que quieras y muestra solo esos en el mapa.",
+        "SearchNoResults": "Nada encontrado",
+        "SearchMatches": "%d encontrados en %d regiones",
+        "SearchTruncated": "Se muestran los primeros %d - escribe mas letras",
+        "SearchShowAll": "Mostrar todo lo encontrado en el mapa",
+        "SearchPickAll": "Marcar todos",
+        "SearchClearPicks": "Quitar marcas",
+        "SearchCollected": "recogido",
+        "SearchFocusSubject": "marcados en la busqueda (%d)",
+        "SearchClearField": "Borrar",
+        "SearchTypeHere": "Escribe el nombre de un objeto..."
     },
     "toasts": {
         "MapIconsOn": "Iconos del mapa: ACTIVADOS",
@@ -196,6 +208,7 @@
         "hover_info": "Info al pasar el cursor",
         "menu_render_mode": "Tipo de menú",
         "hide_marker_gamepad": "Botón de ocultar",
+        "search_hide_collected": "Solo no recogidos",
         "map_panel_offset_percent": "Posicion de los paneles del mapa"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "Tecla que oculta el marcador del mapa bajo el cursor.",
         "hover_info": "Con el mapa abierto, muestra a la IZQUIERDA un pequeño panel con cuánto más alto o\nbajo que tú está el marcador bajo el cursor. Su nombre no se repite: ya lo muestra\nla ventana del propio juego.",
         "hide_marker_gamepad": "Botón del mando que oculta el marcador bajo el cursor (igual que la tecla de ocultar).",
+        "search_hide_collected": "Busqueda de objetos: mostrar solo marcadores aun no recogidos. Apagado = mostrar todo, los recogidos se marcan.",
         "map_panel_offset_percent": "Donde se situan la informacion del marcador y el banner de foco en el mapa. 100 es la esquina prevista, 0 el centro. Por encima de 100 se desplazan mas a la izquierda."
     }
 }

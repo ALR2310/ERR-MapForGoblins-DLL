@@ -36,6 +36,24 @@ namespace goblin
     int focus_category();
     int32_t focus_region();
 
+    // The other focus shape: an explicit SET of markers (the item search's picks), keyed by
+    // original_row_id (MAP_ENTRIES.row_id). While active, the live map shows ONLY those
+    // markers (uncollected, same rules as the category focus) with the highlight ring on each.
+    // Replaces any category focus; an empty set clears. set_focus_category(-1) clears it too.
+    // Stores the state; call reapply_live_settings() to apply.
+    void set_focus_rows(const std::vector<uint64_t> &original_row_ids);
+    bool focus_rows_active();
+    size_t focus_rows_count();
+
+    // Search-index feed: one entry per injected marker, with the row's CURRENT label textId
+    // (live-loot relabels and the anonymous-loot label included, so a spoiler-free player
+    // cannot search past the "something" label), its progress region and category.
+    struct SearchRow { uint64_t key; int32_t textId; int32_t region; uint8_t cat; };
+    std::vector<SearchRow> search_row_snapshot();
+    // Bumped whenever marker labels may have changed (live-loot refresh, every live-settings
+    // re-apply). The search index rebuilds when it sees a new value.
+    uint32_t label_epoch();
+
     // Swap focused rows to the glow-highlight icon (and others back to normal).
     // Called by reapply_live_settings() and after remap_injected_icons().
     void apply_focus_highlight();

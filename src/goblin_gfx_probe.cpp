@@ -1010,8 +1010,11 @@ namespace
 
     // Read a movie's own file name through its definition. false = it could not be established, and
     // callers must then fall back to whatever they did before.
-    bool movie_file_url(uint64_t movieDef, char *out, size_t cap)
+    // `used_off` (optional) receives the field offset the name was read from. Only a name read
+    // from the CANONICAL field (g_url_off, see below) may rule a movie out.
+    bool movie_file_url(uint64_t movieDef, char *out, size_t cap, int *used_off = nullptr)
     {
+        if (used_off) *used_off = -1;
         if (!looks_heap(movieDef) || cap < 32)
             return false;
         if (DeadDef *d = dead_slot(movieDef, false))
@@ -1019,14 +1022,29 @@ namespace
                 return false; // retired: see the note above, this is the storm fix
         const int known = g_url_off.load(std::memory_order_relaxed);
         if (known >= 0 && read_name_at(movieDef, known, out, cap))
+        {
+            if (used_off) *used_off = known;
             return true;
+        }
         // Discovery pass: the field's offset is not hardcoded, because this SDK build may lay the
-        // object out differently than the published headers. One hit is enough to cache.
+        // object out differently than the published headers.
+        // The cache keeps the SMALLEST offset that ever produced a name, never a larger one. Two
+        // fields read as a name on this build: +0x48 (the movie's own file url) and +0x2C8, which
+        // holds a pointer to ANOTHER movie's name (Convergence 2026-09-02: movies #27/#28/#33/#37
+        // came out "named" after movies parsed earlier). The old exchange() let the +0x2C8 hit of a
+        // def with no +0x48 name become the cached offset for every def after it, so the worldmap's
+        // def read a stranger's name, the name test ruled it out, and the session ran without icons.
         for (int off = 0; off <= 0x300; off += 8)
             if (read_name_at(movieDef, off, out, cap))
             {
-                if (g_url_off.exchange(off, std::memory_order_relaxed) != off)
+                int cur = g_url_off.load(std::memory_order_relaxed);
+                while ((cur < 0 || off < cur) &&
+                       !g_url_off.compare_exchange_weak(cur, off, std::memory_order_relaxed))
+                {
+                }
+                if (cur < 0 || off < cur)
                     spdlog::info("[gfxprobe] movie name found at def+0x{:X}: '{}'", off, out);
+                if (used_off) *used_off = off;
                 if (DeadDef *d = dead_slot(movieDef, false))
                     d->fails.store(0, std::memory_order_relaxed);
                 return true;
@@ -1087,10 +1105,20 @@ namespace
         if (!looks_heap(movieDef))
             movieDef = ctx; // pre-0x38 layout, same fallback compute_safe_base uses
         char url[kUrlMax] = {};
-        if (!movie_file_url(movieDef, url, sizeof(url)))
+        int used = -1;
+        if (!movie_file_url(movieDef, url, sizeof(url), &used))
+            return -1;
+        if (name_contains(url, "02_120_worldmap"))
+        {
+            note_name(url);
+            return 1;
+        }
+        // A name from any field but the canonical (smallest) one is not this movie's own name for
+        // certain - see movie_file_url - so it cannot rule the movie out.
+        if (used != g_url_off.load(std::memory_order_relaxed))
             return -1;
         note_name(url);
-        return name_contains(url, "02_120_worldmap") ? 1 : 0;
+        return 0;
     }
 
     // ══ the map's own panels, added to the PARSED movie ══════════════════════════════
@@ -1446,8 +1474,9 @@ namespace
             // Ruled out by a name from a field that has proven itself. Before this existed, a sprite 171
             // belonging to some other movie could be taken for the worldmap's.
             static std::atomic<int> s_said{0};
-            if (s_said.exchange(1) == 0)
-                spdlog::info("[gfxprobe] sprite 171 belongs to another movie - not ours to touch");
+            if (s_said.fetch_add(1) < 8)
+                spdlog::info("[gfxprobe] sprite 171 belongs to another movie (ctx 0x{:X}) - not ours to touch",
+                             (uint64_t)rcx);
         }
         else if (cid == 171 && rcx && !g_qmark_injected.load(std::memory_order_relaxed))
         {

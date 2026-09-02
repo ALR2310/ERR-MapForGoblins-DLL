@@ -85,6 +85,9 @@ namespace goblin::nmenu
     // so one page id each is enough.
     constexpr int32_t kPageValue = 4;
     constexpr int32_t kPageRebind = 5;
+    // The item-search page: a text row the host types into (see search_* below), the
+    // pick / show actions, then the matches grouped by region.
+    constexpr int32_t kPageSearch = 6;
     constexpr int32_t kPageSectionBase = 100;
     // Pages contributed by other mods through the SDK occupy [kPageAddonBase, kPageRegionBase).
     constexpr int32_t kPageAddonBase = 1000;
@@ -166,4 +169,14 @@ namespace goblin::nmenu
     // marks the key, and every hotkey edge detector asks here before acting; the mark clears itself
     // once the key comes back up, so nothing is suppressed for longer than the player holds it.
     bool key_swallowed(uint32_t vk);
+
+    // ── item search page ─────────────────────────────────────────────────────────────
+    // Like the rebind page, the search page has no text input of its own: the host polls
+    // the keyboard while search_active() and feeds characters here. The game itself reads
+    // typed text the same way (a keyboard-state snapshot per key); the host translates through
+    // the game thread's layout so a non-Latin layout types its own letters.
+    bool search_active();            // the search page is the live page
+    void search_type(wchar_t c);     // append one character (the rows must be rebuilt after)
+    bool search_backspace();         // drop the last character; false when already empty
+    void search_clear();
 }

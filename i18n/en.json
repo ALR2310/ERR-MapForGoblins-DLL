@@ -74,7 +74,19 @@
         "MenuPressPad": "Press a gamepad button...",
         "MenuUnbind": "Unbind",
         "MapPanelOffset": "Map panel position",
-        "MapPanelOffsetTip": "Where the marker tooltip and the focus banner sit on the map screen. 100 is the corner they were designed for, 0 is the centre. Raise it above 100 to push them further left. Applies immediately."
+        "MapPanelOffsetTip": "Where the marker tooltip and the focus banner sit on the map screen. 100 is the corner they were designed for, 0 is the centre. Raise it above 100 to push them further left. Applies immediately.",
+        "TabSearch": "Search",
+        "SearchHint": "Type part of an item name - in your language or in English. Tick the results you want and show only them on the map.",
+        "SearchNoResults": "Nothing found",
+        "SearchMatches": "%d found in %d regions",
+        "SearchTruncated": "Showing the first %d - type more letters",
+        "SearchShowAll": "Show all found on map",
+        "SearchPickAll": "Pick all",
+        "SearchClearPicks": "Clear picks",
+        "SearchCollected": "collected",
+        "SearchFocusSubject": "search picks (%d)",
+        "SearchClearField": "Clear",
+        "SearchTypeHere": "Type an item name..."
     },
     "toasts": {
         "MapIconsOn": "Map icons: ON",
@@ -196,6 +208,7 @@
         "hover_info": "Marker hover info",
         "menu_render_mode": "Menu type",
         "hide_marker_gamepad": "Hide-marker button",
+        "search_hide_collected": "Only uncollected",
         "map_panel_offset_percent": "Map panel position"
     },
     "entry_comments": {
@@ -288,6 +301,7 @@
         "hide_marker_key": "Key that hides the map marker currently under the cursor.",
         "hover_info": "While the map is open, show a small panel on the LEFT telling you how far above or\nbelow you the marker under the cursor sits. Its name is not repeated there - the\ngame's own popup already shows it.",
         "hide_marker_gamepad": "Gamepad button that hides the map marker under the cursor (same as the hide-marker key). RB is also the map's own tab-switch button, so it is easy to press by accident - set this to \"none\" to unbind it.",
+        "search_hide_collected": "Item search: list only markers not yet collected. Off = list everything, collected ones tagged.",
         "map_panel_offset_percent": "Where the marker tooltip and the focus banner sit on the map screen. 100 is the corner they were designed for, 0 is the centre. Above 100 pushes them further left. Applies immediately, no need to reopen the map."
     }
 }

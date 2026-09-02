@@ -43,11 +43,44 @@ static std::unordered_set<int32_t> g_placename_valid_ids;
 // setup_messages(): offset-ENCODED key -> FRESH PlaceName id allocated
 // contiguously above the runtime max. Empty until built -> identity.
 static std::unordered_map<int32_t, int32_t> g_textid_remap;
+// The reverse: FRESH PlaceName id -> the offset-encoded key it was allocated for. The
+// search index reads a live row's textId1 (already remapped) and needs the encoded key
+// back to find the item's ENGLISH name in the baked fallback table.
+static std::unordered_map<int32_t, int32_t> g_textid_unremap;
 
 int32_t goblin::remap_textid(int32_t encoded)
 {
     auto it = g_textid_remap.find(encoded);
     return it != g_textid_remap.end() ? it->second : encoded;
+}
+
+int32_t goblin::unremap_textid(int32_t fresh)
+{
+    auto it = g_textid_unremap.find(fresh);
+    return it != g_textid_unremap.end() ? it->second : fresh;
+}
+
+const wchar_t *goblin::lookup_text_english(int32_t encoded)
+{
+    if (encoded >= 900000000 && encoded < 950000000)
+    {
+        // Enemy name: the +900M band. The baked table carries 15 languages, index 0 = engus.
+        // The err profile ships this table EMPTY (names resolve from its runtime data), so
+        // there English boss names are simply not available offline.
+        const int32_t id = encoded - 900000000;
+        const auto *begin = generated::ENEMY_NAMES;
+        const auto *end = begin + generated::ENEMY_NAME_COUNT;
+        const auto *it = std::lower_bound(begin, end, id,
+            [](const generated::EnemyName &a, int32_t k) { return a.id < k; });
+        if (it != end && it->id == id && it->names[0] && it->names[0][0]) return it->names[0];
+        return nullptr;
+    }
+    const auto *begin = generated::ITEM_NAME_FALLBACK;
+    const auto *end = begin + generated::ITEM_NAME_FALLBACK_COUNT;
+    const auto *it = std::lower_bound(begin, end, encoded,
+        [](const generated::ItemNameFallback &a, int32_t k) { return a.id < k; });
+    if (it != end && it->id == encoded && it->name && it->name[0]) return it->name;
+    return nullptr;
 }
 
 // (Toggle state for the PlaceName FMG slot lived here - g_placename_slot_ptr and
@@ -1024,6 +1057,8 @@ void goblin::setup_messages()
         int64_t next = (int64_t)max_id + 1;
         g_textid_remap.clear();
         g_textid_remap.reserve(new_entries.size());
+        g_textid_unremap.clear();
+        g_textid_unremap.reserve(new_entries.size());
         bool overflow = false;
         for (auto &e : new_entries)
         {
@@ -1033,6 +1068,7 @@ void goblin::setup_messages()
             { overflow = true; break; }
             int32_t fresh = (int32_t)next++;
             g_textid_remap[e.id] = fresh;   // key = ORIGINAL encoded id
+            g_textid_unremap[fresh] = e.id;
             e.id = fresh;
         }
         if (overflow)

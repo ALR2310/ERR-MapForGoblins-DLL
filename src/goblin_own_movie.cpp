@@ -575,14 +575,13 @@ namespace
     // block spans roughly 113..863 px and its centre is ~488. Moving that centre to the stage centre
     // (960) is +472. Set to 0 to leave the screen exactly as authored.
     //
-    // 0 SINCE 2026-09-06, and the shift lives in goblin_stall_probe (shift_section_after_advance).
-    // Moving the authored matrix moved EVERY instance of this one parse - the player's own Key
-    // Assignments screen and other mods' key-binding pages came up shifted right too. The
-    // per-instance route works after all when it is done from the dialog's OWN update (the screen is
-    // alive by construction there, which is what the 2026-07 attempts lacked) and re-asserted only
-    // while the intro is still re-placing the section. Kept at 0 rather than removed: the tag parse
-    // below still documents where the section sits.
-    constexpr int32_t kRowSectionShiftPx = 0;
+    // Back to 472 on 2026-09-06 (it was 0 for a few hours): moving the authored matrix used to move
+    // EVERY instance of the one shared parse - the player's own Key Assignments screen and other
+    // mods' key-binding pages came up shifted right too. With the SEPARATE movie definition (see the
+    // header) the transform only ever runs for our own parse, so the movie-level shift is per screen
+    // again. goblin_stall_probe still carries a per-instance runtime shift for the fallback where the
+    // opener hook is dead and the shared parse is transformed; it is a no-op when this def is in use.
+    constexpr int32_t kRowSectionShiftPx = 472;
     constexpr uint16_t kRowSectionDepth = 344;
     constexpr uint16_t kRowSectionCid = 198;
     constexpr const char *kRowSectionName = "KeySetting";
@@ -1300,6 +1299,66 @@ namespace
     // (the byte transform knows the host sprite as a constant) and would only get in its way.
     constexpr const char *kMenuClassMark = "02_160_KeyConfiguration";
 
+    // ── the separate movie definition: alias our URL onto the game's file ─────────────
+    // The Scaleform file opener (GFx FileOpener::OpenFile on the engine's side: this, url as UTF-8,
+    // two ints) turns `menu:/Win/<name>.gfx` into a memory-backed File by looking the path up in the
+    // repository of files the menu preload loaded (a hash map keyed by the path, a pure lookup - a name
+    // nobody preloaded finds nothing and the movie never comes up). For OUR name the lookup is done
+    // under the game's name instead: same bytes, but the caller keys the definition it parses by the
+    // URL it asked for, so it becomes a second definition. The flag tells the tag loop that the parse
+    // about to run is ours - the only parse of this content since the startup preload.
+    constexpr const char *kOurMovieName = "02_160_MfgSettings";
+    constexpr const wchar_t *kOurMovieNameW = L"02_160_MfgSettings";
+    using OpenFileFn = void *(void *opener, const char *url, int a, int b);
+    OpenFileFn *o_open_file = nullptr;
+    std::atomic<bool> g_alias_armed{false};
+    std::atomic<int> g_alias_pending{0};
+
+    // Case-insensitive strstr: the URL that reaches the opener is the RESOLVED path, lower-cased by
+    // the mount step (`menu:/Win/02_160_KeyConfiguration.gfx` arrives as
+    // `data0:/menu/02_160_keyconfiguration.gfx` - the name the tag loop logs). The first build of
+    // this hook compared case-sensitively, never matched, and the screen "never came up".
+    const char *find_ci(const char *hay, const char *needle)
+    {
+        for (const char *p = hay; *p; ++p)
+        {
+            size_t k = 0;
+            while (needle[k] && std::tolower(static_cast<unsigned char>(p[k])) ==
+                                    std::tolower(static_cast<unsigned char>(needle[k])))
+                ++k;
+            if (!needle[k])
+                return p;
+        }
+        return nullptr;
+    }
+
+    void *open_file_detour(void *opener, const char *url, int a, int b)
+    {
+        if (url)
+        {
+            // What the opener is asked for around our screen, a few times, so the shape of the URL
+            // is on record (mount prefix, case) when the alias ever stops matching.
+            if (goblin::config::debugLogging && find_ci(url, "02_160"))
+            {
+                static std::atomic<int> s_seen{0};
+                if (s_seen.fetch_add(1) < 6)
+                    spdlog::info("[ownmovie] opener url: '{}'", url);
+            }
+            const char *hit = find_ci(url, kOurMovieName);
+            if (hit)
+            {
+                std::string real(url, static_cast<size_t>(hit - url));
+                real += kMenuClassMark; // the repository folds case itself
+                real += hit + std::strlen(kOurMovieName);
+                g_alias_pending.store(1, std::memory_order_release);
+                spdlog::info("[ownmovie] opener asked for '{}' - answering with the game's '{}'", url,
+                             real);
+                return o_open_file(opener, real.c_str(), a, b);
+            }
+        }
+        return o_open_file(opener, url, a, b);
+    }
+
     bool content_is_menu(const uint8_t *b, uint32_t len)
     {
         const size_t mlen = std::strlen(kMenuClassMark);
@@ -1348,6 +1407,16 @@ namespace
             o_tag_loop(movieData, ctx, arg3);
             return;
         }
+        // WITH the separate definition (the opener hook is live) the shared parse - the game's own
+        // 02_160, preloaded at startup and instanced by the player's screen - passes untouched, and
+        // only the parse our aliased open just triggered is rebuilt. Without it (the opener pattern
+        // is dead on this exe) the old behaviour stands: transform the one shared parse.
+        const bool separate = g_alias_armed.load(std::memory_order_acquire);
+        if (separate && g_alias_pending.load(std::memory_order_acquire) == 0)
+        {
+            o_tag_loop(movieData, ctx, arg3);
+            return;
+        }
         std::vector<uint8_t> src;
         uint32_t len = 0, at = 0;
         if (source_is_ours(source) || !read_whole_movie(source, &len, &at, src))
@@ -1359,6 +1428,12 @@ namespace
         {
             o_tag_loop(movieData, ctx, arg3);
             return;
+        }
+        if (separate)
+        {
+            g_alias_pending.store(0, std::memory_order_release); // this is the parse the alias was for
+            spdlog::info("[ownmovie] separate definition: transforming our own parse of '{}'",
+                         nameless ? "(no name)" : name);
         }
         std::vector<uint8_t> built;
         if (!rebuild(src.data(), len, built) || built.empty())
@@ -1415,6 +1490,29 @@ void goblin::own_movie::install()
             tag_loop_detour, o_tag_loop);
         g_ready.store(true, std::memory_order_release);
         spdlog::info("[ownmovie] movie parse route ready @ 0x{:X}", reinterpret_cast<uintptr_t>(fn));
+        // The file-opener route for the separate definition. Its own try: a dead pattern here only
+        // costs the separation (the shared parse is transformed as before), not the menu.
+        try
+        {
+            // GFx FileOpener::OpenFile: seven pushes, the 0xB0 frame, the stack cookie, then the
+            // argument moves (r15d=r9d, r14d=r8d, rbx=url, rsi=this) and the singleton load.
+            // Unique on 1.16 / 1.17 (checked against both exe files and the live one, 2026-09-06).
+            auto *op = modutils::hook<OpenFileFn>(
+                {.aob = "40 55 53 56 57 41 54 41 56 41 57 48 8D 6C 24 D9 48 81 EC B0 00 00 00 "
+                        "48 C7 45 B7 FE FF FF FF 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 1F 45 8B F9 "
+                        "45 8B F0 48 8B DA 48 8B F1 48 8B 0D ?? ?? ?? ?? 48 85 C9 75"},
+                open_file_detour, o_open_file);
+            g_alias_armed.store(true, std::memory_order_release);
+            spdlog::info("[ownmovie] file-opener route ready @ 0x{:X}: our screens get their own "
+                         "definition ('{}')",
+                         reinterpret_cast<uintptr_t>(op), kOurMovieName);
+        }
+        catch (const std::exception &e)
+        {
+            spdlog::warn("[ownmovie] file-opener route unavailable ({}) - our screens share the "
+                         "game's own movie definition (the transform reaches its screen too)",
+                         e.what());
+        }
     }
     catch (const std::exception &e)
     {
@@ -1426,6 +1524,9 @@ void goblin::own_movie::install()
 }
 
 bool goblin::own_movie::available() { return g_ready.load(std::memory_order_acquire); }
+
+const wchar_t *goblin::own_movie::menu_movie_name() { return kOurMovieNameW; }
+bool goblin::own_movie::separate_movie_armed() { return g_alias_armed.load(std::memory_order_acquire); }
 
 // arm() / disarm() stood here: a nesting counter the host raised around its own screen open, so the
 // transform could tell our load of 02_160 from the player's. It is gone because there is no such

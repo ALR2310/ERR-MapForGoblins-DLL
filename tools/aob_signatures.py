@@ -255,6 +255,20 @@ SIGNATURES = [
         "refs": ["goblin_gfx_probe.cpp:1180"],
     },
     {
+        "name": "gfx_file_opener_open",
+        "pattern": "40 55 53 56 57 41 54 41 56 41 57 48 8D 6C 24 D9 48 81 EC B0 00 00 00 "
+                   "48 C7 45 B7 FE FF FF FF 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 1F 45 8B F9 "
+                   "45 8B F0 48 8B DA 48 8B F1 48 8B 0D ?? ?? ?? ?? 48 85 C9 75",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "GFx FileOpener::OpenFile (this, url UTF-8, int, int): turns `menu:/Win/<name>.gfx` "
+                "into a memory-backed File by a pure lookup in the preloaded-file repository. Hooked "
+                "to alias OUR movie name onto the game's 02_160 file, which gives our screens their "
+                "own movie definition (2026-09-06). Not critical: a miss falls back to transforming "
+                "the shared parse, which bleeds into the player's own key-binding screen but works.",
+    },
+    {
         "name": "gfx_tag_loop",
         "pattern": "4C 89 44 24 18 53 55 56 57 41 55 41 56 48 83 EC 68 48 8B AA 18 04 00 00 "
                    "49 8B F8 4C 8B EA 4C 8B F1 48 85 ED",

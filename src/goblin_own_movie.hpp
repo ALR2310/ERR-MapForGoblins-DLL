@@ -37,6 +37,25 @@ namespace goblin::own_movie
     // transform is therefore all-or-nothing per launch. Telling the two screens apart is a
     // per-INSTANCE decision (the live display list), not a per-parse one.
 
+    // THE SEPARATE MOVIE DEFINITION (2026-09-06). The paragraph above still holds for the game's
+    // own parse - and that is exactly why our screens no longer use it. The engine keys movie
+    // definitions by NAME (CSMenuMan's map, filled by the job's load step) and by URL (Scaleform's
+    // SwfCache); a job that asks for a name nobody preloaded misses both caches and goes to the file
+    // opener with `menu:/Win/<name>.gfx`. We hook that opener: for menu_movie_name() it hands back
+    // the game's own 02_160 file, so the bytes are the stock movie, but the definition the parser
+    // builds from them is a NEW one, cached under OUR name and URL. The transform below then runs
+    // for that parse only, and the player's Key Assignments screen - and any other mod's key-binding
+    // page - instances the untouched preload parse. The job is re-pointed at our name by the opener
+    // (goblin_stall_probe open_screen) right after the game's own builder made it: the descriptor
+    // is copied into the job at +0x58 {u32 8, u8 kind, wchar_t *name @+0x60}.
+    //
+    // The name our job asks the engine for. Never the game's own "02_160_KeyConfiguration".
+    const wchar_t *menu_movie_name();
+    // True once the file-opener route is hooked. Without it a job re-pointed at our name would fail
+    // to load, so the caller leaves the game's name in place and the old shared-parse transform
+    // applies (bleeding into the player's screen, but working).
+    bool separate_movie_armed();
+
     // One-line state: what happened on the last load. NO CONSUMER at present - the overlay
     // Tools page that read it was retired with the rest of the on-map overlay UI (2026-07-28),
     // and the native menu never picked it up. Kept because g_status is maintained anyway and

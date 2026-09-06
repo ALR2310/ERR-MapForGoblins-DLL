@@ -6314,7 +6314,10 @@ namespace
 
     void shift_section_after_advance(uintptr_t dlg)
     {
-        if (kSectionShiftPx == 0)
+        // With our own movie definition the shift is authored into that movie (goblin_own_movie,
+        // kRowSectionShiftPx) and reaches no other screen; this runtime write is the fallback for
+        // an exe where the opener route is dead and the shared parse is what our screens run on.
+        if (kSectionShiftPx == 0 || goblin::own_movie::separate_movie_armed())
             return;
         const int level = screen_level(dlg);
         if (level < 0)
@@ -7298,6 +7301,44 @@ namespace
     constexpr goblin::AnchorId kFormDescKindFn = goblin::AnchorId::keyconfig_form_build; // anchor: keyconfig_form_build
     constexpr uintptr_t kFormDescKindInFn = 0x7B;
 
+    // ── the separate movie definition: re-point the job at OUR movie name ──────────────────
+    // The game's builder (keyconfig_form_build) copies its 16-byte movie descriptor into the job it
+    // makes: {u32 8, u8 kind, pad, wchar_t *name} at job+0x58 (the MOVUPS in FUN_1407ACB00, 2026-09-06
+    // RE). The job's load step later resolves that name through CSMenuMan's name-keyed definition
+    // cache and, on a miss, the file opener - which goblin_own_movie aliases onto the game's file
+    // for our name. So a job that carries our name gets its own definition, and the game's own Key
+    // Assignments job (same builder, untouched job) keeps the shared one. POD-only body (SEH).
+    // Shape-checked before the write: the u32 8 and the game's own name must be exactly where the
+    // layout says, or the job is left alone and the screen simply shares the game's definition.
+    constexpr uintptr_t kJobDescOff = 0x58;
+    constexpr uintptr_t kJobDescNameOff = 0x60;
+    constexpr const wchar_t *kGameMovieNameW = L"02_160_KeyConfiguration";
+
+    int repoint_job_movie(uintptr_t job)
+    {
+        if (!job || !goblin::own_movie::separate_movie_armed())
+            return 0;
+        int done = 0;
+        __try
+        {
+            const uint32_t tag = *reinterpret_cast<const uint32_t *>(job + kJobDescOff);
+            const wchar_t *name = *reinterpret_cast<const wchar_t *const *>(job + kJobDescNameOff);
+            if (tag == 8 && name && wcscmp(name, kGameMovieNameW) == 0)
+            {
+                *reinterpret_cast<const wchar_t **>(job + kJobDescNameOff) =
+                    goblin::own_movie::menu_movie_name();
+                done = 1;
+            }
+            else
+                done = -1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            done = -2;
+        }
+        return done;
+    }
+
     // Returns the previous value, or 0 if the patch could not be applied.
     uint8_t patch_form_desc_kind(uint8_t want)
     {
@@ -7590,6 +7631,18 @@ namespace
             void *r = p_keycfg(&slotA, owner, kFormMode);
             if (prev_kind)
                 patch_form_desc_kind(prev_kind); // restore at once - one call, one patch
+            // Our own movie definition for this screen (see repoint_job_movie). Logged once per
+            // outcome so a layout change shows up as "-1" rather than as a silently shared movie.
+            {
+                const int rp = repoint_job_movie(reinterpret_cast<uintptr_t>(slotA));
+                static std::atomic<int> s_logged{0};
+                if (rp != 0 && s_logged.fetch_add(1) < 3)
+                    spdlog::info("[form] job movie name: {} (job 0x{:X})",
+                                 rp == 1 ? "re-pointed at our own definition"
+                                 : rp == -1 ? "descriptor shape unexpected - sharing the game's"
+                                            : "unreadable - sharing the game's",
+                                 reinterpret_cast<uintptr_t>(slotA));
+            }
             r = p_conv1(r, &slotB);
             r = p_conv2(r, &slotC);
             if (!slotC)

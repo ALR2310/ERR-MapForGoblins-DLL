@@ -29,7 +29,7 @@ Current version: **v1.0.13** (pre), ~9000 WorldMapPointParam entries (+ ~740 van
 | `goblin_logic.cpp` | Map fragment logic - icons only appear after the map fragment is collected |
 | `goblin_collected.cpp` | Detection of collected Rune/Ember Pieces: GEOF (model hash + InstanceID slot) + WGM (+0x263 bit1 + +0x26B bit4) |
 | `goblin_config.cpp` | INI parsing (mINI), 60+ category toggles + debug_logging, VK hotkey parsing |
-| `goblin_markers.cpp` | In-memory beacon/stamp-array dump via hotkey (F9, **ON by default**); shows an on-screen codex confirmation banner (Markers dumped / Marker dump failed). Reads the stable pointer chain `*(exe+0x3D5DF38)->+0x68->beacons+0x118/stamps+0x1B8` (not a memory scan) |
+| `goblin_markers.cpp` | In-memory beacon/stamp-array dump via hotkey (F9, **ON by default**); shows an on-screen status-line confirmation (Markers dumped / Marker dump failed). Reads the stable pointer chain `*(exe+0x3D5DF38)->+0x68->beacons+0x118/stamps+0x1B8` (not a memory scan) |
 | `goblin_kindling.cpp` | Kindling Spirits module (`Category::WorldKindlingSpirits`); per-spirit liveness via heap scan for `CS::EcTestDistance` condition objects |
 | `goblin_massedit.cpp` | Runtime MASSEDIT file parser (alternative loading path from `dll/offline/massedit/`) |
 | `generated/goblin_map_data.cpp` | Auto-generated array from MASSEDIT files (~9000 entries) |
@@ -88,11 +88,16 @@ Icons are **EXPANDED everywhere, always**. `F10` (keyboard) or `Y + R3` (gamepad
 master show/hide that swaps `WorldMapPointParam` between EXPANDED and VANILLA. The old "expand only
 while the map is open" auto-hide (which read `CSMenuMan + 0xCD`) was **REMOVED** after the 16-align fix.
 
-### On-screen banners (F10 / F9)
+### On-screen announcements (F10 / F9)
 
-The F10/F9 confirmation banner uses `CSPopupMenu::ShowTutorialPopup` (the EMEVD `2007[15]` toast).
-It is **AOB-resolved at runtime - NOT a hardcoded RVA** - because game updates shift `.text` RVAs
-(`0x80DA50 -> 0x80D960` in May 2026). By contrast, `.data` singleton slots and `.rdata` vtables stay put.
+Since 2026-09-04 the F10 "Map icons: ON/OFF" and F9 "Markers dumped" texts go through the game's own
+small **status line** (the bottom text that also says "Cannot use this now"): `goblin_status_line`
+puts an id of its own into the entry the front-end is displaying (CSFeMan ring `+0x59A4`, read cursor
+`+0x59BC`), restarts the timer (`+0x3758`, 3 s) and answers the engine's MenuString builder for that
+id with the text. ONE slot: a fast toggle replaces the previous message instead of queueing, no sound.
+The builder is located from the unique front-end block (`fe_status_anchor`), not by its own bytes (it
+is a templated instance with dozens of twins). The former channel - injected `TutorialParam` rows +
+`TutorialBody.fmg` entries fired through `CSPopupMenu::ShowTutorialPopup` on the UI thread - is gone.
 
 ### Data generation pipeline
 

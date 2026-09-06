@@ -263,24 +263,8 @@ namespace goblin
     // up to a second later, and the poll drops to a rare safety net.
     void note_visibility_changed();
 
-    // Codex-toast ids, allocated DYNAMICALLY at runtime above the live max so they
-    // never collide with an overhaul's / another mod's tutorial content (same
-    // principle as the marker textId remap). Two independent id spaces:
-    //   g_toast_fmg_id[]       = TutorialBody.fmg text ids (set by setup_messages,
-    //                            above the live TutorialBody max). The TutorialParam
-    //                            row's textId field points here, and the FMG text
-    //                            lives here.
-    //   g_toast_param_row_id[] = TutorialParam row ids (set by inject_tutorial_popup_rows,
-    //                            above the live TutorialParam max). show_codex_toast
-    //                            triggers a banner by one of THESE.
-    // setup_messages MUST run before inject_tutorial_popup_rows (the popup rows
-    // point at the fmg ids). 0 until allocated.
-    enum ToastSlot { TOAST_ON = 0, TOAST_OFF, TOAST_DUMP_OK, TOAST_DUMP_FAIL, TOAST_COUNT };
-    extern int g_toast_fmg_id[TOAST_COUNT];
-    extern int g_toast_param_row_id[TOAST_COUNT];
-
     // Native settings-menu texts: GR_MenuText.fmg ids allocated dynamically
-    // above the live max by setup_messages (same principle as the toast ids).
+    // above the live max by setup_messages (same principle as the marker textId remap).
     // The native menu (goblin_stall_probe) builds its tab category label and its
     // page row labels via the game's MenuTextCtor against these ids. 0/empty
     // until allocated / if the merge failed.
@@ -302,28 +286,6 @@ namespace goblin
         bool def; // schema default (drives the row's "modified" indicator)
     };
     const NativeMenuRowDef *native_menu_rows(size_t *count);
-
-    // Inject the codex-toast TutorialParam rows for the F10/F9 banners. Rows
-    // get menuType=0 (upper-left codex caption widget) with textId pointing
-    // at TutorialBody.fmg entries injected by goblin_messages.
-    // Returns true on success.
-    bool inject_tutorial_popup_rows();
-
-    // Fire an upper-left codex-style toast for one of the injected TutorialParam
-    // rows (pass a goblin::g_toast_param_row_id[...] value). Static text, no FMG
-    // rewrite - same path as the F10 banner.
-    // ONLY CALL THIS FROM THE UI THREAD. It runs the game's own tutorial-popup routine, which
-    // builds on-screen menu state; the "safe from any thread" this comment used to claim was
-    // wrong. Measured 2026-07-31 in a player log: with menu_enabled=false the toggle key is the
-    // icon master switch, the user flipped it seven times in eighteen seconds, every flip fired
-    // this from the 10 ms polling thread, and 0.8 s after the last one the game died in Scaleform
-    // (exe+0x1177413, a null container). Off-thread callers must use queue_codex_toast.
-    void show_codex_toast(int tutorial_id);
-
-    // Thread-safe request for the toast above: stores the id and returns. pump_codex_toast()
-    // fires it from the UI thread (the CSMenuMan::updateTask detour drives it).
-    void queue_codex_toast(int tutorial_id);
-    void pump_codex_toast();
 
     // Background thread polling the toggle hotkey.
     void toggle_hotkey_loop();

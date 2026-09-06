@@ -3883,11 +3883,16 @@ namespace
     // cursor - it calls the dialog's vt[8] and the command dispatcher - so there is no
     // earlier point in this detour to intercept anyway.
 
+    void shift_section_after_advance(uintptr_t dlg); // defined with the layout helpers below
+
     void form_update_detour(void *dlg, float dt, void *consumed)
     {
         const uintptr_t d = reinterpret_cast<uintptr_t>(dlg);
         form_dialog_ticked(d);
         o_form_update(dlg, dt, consumed);
+        // Menu centring, per INSTANCE: only a dialog of ours is moved, the player's own screen on
+        // the same movie is not (the movie-level shift that did this for every instance is gone).
+        shift_section_after_advance(d);
         // Order inside the frame is what decides whether an icon is visible at all. Writing the
         // strip position from our tick puts it BEFORE the timeline advance, and the advance
         // re-applies the authored matrix (DisplayList::MoveDisplayObject) - so the engine always
@@ -4320,6 +4325,10 @@ namespace
         bool hidden = false; // stepped aside while a child screen is over it
         bool shifted = false;  // the centring shift has been applied to this screen
         float shift_tx = 0.0f; // the tx we want the row section to sit at (twips)
+        // Frames the centring shift has been asserted for since the screen was shown (or shown
+        // again): the intro re-places the section for its first frames, so the shift is written
+        // from the dialog's own update until that has run its course, then left alone.
+        uint32_t shift_frames = 0;
     };
 
     // How fresh a screen's heartbeat must be before we may call INTO the engine on its dialog.
@@ -5370,6 +5379,13 @@ namespace
 
     void set_screen_visible(uintptr_t dlg, bool on)
     {
+        // Shown again = the intro plays again and re-places the section: re-assert the shift.
+        if (on)
+        {
+            const int lvl = screen_level(dlg);
+            if (lvl >= 0)
+                g_screens[static_cast<size_t>(lvl)].shift_frames = 0;
+        }
         if (!dlg)
             return;
         auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
@@ -6252,6 +6268,68 @@ namespace
     // recon_02_160_structure.md, section "visual element we want".
     uint32_t g_caption_hits = 0;
 
+    // ── menu centring, per instance ───────────────────────────────────────────────
+    // The key-binding screen lays its rows out to the LEFT of the 'KeySetting' section origin (960,
+    // 480 px in the root): our single-column page reads as "left half". Moving the section by +472 px
+    // centres it (the derivation is with kRowSectionShiftPx in goblin_own_movie.cpp). Done here, on
+    // the dialog's OWN update, for OUR screens only - the 2026-07 runtime attempts wrote from the
+    // menu tick and reached dying screens; the movie-level edit that replaced them moved every
+    // instance of the one parse, the player's own Key Assignments screen included. The timeline
+    // re-places the section during the intro (frames 2+, and again whenever a hidden page is shown
+    // again), so the position is re-asserted for the first kShiftFrames frames after each show and
+    // then left alone. SetPos is absolute, in px, in the parent's space.
+    constexpr int32_t kSectionShiftPx = 472;
+    constexpr int32_t kSectionAuthoredX = 960;
+    constexpr int32_t kSectionAuthoredY = 480;
+    constexpr uint32_t kShiftFrames = 180; // 3 s at 60 fps: comfortably past the FadeIn frames
+
+    // POD-only body (SEH): resolve the section from the movie root and place it. 1 = placed.
+    int shift_section_raw(uintptr_t dlg)
+    {
+        auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
+        auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
+        auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
+        using SetPosFn = void(void *proxy, int32_t x, int32_t y);
+        auto p_setpos = reinterpret_cast<SetPosFn *>(goblin::anchors::at(goblin::AnchorId::clip_set_pos));
+        if (!p_resolve || !p_valid || !p_dtor || !p_setpos)
+            return 0;
+        void *root = reinterpret_cast<void *>(dlg + 0x120);
+        int placed = 0;
+        __try
+        {
+            uint8_t buf[0x60] = {};
+            void *r = p_resolve(root, buf, "KeySetting");
+            if (p_valid(r))
+            {
+                p_setpos(r, kSectionAuthoredX + kSectionShiftPx, kSectionAuthoredY);
+                placed = 1;
+            }
+            p_dtor(buf + 0x28);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return placed;
+    }
+
+    void shift_section_after_advance(uintptr_t dlg)
+    {
+        if (kSectionShiftPx == 0)
+            return;
+        const int level = screen_level(dlg);
+        if (level < 0)
+            return; // not one of ours: the player's screen keeps its authored layout
+        Screen &s = g_screens[static_cast<size_t>(level)];
+        if (s.shift_frames >= kShiftFrames)
+            return;
+        ++s.shift_frames;
+        const int placed = shift_section_raw(dlg);
+        static std::atomic<int> s_logged{0};
+        if (s.shift_frames == 1 && s_logged.fetch_add(1) < 3)
+            spdlog::info("[form] section shift (+{} px) on level {}: {}", kSectionShiftPx, level,
+                         placed ? "placed" : "'KeySetting' did not resolve");
+    }
+
     void prepare_form_layout(uintptr_t base, uintptr_t dlg)
     {
         auto p_resolve = reinterpret_cast<ResolveFn *>(goblin::anchors::at(goblin::AnchorId::clip_resolve_child));
@@ -6290,7 +6368,7 @@ namespace
             // The RIGHT column - the "second bind" half the gamepad screen does not even have.
             // Our rows are all left-column, so those eleven clips are dead furniture under the
             // caption we just removed. Unlike the captions they ARE named, so a plain hide works.
-            for (int r = 0; r < 11; ++r)
+            for (int r = 0; r < goblin::own_movie::kRowSlots; ++r) // the added rows have partners too
             {
                 char rp[64];
                 _snprintf_s(rp, sizeof(rp), _TRUNCATE, "KeySetting/ItemList/Item_%d_1", r);
@@ -6404,7 +6482,7 @@ namespace
         auto p_valid = reinterpret_cast<ProxyValidFn *>(goblin::anchors::at(goblin::AnchorId::clip_is_valid));
         auto p_dtor = reinterpret_cast<ProxyDtorFn *>(goblin::anchors::at(goblin::AnchorId::clip_proxy_dtor));
         void *root = reinterpret_cast<void *>(dlg + 0x120);
-        for (int n = 0; n < 11; ++n)
+        for (int n = 0; n < goblin::own_movie::kRowSlots; ++n) // rows past the model hide their clip
         {
             const goblin::nmenu::Row *row = goblin::nmenu::right_row(static_cast<size_t>(n));
             char path[64];
@@ -8258,11 +8336,6 @@ namespace
         // Whatever id answers YES there is the action ESC really produces - and the first run proved
         // it is none of the nine our screen listens for.
         arm_action_log_on_escape();
-        // The UI-thread beachhead this detour was always meant to be: anything that has to touch
-        // on-screen menu state but was asked for elsewhere runs HERE. First user is the icons
-        // ON/OFF toast, which menu_auto_toggle_loop used to fire from its own 10 ms polling thread
-        // straight into the game's popup routine - see queue_codex_toast for the measurement.
-        goblin::pump_codex_toast();
         // F11 (dev-only): open the native settings menu on this UI thread. GATED to
         // IN-GAME with the map open - the settings dialog reads gameplay-state
         // singletons that are NULL at the title screen (opening it from the main menu

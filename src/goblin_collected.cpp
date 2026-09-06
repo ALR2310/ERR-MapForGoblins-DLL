@@ -12,8 +12,10 @@
 #include <mutex>
 #include <set>
 #include <spdlog/spdlog.h>
+#include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -705,10 +707,14 @@ void goblin::collected::initialize()
 // ─── remap row IDs after dynamic assignment ────────────────────────
 
 static std::unordered_map<uint64_t, uint64_t> g_original_to_dynamic;
+static std::unordered_map<uint64_t, uint64_t> g_dynamic_to_original;  // the dump reads LIVE ids
 
 void goblin::collected::remap_row_ids(const std::unordered_map<uint64_t, uint64_t> &old_to_new)
 {
     g_original_to_dynamic = old_to_new;
+    g_dynamic_to_original.clear();
+    for (const auto &[orig, dyn] : old_to_new)
+        g_dynamic_to_original[dyn] = orig;
 
     // Remap g_tile_to_rows
     for (auto &[tile, rows] : g_tile_to_rows)
@@ -1102,4 +1108,131 @@ int goblin::collected::collected_count()
 int goblin::collected::skipped_count()
 {
     return g_unmatched_count;
+}
+
+// ─── field diagnostic for the marker dump ───────────────────────────
+
+const goblin::generated::MapEntry *goblin::collected::entry_for_live_row(uint64_t live_row_id)
+{
+    auto it = g_dynamic_to_original.find(live_row_id);
+    const uint64_t orig = (it != g_dynamic_to_original.end()) ? it->second : live_row_id;
+    for (size_t i = 0; i < generated::MAP_ENTRY_COUNT; i++)
+        if (generated::MAP_ENTRIES[i].row_id == orig)
+            return &generated::MAP_ENTRIES[i];
+    return nullptr;
+}
+
+std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_row_ids)
+{
+    std::ostringstream o;
+    if (!g_initialized)
+    {
+        o << "      collected: tracker not initialized\n";
+        return o.str();
+    }
+    const auto wgm = read_wgm_snapshot();
+    const auto geof = read_geof_from_memory();
+    char buf[256];
+    for (uint64_t id : live_row_ids)
+    {
+        const auto *e = entry_for_live_row(id);
+        if (!e)
+            continue;
+        if (!e->object_name || !e->object_name[0])
+        {
+            o << "      row " << id << ": no MSB object bound (drop/scripted source) - collection tracking "
+                 "cannot hide it\n";
+            continue;
+        }
+        const std::string prefix = prefix_from_object_name(e->object_name);
+        std::string geof_prefix = prefix;
+        {
+            auto *end = generated::GEOF_MODEL_OVERRIDES + generated::GEOF_MODEL_OVERRIDE_COUNT;
+            auto *ov = std::lower_bound(
+                generated::GEOF_MODEL_OVERRIDES, end, e->row_id,
+                [](const generated::GeofModelOverride &ovr, uint64_t rid) { return ovr.row_id < rid; });
+            if (ov != end && ov->row_id == e->row_id)
+                geof_prefix = prefix_from_model_id(ov->model_id);
+        }
+        const uint32_t tile = encode_tile(e->data.areaNo, e->data.gridXNo, e->data.gridZNo);
+        const bool hidden = is_row_collected(id);
+        snprintf(buf, sizeof(buf),
+                 "      row %llu obj=%s slot=%d tile=m%02u_%02u_%02u real=(%.2f,%.2f) model=%s -> %s\n",
+                 (unsigned long long)id, e->object_name, (int)e->geom_slot, (unsigned)e->data.areaNo,
+                 (unsigned)e->data.gridXNo, (unsigned)e->data.gridZNo, e->real_posX, e->real_posZ,
+                 geof_prefix.c_str(), hidden ? "HIDDEN (in the collected set)" : "SHOWN (not collected)");
+        o << buf;
+
+        // WGM: the live instances of this model on the tile, nearest first.
+        auto wt = wgm.find(tile);
+        const bool loaded = wt != wgm.end();
+        if (!loaded)
+            o << "        WGM: tile not loaded (no live instances) -> GEOF decides\n";
+        else
+        {
+            size_t total = 0;
+            for (const auto &[p, sm] : wt->second.slot_insts)
+                for (const auto &[s, v] : sm) total += v.size();
+            auto pi = wt->second.slot_insts.find(geof_prefix);
+            if (pi == wt->second.slot_insts.end())
+            {
+                snprintf(buf, sizeof(buf),
+                         "        WGM: tile loaded, %zu tracked instance(s) on it, NONE of model %s -> "
+                         "no WGM outcome, and GEOF is skipped for a loaded tile\n",
+                         total, geof_prefix.c_str());
+                o << buf;
+            }
+            else
+            {
+                struct Row { int slot; const WGMSnapshot::SlotInst *in; float d; };
+                std::vector<Row> rows;
+                for (const auto &[slot, v] : pi->second)
+                    for (const auto &in : v)
+                    {
+                        const float dx = in.px - e->real_posX, dz = in.pz - e->real_posZ;
+                        rows.push_back({slot, &in, std::sqrt(dx * dx + dz * dz)});
+                    }
+                std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.d < b.d; });
+                snprintf(buf, sizeof(buf), "        WGM: tile loaded, %zu instance(s) of %s (%zu tracked total):\n",
+                         rows.size(), geof_prefix.c_str(), total);
+                o << buf;
+                for (size_t i = 0; i < rows.size() && i < 8; ++i)
+                {
+                    const auto &r = rows[i];
+                    const char *outcome = i != 0 ? "" : (r.d > 4.0f ? "  <- nearest, but > 4u: NO MATCH"
+                                                          : r.in->alive ? "  <- match: ALIVE"
+                                                                        : "  <- match: dead -> collected");
+                    snprintf(buf, sizeof(buf),
+                             "          slot=%d name-slot=%d pos=(%.2f,%.2f) dist=%.1f alive=%d f263=0x%02X "
+                             "f26B=0x%02X model=%u gidx=%u%s\n",
+                             r.slot, r.in->suffix_slot, r.in->px, r.in->pz, r.d, r.in->alive ? 1 : 0,
+                             (unsigned)r.in->f263, (unsigned)r.in->f26B, r.in->model_id, r.in->gidx, outcome);
+                    o << buf;
+                }
+            }
+        }
+
+        // GEOF: the flag-save records for this model on the tile.
+        int n = 0;
+        for (const auto &g : geof)
+        {
+            if (g.tile_id != tile) continue;
+            if (prefix_from_model_id(g.model_hash) != geof_prefix) continue;
+            const int slot = aeg099_index_from_geof(g.geom_idx, g.flags);
+            snprintf(buf, sizeof(buf), "        GEOF: slot=%d geom_idx=0x%04X flags=0x%02X%s\n", slot,
+                     (unsigned)g.geom_idx, (unsigned)g.flags,
+                     slot == e->geom_slot ? "  <- this row's slot" : "");
+            o << buf;
+            ++n;
+        }
+        if (n == 0)
+        {
+            snprintf(buf, sizeof(buf), "        GEOF: no record for %s on this tile\n", geof_prefix.c_str());
+            o << buf;
+        }
+        if (loaded)
+            o << "        rule: tile LOADED -> only the WGM position match (< 4u, dead instance) hides; "
+                 "GEOF is not consulted while loaded\n";
+    }
+    return o.str();
 }

@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <unordered_map>
+#include <vector>
+
+#include "goblin_map_data.hpp"
 
 namespace goblin::collected
 {
@@ -26,6 +30,15 @@ namespace goblin::collected
 
     int collected_count();
     int skipped_count();
+
+    /// Our MAP_ENTRY behind a LIVE (post-remap) row id; nullptr when the id is not one of ours.
+    const generated::MapEntry *entry_for_live_row(uint64_t live_row_id);
+
+    /// Field diagnostic for the marker dump. For each LIVE row id that is ours and bound to an
+    /// MSB object: the object, its tile and real coords, every WGM instance of its model on that
+    /// tile (distance, alive flags, engine slot), the GEOF records for that model on the tile, and
+    /// the outcome the tracker currently holds. WGM and GEOF are read once for the whole batch.
+    std::string diagnose_rows(const std::vector<uint64_t> &live_row_ids);
 
     /// Live player world position (block-local): CSWorldGeomMan + 0x70/0x74/0x78 =
     /// X/Z/Y. Returns false if the manager isn't resolved/available. Used by the

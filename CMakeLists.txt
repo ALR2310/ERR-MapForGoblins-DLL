@@ -144,6 +144,8 @@ add_library( MapForGoblins SHARED
   src/goblin_progress.hpp
   src/goblin_progress.cpp
   src/goblin_search.cpp
+  src/goblin_status_line.cpp
+  src/goblin_status_line.cpp
   src/goblin_native_menu.hpp
   src/goblin_native_menu.cpp
     src/goblin_own_movie.cpp

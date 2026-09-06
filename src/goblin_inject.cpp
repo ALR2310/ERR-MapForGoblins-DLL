@@ -6,6 +6,8 @@
 #include "goblin_logic.hpp"
 #include "goblin_config.hpp"
 #include "goblin_messages.hpp"
+#include "goblin_status_line.hpp" // the icons ON/OFF announcement
+#include "goblin_i18n.hpp"
 #include "modutils.hpp"
 #include "goblin_map_data.hpp"
 #include "goblin_item_icons.hpp"
@@ -18,6 +20,7 @@
 #include "goblin_mapproject.hpp" // read_view/to_map for the native reticle-hover proxy
 #include "goblin_overlay.hpp"
 #include "goblin_progress.hpp"   // region_place_id (tag each CategoryRow for focus)
+#include "goblin_search.hpp"     // pick_many: a restored pick focus goes back through the search's own set
 #include "goblin/goblin_map_flags.hpp"
 #include "from/params.hpp"
 #include "from/paramdef/WORLD_MAP_POINT_PARAM_ST.hpp"
@@ -32,6 +35,7 @@
 #include <chrono>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -92,6 +96,7 @@ struct CategoryRow
     bool baked_notext;       // isEnableNoText as baked (restored after focus force-show)
     bool focus_text;         // true while focus fabricated a label on a textless row
     bool picked;             // member of the search-pick focus set (set_focus_rows)
+    uint64_t hide_key;       // stable manual-hide key (stable_hide_key of the baked entry)
     uint8_t native_area;
     uint8_t native_layer;
     uint16_t native_gx;
@@ -148,6 +153,16 @@ static std::atomic<bool> g_focus_pick{false};
 static std::atomic<size_t> g_focus_pick_count{0};
 // Marker labels changed (live-loot relabel / settings re-apply): the search index rebuilds.
 static std::atomic<uint32_t> g_label_epoch{1};
+// The focus persists per character in MapForGoblins_focus_s<slot>.txt (same folder and slot
+// tracking as the manual hides): a category focus as its config key + region, a pick focus as
+// the stable hide keys of the picked rows. Written on every focus change, read on a slot
+// switch and applied once the injected rows exist (restore_focus_pending).
+static std::filesystem::path g_focus_file;
+static bool g_focus_restore_pending = false;
+static int g_pending_focus_cat = -1;
+static int32_t g_pending_focus_region = -1;
+static std::set<uint64_t> g_pending_focus_picks;
+static void persist_focus();
 
 static inline bool focus_active() { return g_focus_pick.load() || g_focus_category >= 0; }
 // ONE definition of "this row is in the active focus", for both shapes. `focus` is the
@@ -160,21 +175,27 @@ static inline bool row_in_focus(const CategoryRow &cr, int focus)
 
 // ---- Manual per-marker hide (hover + hotkey; managed in the overlay) --------
 // A user can hide an individual marker by hovering it on the map and pressing the
-// hide key. The hidden set persists across sessions keyed by a STABLE hash of the
-// marker's deterministic fields (position + area/grid + textId + iconId), NOT the
-// dynamic row id. apply_category_visibility() ANDs this in, so a hidden marker's
-// icon disappears live and stays hidden on reload. Unhide/clear via the overlay.
+// hide key. The hidden set persists across sessions keyed by a STABLE hash of what the
+// marker IS, never by the dynamic row id: the MSB object it tracks, else the item lot it
+// announces, else the flag that clears it, else (springs, stakes) its tile + position.
+// apply_category_visibility() ANDs this in, so a hidden marker's icon disappears live and
+// stays hidden on reload. Unhide/clear via the overlay.
 struct HiddenMeta { int32_t textId; uint16_t iconId; int32_t region; uint8_t cat; };
 static std::map<uint64_t, HiddenMeta> g_manual_hidden;
+static std::map<uint64_t, HiddenMeta> g_hidden_v1_pending;  // legacy keys read from a v1 file, migrated once rows exist
 static std::mutex g_manual_hidden_mtx;
 static std::filesystem::path g_hidden_dir;   // folder holding the per-slot hide files
 static std::filesystem::path g_hidden_file;  // current slot's file (persist target)
 static int g_hidden_slot = -2;               // slot the loaded set belongs to (-2 = none synced yet)
 
-static uint64_t marker_key(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
+// The v1 key (files without a header). Baked display position + textId1 + iconId of the
+// LIVE row: every one of those moves between builds - the offline de-overlap re-spirals a
+// position when a neighbour appears, textIds are remapped per FMG expansion, icon ids
+// change with icon patches - so a hidden marker came back after an update and re-hiding
+// it left the stale twin in the file. Kept only to migrate such files (migrate_hidden_v1).
+static uint64_t marker_key_v1(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
 {
     if (!p) return 0;
-    // quantise position to 1/8u so tiny float noise can't change the key
     auto q = [](float f) { return static_cast<int64_t>(std::llround(f * 8.0f)); };
     uint64_t h = 1469598103934665603ull;  // FNV-1a
     auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
@@ -188,11 +209,67 @@ static uint64_t marker_key(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
     return h;
 }
 
-static bool is_manually_hidden(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
+// The v2 key, from the BAKED entry (not the live row), by what identifies the marker across
+// builds and data updates. An object or lot that ERR moves keeps its key, so it stays hidden.
+//   1. MSB object (pieces, material nodes, kindling): tile + part name. Twins that share a
+//      part name in one tile share the key - the engine fuses them too (GEOF).
+//   2. Item lot: type + lot id. A map lot is one pickup; an enemy lot is shared by every
+//      enemy of that kind, so it also takes the tile and the position at 1u.
+//   3. The flag that hides it: clearedEventFlagId (bosses, hostile NPCs, hawks), else
+//      textDisableFlagId1 (graces, pools, statues, maps, paintings, gestures, great runes).
+//   4. Tile + category + real position at 0.5u (spirit springs, stakes of Marika only).
+static uint64_t stable_hide_key(const goblin::generated::MapEntry &e)
 {
-    if (!p) return false;
+    uint64_t h = 1469598103934665603ull;  // FNV-1a
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    auto mix_tile = [&]() {
+        mix(static_cast<uint64_t>(e.data.areaNo));
+        mix(static_cast<uint64_t>(e.data.gridXNo));
+        mix(static_cast<uint64_t>(e.data.gridZNo));
+    };
+    auto mix_pos = [&](float scale) {
+        mix(static_cast<uint64_t>(static_cast<int64_t>(std::llround(e.real_posX * scale))));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(std::llround(e.real_posZ * scale))));
+    };
+    mix(2);  // key version
+    if (e.object_name && e.object_name[0])
+    {
+        mix('o');
+        mix_tile();
+        for (const char *c = e.object_name; *c; ++c) mix(static_cast<uint8_t>(*c));
+    }
+    else if (e.lotId != 0 && e.lotType != 0)
+    {
+        mix('l');
+        mix(e.lotType);
+        mix(e.lotId);
+        if (e.lotType == 2) { mix_tile(); mix_pos(1.0f); }
+    }
+    else if (e.data.clearedEventFlagId != 0)
+    {
+        mix('c');
+        mix(e.data.clearedEventFlagId);
+    }
+    else if (e.data.textDisableFlagId1 != 0)
+    {
+        mix('d');
+        mix(e.data.textDisableFlagId1);
+    }
+    else
+    {
+        mix('p');
+        mix_tile();
+        mix(static_cast<uint64_t>(e.category));
+        mix_pos(2.0f);
+    }
+    return h;
+}
+
+static bool is_manually_hidden(const CategoryRow &cr)
+{
+    if (!cr.p) return false;
     std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
-    return g_manual_hidden.find(marker_key(p)) != g_manual_hidden.end();
+    return g_manual_hidden.find(cr.hide_key) != g_manual_hidden.end();
 }
 
 // True if any of the row's live "hide when set" flags is currently set - i.e. the engine
@@ -233,7 +310,7 @@ static bool row_is_hidden(const CategoryRow &cr)
 {
     return goblin::collected::is_row_collected(cr.row_id) ||
            goblin::kindling::is_row_collected(cr.row_id) ||
-           is_manually_hidden(cr.p) ||
+           is_manually_hidden(cr) ||
            row_hidden_by_flag(cr.p);
 }
 
@@ -513,6 +590,7 @@ void goblin::set_focus_category(int category_or_negative, int32_t region_place_i
         g_focus_pick_count.store(0);
     }
     spdlog::info("[focus] set category={} region={}", g_focus_category, g_focus_region);
+    persist_focus();
 }
 
 int goblin::focus_category() { return g_focus_category; }
@@ -532,10 +610,106 @@ void goblin::set_focus_rows(const std::vector<uint64_t> &original_row_ids)
     g_focus_pick_count.store(n);
     g_focus_pick.store(n > 0);
     spdlog::info("[focus] set picks: {} requested, {} matched", original_row_ids.size(), n);
+    persist_focus();
 }
 
 bool goblin::focus_rows_active() { return g_focus_pick.load(); }
 size_t goblin::focus_rows_count() { return g_focus_pick_count.load(); }
+
+// ---- Focus persistence -------------------------------------------------------
+// File: `#mfg-focus v2`, then either one `category <config_key> <region>` line or one
+// `pick <stable_hide_key>` line per picked row. Keys are the same stable identities the manual
+// hides use, so a build or data update (or an object ERR moved) keeps the focus intact.
+static constexpr const char *kFocusHeaderV2 = "#mfg-focus v2";
+
+static void persist_focus()
+{
+    if (g_focus_file.empty()) return;
+    try
+    {
+        std::ofstream f(g_focus_file, std::ios::trunc);
+        f << kFocusHeaderV2 << '\n';
+        if (g_focus_pick.load())
+        {
+            for (const auto &cr : g_category_rows)
+                if (cr.picked && cr.hide_key) f << "pick " << cr.hide_key << '\n';
+        }
+        else if (g_focus_category >= 0)
+        {
+            const char *key = goblin::category_config_key(static_cast<goblin::generated::Category>(g_focus_category));
+            if (key) f << "category " << key << ' ' << g_focus_region << '\n';
+        }
+    }
+    catch (...) {}
+}
+
+static void load_focus_file(const std::filesystem::path &path)
+{
+    g_focus_restore_pending = false;
+    g_pending_focus_cat = -1;
+    g_pending_focus_region = -1;
+    g_pending_focus_picks.clear();
+    try
+    {
+        std::ifstream f(path);
+        std::string line;
+        if (!std::getline(f, line) || line.rfind(kFocusHeaderV2, 0) != 0) return;
+        while (std::getline(f, line))
+        {
+            std::istringstream ss(line);
+            std::string kind;
+            if (!(ss >> kind)) continue;
+            if (kind == "pick")
+            {
+                uint64_t k = 0;
+                if (ss >> k) g_pending_focus_picks.insert(k);
+            }
+            else if (kind == "category")
+            {
+                std::string ckey;
+                long region = -1;
+                if (!(ss >> ckey >> region)) continue;
+                for (int c = 0; c <= static_cast<int>(goblin::generated::Category::WorldInteractables); ++c)
+                {
+                    const char *k = goblin::category_config_key(static_cast<goblin::generated::Category>(c));
+                    if (k && ckey == k) { g_pending_focus_cat = c; break; }
+                }
+                g_pending_focus_region = static_cast<int32_t>(region);
+            }
+        }
+    }
+    catch (...) {}
+    g_focus_restore_pending = g_pending_focus_cat >= 0 || !g_pending_focus_picks.empty();
+}
+
+// Apply a loaded focus once the injected rows exist. Returns true when it applied (the
+// caller reapplies visibility); the pick shape goes through the search module so its own pick
+// set (the ticks in the search list) matches the map.
+static bool restore_focus_pending()
+{
+    if (!g_focus_restore_pending) return false;
+    if (g_category_rows.empty()) return false;  // rows not injected yet; next poll
+    g_focus_restore_pending = false;
+    if (!g_pending_focus_picks.empty())
+    {
+        std::vector<uint64_t> ids;
+        for (const auto &cr : g_category_rows)
+            if (cr.original_row_id && g_pending_focus_picks.count(cr.hide_key))
+                ids.push_back(cr.original_row_id);
+        spdlog::info("[focus] restored pick focus: {} saved key(s), {} matched a marker",
+                     g_pending_focus_picks.size(), ids.size());
+        g_pending_focus_picks.clear();
+        if (ids.empty()) { persist_focus(); return false; }
+        goblin::search::pick_many(ids, true);  // set_focus_rows + reapply + highlight
+        return true;
+    }
+    spdlog::info("[focus] restored category focus: category={} region={}", g_pending_focus_cat,
+                 g_pending_focus_region);
+    goblin::set_focus_category(g_pending_focus_cat, g_pending_focus_region);
+    goblin::reapply_live_settings();
+    goblin::apply_focus_highlight();
+    return true;
+}
 
 std::vector<goblin::SearchRow> goblin::search_row_snapshot()
 {
@@ -714,7 +888,16 @@ std::unordered_set<uint64_t> goblin::hidden_marker_original_ids()
 bool goblin::prune_focus_if_empty()
 {
     if (!focus_active()) return false;
-    if (!focus_highlight_points().empty()) return false;  // still something to show
+    // Layer-independent on purpose. This used to ask focus_highlight_points(), which answers
+    // for the layer being LOOKED AT (the rings are drawn there): switching to a map layer that
+    // holds none of the focused markers returned "empty" and the focus was dropped as if
+    // everything had been collected. What "empty" means is that no focused marker is left
+    // that could be shown anywhere - collected, kindling-collected, manually hidden, or hidden
+    // by its live flag.
+    const int focus = g_focus_category;
+    for (const auto &cr : g_category_rows)
+        if (cr.p && row_in_focus(cr, focus) && !row_is_hidden(cr))
+            return false;  // still something to show (on some layer)
     set_focus_category(-1);
     return true;
 }
@@ -741,6 +924,7 @@ void goblin::inject_map_entries()
         // de-overlap spreads from THIS, so it never spirals an already-spiralled position.
         float real_px;
         float real_pz;
+        uint64_t hide_key; // stable manual-hide key (stable_hide_key of the baked entry)
     };
 
     // Live-loot icons (config::liveLootIcons): a randomized lot may now hold an
@@ -812,7 +996,7 @@ void goblin::inject_map_entries()
         // unrelated markers whose baked category happened to be Armaments.
         // (Spoiler-free and non-lot rows leave gate_cat == e.category.)
         entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType,
-                           e.real_posX, e.real_posZ});
+                           e.real_posX, e.real_posZ, stable_hide_key(e)});
     }
 
     spdlog::info("Adding {} map entries ({} live-recategorized, live-loot table ready={})",
@@ -879,7 +1063,7 @@ void goblin::inject_map_entries()
     // before using it as the binary-search base. 4-align worked for WMP only
     // because it's iterated, never id-looked-up - but keep it correct so an
     // id lookup (or a future engine path) can't read past the array. (This
-    // exact bug crashed TutorialParam save-load; see inject_tutorial_popup_rows.)
+    // exact bug once crashed a TutorialParam save-load in an earlier build.)
     size_t wrapper_row_loc_start = (after_type_str + 0xf) & ~(size_t)0xf;
     size_t wrapper_row_loc_end = wrapper_row_loc_start + total_rows * WRAPPER_ROW_LOC_SIZE;
     size_t param_file_size = wrapper_row_loc_end;
@@ -948,6 +1132,7 @@ void goblin::inject_map_entries()
         uint8_t lotType;           // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
         float real_px;             // MSB-true position (see InjectedEntry)
         float real_pz;
+        uint64_t hide_key;         // stable manual-hide key (0 for vanilla rows)
     };
 
     std::vector<RowSource> all_rows;
@@ -957,13 +1142,13 @@ void goblin::inject_map_entries()
     {
         auto *data = old_param_file + old_table->rows[i].param_offset;
         all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false, {}, 0, 0, 0,
-                            0.0f, 0.0f});  // vanilla rows: filled from the row itself below
+                            0.0f, 0.0f, 0});  // vanilla rows: filled from the row itself below
     }
     for (auto &entry : entries)
     {
         all_rows.push_back({entry.row_id, reinterpret_cast<const uint8_t *>(entry.data),
                             entry.is_piece, entry.is_kindling, entry.category, entry.original_row_id,
-                            entry.lotId, entry.lotType, entry.real_px, entry.real_pz});
+                            entry.lotId, entry.lotType, entry.real_px, entry.real_pz, entry.hide_key});
     }
 
     std::sort(all_rows.begin(), all_rows.end(),
@@ -1021,6 +1206,7 @@ void goblin::inject_map_entries()
                              ? all_rows[i].real_pz : wp->posZ;
             cr.native_px = cr.real_px;
             cr.native_pz = cr.real_pz;
+            cr.hide_key = all_rows[i].hide_key;
             unsigned *en[8];
             enable_flag_ptrs(wp, en);
             for (int k = 0; k < 8; ++k) cr.baked_enable[k] = *en[k];
@@ -1193,257 +1379,11 @@ void goblin::inject_map_entries()
     spdlog::debug("Map entries complete: {} total rows", total_rows);
 }
 
-// ─── TutorialParam row injection ─────────────────────────────────────
-//
-// Adds two new rows for the F10 banner: one displays "Map icons: ON", the
-// other "Map icons: OFF". Each row is copied from an existing codex row
-// (4167000 - guaranteed to exist with menuType=0 / triggerType=0 / repeatType=1
-// from ERR's codex data) and then patched so its textId points at our newly
-// injected TutorialBody.fmg entries.
-//
-// Per ERR TutorialParam.xml paramdef (TUTORIAL_PARAM_ST):
-//   offset 4  u8 menuType                (0 = upper-left toast widget)
-//   offset 5  u8 triggerType
-//   offset 6  u8 repeatType
-//   offset 16 (0x10) s32 textId          ← FMG id we point at our entries
-//   offset 12 u32 unlockEventFlagId      ← cleared, no gate
-//   offset 20 (0x14) f32 dispMinTime
-//   offset 24 (0x18) f32 dispTime
-
-// TutorialParam template row we clone.
-static constexpr int TUTORIAL_TEMPLATE_ROW_ID = 4167000;
-
-// Dynamically-allocated codex-toast ids (see goblin_inject.hpp). 0 until init.
-int goblin::g_toast_fmg_id[goblin::TOAST_COUNT]       = {0, 0, 0, 0};
-int goblin::g_toast_param_row_id[goblin::TOAST_COUNT] = {0, 0, 0, 0};
-
 // Native settings-menu text ids in GR_MenuText.fmg (see goblin_inject.hpp).
 int goblin::g_menutext_tab_id = 0;
 std::vector<int> goblin::g_menutext_row_ids;
 int goblin::g_menutext_on_id = 0;
 int goblin::g_menutext_off_id = 0;
-
-static ParamResCap *find_param_res_cap_by_name(const wchar_t *target)
-{
-    auto param_list = *from::params::param_list_address;
-    if (!param_list) return nullptr;
-    for (int i = 0; i < 186; i++)
-    {
-        auto prc = param_list->entries[i].param_res_cap;
-        if (!prc) continue;
-        std::wstring_view name = from::params::dlw_c_str(&prc->param_name);
-        if (name == target) return prc;
-    }
-    return nullptr;
-}
-
-bool goblin::inject_tutorial_popup_rows()
-{
-    auto prc = find_param_res_cap_by_name(L"TutorialParam");
-    if (!prc)
-    {
-        spdlog::warn("[TOAST] TutorialParam not found - F10 banner falls back to Summon");
-        return false;
-    }
-    auto *rescap = reinterpret_cast<uint8_t *>(prc->param_header);
-    auto *&file_ptr = *reinterpret_cast<uint8_t **>(rescap + 0x80);
-    auto &file_size = *reinterpret_cast<int64_t *>(rescap + 0x78);
-
-    auto *old_file = file_ptr;
-    auto *old_table = reinterpret_cast<ParamTable *>(old_file);
-    uint16_t orig_rows = old_table->num_rows;
-    if (orig_rows < 2)
-    {
-        spdlog::warn("[TOAST] TutorialParam has only {} rows", orig_rows);
-        return false;
-    }
-
-    // Row data size from TUTORIAL_PARAM_ST paramdef: 1+3 reserve, menuType,
-    // triggerType, repeatType, pad1, imageId(u16), pad2(2), unlockEventFlagId
-    // (u32), textId(s32), displayMinTime(f32), displayTime(f32), pad3(4) = 32B.
-    constexpr int64_t TUTORIAL_ROW_DATA_SIZE = 32;
-    int64_t row_data_size = TUTORIAL_ROW_DATA_SIZE;
-
-    // Sanity: the in-memory stride between rows must match the paramdef size.
-    int64_t derived_stride = (int64_t)old_table->rows[1].param_offset -
-                             (int64_t)old_table->rows[0].param_offset;
-    if (derived_stride != row_data_size)
-    {
-        spdlog::warn("[TOAST] TutorialParam stride {} != paramdef {} - re-laying contiguously",
-                     derived_stride, row_data_size);
-    }
-
-    // Find a template row. Preferred: ERR codex row 4167000 (menuType=0,
-    // repeatType=1). Vanilla has no such row, so fall back to any row with
-    // menuType==0 (vanilla ships 13 of those - the toast widget is a vanilla
-    // mechanism), and as a last resort synthesize the 32-byte row locally.
-    // Every field we depend on is patched explicitly below anyway.
-    uint8_t synth_row[TUTORIAL_ROW_DATA_SIZE] = {};
-    const uint8_t *template_data = nullptr;
-    for (uint16_t i = 0; i < orig_rows; i++)
-    {
-        if ((int)old_table->rows[i].row_id == TUTORIAL_TEMPLATE_ROW_ID)
-        {
-            template_data = old_file + old_table->rows[i].param_offset;
-            break;
-        }
-    }
-    if (!template_data)
-    {
-        for (uint16_t i = 0; i < orig_rows; i++)
-        {
-            const uint8_t *row = old_file + old_table->rows[i].param_offset;
-            if (row[4] == 0)  // menuType == 0 (toast)
-            {
-                template_data = row;
-                spdlog::info("[TOAST] template row {} absent (vanilla?) - using row {} (menuType=0)",
-                             TUTORIAL_TEMPLATE_ROW_ID, (int)old_table->rows[i].row_id);
-                break;
-            }
-        }
-    }
-    if (!template_data)
-    {
-        // Synthesized toast row: menuType=0, triggerType=0, repeatType set
-        // below, no image, dispMinTime=1s, dispTime=3s (vanilla toast values).
-        *reinterpret_cast<float *>(synth_row + 0x14) = 1.0f;
-        *reinterpret_cast<float *>(synth_row + 0x18) = 3.0f;
-        template_data = synth_row;
-        spdlog::info("[TOAST] no menuType=0 row found - synthesizing toast template");
-    }
-
-    constexpr size_t WRAPPER_HEADER = 0x10;
-    constexpr size_t HEADER_SIZE = 0x40;
-    constexpr size_t ROW_LOCATOR_SIZE = sizeof(ParamRowInfo);
-    constexpr size_t WRAPPER_ROW_LOC_SIZE = sizeof(WrapperRowLocator);
-
-    const char *type_str = reinterpret_cast<const char *>(old_file + old_table->param_type_offset);
-    size_t type_str_len = strlen(type_str) + 1;
-
-    uint32_t new_row_count = 4;  // ON, OFF, DUMP_OK, DUMP_FAIL
-    uint32_t total_rows = orig_rows + new_row_count;
-
-    size_t row_locators_start = HEADER_SIZE;
-    size_t data_start = row_locators_start + total_rows * ROW_LOCATOR_SIZE;
-    size_t data_end = data_start + total_rows * (size_t)row_data_size;
-    size_t type_str_start = data_end;
-    size_t after_type_str = type_str_start + type_str_len;
-    // CRITICAL: align wrapper_row_loc to 16, NOT 4. The lookup-by-id engine
-    // (LookupTutorialParam @ eldenring.exe+0xD51BA0, pre-2026-05-29 RVA) reads this offset from the
-    // wrapper header and rounds it UP to 16 via `(x + 0xf) & ~0xf` before using
-    // it as the wrapper_row_locator base for its binary search. If our actual
-    // array sits at a merely-4-aligned offset, the engine reads 4-12 bytes
-    // past it → garbage row ids → out-of-range index → OOB row-data read →
-    // crash on save-load (which does an id lookup). WMP got away with 4-align
-    // because it's only ever iterated, never id-looked-up.
-    size_t wrapper_row_loc_start = (after_type_str + 0xf) & ~(size_t)0xf;
-    size_t wrapper_row_loc_end = wrapper_row_loc_start + total_rows * WRAPPER_ROW_LOC_SIZE;
-    size_t param_file_size = wrapper_row_loc_end;
-    size_t total_alloc = WRAPPER_HEADER + param_file_size;
-
-    // Same ownership contract as the marker table above - see the note there (incl. the
-    // 2026-08-12 arena-first rule). TutorialParam has no ini toggle, so before this fix it made
-    // the crash unavoidable on every single exit.
-    auto *allocation = goblin::gfx_probe::dl_alloc_like(old_file, total_alloc);
-    if (!allocation)
-        allocation = goblin::gfx_probe::game_aligned_alloc(total_alloc);
-    if (!allocation)
-    {
-        spdlog::error("[TOAST] alloc failed ({} bytes) for TutorialParam expansion - the game's "
-                      "aligned allocator is unavailable, expansion skipped",
-                      total_alloc);
-        return false;
-    }
-
-    auto *new_wrapper = reinterpret_cast<uint8_t *>(allocation);
-    auto *new_file = new_wrapper + WRAPPER_HEADER;
-    auto *new_table = reinterpret_cast<ParamTable *>(new_file);
-
-    *reinterpret_cast<uint32_t *>(new_wrapper + 0x00) = (uint32_t)wrapper_row_loc_start;
-    *reinterpret_cast<int32_t *>(new_wrapper + 0x04) = (int32_t)total_rows;
-
-    memcpy(new_file, old_file, HEADER_SIZE);
-    new_table->num_rows = (uint16_t)total_rows;
-    new_table->param_type_offset = type_str_start;
-    *reinterpret_cast<uint32_t *>(new_file + 0x00) = (uint32_t)type_str_start;
-    // Offset 0x04 (ushortDataOffset) left as memcpy'd from original (0): the
-    // new ER param format uses the u64 dataOffset @0x30 as canonical source.
-    *reinterpret_cast<uint64_t *>(new_file + 0x30) = data_start;
-
-    memcpy(new_file + type_str_start, type_str, type_str_len);
-
-    struct RowSource
-    {
-        int32_t row_id;
-        const uint8_t *data_ptr;
-    };
-    std::vector<RowSource> all_rows;
-    all_rows.reserve(total_rows);
-    for (uint16_t i = 0; i < orig_rows; i++)
-    {
-        auto *data = old_file + old_table->rows[i].param_offset;
-        all_rows.push_back({(int32_t)old_table->rows[i].row_id, data});
-    }
-    // Allocate our 4 TutorialParam row ids ABOVE the live max (dynamic - never
-    // collides with an overhaul's/another mod's tutorial rows).
-    int32_t tp_max = 0;
-    for (uint16_t i = 0; i < orig_rows; i++)
-        tp_max = std::max(tp_max, (int32_t)old_table->rows[i].row_id);
-    for (int s = 0; s < goblin::TOAST_COUNT; ++s)
-        goblin::g_toast_param_row_id[s] = tp_max + 1 + s;
-    all_rows.push_back({goblin::g_toast_param_row_id[goblin::TOAST_ON],        template_data});
-    all_rows.push_back({goblin::g_toast_param_row_id[goblin::TOAST_OFF],       template_data});
-    all_rows.push_back({goblin::g_toast_param_row_id[goblin::TOAST_DUMP_OK],   template_data});
-    all_rows.push_back({goblin::g_toast_param_row_id[goblin::TOAST_DUMP_FAIL], template_data});
-
-    std::sort(all_rows.begin(), all_rows.end(),
-              [](const RowSource &a, const RowSource &b) { return a.row_id < b.row_id; });
-
-    auto *new_locators = reinterpret_cast<ParamRowInfo *>(new_file + row_locators_start);
-    auto *new_wrapper_locs = reinterpret_cast<WrapperRowLocator *>(new_file + wrapper_row_loc_start);
-    size_t file_end_marker = type_str_start + type_str_len;
-
-    for (size_t i = 0; i < all_rows.size(); i++)
-    {
-        size_t data_offset = data_start + i * (size_t)row_data_size;
-        new_locators[i].row_id = (uint64_t)all_rows[i].row_id;
-        new_locators[i].param_offset = data_offset;
-        new_locators[i].param_end_offset = file_end_marker;
-        memcpy(new_file + data_offset, all_rows[i].data_ptr, (size_t)row_data_size);
-        new_wrapper_locs[i].row = all_rows[i].row_id;
-        new_wrapper_locs[i].index = (int32_t)i;
-
-        // Patch our new rows: textId -> our dynamically-allocated TutorialBody fmg
-        // id (set by setup_messages, which runs first), clear unlockEventFlagId so
-        // no gate prevents display. repeatType is set to 1 explicitly: ERR's
-        // template carries 1, but vanilla menuType=0 rows ship repeatType=0
-        // (show-once) - the toast must repeat.
-        int32_t rid = all_rows[i].row_id;
-        int slot = -1;
-        for (int s = 0; s < goblin::TOAST_COUNT; ++s)
-            if (rid == goblin::g_toast_param_row_id[s]) { slot = s; break; }
-        if (slot >= 0)
-        {
-            auto *p = new_file + data_offset;
-            *reinterpret_cast<uint8_t *>(p + 4)  = 0;      // menuType = 0 (toast)
-            *reinterpret_cast<uint8_t *>(p + 6)  = 1;      // repeatType = 1 (repeatable)
-            *reinterpret_cast<uint32_t *>(p + 12) = 0;     // unlockEventFlagId = 0
-            *reinterpret_cast<int32_t *>(p + 16)  = goblin::g_toast_fmg_id[slot]; // textId -> our TutorialBody fmg id
-        }
-    }
-
-    file_ptr = new_file;
-    file_size = (int64_t)param_file_size;
-
-    spdlog::info("[TOAST] TutorialParam expanded: {} -> {} rows (row ids ON={}, OFF={}, DUMP_OK={}, DUMP_FAIL={} -> fmg {}/{}/{}/{})",
-                 orig_rows, total_rows,
-                 goblin::g_toast_param_row_id[goblin::TOAST_ON], goblin::g_toast_param_row_id[goblin::TOAST_OFF],
-                 goblin::g_toast_param_row_id[goblin::TOAST_DUMP_OK], goblin::g_toast_param_row_id[goblin::TOAST_DUMP_FAIL],
-                 goblin::g_toast_fmg_id[goblin::TOAST_ON], goblin::g_toast_fmg_id[goblin::TOAST_OFF],
-                 goblin::g_toast_fmg_id[goblin::TOAST_DUMP_OK], goblin::g_toast_fmg_id[goblin::TOAST_DUMP_FAIL]);
-    return true;
-}
-
 
 // ─── Runtime param toggle (drives the F10 personal show/hide) ────────
 
@@ -1510,7 +1450,7 @@ void goblin::apply_category_visibility()
         bool show = eligible &&
                     !collected::is_row_collected(cr.row_id) &&
                     !kindling::is_row_collected(cr.row_id) &&
-                    !is_manually_hidden(cr.p);  // user-hidden markers stay hidden
+                    !is_manually_hidden(cr);  // user-hidden markers stay hidden
         unsigned *en[8];
         enable_flag_ptrs(cr.p, en);
         for (int k = 0; k < 8; ++k)
@@ -1526,7 +1466,7 @@ void goblin::apply_category_visibility()
 static bool native_row_hidden(const CategoryRow &cr)
 {
     if (!cr.p || goblin::collected::is_row_collected(cr.row_id) ||
-        goblin::kindling::is_row_collected(cr.row_id) || is_manually_hidden(cr.p))
+        goblin::kindling::is_row_collected(cr.row_id) || is_manually_hidden(cr))
         return true;
     const unsigned fl[8] = {cr.p->textDisableFlagId1, cr.p->textDisableFlagId2,
                             cr.p->textDisableFlagId3, cr.p->textDisableFlagId4,
@@ -2114,7 +2054,7 @@ goblin::ManualHideResult goblin::toggle_hovered_marker(void *rowptr)
         if (cr.p != rowptr) continue;
         r.matched = true;
         r.textId = cr.p->textId1;
-        uint64_t k = marker_key(cr.p);
+        const uint64_t k = cr.hide_key;
         std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
         auto it = g_manual_hidden.find(k);
         if (it != g_manual_hidden.end()) { g_manual_hidden.erase(it); r.now_hidden = false; }
@@ -2179,12 +2119,22 @@ void goblin::clear_manual_hidden()
     g_manual_hidden.clear();
 }
 
+// File format. v2 starts with the header line below; every other line is
+// `<key> <textId> <iconId> <region> <category>`. A file WITHOUT the header is v1: its keys
+// are marker_key_v1 values, which only mean something against the build that wrote them.
+// They are parked in g_hidden_v1_pending and migrate_hidden_v1() maps each one to the row it
+// still denotes in THIS build (same live position/text/icon), re-keys it, and drops the
+// rest - those are exactly the entries whose icon had already come back and been hidden
+// again under a fresh key, i.e. the duplicates the user saw in the list.
+static constexpr const char *kHiddenHeaderV2 = "#mfg-hidden v2";
+
 void goblin::save_manual_hidden(const std::filesystem::path &path)
 {
     std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
     try
     {
         std::ofstream f(path, std::ios::trunc);
+        f << kHiddenHeaderV2 << '\n';
         for (const auto &[k, m] : g_manual_hidden)
             f << k << ' ' << m.textId << ' ' << m.iconId << ' ' << m.region << ' '
               << static_cast<int>(m.cat) << '\n';
@@ -2198,12 +2148,56 @@ void goblin::load_manual_hidden(const std::filesystem::path &path)
     try
     {
         std::ifstream f(path);
-        uint64_t k; long tid, icon, region, cat;
-        while (f >> k >> tid >> icon >> region >> cat)
-            g_manual_hidden[k] = HiddenMeta{static_cast<int32_t>(tid), static_cast<uint16_t>(icon),
-                                            static_cast<int32_t>(region), static_cast<uint8_t>(cat)};
+        std::string line;
+        bool v2 = false, first = true;
+        while (std::getline(f, line))
+        {
+            if (first)
+            {
+                first = false;
+                if (line.rfind(kHiddenHeaderV2, 0) == 0) { v2 = true; continue; }
+            }
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            uint64_t k; long tid, icon, region, cat;
+            if (!(ss >> k >> tid >> icon >> region >> cat)) continue;
+            auto &target = v2 ? g_manual_hidden : g_hidden_v1_pending;
+            target[k] = HiddenMeta{static_cast<int32_t>(tid), static_cast<uint16_t>(icon),
+                                   static_cast<int32_t>(region), static_cast<uint8_t>(cat)};
+        }
     }
     catch (...) {}
+}
+
+// v1 -> v2, once the injected rows exist to resolve the legacy keys against. Returns true when
+// the hidden set changed (caller persists + reapplies visibility).
+static bool migrate_hidden_v1()
+{
+    size_t matched_keys = 0, added = 0, dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
+        if (g_hidden_v1_pending.empty()) return false;
+        if (g_category_rows.empty()) return false;  // rows not injected yet; try again next poll
+        std::set<uint64_t> seen;
+        for (const auto &cr : g_category_rows)
+        {
+            if (!cr.p) continue;
+            auto it = g_hidden_v1_pending.find(marker_key_v1(cr.p));
+            if (it == g_hidden_v1_pending.end()) continue;
+            seen.insert(it->first);
+            if (g_manual_hidden.emplace(cr.hide_key,
+                                        HiddenMeta{cr.p->textId1, cr.p->iconId, cr.region_id,
+                                                   static_cast<uint8_t>(cr.cat)}).second)
+                ++added;
+        }
+        matched_keys = seen.size();
+        dropped = g_hidden_v1_pending.size() - matched_keys;
+        g_hidden_v1_pending.clear();
+    }
+    spdlog::info("[hide] legacy hide file migrated: {} key(s) matched a current marker ({} re-keyed), "
+                 "{} matched none and were dropped",
+                 matched_keys, added, dropped);
+    return true;
 }
 
 void goblin::set_hidden_dir(const std::filesystem::path &dir) { g_hidden_dir = dir; }
@@ -2248,18 +2242,48 @@ int goblin::active_save_slot()
 bool goblin::sync_hidden_slot()
 {
     const int slot = active_save_slot();
-    if (slot == g_hidden_slot) return false;  // no character-switch since last check
+    if (slot == g_hidden_slot)
+    {
+        // Same character: the pending work is a legacy hide file whose keys could not be
+        // resolved at load time, or a saved focus, both waiting for the injected rows.
+        bool changed = false;
+        if (migrate_hidden_v1())
+        {
+            persist_manual_hidden();
+            changed = true;
+        }
+        if (restore_focus_pending())
+            changed = true;
+        return changed;  // false = no character-switch since last check
+    }
     g_hidden_slot = slot;
     {
         std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
         g_manual_hidden.clear();
+        g_hidden_v1_pending.clear();
     }
+    // The focus belongs to the character too: drop the old one WITHOUT writing it into the new
+    // character's file (no persist target while it is cleared), then load the new one.
+    g_focus_file.clear();
+    g_focus_restore_pending = false;
+    if (focus_active())
+        set_focus_category(-1);
     if (slot >= 0 && !g_hidden_dir.empty())
     {
         g_hidden_file = g_hidden_dir / ("MapForGoblins_hidden_s" + std::to_string(slot) + ".txt");
         load_manual_hidden(g_hidden_file);  // per-character set (empty file -> empty set)
-        spdlog::info("[hide] active save slot {} -> {} ({} hidden loaded)", slot,
-                     g_hidden_file.filename().string(), manual_hidden_count());
+        size_t legacy = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
+            legacy = g_hidden_v1_pending.size();
+        }
+        spdlog::info("[hide] active save slot {} -> {} ({} hidden loaded, {} legacy key(s) to migrate)",
+                     slot, g_hidden_file.filename().string(), manual_hidden_count(), legacy);
+        if (migrate_hidden_v1())
+            persist_manual_hidden();
+        g_focus_file = g_hidden_dir / ("MapForGoblins_focus_s" + std::to_string(slot) + ".txt");
+        load_focus_file(g_focus_file);
+        restore_focus_pending();  // applies now if the rows exist, else on a later poll
     }
     else
     {
@@ -2486,90 +2510,13 @@ void goblin::toggle_hotkey_loop()
     }
 }
 
-// (The old Summon-message path (post_summon) was removed: it depended on five
-// hardcoded RVAs (0x763360/0x11A3E0/0x843860/0x844060/0x843910) that a game
-// update invalidates, and the codex trampoline below is the toast style we
-// actually ship. The F10/F9 banner uses the AOB-resolved trampoline only.)
-
-// ShowTutorialPopup callers - codex/medal upper-left toast.
-// Three entries pinned by static analysis (agent run, May 2026):
-//   - inner   0x7EF5B0  `void(CSPopupMenu*, int id, bool, bool)` (286-byte fn)
-//   - outer   0x7EE630  `void(CSPopupMenu*, int id, bool)` (4 direct call sites)
-//   - tramp   0x80DA50  `void(int id)` - resolves singleton internally
-// CSPopupMenu singleton ptr lives in .data at `CSFeMan_slot + 0x80`.
-// AOB anchor for outer (24 bytes, unique across image):
-//   48 8B C4 44 88 40 18 89 50 10 55 56 57 41 56 41 57 48 8D 68 A1 48 81 EC
-// Patch-resilient anchor: LEA xref in real-.text to string
-//   "CS::CSPopupMenu::_CanOpenTutorialParam" in .rdata.
-//
-// Note: eldenring.exe has TWO `.text` sections (VMProtect adds one). When
-// pinning via pefile, scan the original MSVC `.text` at RVA 0x1000..0x29A3000,
-// NOT the VMP-added one at 0x4C0E000+ - different content, will miss real fns.
-// Resolve the trampoline by AOB (NOT a hardcoded RVA): a game update shifts
-// every function's RVA (the May-2026 patch moved this one from 0x80DA50 to
-// 0x80D960), so we pin it by a stable surrounding-byte signature that survives
-// patches. modutils::scan returns the address of the AOB's first byte = the
-// function entry. Resolved once and cached.
-static void show_tutorial_popup_trampoline(uintptr_t /*er*/, int tutorial_id)
-{
-    static void (*fn)(int) = nullptr;
-    static bool tried = false;
-    if (!tried)
-    {
-        tried = true;
-        fn = reinterpret_cast<void (*)(int)>(modutils::scan<void>({
-            .aob = "48 8B 05 ?? ?? ?? ?? 8B D1 48 85 C0 74 17 48 8B 88 80 00 00 00 48 85 C9",
-        }));
-        spdlog::info("[TOAST] resolved ShowTutorialPopup @ {:p}", (void *)fn);
-    }
-    if (fn) fn(tutorial_id);
-}
-
-// SEH-guarded trampoline fire (POD-only locals - no C++ unwinding). ONE of these, not two: there
-// used to be a seh_dispatch_toast and a seh_fire_trampoline with byte-identical bodies, differing
-// only in how the caller obtained the tutorial id.
-//
-// Both callers also computed a module handle first - GetModuleHandleA(nullptr), checked against 0
-// (which cannot happen for one's own process) and passed as `er` - and the trampoline's `er`
-// parameter has been commented out for as long as it has existed. That whole dance is gone.
-static void seh_fire_toast(int tutorial_id)
-{
-    __try { show_tutorial_popup_trampoline(0, tutorial_id); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { }
-}
-
-// The toast the toggle asks for, handed to the UI thread. 0 = nothing pending. One slot is
-// enough: the toggle is a two-state announcement, so a flip that overtakes an unfired one has
-// simply superseded it - showing the stale state would be worse than dropping it.
-static std::atomic<int> g_pending_toast{0};
-
-void goblin::queue_codex_toast(int tutorial_id)
-{
-    g_pending_toast.store(tutorial_id, std::memory_order_release);
-}
-
-void goblin::pump_codex_toast()
-{
-    const int id = g_pending_toast.exchange(0, std::memory_order_acq_rel);
-    if (id)
-        seh_fire_toast(id);
-}
-
-// Ask for the upper-left codex toast for the icons ON/OFF toggle. QUEUED, not fired: this runs on
-// menu_auto_toggle_loop's polling thread, and the popup routine it ends in is UI-thread state.
+// The icons ON/OFF announcement. The status line copies the text and can be asked from this
+// polling thread; there is no UI-thread hand-off any more (the codex toast needed one).
 static void show_toggle_banner(bool icons_on)
 {
-    spdlog::info("[TOAST] queue (icons {})", icons_on ? "ON" : "OFF");
-    goblin::queue_codex_toast(
-        goblin::g_toast_param_row_id[icons_on ? goblin::TOAST_ON : goblin::TOAST_OFF]);
-}
-
-// Fire an upper-left codex toast for one of the injected TutorialParam rows
-// (a goblin::g_toast_param_row_id[...] value). Static text via the same trampoline
-// path as the F10 banner - no FMG rewrite. Used by the F9 marker-dump banner.
-void goblin::show_codex_toast(int tutorial_id)
-{
-    seh_fire_toast(tutorial_id);
+    spdlog::info("[status] icons {}", icons_on ? "ON" : "OFF");
+    goblin::status_line::show(goblin::i18n::wtr(
+        icons_on ? goblin::i18n::ToastId::MapIconsOn : goblin::i18n::ToastId::MapIconsOff));
 }
 
 

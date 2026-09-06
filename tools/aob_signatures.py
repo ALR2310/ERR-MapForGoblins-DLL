@@ -65,6 +65,18 @@ SIGNATURES = [
         "critical": True,
         "refs": ["from/params.cpp:15"],
     },
+    # ---- Front-end status line (the small bottom text, one slot) - the toggle announcements ----
+    # The FE update's status block: `lea rbx,[rdi+3720]; movsxd rax,[rdi+59BC]; mov esi,[rdi+rax*4+59A4]`.
+    # goblin_status_line locates the MenuString builder and the empty ctor from it by the byte shapes
+    # of their calls, then answers the builder for its own id. A miss only silences the announcements.
+    {
+        "name": "fe_status_anchor",
+        "pattern": "48 8D 9F 20 37 00 00 48 63 87 BC 59 00 00 8B B4 87 A4 59 00 00",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_status_line.cpp:19"],
+        "note": "Match address is mid-function (the block itself), not a call target.",
+    },
     # ---- CSFeManImp singleton (HUD mode restore after our over-gameplay screen) ----
     # The store at the tail of the manager's init. Only needed to put CSFeManImp+0x78 (the HUD
     # visibility mode) back to the value it had before we pushed a screen; a miss just means the HUD

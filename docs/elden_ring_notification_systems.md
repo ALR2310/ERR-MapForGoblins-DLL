@@ -44,7 +44,16 @@ Throughout, each fact is labelled:
 
 ## What MapForGoblins actually ships
 
-The shipping toast channel is the **AOB-resolved ShowTutorialPopup
+**Since 2026-09-04: the proc-status line** (see the "SILENT small status line" section). The FE
+update rebuilds that MenuString slot from the id ring EVERY frame (id at `ring[read]`, -1 = empty ->
+the slot is cleared; else timer += dt, past 3.0 the entry is dropped; then `slot = Builder(id)`), so
+writing the slot directly shows nothing. `goblin_status_line` writes its own id into `ring[read]`,
+restarts the timer and hooks the builder (located from the unique FE block, `fe_status_anchor`,
+by the byte shapes of its two calls) to answer with its text. One slot = replace, not queue.
+
+The channel below is what shipped BEFORE that (kept as the record of how it worked):
+
+The toast channel was the **AOB-resolved ShowTutorialPopup
 trampoline** (inner 0x7EF5B0 / outer 0x7EE630, popup singleton at
 CSFeMan_slot+0x80 - see the TUTORIAL_PARAM_ST section), driven by:
 

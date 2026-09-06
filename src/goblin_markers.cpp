@@ -11,6 +11,8 @@
 // committed memory for the beacon signature - see the note at find_beacon_arrays().
 
 #include "goblin_markers.hpp"
+#include "goblin_status_line.hpp"
+#include "goblin_i18n.hpp"
 #include "goblin_collected.hpp"
 #include "goblin_config.hpp"
 #include "goblin_inject.hpp"
@@ -555,8 +557,14 @@ static int dump_impl(std::ostream &f, DumpSel sel)
               << "  " << tile
               << "  icon=" << n.icon_id
               << "  row=" << n.row_id
-              << (n.is_ours ? "  [ours]" : "  [live]")
-              << "  " << status
+              << (n.is_ours ? "  [ours]" : "  [live]");
+            // The MSB object the collected-tracker hides this row by, when it has one. The live
+            // param row carries no such name, so it comes from our own entry behind the live id.
+            if (n.is_ours)
+                if (const auto *me = goblin::collected::entry_for_live_row(n.row_id);
+                    me && me->object_name && me->object_name[0])
+                    f << "  obj=" << me->object_name;
+            f << "  " << status
               << "  pos=(" << std::fixed << std::setprecision(2)
               << n.posX << "," << n.posY << "," << n.posZ << ")";
             // The row's own coordinates are NOT where the icon is any more: the live de-overlap moves
@@ -607,6 +615,20 @@ static int dump_impl(std::ostream &f, DumpSel sel)
                     else                 f << "=EMPTY";
                 }
                 f << "\n";
+            }
+        }
+        // Why each of OUR nearby markers is (not) hidden by collection: the live WGM instances
+        // and GEOF records behind the outcome. "still on the map after I picked it up" cannot be
+        // answered from the status word alone.
+        {
+            std::vector<uint64_t> ours_ids;
+            for (const auto &n : nearby)
+                if (n.is_ours) ours_ids.push_back(n.row_id);
+            if (!ours_ids.empty())
+            {
+                const std::string diag = goblin::collected::diagnose_rows(ours_ids);
+                if (!diag.empty())
+                    f << "      collected-tracking behind the [ours] rows above:\n" << diag;
             }
         }
     };
@@ -761,19 +783,13 @@ void hotkey_loop()
             }
             catch (...) { spdlog::error("Marker dump failed: unknown"); count = -2; }
 
-            // On-screen feedback via the codex toast (static DUMP_OK/FAIL text).
-            // The earlier F9 crash here was NOT override/map related - it was
-            // the same broken trampoline RVA that also crashed F10 (the May-2026
-            // game update shifted .text). With the trampoline now AOB-resolved,
-            // this is safe again. Exact count goes to the log.
+            // On-screen feedback on the status line (any thread). Exact count goes to the log.
             if (count >= 0)
                 spdlog::info("Marker dump OK: {} markers", count);
             else
                 spdlog::error("Marker dump failed (code {})", count);
-            // QUEUED, not fired: this is the dump hotkey's own polling thread, and the popup
-            // routine behind the toast is UI-thread state (see queue_codex_toast).
-            goblin::queue_codex_toast(goblin::g_toast_param_row_id[
-                count >= 0 ? goblin::TOAST_DUMP_OK : goblin::TOAST_DUMP_FAIL]);
+            goblin::status_line::show(goblin::i18n::wtr(
+                count >= 0 ? goblin::i18n::ToastId::MarkersDumped : goblin::i18n::ToastId::MarkerDumpFailed));
         }
         prev_down = down;
     }

@@ -1170,43 +1170,6 @@ void goblin::setup_messages()
     else
         spdlog::error("PlaceName FMG merge failed");
 
-    // Inject NEW TutorialBody entries (slot 208 = 0xD0) for the codex toasts.
-    // CSPopupMenu::ShowTutorialPopup (trampoline, AOB-resolved at runtime - its
-    // RVA shifts on game updates) looks up TutorialParam[id].textId then
-    // TutorialBody.fmg[textId]. Matching TutorialParam rows are injected by
-    // goblin::inject_tutorial_popup_rows. Using fresh ids leaves all vanilla/ERR
-    // codex text untouched. All four entries (ON/OFF/DUMP_OK/DUMP_FAIL) are
-    // STATIC strings written below - there is no runtime text rewriting.
-    if (count2 > 208 && sub[208])
-    {
-        // Allocate the 4 toast text ids ABOVE the live TutorialBody max (dynamic -
-        // never collides with an overhaul's codex text). inject_tutorial_popup_rows
-        // (runs after this) points its param rows' textId at these.
-        int32_t tb_base = fmg_max_id(sub[208]) + 1;
-        for (int s = 0; s < goblin::TOAST_COUNT; ++s)
-            goblin::g_toast_fmg_id[s] = tb_base + s;
-        const auto toast_lang = goblin::i18n::current_language();
-        std::vector<NewEntry> tb_entries = {
-            {goblin::g_toast_fmg_id[goblin::TOAST_ON],
-             goblin::i18n::wtr(goblin::i18n::ToastId::MapIconsOn, toast_lang)},
-            {goblin::g_toast_fmg_id[goblin::TOAST_OFF],
-             goblin::i18n::wtr(goblin::i18n::ToastId::MapIconsOff, toast_lang)},
-            {goblin::g_toast_fmg_id[goblin::TOAST_DUMP_OK],
-             goblin::i18n::wtr(goblin::i18n::ToastId::MarkersDumped, toast_lang)},
-            {goblin::g_toast_fmg_id[goblin::TOAST_DUMP_FAIL],
-             goblin::i18n::wtr(goblin::i18n::ToastId::MarkerDumpFailed, toast_lang)},
-        };
-        if (patch_fmg_in_memory(sub[208], &sub[208], tb_entries))
-            spdlog::info("[TOAST] TutorialBody.fmg expanded (ids {}/{}/{}/{} above max {})",
-                         goblin::g_toast_fmg_id[goblin::TOAST_ON], goblin::g_toast_fmg_id[goblin::TOAST_OFF],
-                         goblin::g_toast_fmg_id[goblin::TOAST_DUMP_OK], goblin::g_toast_fmg_id[goblin::TOAST_DUMP_FAIL],
-                         tb_base - 1);
-        else
-            spdlog::warn("[TOAST] TutorialBody.fmg merge failed - codex banners unavailable");
-    }
-    else
-        spdlog::warn("[TOAST] TutorialBody (slot 208) unavailable - codex banners unavailable");
-
     // Inject the native settings-menu tab label into GR_MenuText (menu.msgbnd,
     // bank "GRMT"; MsgRepository slots are indexed by global BND file id -> 200).
     // The native menu builds its tab category label via the game's MenuTextCtor(fmgId) against this

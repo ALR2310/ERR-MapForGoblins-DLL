@@ -21,6 +21,7 @@
 #include "goblin_logic.hpp"
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp"
+#include "goblin_status_line.hpp"
 #include "goblin_overlay.hpp"
 #include "sc2/overlay_present.hpp" // capture_creation_entrypoints(), called first thing below
 #include "goblin_map_timing.hpp"
@@ -121,7 +122,7 @@ static void init_collected()        { goblin::collected::initialize(); }
 static void init_kindling()         { goblin::kindling::initialize(); }
 static void init_inject_entries()   { goblin::inject_map_entries(); }
 static void init_apply_map_logic()  { goblin::apply_map_logic(); goblin::apply_worldmap_fragment_bypass(); }
-static void init_tutorial_popup()   { goblin::inject_tutorial_popup_rows(); }
+static void init_status_line()      { goblin::status_line::setup(); }
 static void init_setup_messages()   { goblin::setup_messages(); }
 static void init_live_loot()        { goblin::refresh_loot_from_itemlot(); }
 static void init_overlay()          { goblin::overlay::setup(); }
@@ -921,12 +922,9 @@ static void setup_mod()
     safe_init_step(&init_kindling,        "kindling::initialize");
     safe_init_step(&init_inject_entries,  "add_map_entries");
     safe_init_step(&init_apply_map_logic, "apply_map_logic");
-    // setup_messages MUST precede inject_tutorial_popup_rows: it allocates the
-    // dynamic codex-toast FMG ids (goblin::g_toast_fmg_id) that the popup rows
-    // point their textId at. (It also builds the PlaceName textId remap used by
-    // the marker rows injected above.)
+    // setup_messages builds the PlaceName textId remap used by the marker rows added above.
     safe_init_step(&init_setup_messages,  "setup_messages");
-    safe_init_step(&init_tutorial_popup,  "add_tutorial_rows");
+    safe_init_step(&init_status_line,     "status_line::setup");
     safe_init_step(&init_live_loot,       "refresh_loot_from_itemlot");
     safe_init_step(&init_overlay,         "overlay::setup");
     safe_init_step(&init_map_timing,      "map_timing::setup");

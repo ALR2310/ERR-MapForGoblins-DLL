@@ -315,20 +315,30 @@ namespace
     constexpr uint16_t kRowDepthStep = 16;
     constexpr int kRowAuthored = 11;            // clips the movie ships in the left column
     constexpr int kRowExtra = goblin::own_movie::kRowSlots - kRowAuthored;
+    // The RIGHT column partner of each added row. The screen is one parse shared with the player's
+    // own Key Assignments screen and any other mod's key-binding pages, and those lay a keyboard
+    // bind in Item_N_0 and a mouse bind in Item_N_1. Rows 11..14 with only a left clip made the
+    // mouse binds of those rows vanish on such pages (reported by another modder, 2026-09-06). The
+    // authored right clips (offline parse of 02_160): cid 182, x 892.15 px, depths 131 - 13*N
+    // (Item_10_1 = 1). Depths 145..159 are unused, between Item_10_0 (144) and Item_9_0 (160).
+    constexpr uint16_t kRowRightCid = 182;
+    constexpr int32_t kRowRightXTwips = 17843;
+    constexpr uint16_t kRowRightExtraDepth = 145;
 
     int32_t row_y_twips(int index) { return kRowFirstYTwips + kRowPitchPx * 20 * index; }
 
     // A PlaceObject2 for one row clip: flags 0x26 (HasCharacter|HasMatrix|HasName), then the matrix
     // packed as {HasScale 0, HasRotate 0, nTranslateBits 16, tx, ty} - the same shape the authored
     // rows use, with a fixed 16 bits so our own numbers always fit.
-    size_t build_row_place(uint8_t *out, uint16_t depth, const char *name, int32_t tx, int32_t ty)
+    size_t build_row_place(uint8_t *out, uint16_t depth, uint16_t cid, const char *name, int32_t tx,
+                           int32_t ty)
     {
         size_t n = 0;
         out[n++] = 0x26;
         out[n++] = static_cast<uint8_t>(depth & 0xFF);
         out[n++] = static_cast<uint8_t>(depth >> 8);
-        out[n++] = static_cast<uint8_t>(goblin::menu_icon_tags::ROW_CID & 0xFF);
-        out[n++] = static_cast<uint8_t>(goblin::menu_icon_tags::ROW_CID >> 8);
+        out[n++] = static_cast<uint8_t>(cid & 0xFF);
+        out[n++] = static_cast<uint8_t>(cid >> 8);
         uint8_t mx[5] = {};
         uint32_t bit = 0;
         auto put = [&](uint32_t value, uint32_t bits) {
@@ -352,22 +362,31 @@ namespace
     size_t append_extra_rows(uint8_t *dst, size_t cap)
     {
         size_t len = 0;
+        auto emit = [&](uint16_t depth, uint16_t cid, const char *name, int32_t tx, int32_t ty) {
+            uint8_t body[48];
+            const size_t blen = build_row_place(body, depth, cid, name, tx, ty);
+            const uint16_t th = static_cast<uint16_t>((26u << 6) | (blen & 0x3F));
+            if (len + 2 + blen > cap)
+                return false;
+            dst[len++] = static_cast<uint8_t>(th & 0xFF);
+            dst[len++] = static_cast<uint8_t>(th >> 8);
+            std::memcpy(dst + len, body, blen);
+            len += blen;
+            return true;
+        };
         for (int k = 0; k < kRowExtra; ++k)
         {
             const int index = kRowAuthored + k;
             char name[16];
             _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_0", index);
-            uint8_t body[48];
-            const size_t blen = build_row_place(body, static_cast<uint16_t>(kRowFirstDepth -
-                                                                           kRowDepthStep * index),
-                                                name, kRowXTwips, row_y_twips(index));
-            const uint16_t th = static_cast<uint16_t>((26u << 6) | (blen & 0x3F));
-            if (len + 2 + blen > cap)
+            if (!emit(static_cast<uint16_t>(kRowFirstDepth - kRowDepthStep * index),
+                      goblin::menu_icon_tags::ROW_CID, name, kRowXTwips, row_y_twips(index)))
                 return len;
-            dst[len++] = static_cast<uint8_t>(th & 0xFF);
-            dst[len++] = static_cast<uint8_t>(th >> 8);
-            std::memcpy(dst + len, body, blen);
-            len += blen;
+            // Its right-column partner, so a page that fills both columns keeps its mouse binds.
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_1", index);
+            if (!emit(static_cast<uint16_t>(kRowRightExtraDepth + k), kRowRightCid, name,
+                      kRowRightXTwips, row_y_twips(index)))
+                return len;
         }
         return len;
     }
@@ -511,7 +530,8 @@ namespace
                     const size_t elen = append_extra_rows(extra, sizeof(extra));
                     if (elen && emit_sprite_with(out, t, src, extra, elen))
                     {
-                        spdlog::info("[ownmovie] row pool: {} extra row clips added (slots {}..{})",
+                        spdlog::info("[ownmovie] row pool: {} extra row pairs added (slots {}..{}, "
+                                     "left + right clip each)",
                                      kRowExtra, kRowAuthored, goblin::own_movie::kRowSlots - 1);
                         continue;
                     }
@@ -554,7 +574,15 @@ namespace
     // authored with TWO columns of 11 rows, 'Item_N_0' at x=7 and 'Item_N_1' at x=892 - so the visible
     // block spans roughly 113..863 px and its centre is ~488. Moving that centre to the stage centre
     // (960) is +472. Set to 0 to leave the screen exactly as authored.
-    constexpr int32_t kRowSectionShiftPx = 472;
+    //
+    // 0 SINCE 2026-09-06, and the shift lives in goblin_stall_probe (shift_section_after_advance).
+    // Moving the authored matrix moved EVERY instance of this one parse - the player's own Key
+    // Assignments screen and other mods' key-binding pages came up shifted right too. The
+    // per-instance route works after all when it is done from the dialog's OWN update (the screen is
+    // alive by construction there, which is what the 2026-07 attempts lacked) and re-asserted only
+    // while the intro is still re-placing the section. Kept at 0 rather than removed: the tag parse
+    // below still documents where the section sits.
+    constexpr int32_t kRowSectionShiftPx = 0;
     constexpr uint16_t kRowSectionDepth = 344;
     constexpr uint16_t kRowSectionCid = 198;
     constexpr const char *kRowSectionName = "KeySetting";

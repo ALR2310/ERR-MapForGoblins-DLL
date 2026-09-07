@@ -16,6 +16,7 @@ namespace goblin::watch { void pump(); }
 #include "goblin_build_variants.hpp"
 #include "generated_shared/goblin_map_icons.hpp" // one DefineBitsLossless2 tag per custom map icon
 #include "generated_shared/goblin_logo.hpp"       // runtime-injectable MapForGoblins logo (bitmap + matrix)
+#include "goblin_own_movie.hpp"                    // log_stack (observation: who parses the world map)
 #include "generated/goblin_item_icons.hpp"       // goblin::generated::ANON_ICON_ID
 #include "goblin_inject.hpp"   // goblin::remap_injected_icons (point markers at our injected frames)
 #include "goblin_maphover.hpp" // map_dialog() - the V3 spike only fires while the map is open
@@ -780,6 +781,13 @@ namespace
             inject_all_icons(ctx); // registers all icon bitmaps + the logo bitmap
             spdlog::info("[icons] worldmap sprite-171 (frameCount={}) loading; appending {} icon frames.",
                          fcnt, goblin::generated::MAP_ICON_TAG_COUNT);
+            {
+                // OBSERVATION (2026-09-07): who initiated the world map's parse - its file never passes
+                // the GFx file opener, and the separate-definition work needs that route.
+                static std::atomic<int> s_stack_once{0};
+                if (goblin::config::debugLogging && s_stack_once.exchange(1) == 0)
+                    goblin::own_movie::log_stack("sprite-171 parse");
+            }
             for (int k = 0; k < ICON_MAP_SIZE; ++k) g_icon_iid[k] = 0;
             int placed = 0;
             uint32_t iid_lo = 0, iid_hi = 0;

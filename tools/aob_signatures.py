@@ -269,6 +269,69 @@ SIGNATURES = [
                 "the shared parse, which bleeds into the player's own key-binding screen but works.",
     },
     {
+        "name": "gfx_loader_create_movie",
+        "pattern": "45 8B D0 48 8B C1 48 85 D2 74 1A 80 3A 00 74 15 48 8B 49 08 48 85 C9 74 0C "
+                   "44 8B 40 18 45 0B C2 E9",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "GFxLoader::CreateMovie stub (FUN_14112b130 on 1.16; tail-jumps into the loader). "
+                "Observation hook only (which URLs the loader is asked for): the world map's file never "
+                "passes the file opener in the stock flow, and this is the level above it.",
+    },
+    {
+        "name": "menu_movie_path_format",
+        "pattern": "48 8B C4 55 57 41 56 48 8D 68 A8 48 81 EC 40 01 00 00 48 C7 44 24 60 FE FF FF FF "
+                   "48 89 58 18 48 89 70 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 30 48 8B FA 48 8B D9 "
+                   "48 89 4C 24 68 33 F6 89 74 24 30 4C 8B 42 08 48 8D 15 ?? ?? ?? ?? 48 8D 4D C8 E8 ?? ?? ?? ?? "
+                   "90 48 8D 50 08 48 83 7A 18 08 72 03 48 8B 12",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "CSMenuMan movie descriptor -> URL (FUN_140d7b800 on 1.16): `menu:/Win/<name>.gfx`, then the "
+                "FD4 device step - where me3 substitutes its `\\\\me3??NN` token for an overridden movie. "
+                "Hooked so our world-map descriptor also learns the GAME's resolved URL to alias onto.",
+    },
+    {
+        "name": "menu_movie_request_file",
+        "pattern": "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 B8 FE FF FF FF 49 89 5B 18 49 89 73 20 "
+                   "48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 88 00 00 00 48 8B FA 48 8B 99 98 09 00 00 "
+                   "48 8D B1 90 09 00 00 4C 8B C2 49 8D 53 98 48 8B CE E8 ?? ?? ?? ?? 48 39 18",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "CSMenuMan on-demand file request by descriptor (FUN_140d77400 on 1.16): list at +0x990, "
+                "else `menu:/Win/<name>.gfx` -> CSFile::Load. CALLED (not hooked) with the game's world-map "
+                "descriptor at every redirect, so the real file is in the repository for the opener alias.",
+    },
+    {
+        "name": "menu_movie_name_to_def",
+        "pattern": "40 55 53 56 57 41 54 41 56 41 57 48 8D AC 24 20 FE FF FF 48 81 EC E0 02 00 00 "
+                   "48 C7 44 24 60 FE FF FF FF 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 D0 01 00 00 "
+                   "49 8B C0 48 89 44 24 50 48 8B FA 48 8B D9 48 89 4C 24 38 48 89 54 24 68 33 F6 "
+                   "89 74",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "CSMenuMan: movie definition by descriptor NAME (FUN_140d7a630 on 1.16): the name "
+                "cache, then `menu:/Win/<name>.gfx` through the Scaleform loader. Hooked to redirect the "
+                "world map's descriptor to our own name so its definition parses after our hooks are "
+                "live (2026-09-07). Not critical: a miss only restores the injection-timing dependency.",
+    },
+    {
+        "name": "menu_movie_pin",
+        "pattern": "4C 8B 81 00 0D 00 00 4C 8B DA 4C 8B D1 49 8B 00 49 3B C0 74 59 4C 8B 40 10 "
+                   "4D 85 C0 74 44 41 0F 10 48 20 4D 8B 4B 08 66 0F 73 D9 08 66 48 0F 7E C9 "
+                   "4C 2B C9 0F 1F 40 00 0F 1F 84 00 00 00 00 00 44 0F B7 01 42 0F B7 14 09 "
+                   "44 2B C2 75 08 48 83",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_own_movie.cpp"],
+        "note": "Body of the keep-resident pin the map menu puts on its movie by name (timer -1 on the "
+                "cache entry; the exported entry is a 13-byte thunk). Redirected with the one above so "
+                "our world-map definition is the pinned one.",
+    },
+    {
         "name": "gfx_tag_loop",
         "pattern": "4C 89 44 24 18 53 55 56 57 41 55 41 56 48 83 EC 68 48 8B AA 18 04 00 00 "
                    "49 8B F8 4C 8B EA 4C 8B F1 48 85 ED",

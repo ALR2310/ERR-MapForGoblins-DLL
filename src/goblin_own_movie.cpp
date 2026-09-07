@@ -1309,10 +1309,186 @@ namespace
     // about to run is ours - the only parse of this content since the startup preload.
     constexpr const char *kOurMovieName = "02_160_MfgSettings";
     constexpr const wchar_t *kOurMovieNameW = L"02_160_MfgSettings";
+    // The world map's movie, same trick, different reason (2026-09-07): our map icons are injected
+    // WHILE 02_120 parses (frames into sprite 171, bitmaps into the load context), so a DLL that
+    // arrives after the game's parse - a late injector, a fast boot - has no icons and no way to add
+    // them afterwards. With the map's job asking for a name of ours instead, the parse the map
+    // instances is one that happens AFTER the request, i.e. after our hooks are live, whatever the
+    // injection moment. The name keeps `02_120_worldmap` inside it: gfx_probe recognises the map's
+    // movie by that substring of the (lower-cased) URL.
+    constexpr const char *kOurWorldMapName = "02_120_WorldMap_Mfg";
+    constexpr const wchar_t *kOurWorldMapNameW = L"02_120_WorldMap_Mfg";
+    constexpr const char *kGameWorldMapName = "02_120_WorldMap";
+    constexpr const wchar_t *kGameWorldMapNameW = L"02_120_WorldMap";
+    struct MovieAlias { const char *ours; const char *game; bool menu_parse; };
+    constexpr MovieAlias kAliases[] = {
+        {kOurMovieName, kMenuClassMark, true},
+        {kOurWorldMapName, kGameWorldMapName, false},
+    };
     using OpenFileFn = void *(void *opener, const char *url, int a, int b);
     OpenFileFn *o_open_file = nullptr;
     std::atomic<bool> g_alias_armed{false};
     std::atomic<int> g_alias_pending{0};
+
+    // The movie descriptor the job builders make and the job carries at +0x58.
+    struct MovieDesc
+    {
+        uint32_t tag;   // 8
+        uint8_t kind;   // 1 = key-binding form, 2 = pushed screen / the world map
+        uint8_t pad[3];
+        const wchar_t *name;
+    };
+    using NameToDefFn = void *(void *menuman, void *out, const MovieDesc *desc);
+    using MoviePinFn = void(void *inner, const MovieDesc *desc);
+    // The world map's file is not what its name says (2026-09-07, measured): with ERR under me3 the
+    // path resolver (FUN_140d7b800: `menu:/Win/<name>.gfx`, then the FD4 device step where me3
+    // substitutes its override) hands the loader an opaque token such as `\\me3??22`, and THAT is
+    // the key the loaded file sits under. A name of ours resolves to a vanilla path nobody loaded.
+    // So the resolver is hooked too: the first time it formats OUR world-map descriptor it also
+    // formats the GAME's, records the URL that produced, and the opener alias maps our URL onto
+    // that recorded one - the token under me3, the vanilla path without a loader.
+    constexpr bool kWorldMapRedirect = true;
+    NameToDefFn *o_name_to_def = nullptr;
+    MoviePinFn *o_movie_pin = nullptr;
+    using PathFmtFn = void *(void *out, const MovieDesc *desc);
+    PathFmtFn *o_path_fmt = nullptr;
+    std::string g_worldmap_game_url;            // UTF-8, as the opener will see it
+    std::atomic<bool> g_worldmap_game_url_ready{false};
+
+    // POD-only (SEH): the wide string a resolved DLString holds - data at +8 (heap pointer when the
+    // capacity at +0x20 exceeds 7), length at +0x18 - narrowed into `out`.
+    int read_dlstring_narrow(const void *str, char *out, size_t cap)
+    {
+        __try
+        {
+            const auto base = reinterpret_cast<uintptr_t>(str);
+            const uint64_t capw = *reinterpret_cast<const uint64_t *>(base + 0x20);
+            const uint64_t len = *reinterpret_cast<const uint64_t *>(base + 0x18);
+            const wchar_t *w = capw > 7 ? *reinterpret_cast<const wchar_t *const *>(base + 8)
+                                        : reinterpret_cast<const wchar_t *>(base + 8);
+            if (!w || len == 0 || len >= cap) return 0;
+            size_t k = 0;
+            for (; k < len && k + 1 < cap; ++k) out[k] = static_cast<char>(w[k] & 0x7F);
+            out[k] = 0;
+            return static_cast<int>(k);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
+    // POD-only (SEH): is this descriptor ours for the world map?
+    int is_our_worldmap_desc(const MovieDesc *desc)
+    {
+        __try
+        {
+            return desc && desc->name && wcscmp(desc->name, kOurWorldMapNameW) == 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    void *path_fmt_detour(void *out, const MovieDesc *desc)
+    {
+        if (is_our_worldmap_desc(desc) && !g_worldmap_game_url_ready.load(std::memory_order_acquire))
+        {
+            MovieDesc game = *desc;
+            game.name = kGameWorldMapNameW;
+            o_path_fmt(out, &game); // the game's own resolution, override step included
+            char narrow[256] = {};
+            if (read_dlstring_narrow(out, narrow, sizeof(narrow)) > 0)
+            {
+                g_worldmap_game_url = narrow;
+                g_worldmap_game_url_ready.store(true, std::memory_order_release);
+                spdlog::info("[ownmovie] the game's world-map movie resolves to '{}' - our URL will alias onto it",
+                             narrow);
+            }
+            else
+                spdlog::warn("[ownmovie] could not read the game's world-map URL from the resolver");
+            // then ours, assigned over the same out string (the resolver assigns, it does not construct)
+        }
+        return o_path_fmt(out, desc);
+    }
+    // The engine's on-demand file request by descriptor (FUN_140d77400 on 1.16): finds the descriptor
+    // in its list at menuman+0x990, else formats `menu:/Win/<name>.gfx` and asks CSFile to load it.
+    // Not hooked, CALLED: with a redirected name the engine requests OUR name's file, which does not
+    // exist, and the Scaleform loader retries the opener forever (measured 2026-09-07: nine asks in five
+    // seconds, the map never came up). So at every redirect the request is also made for the GAME'S
+    // descriptor, so the real file is in the repository when the opener alias looks for it.
+    using EnsureFileFn = void(void *menuman, const MovieDesc *desc);
+    EnsureFileFn *p_ensure_file = nullptr;
+    std::atomic<bool> g_worldmap_redirect{false};
+
+    // POD-only (SEH): the engine's own request, with the engine's own descriptor.
+    int request_game_file(void *menuman, const MovieDesc *game_desc)
+    {
+        if (!p_ensure_file || !menuman || !game_desc)
+            return 0;
+        __try
+        {
+            p_ensure_file(menuman, game_desc);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
+    // POD-only (SEH): a descriptor naming the game's world-map movie becomes one naming ours.
+    int redirect_worldmap_desc(const MovieDesc *desc, MovieDesc *copy)
+    {
+        if (!desc || !g_worldmap_redirect.load(std::memory_order_acquire))
+            return 0;
+        __try
+        {
+            if (desc->tag != 8 || !desc->name || wcscmp(desc->name, kGameWorldMapNameW) != 0)
+                return 0;
+            *copy = *desc;
+            copy->name = kOurWorldMapNameW;
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    // CSMenuMan's name -> definition resolution (the job's load step). Redirected, the map's job
+    // misses the name cache, goes through the opener alias below and parses a definition of its own.
+    void *name_to_def_detour(void *menuman, void *out, const MovieDesc *desc)
+    {
+        MovieDesc copy{};
+        if (redirect_worldmap_desc(desc, &copy))
+        {
+            // The game's file first (see request_game_file), then the definition under our name.
+            const int req = request_game_file(menuman, desc);
+            static std::atomic<int> s_logged{0};
+            if (s_logged.fetch_add(1) < 2)
+                spdlog::info("[ownmovie] world map asked for '{}' - resolving '{}' instead (game file "
+                             "request: {})",
+                             kGameWorldMapName, kOurWorldMapName,
+                             req == 1 ? "made" : req == 0 ? "skipped" : "FAULTED");
+            return o_name_to_def(menuman, out, &copy);
+        }
+        return o_name_to_def(menuman, out, desc);
+    }
+
+    // The keep-resident pin the map menu puts on its movie by NAME (timer -1 on the cache entry).
+    // Redirected as well, or our definition would be the one the cache is free to drop.
+    void movie_pin_detour(void *inner, const MovieDesc *desc)
+    {
+        MovieDesc copy{};
+        if (redirect_worldmap_desc(desc, &copy))
+        {
+            o_movie_pin(inner, &copy);
+            return;
+        }
+        o_movie_pin(inner, desc);
+    }
 
     // Case-insensitive strstr: the URL that reaches the opener is the RESOLVED path, lower-cased by
     // the mount step (`menu:/Win/02_160_KeyConfiguration.gfx` arrives as
@@ -1332,8 +1508,188 @@ namespace
         return nullptr;
     }
 
+    // ── diagnostic: who is on the stack ──────────────────────────────────────────────
+    // Frames as module+offset, the crash log's convention, so a 1.17 address can be carried back
+    // to the Ghidra project (1.16) by byte pattern. Used once per site, observation builds only.
+    void log_stack_impl(const char *tag)
+    {
+        void *frames[24] = {};
+        const USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+        std::string line;
+        char buf[128];
+        for (USHORT i = 0; i < n; ++i)
+        {
+            HMODULE mod = nullptr;
+            const auto addr = reinterpret_cast<uintptr_t>(frames[i]);
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(addr), &mod) && mod)
+            {
+                wchar_t path[MAX_PATH] = {};
+                GetModuleFileNameW(mod, path, MAX_PATH);
+                const wchar_t *base = wcsrchr(path, L'\\');
+                base = base ? base + 1 : path;
+                char name[64] = {};
+                for (int k = 0; k < 63 && base[k]; ++k) name[k] = static_cast<char>(base[k] & 0x7F);
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, " #%u %s+0x%llX", i, name,
+                            static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(mod)));
+            }
+            else
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, " #%u 0x%llX", i, static_cast<unsigned long long>(addr));
+            line += buf;
+        }
+        spdlog::info("[ownmovie] stack {}:{}", tag, line);
+    }
+
+    // GFxLoader::CreateMovie (stub FUN_14112b130 on 1.16; tail-jumps into the real loader). Hooked
+    // for OBSERVATION: which URLs the loader is asked for, with what flags, and what comes back - the
+    // world map's URL never reached the file opener in the stock flow (2026-09-07), so its file gets to
+    // the parser another way, and this is the level above the opener.
+    using CreateMovieFn = void *(void *loader, const char *url, uint32_t flags, void *a4, uint64_t a5, uint64_t a6);
+    CreateMovieFn *o_create_movie = nullptr;
+    void *create_movie_detour(void *loader, const char *url, uint32_t flags, void *a4, uint64_t a5, uint64_t a6)
+    {
+        void *def = o_create_movie(loader, url, flags, a4, a5, a6);
+        static std::atomic<int> s_count{0};
+        const int n = s_count.fetch_add(1);
+        const bool map = url && find_ci(url, "02_120_worldmap");
+        if ((goblin::config::debugLogging && n < 140) || map)
+            spdlog::info("[ownmovie] CreateMovie #{} '{}' flags 0x{:X} a4 0x{:X}: def 0x{:X}", n,
+                         url ? url : "(null)", flags, reinterpret_cast<uintptr_t>(a4),
+                         reinterpret_cast<uintptr_t>(def));
+        if (map && goblin::config::debugLogging)
+        {
+            static std::atomic<int> s_stacks{0};
+            if (s_stacks.fetch_add(1) < 2)
+                log_stack_impl("CreateMovie(02_120)");
+        }
+        return def;
+    }
+
+    // ── diagnostic: what the preloaded-file repository holds ─────────────────────────────
+    // The repository the opener consults (singleton, hash map at +0x78: bucket array @map+0x20,
+    // bucket count @map+0x1C, node {hash @+8, std::wstring path @+0x18 (heap ptr when cap @+0x30 > 7),
+    // next @+0x50, blob @+0x78, size u32 @+0x80}). The singleton slot is read off the hooked opener's
+    // own body: its `cmp qword ptr [rip+slot], 0 ; jz` is the only instruction of that shape there.
+    // Walked only when an aliased open came back empty, a few times per run, to say whether the
+    // game's file is there at all and under which key (2026-09-07: the world map never came up).
+    uintptr_t g_open_file_fn = 0;
+    uintptr_t g_repo_slot = 0;
+
+    uintptr_t repo_slot_from_opener(uintptr_t fn)
+    {
+        if (!fn) return 0;
+        __try
+        {
+            const auto *p = reinterpret_cast<const uint8_t *>(fn);
+            for (size_t i = 0; i + 10 < 0x300; ++i)
+            {
+                if (p[i] == 0x48 && p[i + 1] == 0x83 && p[i + 2] == 0x3D && p[i + 7] == 0x00 &&
+                    p[i + 8] == 0x0F && p[i + 9] == 0x84)
+                {
+                    int32_t disp = 0;
+                    std::memcpy(&disp, p + i + 3, 4);
+                    return fn + i + 8 + static_cast<intptr_t>(disp);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return 0;
+    }
+
+    // Copies the matching entries into `out` (POD, SEH); returns the count seen.
+    struct RepoEntry { wchar_t path[96]; uint64_t blob; uint32_t size; };
+    int walk_repo(RepoEntry *out, int cap, uint32_t *bucket_count, uint32_t *nodes_total)
+    {
+        int n = 0;
+        *bucket_count = 0;
+        *nodes_total = 0;
+        if (!g_repo_slot) return -1;
+        __try
+        {
+            const uintptr_t single = *reinterpret_cast<const uintptr_t *>(g_repo_slot);
+            if (!single) return -2;
+            const uintptr_t map = single + 0x78;
+            const uint32_t buckets = *reinterpret_cast<const uint32_t *>(map + 0x1C);
+            const uintptr_t arr = *reinterpret_cast<const uintptr_t *>(map + 0x20);
+            *bucket_count = buckets;
+            if (!arr || buckets == 0 || buckets > 65536) return -3;
+            for (uint32_t bi = 0; bi < buckets; ++bi)
+            {
+                uintptr_t node = *reinterpret_cast<const uintptr_t *>(arr + bi * 8);
+                for (int guard = 0; node && guard < 64; ++guard)
+                {
+                    ++*nodes_total;
+                    const uint64_t capw = *reinterpret_cast<const uint64_t *>(node + 0x30);
+                    const wchar_t *s = capw > 7 ? *reinterpret_cast<const wchar_t *const *>(node + 0x18)
+                                                : reinterpret_cast<const wchar_t *>(node + 0x18);
+                    bool hit = false;
+                    for (int k = 0; s && k < 200 && s[k]; ++k)
+                        if (s[k] == L'0' && s[k + 1] == L'2' && s[k + 2] == L'_' && s[k + 3] == L'1')
+                        {
+                            hit = true;
+                            break;
+                        }
+                    if (hit && n < cap)
+                    {
+                        int k = 0;
+                        for (; k < 95 && s[k]; ++k) out[n].path[k] = s[k];
+                        out[n].path[k] = 0;
+                        out[n].blob = *reinterpret_cast<const uint64_t *>(node + 0x78);
+                        out[n].size = *reinterpret_cast<const uint32_t *>(node + 0x80);
+                        ++n;
+                    }
+                    node = *reinterpret_cast<const uintptr_t *>(node + 0x50);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -4;
+        }
+        return n;
+    }
+
+    void dump_repo_for(const char *url)
+    {
+        static std::atomic<int> s_dumps{0};
+        if (s_dumps.fetch_add(1) >= 3) return;
+        if (!g_repo_slot) g_repo_slot = repo_slot_from_opener(g_open_file_fn);
+        static RepoEntry entries[24];
+        uint32_t buckets = 0, nodes = 0;
+        const int n = walk_repo(entries, 24, &buckets, &nodes);
+        spdlog::info("[ownmovie] repository after an empty answer for '{}': slot 0x{:X}, {} bucket(s), "
+                     "{} node(s), {} with '02_1' in the path{}",
+                     url, g_repo_slot, buckets, nodes, n < 0 ? 0 : n, n < 0 ? " (walk failed)" : "");
+        for (int i = 0; i < n; ++i)
+        {
+            char narrow[96];
+            int k = 0;
+            for (; k < 95 && entries[i].path[k]; ++k) narrow[k] = static_cast<char>(entries[i].path[k] & 0x7F);
+            narrow[k] = 0;
+            spdlog::info("[ownmovie]   '{}' blob=0x{:X} size={}", narrow, entries[i].blob, entries[i].size);
+        }
+    }
+
     void *open_file_detour(void *opener, const char *url, int a, int b)
     {
+        // OBSERVATION (2026-09-07, while the world map's file route is being worked out): the first
+        // opens of the run, and the repository at the first ask for 02_120, so the stock flow is on
+        // record - which URL the map's file is asked under, with what flags, and whether it is there.
+        {
+            static std::atomic<int> s_count{0};
+            const int n = s_count.fetch_add(1);
+            if (goblin::config::debugLogging && n < 140 && !(url && find_ci(url, "_mfg"))) // ours take the alias path below
+            {
+                void *file = o_open_file(opener, url, a, b);
+                spdlog::info("[ownmovie] open #{} '{}' (flags {} {}): {}", n, url ? url : "(null)", a, b,
+                             file ? "file" : "NOTHING");
+                if (url && find_ci(url, "02_120_worldmap") && !find_ci(url, "_mfg"))
+                    dump_repo_for(url);
+                return file;
+            }
+        }
         if (url)
         {
             // What the opener is asked for around our screen, a few times, so the shape of the URL
@@ -1344,16 +1700,32 @@ namespace
                 if (s_seen.fetch_add(1) < 6)
                     spdlog::info("[ownmovie] opener url: '{}'", url);
             }
-            const char *hit = find_ci(url, kOurMovieName);
-            if (hit)
+            for (const MovieAlias &al : kAliases)
             {
-                std::string real(url, static_cast<size_t>(hit - url));
-                real += kMenuClassMark; // the repository folds case itself
-                real += hit + std::strlen(kOurMovieName);
-                g_alias_pending.store(1, std::memory_order_release);
-                spdlog::info("[ownmovie] opener asked for '{}' - answering with the game's '{}'", url,
-                             real);
-                return o_open_file(opener, real.c_str(), a, b);
+                const char *hit = find_ci(url, al.ours);
+                if (!hit)
+                    continue;
+                // The URL arrives resolved AND lower-cased, so the game's name goes in lower-cased too:
+                // the repository folds case, but the direct device route the opener can take instead
+                // (flag `a` set) looks the path up by a hash of the bytes as given.
+                std::string real;
+                if (!al.menu_parse && g_worldmap_game_url_ready.load(std::memory_order_acquire))
+                    real = g_worldmap_game_url; // whatever the game's own resolution produced (me3 token, or the vanilla path)
+                else
+                {
+                    real.assign(url, static_cast<size_t>(hit - url));
+                    for (const char *c = al.game; *c; ++c)
+                        real += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+                    real += hit + std::strlen(al.ours);
+                }
+                if (al.menu_parse)
+                    g_alias_pending.store(1, std::memory_order_release);
+                void *file = o_open_file(opener, real.c_str(), a, b);
+                spdlog::info("[ownmovie] opener asked for '{}' - answered with the game's '{}' (flags {} {}): {}",
+                             url, real, a, b, file ? "file" : "NOTHING");
+                if (!file)
+                    dump_repo_for(real.c_str());
+                return file;
             }
         }
         return o_open_file(opener, url, a, b);
@@ -1502,10 +1874,75 @@ void goblin::own_movie::install()
                         "48 C7 45 B7 FE FF FF FF 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 1F 45 8B F9 "
                         "45 8B F0 48 8B DA 48 8B F1 48 8B 0D ?? ?? ?? ?? 48 85 C9 75"},
                 open_file_detour, o_open_file);
+            g_open_file_fn = reinterpret_cast<uintptr_t>(op);
+            g_repo_slot = repo_slot_from_opener(g_open_file_fn);
             g_alias_armed.store(true, std::memory_order_release);
+            // OBSERVATION hook on the loader's CreateMovie stub (see create_movie_detour). Its own try:
+            // a miss costs only the observation.
+            try
+            {
+                modutils::hook<CreateMovieFn>(
+                    {.aob = "45 8B D0 48 8B C1 48 85 D2 74 1A 80 3A 00 74 15 48 8B 49 08 48 85 C9 74 0C "
+                            "44 8B 40 18 45 0B C2 E9"},
+                    create_movie_detour, o_create_movie);
+                spdlog::info("[ownmovie] CreateMovie observation hooked");
+            }
+            catch (const std::exception &e)
+            {
+                spdlog::info("[ownmovie] CreateMovie observation unavailable ({})", e.what());
+            }
             spdlog::info("[ownmovie] file-opener route ready @ 0x{:X}: our screens get their own "
                          "definition ('{}')",
                          reinterpret_cast<uintptr_t>(op), kOurMovieName);
+            // The world map's own definition rides on the same alias: its two name-keyed entry
+            // points (resolution + the keep-resident pin) are redirected to our name. Either pattern
+            // dead = no redirect, and the map keeps depending on our hooks being live before its parse.
+            if (!kWorldMapRedirect)
+                spdlog::info("[ownmovie] world-map definition route is switched off in this build");
+            else try
+            {
+                // FUN_140d77400 (1.16): the on-demand file request by descriptor - resolved, not hooked;
+                // the redirect calls it with the game's descriptor so the real file gets loaded.
+                p_ensure_file = reinterpret_cast<EnsureFileFn *>(modutils::scan<void>(
+                    {.aob = "4C 8B DC 57 48 81 EC 90 00 00 00 49 C7 43 B8 FE FF FF FF 49 89 5B 18 49 89 73 20 "
+                            "48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 88 00 00 00 48 8B FA 48 8B 99 98 09 00 00 "
+                            "48 8D B1 90 09 00 00 4C 8B C2 49 8D 53 98 48 8B CE E8 ?? ?? ?? ?? 48 39 18"}));
+                // FUN_140d7b800 (1.16): descriptor -> `menu:/Win/<name>.gfx` -> resolved URL (this is where
+                // a loader's override lands). Hooked so our world-map descriptor learns the game's URL.
+                modutils::hook<PathFmtFn>(
+                    {.aob = "48 8B C4 55 57 41 56 48 8D 68 A8 48 81 EC 40 01 00 00 48 C7 44 24 60 FE FF FF FF "
+                            "48 89 58 18 48 89 70 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 30 48 8B FA 48 8B D9 "
+                            "48 89 4C 24 68 33 F6 89 74 24 30 4C 8B 42 08 48 8D 15 ?? ?? ?? ?? 48 8D 4D C8 E8 ?? ?? ?? ?? "
+                            "90 48 8D 50 08 48 83 7A 18 08 72 03 48 8B 12"},
+                    path_fmt_detour, o_path_fmt);
+                // FUN_140d7a630 (1.16): CSMenuMan movie def by descriptor name; prologue with the 0x2E0
+                // frame, the cookie and the (menuman, out, desc) moves. Unique on 1.16 / 1.17.
+                auto *nd = modutils::hook<NameToDefFn>(
+                    {.aob = "40 55 53 56 57 41 54 41 56 41 57 48 8D AC 24 20 FE FF FF 48 81 EC E0 02 00 00 "
+                            "48 C7 44 24 60 FE FF FF FF 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 D0 01 00 00 "
+                            "49 8B C0 48 89 44 24 50 48 8B FA 48 8B D9 48 89 4C 24 38 48 89 54 24 68 33 F6 "
+                            "89 74"},
+                    name_to_def_detour, o_name_to_def);
+                // The pin's body (the exported stub is a 13-byte thunk): walks the list at inner+0xD00
+                // comparing entry names with desc->name. Unique on 1.16 / 1.17.
+                auto *pin = modutils::hook<MoviePinFn>(
+                    {.aob = "4C 8B 81 00 0D 00 00 4C 8B DA 4C 8B D1 49 8B 00 49 3B C0 74 59 4C 8B 40 10 "
+                            "4D 85 C0 74 44 41 0F 10 48 20 4D 8B 4B 08 66 0F 73 D9 08 66 48 0F 7E C9 "
+                            "4C 2B C9 0F 1F 40 00 0F 1F 84 00 00 00 00 00 44 0F B7 01 42 0F B7 14 09 "
+                            "44 2B C2 75 08 48 83"},
+                    movie_pin_detour, o_movie_pin);
+                g_worldmap_redirect.store(true, std::memory_order_release);
+                spdlog::info("[ownmovie] world-map definition route ready (resolve @ 0x{:X}, pin @ 0x{:X}): "
+                             "the map parses '{}' after our hooks, whatever the injection moment",
+                             reinterpret_cast<uintptr_t>(nd), reinterpret_cast<uintptr_t>(pin),
+                             kOurWorldMapName);
+            }
+            catch (const std::exception &e)
+            {
+                spdlog::warn("[ownmovie] world-map definition route unavailable ({}) - map icons still "
+                             "need our hooks live before the game parses 02_120",
+                             e.what());
+            }
         }
         catch (const std::exception &e)
         {
@@ -1527,6 +1964,9 @@ bool goblin::own_movie::available() { return g_ready.load(std::memory_order_acqu
 
 const wchar_t *goblin::own_movie::menu_movie_name() { return kOurMovieNameW; }
 bool goblin::own_movie::separate_movie_armed() { return g_alias_armed.load(std::memory_order_acquire); }
+void goblin::own_movie::log_stack(const char *tag) { log_stack_impl(tag); }
+const wchar_t *goblin::own_movie::worldmap_movie_name() { return kOurWorldMapNameW; }
+bool goblin::own_movie::worldmap_redirect_armed() { return g_worldmap_redirect.load(std::memory_order_acquire); }
 
 // arm() / disarm() stood here: a nesting counter the host raised around its own screen open, so the
 // transform could tell our load of 02_160 from the player's. It is gone because there is no such

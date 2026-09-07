@@ -56,6 +56,20 @@ namespace goblin::own_movie
     // applies (bleeding into the player's screen, but working).
     bool separate_movie_armed();
 
+    // THE WORLD MAP'S OWN DEFINITION (2026-09-07). The map's icons are injected while 02_120 parses,
+    // which made the mod sensitive to the injection moment: a DLL arriving after the game's parse had
+    // no icons. Now the two name-keyed entry points the map goes through (CSMenuMan's name -> def
+    // resolution and the keep-resident pin) are hooked to ask for worldmap_movie_name() instead, and
+    // the opener alias hands that name the game's 02_120 file - so the map's definition is parsed
+    // when the map is first requested, after our hooks are live, whatever the injection moment. The
+    // name keeps "02_120_worldmap" inside it because gfx_probe recognises the map's movie by that.
+    const wchar_t *worldmap_movie_name();
+    bool worldmap_redirect_armed();
+
+    // Observation aid: the current stack as module+offset frames, one log line. Call it once per
+    // site; it is what carries a live 1.17 address back to the 1.16 Ghidra project by byte pattern.
+    void log_stack(const char *tag);
+
     // One-line state: what happened on the last load. NO CONSUMER at present - the overlay
     // Tools page that read it was retired with the rest of the on-map overlay UI (2026-07-28),
     // and the native menu never picked it up. Kept because g_status is maintained anyway and

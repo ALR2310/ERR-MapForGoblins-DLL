@@ -871,7 +871,26 @@ int goblin::collected::refresh()
                     // Same physical node: baked real coords match the live MsbPart
                     // position to well under 1u. Reject a far "nearest" (the row's own
                     // instance hasn't spawned - don't cross-match to another node's).
-                    if (!best || best_d2 > 16.0f) continue;
+                    if (!best || best_d2 > 16.0f)
+                    {
+                        // Nothing at the baked position. The asset may have moved (a game/mod
+                        // update relocating it, or a marker placed on a pickup target away
+                        // from the asset itself). Fall back to the MSB identity: the live
+                        // part name's suffix - parsed from the SAME MSB name our geom_slot was
+                        // baked from, NOT the engine's geom_idx (the formula that failed for
+                        // lilies). Nearest same-named instance wins; duplicate-named twins
+                        // share one collected key in the engine anyway.
+                        best = nullptr;
+                        best_d2 = 1e18f;
+                        for (auto *in : insts)
+                        {
+                            if (in->suffix_slot != slot) continue;
+                            float dx = in->px - ex, dz = in->pz - ez;
+                            float d2 = dx * dx + dz * dz;
+                            if (d2 < best_d2) { best_d2 = d2; best = in; }
+                        }
+                        if (!best) continue;
+                    }
                     if (best->alive) demonstrably_alive_rows.insert(row_id);
                     else             new_collected.insert(row_id);
                 }
@@ -1196,12 +1215,25 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
                 snprintf(buf, sizeof(buf), "        WGM: tile loaded, %zu instance(s) of %s (%zu tracked total):\n",
                          rows.size(), geof_prefix.c_str(), total);
                 o << buf;
+                // Same rule as refresh(): nearest within 4u, else the nearest instance whose
+                // MSB name carries this row's slot.
+                const Row *byname = nullptr;
+                if (rows.empty() || rows.front().d > 4.0f)
+                    for (const auto &r : rows)
+                        if (r.in->suffix_slot == e->geom_slot && (!byname || r.d < byname->d)) byname = &r;
                 for (size_t i = 0; i < rows.size() && i < 8; ++i)
                 {
                     const auto &r = rows[i];
-                    const char *outcome = i != 0 ? "" : (r.d > 4.0f ? "  <- nearest, but > 4u: NO MATCH"
-                                                          : r.in->alive ? "  <- match: ALIVE"
-                                                                        : "  <- match: dead -> collected");
+                    const char *outcome = "";
+                    if (i == 0 && r.d <= 4.0f)
+                        outcome = r.in->alive ? "  <- match: ALIVE" : "  <- match: dead -> collected";
+                    else if (i == 0 && !byname)
+                        outcome = "  <- nearest, but > 4u, and no instance is named with this row's slot: NO MATCH";
+                    else if (i == 0)
+                        outcome = "  <- nearest, but > 4u: position match fails, name-slot fallback below";
+                    if (byname == &r)
+                        outcome = byname->in->alive ? "  <- name-slot match: ALIVE"
+                                                    : "  <- name-slot match: dead -> collected";
                     snprintf(buf, sizeof(buf),
                              "          slot=%d name-slot=%d pos=(%.2f,%.2f) dist=%.1f alive=%d f263=0x%02X "
                              "f26B=0x%02X model=%u gidx=%u%s\n",
@@ -1231,8 +1263,9 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
             o << buf;
         }
         if (loaded)
-            o << "        rule: tile LOADED -> only the WGM position match (< 4u, dead instance) hides; "
-                 "GEOF is not consulted while loaded\n";
+            o << "        rule: tile LOADED -> WGM decides: nearest instance within 4u, else the instance "
+                 "whose MSB name carries this row's slot; a dead match hides. GEOF is not consulted "
+                 "while loaded\n";
     }
     return o.str();
 }

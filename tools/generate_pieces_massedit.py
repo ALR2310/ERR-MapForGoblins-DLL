@@ -158,7 +158,12 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
         slot_map[row_id2] = {
             'geom_slot': (iid - 9000) if iid >= 9000 else -1,
             'name_suffix': suffix,
-            'object_name': name
+            'object_name': name,
+            # MSB-true position of the piece asset. A refinement pass may move the DISPLAY
+            # position onto the pickup target (msb_x/msb_z set by it); the live
+            # CSWorldGeomIns stays at the MSB position, which is what tracking matches.
+            'msb_x': float(item.get('msb_x', item['x'])),
+            'msb_z': float(item.get('msb_z', item['z'])),
         }
         row_id2 += 1
 

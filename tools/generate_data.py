@@ -373,6 +373,11 @@ def generate_map_data_cpp(entries, output_path, geom_slots=None, orig_xz=None):
             # real_posX/real_posZ = pre-de-overlap MSB-true coords (fall back to the
             # possibly-shifted display pos if not snapshotted) for collected tracking.
             rx, rz = orig_xz.get(row_id, (fields.get("posX", "0"), fields.get("posZ", "0")))
+            # A piece whose display position was moved onto its pickup target carries the
+            # MSB position of the asset itself in the slots side file - that is where the
+            # live CSWorldGeomIns sits, so that is what collected-tracking must match.
+            if isinstance(meta, dict) and 'msb_x' in meta and 'msb_z' in meta:
+                rx, rz = meta['msb_x'], meta['msb_z']
             rx = format_value("real_posX", "f", str(rx))
             rz = format_value("real_posZ", "f", str(rz))
             f.write(f"    }}, Category::{category}, {slot}, {suffix}, {name_field}, "

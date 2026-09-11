@@ -19,6 +19,7 @@
 #include "goblin_anchors.hpp" // EcTestDistance vtable, by RTTI name
 #include "goblin_kindling.hpp"
 #include "goblin_crashdiag.hpp" // register this thread, so a crash record can say it was ours
+#include "goblin_collected.hpp" // read_player_map_id: scan the heap only near the spirits' tiles
 #include "goblin_map_data.hpp"
 #include "modutils.hpp"
 
@@ -65,6 +66,42 @@ struct KindlingSlot
     int slot;            // 1..5 (kindling slot)
     uint32_t entity_id;  // 1045373501..505
 };
+
+// The tiles the kindling rows sit on (area<<16 | gx<<8 | gz), from MAP_ENTRIES at initialize. The
+// discovery is a scan of the WHOLE process heap - measured 2026-09-07 at 39 s per pass over ~3900
+// regions - and the SFX conditions it looks for only exist while the spirits' own area is loaded.
+// Scanning anywhere else finds nothing and, because the refresh tick re-requests discovery while
+// nothing is found, used to run back to back for the whole session (three passes in two minutes,
+// the worker thread never idle, and every pass tripping a first-chance fault in the region scan).
+// So the worker now scans only while the player is near one of these tiles, and after an empty
+// pass it waits a minute before the next.
+static std::vector<uint32_t> g_kindling_tiles;
+static uint64_t g_kindling_backoff_until_ms = 0;
+
+// Is the player within the loaded radius of a kindling tile? Open-world tiles (area 60) load a
+// couple of tiles around the player; a legacy dungeon is one map, so there the area+grid must match.
+// No live player (menu, loading) reads as "not near": nothing to scan for yet.
+static bool player_near_kindling(char *why, size_t cap)
+{
+    uint32_t map_id = 0;
+    if (!goblin::collected::read_player_map_id(map_id) || map_id == 0 || map_id == 0xFFFFFFFFu)
+    {
+        _snprintf_s(why, cap, _TRUNCATE, "no live player map");
+        return false;
+    }
+    const int area = static_cast<int>((map_id >> 24) & 0xFF), gx = static_cast<int>((map_id >> 16) & 0xFF),
+              gz = static_cast<int>((map_id >> 8) & 0xFF);
+    for (uint32_t t : g_kindling_tiles)
+    {
+        const int ta = static_cast<int>((t >> 16) & 0xFF), tx = static_cast<int>((t >> 8) & 0xFF),
+                  tz = static_cast<int>(t & 0xFF);
+        if (ta != area) continue;
+        if (area == 60 ? (std::abs(tx - gx) <= 2 && std::abs(tz - gz) <= 2) : (tx == gx && tz == gz))
+            return true;
+    }
+    _snprintf_s(why, cap, _TRUNCATE, "player on m%02d_%02d_%02d, no kindling tile within reach", area, gx, gz);
+    return false;
+}
 
 struct ParamRef
 {
@@ -419,9 +456,38 @@ static void worker_loop()
             continue;
         }
 
+        // Only near the spirits' own tiles, and not right after an empty pass (see g_kindling_tiles).
+        // Both waits are cheap polls that re-arm the request; the refresh tick keeps asking anyway.
+        {
+            const uint64_t now = GetTickCount64();
+            char why[96] = {};
+            const bool is_near = player_near_kindling(why, sizeof why);
+            if (!is_near || now < g_kindling_backoff_until_ms)
+            {
+                static uint64_t s_last_note = 0;
+                if (now - s_last_note > 60000)
+                {
+                    s_last_note = now;
+                    if (!is_near)
+                        spdlog::info("[KINDLING] discovery deferred: {}", why);
+                    else
+                        spdlog::info("[KINDLING] discovery deferred: last pass found nothing, next in {} s",
+                                     (g_kindling_backoff_until_ms - now) / 1000);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                {
+                    std::lock_guard<std::mutex> lock(g_worker_mutex);
+                    g_discovery_requested = true;
+                }
+                continue;
+            }
+        }
+
         g_discovery_in_progress = true;
         auto conds = discover_kindling_conds();
         g_discovery_in_progress = false;
+        if (conds.empty())
+            g_kindling_backoff_until_ms = GetTickCount64() + 60000;
 
         // Re-check after scan: if world unloaded mid-scan (character
         // switch happened), discard - the cond pointers are now into
@@ -531,6 +597,7 @@ uint32_t entity_id_for_slot(int slot)
 void goblin::kindling::initialize()
 {
     g_slots.clear();
+    g_kindling_tiles.clear();
     g_param_ptrs.clear();
     {
         std::lock_guard<std::mutex> lock(g_collected_rows_mutex);
@@ -556,6 +623,9 @@ void goblin::kindling::initialize()
             continue;
         }
 
+        g_kindling_tiles.push_back((static_cast<uint32_t>(e.data.areaNo) << 16) |
+                                   (static_cast<uint32_t>(e.data.gridXNo) << 8) |
+                                   static_cast<uint32_t>(e.data.gridZNo));
         // (an orig_id field took the second e.row_id here; nothing ever read it, and the
         // original->dynamic mapping is served by g_original_to_dynamic)
         g_slots.push_back({e.row_id, slot, entity_id_for_slot(slot)});

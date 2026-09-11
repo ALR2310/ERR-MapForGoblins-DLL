@@ -63,7 +63,7 @@ ANCHORS = [
     {"name": "clip_goto_frame_num", "rva": 0x74A7D0,
      "bytes": "48 89 5C 24 08 57 48 83 EC 20 48 8B 09 8B",
      "used": "prepare_form_layout (BG wide panel) / draw_row_icon (icon frame)"},
-    {"name": "clip_proxy_dtor", "rva": 0xD81590,
+    {"name": "clip_proxy_dtor", "rva": 0xD81600,
      "bytes": "48 89 4C 24 08 53 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 8D 05 ?? ?? "
                "?? ?? 48 89 01 48 8D 59 08 8B",
      "used": "every resolve site (releases the proxy)"},
@@ -117,10 +117,10 @@ ANCHORS = [
     # panicked. These two slot FUNCTIONS are code, so the resolver finds them anywhere; the vtable
     # is then the one place in .rdata where both sit at their own slot index (goblin_anchors.cpp,
     # vtable_with). Verified on all six builds by scratch/verify_slot_layout_all.py.
-    {"name": "snapshot_slot_vt_fn4", "rva": 0x11FA7F0,
+    {"name": "snapshot_slot_vt_fn4", "rva": 0x11FA860,
      "bytes": "48 8B C4 48 89 58 08 48 89 78 10 55 48 8D 68 A1 48 81 EC A0",
      "used": "v3_child_releasable (snapshot-slot vtable, slot 4)"},
-    {"name": "snapshot_slot_vt_fn6", "rva": 0x11CDEA0,
+    {"name": "snapshot_slot_vt_fn6", "rva": 0x11CDF10,
      "bytes": "49 3B D0 0F 84 ?? ?? ?? ?? 48 8B C4",
      "used": "v3_child_releasable (snapshot-slot vtable, slot 6)"},
 
@@ -150,10 +150,10 @@ ANCHORS = [
     # The two refcount thunks are one instruction each; bytes past the ret are data that
     # changes per build. The exe holds many byte-identical copies of each - any copy is
     # semantically the same call, so a nearest-match rebase is always safe for these.
-    {"name": "refcount_addref", "rva": 0x1EBBFC0,
+    {"name": "refcount_addref", "rva": 0x1EBC030,
      "bytes": "B8 01 00 00 00 F0 0F C1 01 C3",
      "used": "job ref dance"},
-    {"name": "refcount_unref", "rva": 0x1EBC000,
+    {"name": "refcount_unref", "rva": 0x1EBC070,
      "bytes": "83 C8 FF F0 0F C1 01 C3",
      "used": "job ref dance / release_job_ref"},
     {"name": "list_row_path_build", "rva": 0x737E10,
@@ -174,7 +174,7 @@ ANCHORS = [
     # Not called - it is the constructor whose body DEFINES the memory-file layout the transform
     # relies on (+0x18 buffer, +0x20 size, +0x24 position, +0x08 refcount). If these bytes stop
     # matching, re-read the layout before trusting the transform.
-    {"name": "memory_file_ctor", "rva": 0xCE9280,
+    {"name": "memory_file_ctor", "rva": 0xCE92F0,
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 "
                "48 89 6C 24 50 48 89 74 24 58 41 8B F1 49",
      "used": "own_movie: source of the memory-file field offsets"},
@@ -187,21 +187,21 @@ ANCHORS = [
     # build time and it is exactly what a future patch-break investigation would want if that module
     # is ever built back in. The `used` fields below therefore describe the module's INTENDED
     # consumers, not live call sites.
-    {"name": "rawimage_create", "rva": 0x114A7B0,
+    {"name": "rawimage_create", "rva": 0x114A820,
      "bytes": "89 54 24 10 89 4C 24 08 56 57 41 54",
      "used": "sfimage::create_resource (Render::RawImage::Create)"},
-    {"name": "image_resource_ctor", "rva": 0xD61C20,
+    {"name": "image_resource_ctor", "rva": 0xD61C90,
      "bytes": "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 48 "
                "49 8B C0 48 8B DA 48 8B F9 45",
      "used": "sfimage::create_resource (CS::ScaleformImageResource)"},
-    {"name": "draw_image_into_clip", "rva": 0xD83380,
+    {"name": "draw_image_into_clip", "rva": 0xD833F0,
      "bytes": "48 8B C4 48 89 50 10 56 57 41 54 41 56 41 57 48 83 EC 60 48 C7 40 98",
      "used": "sfimage::draw_into"},
     # sfimage::ensure_child_clip no longer CALLS this: it dispatches through the value's own
     # ObjectInterface vtable (slot 29), which is correct for either VM. The anchor stays so
     # that a patch shifting the interface layout is still caught - if these bytes ever stop
     # matching, re-derive the slot index before trusting the icon path.
-    {"name": "create_empty_movie_clip_as3", "rva": 0x10E1BA0,
+    {"name": "create_empty_movie_clip_as3", "rva": 0x10E1C10,
      "bytes": "4C 8B DC 55 56 41 56 41 57 48 8B",
      "used": "sfimage: expected occupant of ObjectInterface vtable slot 29"},
 

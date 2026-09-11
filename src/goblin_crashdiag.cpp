@@ -688,8 +688,40 @@ namespace
     std::atomic<uint64_t> g_faults{0};
     // The busiest faulting sites, as module-relative addresses. A tiny fixed table: a read loop
     // that stalls the game faults from one or two places, and those are the ones worth naming.
-    struct FaultSite { std::atomic<uint32_t> rva; std::atomic<uint32_t> hits; };
-    FaultSite g_sites[8];
+    // Keyed by (reader, caller): the reader is the guarded primitive that faulted (v3_read64 and
+    // its kin - the same handful every time), the caller is the frame above it, which is the one a
+    // fix has to look at. One RtlVirtualUnwind step, only for faults inside our own image.
+    struct FaultSite { std::atomic<uint32_t> rva; std::atomic<uint32_t> caller; std::atomic<uint32_t> hits; };
+    FaultSite g_sites[12];
+
+    // The frame above the faulting instruction, as our module-relative address; 0 when it is not
+    // ours (an engine callback into a guarded helper) or cannot be established.
+    uint32_t caller_rva(const CONTEXT *ctx)
+    {
+        CONTEXT c = *ctx;
+        ULONG64 image_base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
+        if (rf)
+        {
+            void *handler_data = nullptr;
+            ULONG64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, rf, &c, &handler_data, &establisher, nullptr);
+        }
+        else
+        {
+            // Leaf function: the return address is at the top of the stack.
+            __try
+            {
+                c.Rip = *reinterpret_cast<const ULONG64 *>(c.Rsp);
+                c.Rsp += 8;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return 0;
+            }
+        }
+        return (c.Rip >= g_self_lo && c.Rip < g_self_hi) ? static_cast<uint32_t>(c.Rip - g_self_lo) : 0;
+    }
 
     LONG CALLBACK count_fault(EXCEPTION_POINTERS *info)
     {
@@ -698,10 +730,11 @@ namespace
         {
             g_faults.fetch_add(1, std::memory_order_relaxed);
             const uint32_t rva = static_cast<uint32_t>(at - g_self_lo);
+            const uint32_t caller = info->ContextRecord ? caller_rva(info->ContextRecord) : 0;
             for (auto &s : g_sites)
             {
                 const uint32_t have = s.rva.load(std::memory_order_relaxed);
-                if (have == rva)
+                if (have == rva && s.caller.load(std::memory_order_relaxed) == caller)
                 {
                     s.hits.fetch_add(1, std::memory_order_relaxed);
                     break;
@@ -711,6 +744,7 @@ namespace
                     uint32_t expect = 0;
                     if (s.rva.compare_exchange_strong(expect, rva, std::memory_order_relaxed))
                     {
+                        s.caller.store(caller, std::memory_order_relaxed);
                         s.hits.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
@@ -747,11 +781,17 @@ std::string goblin::crashdiag::fault_report()
     for (auto &s : g_sites)
     {
         const uint32_t rva = s.rva.load(std::memory_order_relaxed);
+        const uint32_t caller = s.caller.load(std::memory_order_relaxed);
         const uint32_t hits = s.hits.exchange(0, std::memory_order_relaxed);
         if (rva && hits)
-            where += (where.empty() ? "" : ", ") + std::string("mod+0x") +
-                     [&] { char b[16]; _snprintf_s(b, sizeof b, _TRUNCATE, "%X", rva); return std::string(b); }() +
-                     " x" + std::to_string(hits);
+        {
+            char b[48];
+            if (caller)
+                _snprintf_s(b, sizeof b, _TRUNCATE, "mod+0x%X<-mod+0x%X x%u", rva, caller, hits);
+            else
+                _snprintf_s(b, sizeof b, _TRUNCATE, "mod+0x%X<-(engine) x%u", rva, hits);
+            where += (where.empty() ? "" : ", ") + std::string(b);
+        }
     }
     return "first-chance faults raised by our own reads: " + std::to_string(n) +
            (where.empty() ? std::string() : " (" + where + ")");

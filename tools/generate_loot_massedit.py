@@ -541,7 +541,9 @@ LOOT_CATEGORIES = {
         'startId': 5500000,
     },
     'Loot - Dragon Hearts': {
-        'filter': lambda items: any(i['id'] == 10060 and i['category'] == 1 for i in items),
+        # 10060 Dragon Heart, 2008011 Heart of Bayle (the same Dragon Communion currency)
+        'filter': lambda items: any(i['id'] in (10060, 2008011) and i['category'] == 1
+                                    for i in items),
         'iconId': 413,
         'startId': 5510000,
     },

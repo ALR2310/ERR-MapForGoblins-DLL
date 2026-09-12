@@ -59,6 +59,46 @@ def _stage_file(src: Path, dst: Path) -> str:
     return how
 
 
+# A KRAK DCX whose header version is not the 0x11000 every Elden Ring file carries. The game reads
+# it; SoulsFormats asserts the field and throws, and every stage that reads the file skips it
+# whole. Measured 2026-09-11: VINS 1.9.1 ships m60_52_38_00.emevd.dcx (Radahn's map) with version
+# 0x1000 - one file in 1940, with no other header difference - and Radahn lost his boss-bar name,
+# hence his Great Rune marker. Such a file is staged as a COPY with the field set to 0x11000 (never
+# a hardlink: patching a link would rewrite the mod's own file). The copy's mtime is the source's
+# plus kNormalizedMtimeBumpNs, so stages that hash this directory by (size, mtime) see the change
+# and the up-to-date check below can still recognise an unchanged normalized copy.
+_KRAK_DCX_VERSION = 0x11000
+_NORMALIZED_MTIME_BUMP_NS = 1_000_000
+
+
+def _dcx_version_to_fix(src: Path):
+    """The header version of a KRAK DCX that SoulsFormats would refuse, else None."""
+    if src.suffix.lower() != ".dcx":
+        return None
+    try:
+        with open(src, "rb") as f:
+            head = f.read(0x2C)
+    except OSError:
+        return None
+    if len(head) < 0x2C or head[:4] != b"DCX\x00" or head[0x28:0x2C] != b"KRAK":
+        return None
+    version = int.from_bytes(head[4:8], "big")
+    return version if version != _KRAK_DCX_VERSION else None
+
+
+def _stage_normalized(src: Path, dst: Path) -> str:
+    """Copy src to dst with the DCX header version set to 0x11000 (see above)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    data = bytearray(src.read_bytes())
+    data[4:8] = _KRAK_DCX_VERSION.to_bytes(4, "big")
+    tmp = Path(tempfile.mktemp(dir=str(dst.parent), prefix=".staging_"))
+    tmp.write_bytes(bytes(data))
+    st = src.stat()
+    os.utime(str(tmp), ns=(st.st_atime_ns, st.st_mtime_ns + _NORMALIZED_MTIME_BUMP_NS))
+    os.replace(str(tmp), str(dst))
+    return "normalized"
+
+
 def _same_file(a: Path, b: Path) -> bool:
     try:
         sa, sb = a.stat(), b.stat()
@@ -118,10 +158,24 @@ def main():
 
     plan = collect_plan(overlay, base)
     staged = skipped = 0
-    counts = {"link": 0, "copy": 0}
+    counts = {"link": 0, "copy": 0, "normalized": 0}
     new_manifest = {}
     for rel, src in sorted(plan.items()):
         dst = merged / rel
+        bad_version = _dcx_version_to_fix(src)
+        if bad_version is not None:
+            key = f"{src}#dcx-version-0x{bad_version:X}-normalized"
+            new_manifest[rel] = key
+            if (manifest.get(rel) == key and dst.exists() and not _same_file(src, dst)
+                    and dst.stat().st_size == src.stat().st_size
+                    and dst.stat().st_mtime_ns == src.stat().st_mtime_ns + _NORMALIZED_MTIME_BUMP_NS):
+                skipped += 1
+                continue
+            counts[_stage_normalized(src, dst)] += 1
+            staged += 1
+            print(f"  {rel}: DCX header version 0x{bad_version:X} -> 0x{_KRAK_DCX_VERSION:X} "
+                  f"in the staged copy (the mod's file is untouched)")
+            continue
         new_manifest[rel] = str(src)
         if manifest.get(rel) == str(src) and dst.exists() and _same_file(src, dst):
             skipped += 1
@@ -151,8 +205,8 @@ def main():
     print(f"Merged source staged: {merged}")
     print(f"  total {len(plan)} files ({ov_count} from overlay, "
           f"{len(plan) - ov_count} from vanilla); "
-          f"{staged} (re)staged ({counts['link']} linked, {counts['copy']} copied), "
-          f"{skipped} up-to-date")
+          f"{staged} (re)staged ({counts['link']} linked, {counts['copy']} copied, "
+          f"{counts['normalized']} header-normalized), {skipped} up-to-date")
     return 0
 
 

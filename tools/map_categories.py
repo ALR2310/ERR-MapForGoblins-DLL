@@ -32,6 +32,8 @@ CATEGORIES = [
     ('Key - Pots n Perfumes', 'pots_n_perfumes', 'pots_n_perfumes.png'),
     ('Key - Seeds Tears Ashes', 'seeds_tears', 'seed.png'),
     ('Key - Scadutree Fragments', 'scadutree_fragments', 'skadu.png'),
+    ('Key - Revered Spirit Ashes', 'revered_spirit_ashes', 'revered_ash.png'),
+    ('Key - Spectral Steed Regalia', 'spectral_steed_regalia', 'torrent.png'),
     ('Key - Whetblades', 'whetblades', 'whetblade.png'),
     ('Key - Great Runes', 'great_runes', 'great.png'),
     ('Reforged - Items', 'items_and_changes', 'reforged.png'),
@@ -80,6 +82,7 @@ CATEGORIES = [
     ('World - Spiritspring Hawks', 'spiritspring_hawks', 'stormhawk.png'),
     ('World - Bosses', 'bosses', 'boss.png'),
     ('World - Hostile NPC', 'hostile_npc', 'npc.png'),
+    ('World - Strong Enemies', 'strong_enemies', 'strong_enemy.png'),
     ("World - Hero's Tomb Statues", 'hero_tomb_statues', 'statue.png'),
 ]
 

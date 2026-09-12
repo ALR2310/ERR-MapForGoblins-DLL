@@ -19,7 +19,7 @@
     <row kind="SubPage" target-page="progress" label="Progress" label-textid="TabProgress" value="&gt;" red-when="a category is isolated on the map"/>
     <row kind="SubPage" target-page="hidden" label="Hidden markers" label-textid="HiddenMarkers" value="&lt;count&gt;  &gt;"/>
     <row kind="SubPage" target-page="101" label="Compatibility" value="&lt;count of visible rows&gt;  &gt;" help="Options for running alongside other mods that change item placement."/>
-    <row kind="SubPage" target-page="102" label="Menu settings" value="&lt;count of visible rows&gt;  &gt;"/>
+    <row kind="SubPage" target-page="102" label="Mod settings" value="&lt;count of visible rows&gt;  &gt;"/>
     <row kind="SubPage" target-page="103" label="Debug" value="&lt;count of visible rows&gt;  &gt;" help="Diagnostics, shown on the overlay's Debug tab."/>
     <row kind="SubPage" target-page="addon-pages" label="&lt;one row per page registered by another mod&gt;" note="sdk/mfg_menu_api.h; ids from addon-base"/>
     <row kind="Info" label="&lt;not in the menu on purpose&gt;" note="native_menu (switching the menu off from inside it) and the overlay-only settings (window geometry, opacity, font scale, render mode) stay ini-only"/>
@@ -30,8 +30,8 @@
     <row kind="Toggle" ini-key="show_armaments" config-var="showArmaments" ini-type="Bool" default="true" label="Armaments" icon-id="2" help="Weapons, shields, bows, staves, etc."/>
     <row kind="Toggle" ini-key="show_armour" config-var="showArmour" ini-type="Bool" default="true" label="Armour" icon-id="3" help="Armor pieces (helms, chest, gauntlets, legs)"/>
     <row kind="Toggle" ini-key="show_ashes_of_war" config-var="showAshesOfWar" ini-type="Bool" default="true" label="Ashes of War" icon-id="4" help="Ashes of War (weapon skills)"/>
-    <row kind="Toggle" ini-key="show_spirits" config-var="showSpirits" ini-type="Bool" default="true" label="Spirit Ashes" icon-id="56" help="Spirit Ashes (summons)"/>
-    <row kind="Toggle" ini-key="show_talismans" config-var="showTalismans" ini-type="Bool" default="true" label="Talismans" icon-id="62" help="Talismans"/>
+    <row kind="Toggle" ini-key="show_spirits" config-var="showSpirits" ini-type="Bool" default="true" label="Spirit Ashes" icon-id="57" help="Spirit Ashes (summons)"/>
+    <row kind="Toggle" ini-key="show_talismans" config-var="showTalismans" ini-type="Bool" default="true" label="Talismans" icon-id="63" help="Talismans"/>
     <row kind="Info" label="Key Items" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_celestial_dew" config-var="showCelestialDew" ini-type="Bool" default="true" label="Celestial Dew" icon-id="7" help="Celestial Dew (for Absolution at the Church of Vows, which reverses NPC hostility)"/>
     <row kind="Toggle" ini-key="show_cookbooks" config-var="showCookbooks" ini-type="Bool" default="true" label="Cookbooks" icon-id="10" help="Cookbooks (crafting recipes)"/>
@@ -41,17 +41,18 @@
     <row kind="Toggle" ini-key="show_larval_tears" config-var="showLarvalTears" ini-type="Bool" default="true" label="Larval Tears" icon-id="33" help="Larval Tears (respec items)"/>
     <row kind="Toggle" ini-key="show_lost_ashes" config-var="showLostAshes" ini-type="Bool" default="true" label="Lost Ashes of War" icon-id="34" help="Lost Ashes of War"/>
     <row kind="Toggle" ini-key="show_pots_n_perfumes" config-var="showPotsNPerfumes" ini-type="Bool" default="true" label="Pots &amp; Perfume Bottles" icon-id="40" help="Cracked Pots, Ritual Pots, Perfume Bottles"/>
-    <row kind="Toggle" ini-key="show_scadutree_fragments" config-var="showScadutreeFragments" ini-type="Bool" default="true" label="Scadutree Fragments" icon-id="47" help="Scadutree Fragments (DLC blessing upgrade)"/>
-    <row kind="Toggle" ini-key="show_seeds_tears" config-var="showSeedsTears" ini-type="Bool" default="true" label="Golden Seeds &amp; Sacred Tears" icon-id="50" help="Golden Seeds, Sacred Tears, Revered Spirit Ashes"/>
-    <row kind="Toggle" ini-key="show_whetblades" config-var="showWhetblades" ini-type="Bool" default="true" label="Whetblades" icon-id="65" help="Whetblades (weapon infusion types)"/>
+    <row kind="Toggle" ini-key="show_scadutree_fragments" config-var="showScadutreeFragments" ini-type="Bool" default="true" label="Scadutree Fragments" icon-id="48" help="Scadutree Fragments (DLC blessing upgrade)"/>
+    <row kind="Toggle" ini-key="show_revered_spirit_ashes" config-var="showReveredSpiritAshes" ini-type="Bool" default="true" label="Revered Spirit Ashes" icon-id="45" help="Revered Spirit Ashes (DLC spirit ash blessing upgrade)"/>
+    <row kind="Toggle" ini-key="show_seeds_tears" config-var="showSeedsTears" ini-type="Bool" default="true" label="Golden Seeds &amp; Sacred Tears" icon-id="51" help="Golden Seeds, Sacred Tears"/>
+    <row kind="Toggle" ini-key="show_whetblades" config-var="showWhetblades" ini-type="Bool" default="true" label="Whetblades" icon-id="66" help="Whetblades (weapon infusion types)"/>
     <row kind="Info" label="Loot" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_ammo" config-var="showAmmo" ini-type="Bool" default="true" label="Ammunition" icon-id="0" help="Arrows, bolts, greatarrows, greatbolts"/>
     <row kind="Toggle" ini-key="show_bell_bearings" config-var="showBellBearings" ini-type="Bool" default="true" label="Bell Bearings" icon-id="5" help="Bell Bearings from treasures/chests/quest rewards"/>
     <row kind="Toggle" ini-key="show_merchant_bell_bearings" config-var="showMerchantBellBearings" ini-type="Bool" default="true" label="Merchant Bell Bearings" icon-id="37" help="Bell Bearings dropped by killing merchants (Kale, Patches, Gostoc,&#10;nomadic merchants, etc.)"/>
     <row kind="Toggle" ini-key="show_consumables" config-var="showConsumables" ini-type="Bool" default="true" label="Consumables" icon-id="9" help="Healing/buff consumables (boluses, cured meats, livers)"/>
     <row kind="Toggle" ini-key="show_greases" config-var="showGreases" ini-type="Bool" default="true" label="Greases" icon-id="22" help="Weapon greases"/>
-    <row kind="Toggle" ini-key="show_utilities" config-var="showUtilities" ini-type="Bool" default="true" label="Utility Items" icon-id="64" help="Utility items (rainbow stone, glowstone, soap, soft cotton)"/>
-    <row kind="Toggle" ini-key="show_stat_boosts" config-var="showStatBoosts" ini-type="Bool" default="true" label="Stat-Boost Items" icon-id="59" help="Stat-up items (Starlight Shards, Sacrificial Twig, Blessing of Marika)"/>
+    <row kind="Toggle" ini-key="show_utilities" config-var="showUtilities" ini-type="Bool" default="true" label="Utility Items" icon-id="65" help="Utility items (rainbow stone, glowstone, soap, soft cotton)"/>
+    <row kind="Toggle" ini-key="show_stat_boosts" config-var="showStatBoosts" ini-type="Bool" default="true" label="Stat-Boost Items" icon-id="60" help="Stat-up items (Starlight Shards, Sacrificial Twig, Blessing of Marika)"/>
     <row kind="Toggle" ini-key="show_crafting_materials" config-var="showCraftingMaterials" ini-type="Bool" default="true" label="Crafting Materials" icon-id="11" help="Crafting materials (flowers, bones, bugs, etc.)"/>
     <row kind="Toggle" ini-key="show_gloveworts" config-var="showGloveworts" ini-type="Bool" default="true" label="Gloveworts" icon-id="18" help="Gloveworts (Grave/Ghost [1-9]) - Spirit Ash upgrade materials"/>
     <row kind="Toggle" ini-key="show_golden_runes" config-var="showGoldenRunes" ini-type="Bool" default="true" label="Golden Runes (high)" icon-id="19" help="Golden Runes [4000+], Hero's/Numen's/Lord's/Shadow Realm Runes"/>
@@ -62,42 +63,42 @@
     <row kind="Toggle" ini-key="show_prattling_pates" config-var="showPrattlingPates" ini-type="Bool" default="true" label="Prattling Pates" icon-id="41" help="Prattling Pates"/>
     <row kind="Toggle" ini-key="show_gestures" config-var="showGestures" ini-type="Bool" default="true" label="Gestures" icon-id="17" help="Gestures"/>
     <row kind="Toggle" ini-key="show_reusables" config-var="showReusables" ini-type="Bool" default="true" label="Reusable Tools" icon-id="44" help="Reusable tools (Mimic Veil, Margit's Shackle, etc.)"/>
-    <row kind="Toggle" ini-key="show_smithing_stones" config-var="showSmithingStones" ini-type="Bool" default="true" label="Smithing Stones (high)" icon-id="51" help="Smithing Stones [7-8], Somber [7-9], Scadushards"/>
-    <row kind="Toggle" ini-key="show_smithing_stones_low" config-var="showSmithingStonesLow" ini-type="Bool" default="true" label="Smithing Stones (low)" icon-id="52" help="Smithing Stones [1-6], Somber [1-6]"/>
-    <row kind="Toggle" ini-key="show_smithing_stones_rare" config-var="showSmithingStonesRare" ini-type="Bool" default="true" label="Ancient Dragon Stones" icon-id="53" help="Ancient Dragon Smithing Stones (rare, endgame)"/>
-    <row kind="Toggle" ini-key="show_stonesword_keys" config-var="showStoneswordKeys" ini-type="Bool" default="true" label="Stonesword Keys" icon-id="60" help="Stonesword Keys"/>
-    <row kind="Toggle" ini-key="show_throwables" config-var="showThrowables" ini-type="Bool" default="true" label="Throwables" icon-id="63" help="Throwable items (darts, daggers, stones, chakrams, warming stones)"/>
-    <row kind="Toggle" ini-key="show_rune_arcs" config-var="showRuneArcs" ini-type="Bool" default="true" label="Rune Arcs" icon-id="45" help="Rune Arcs (buffs for active Great Rune)"/>
+    <row kind="Toggle" ini-key="show_smithing_stones" config-var="showSmithingStones" ini-type="Bool" default="true" label="Smithing Stones (high)" icon-id="52" help="Smithing Stones [7-8], Somber [7-9], Scadushards"/>
+    <row kind="Toggle" ini-key="show_smithing_stones_low" config-var="showSmithingStonesLow" ini-type="Bool" default="true" label="Smithing Stones (low)" icon-id="53" help="Smithing Stones [1-6], Somber [1-6]"/>
+    <row kind="Toggle" ini-key="show_smithing_stones_rare" config-var="showSmithingStonesRare" ini-type="Bool" default="true" label="Ancient Dragon Stones" icon-id="54" help="Ancient Dragon Smithing Stones (rare, endgame)"/>
+    <row kind="Toggle" ini-key="show_stonesword_keys" config-var="showStoneswordKeys" ini-type="Bool" default="true" label="Stonesword Keys" icon-id="61" help="Stonesword Keys"/>
+    <row kind="Toggle" ini-key="show_throwables" config-var="showThrowables" ini-type="Bool" default="true" label="Throwables" icon-id="64" help="Throwable items (darts, daggers, stones, chakrams, warming stones)"/>
+    <row kind="Toggle" ini-key="show_rune_arcs" config-var="showRuneArcs" ini-type="Bool" default="true" label="Rune Arcs" icon-id="46" help="Rune Arcs (buffs for active Great Rune)"/>
     <row kind="Toggle" ini-key="show_dragon_hearts" config-var="showDragonHearts" ini-type="Bool" default="true" label="Dragon Hearts" icon-id="14" help="Dragon Hearts (for Dragon Communion incantations)"/>
     <row kind="Info" label="Magic" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_incantations" config-var="showIncantations" ini-type="Bool" default="true" label="Incantations" icon-id="30" help="Incantation locations"/>
     <row kind="Toggle" ini-key="show_memory_stones" config-var="showMemoryStones" ini-type="Bool" default="true" label="Memory Stones" icon-id="36" help="Memory Stone locations (extra spell slots)"/>
     <row kind="Toggle" ini-key="show_prayerbooks" config-var="showPrayerbooks" ini-type="Bool" default="true" label="Prayerbooks &amp; Scrolls" icon-id="42" help="Prayerbooks and Scrolls (unlock spells at vendors)"/>
-    <row kind="Toggle" ini-key="show_sorceries" config-var="showSorceries" ini-type="Bool" default="true" label="Sorceries" icon-id="54" help="Sorcery locations"/>
+    <row kind="Toggle" ini-key="show_sorceries" config-var="showSorceries" ini-type="Bool" default="true" label="Sorceries" icon-id="55" help="Sorcery locations"/>
     <row kind="Info" label="Quest" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_deathroot" config-var="showDeathroot" ini-type="Bool" default="true" label="Deathroot" icon-id="13" help="Deathroot locations (for Gurranq)"/>
     <row kind="Toggle" ini-key="show_progression" config-var="showProgression" ini-type="Bool" default="true" label="Quest Items" icon-id="43" help="Quest progression items (medallions, keys, Needles, quest-specific goods)"/>
-    <row kind="Toggle" ini-key="show_seedbed_curses" config-var="showSeedbedCurses" ini-type="Bool" default="true" label="Seedbed Curses" icon-id="49" help="Seedbed Curse locations (for Dung Eater quest)"/>
+    <row kind="Toggle" ini-key="show_seedbed_curses" config-var="showSeedbedCurses" ini-type="Bool" default="true" label="Seedbed Curses" icon-id="50" help="Seedbed Curse locations (for Dung Eater quest)"/>
     <row kind="Info" label="World" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_bosses" config-var="showBosses" ini-type="Bool" default="true" label="Bosses" icon-id="6" help="Boss markers (field bosses, dungeon bosses)"/>
     <row kind="Toggle" ini-key="show_graces" config-var="showGraces" ini-type="Bool" default="true" label="Sites of Grace" icon-id="21" help="Sites of Grace"/>
     <row kind="Toggle" ini-key="show_hostile_npc" config-var="showHostileNPC" ini-type="Bool" default="true" label="Hostile NPCs" icon-id="27" help="Hostile NPC invader locations"/>
     <row kind="Toggle" ini-key="show_imp_statues" config-var="showImpStatues" ini-type="Bool" default="true" label="Imp Statues" icon-id="29" help="Imp Statue (Stonesword Key fog gate) locations"/>
     <row kind="Toggle" ini-key="show_paintings" config-var="showPaintings" ini-type="Bool" default="true" label="Paintings" icon-id="39" help="Painting locations"/>
-    <row kind="Toggle" ini-key="show_spirit_springs" config-var="showSpiritSprings" ini-type="Bool" default="true" label="Spirit Springs" icon-id="55" help="Spirit Spring (horse jump) locations"/>
-    <row kind="Toggle" ini-key="show_spiritspring_hawks" config-var="showSpiritspringHawks" ini-type="Bool" default="true" label="Spiritspring Hawks" icon-id="57" err-only="true" help="Spiritspring Hawk locations"/>
-    <row kind="Toggle" ini-key="show_stakes_of_marika" config-var="showStakesOfMarika" ini-type="Bool" default="true" label="Stakes of Marika" icon-id="58" help="Stakes of Marika (respawn points)"/>
-    <row kind="Toggle" ini-key="show_summoning_pools" config-var="showSummoningPools" ini-type="Bool" default="true" label="Summoning Pools" icon-id="61" help="Summoning Pool (Martyr Effigy) locations"/>
+    <row kind="Toggle" ini-key="show_spirit_springs" config-var="showSpiritSprings" ini-type="Bool" default="true" label="Spirit Springs" icon-id="56" help="Spirit Spring (horse jump) locations"/>
+    <row kind="Toggle" ini-key="show_spiritspring_hawks" config-var="showSpiritspringHawks" ini-type="Bool" default="true" label="Spiritspring Hawks" icon-id="58" err-only="true" help="Spiritspring Hawk locations"/>
+    <row kind="Toggle" ini-key="show_stakes_of_marika" config-var="showStakesOfMarika" ini-type="Bool" default="true" label="Stakes of Marika" icon-id="59" help="Stakes of Marika (respawn points)"/>
+    <row kind="Toggle" ini-key="show_summoning_pools" config-var="showSummoningPools" ini-type="Bool" default="true" label="Summoning Pools" icon-id="62" help="Summoning Pool (Martyr Effigy) locations"/>
     <row kind="Toggle" ini-key="show_kindling_spirits" config-var="showKindlingSpirits" ini-type="Bool" default="true" label="Kindling Spirits" icon-id="30" err-only="true" help="Kindling Spirits in Misty Forest - collect all 5 between rests for&#10;the Kindling Spirit incantation. Markers hide once you have the incantation."/>
     <row kind="Toggle" ini-key="show_interactables" config-var="showInteractables" ini-type="Bool" default="true" label="Interactables" icon-id="31" help="Interactive world objects &amp; puzzles: blue seal puzzles (unlock hidden&#10;cellars), light-flame interacts (Sellia chalices, Snow Town statues, Siofra&#10;River lanterns), and Hero's Tomb direction statues."/>
-    <row kind="Toggle" ini-key="show_world_maps" config-var="showWorldMaps" ini-type="Bool" default="true" label="Map Fragments" icon-id="66" help="World Map fragment locations"/>
+    <row kind="Toggle" ini-key="show_world_maps" config-var="showWorldMaps" ini-type="Bool" default="true" label="Map Fragments" icon-id="67" help="World Map fragment locations"/>
     <row kind="Toggle" ini-key="show_world_maps_ignore_fragments" config-var="worldMapsIgnoreFragments" ini-type="Bool" default="true" label="Show markers before mapped" help="Always show World Map fragment markers, even when map-fragment gating is on (so you can find a fragment before you own it)."/>
     <row kind="Toggle" ini-key="hide_killed_bosses" config-var="hideKilledBosses" ini-type="Bool" default="false" label="Hide killed bosses" help="Hide boss/invader/hawk markers after defeat (false = show green checkmark instead)"/>
     <row kind="Info" label="Reforged" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="show_ember_pieces" config-var="showEmberPieces" ini-type="Bool" default="true" label="Ember Pieces" icon-id="15" err-only="true" help="Ember Piece locations"/>
-    <row kind="Toggle" ini-key="show_items_and_changes" config-var="showItemsAndChanges" ini-type="Bool" default="true" label="Items &amp; Changes" icon-id="48" err-only="true" help="added items: Oracle Effigy/Remedy, Starlight Tokens, Sealed Curios"/>
+    <row kind="Toggle" ini-key="show_items_and_changes" config-var="showItemsAndChanges" ini-type="Bool" default="true" label="Items &amp; Changes" icon-id="49" err-only="true" help="added items: Oracle Effigy/Remedy, Starlight Tokens, Sealed Curios"/>
     <row kind="Toggle" ini-key="show_fortunes" config-var="showFortunes" ini-type="Bool" default="true" label="Fortunes" icon-id="16" err-only="true" help="Fortune trinkets (12 types)"/>
-    <row kind="Toggle" ini-key="show_rune_pieces" config-var="showRunePieces" ini-type="Bool" default="true" label="Rune Pieces" icon-id="46" err-only="true" help="Rune Piece locations"/>
+    <row kind="Toggle" ini-key="show_rune_pieces" config-var="showRunePieces" ini-type="Bool" default="true" label="Rune Pieces" icon-id="47" err-only="true" help="Rune Piece locations"/>
     <row kind="Info" label="ERR Markers" separator="true" note="valueless Info row -&gt; PadCategory frame (one wide caption)"/>
     <row kind="Toggle" ini-key="patch_overworld_boss_icons" config-var="patchOverworldBossIcons" ini-type="Bool" default="true" label="Overworld boss icons" err-only="true" help="Apply this mod's map-fragment discovery rule to ERR's overworld&#10;field-boss markers."/>
     <row kind="Toggle" ini-key="patch_dungeon_boss_icons" config-var="patchDungeonBossIcons" ini-type="Bool" default="true" label="Dungeon entrance icons" err-only="true" help="Apply this mod's map-fragment discovery rule to ERR's dungeon/cave&#10;entrance markers. Required for hide_dungeon_icons_on_clear below."/>
@@ -111,14 +112,15 @@
     <row kind="Toggle" ini-key="live_loot_icons" config-var="liveLootIcons" ini-type="Bool" default="MFG_LL_DEF" label="Live loot icons" help="Give each loot marker the icon and category of the item its lot currently&#10;gives, so icons and show_* toggles match the randomizer."/>
     <row kind="Toggle" ini-key="anonymous_loot" config-var="anonymousLoot" ini-type="Bool" default="false" label="Anonymous loot" icon-id="1" help="Spoiler-free: every loot marker shows a gray &quot;?&quot; and a generic label instead&#10;of the real item. Overrides live_loot_labels/icons; markers still hide on pickup."/>
   </page>
-  <page id="102" kind="layout" title="Menu settings">
+  <page id="102" kind="layout" title="Mod settings">
     <row kind="Info" ini-key="enable_toggle_hotkey" config-var="enableToggleHotkey" ini-type="Bool" default="true" label="Enable toggle hotkey" read-only="true" note="shown with its value as a greyed Info row - cannot be changed here" help="Enable toggle_key / toggle_gamepad_combo to switch ALL map icons on/off when&#10;the overlay is DISABLED. (When the overlay is enabled, they open it instead.)"/>
-    <row kind="Rebind" ini-key="toggle_key" config-var="toggleInjectionKey" ini-type="VkKey" default="F10" label="Toggle key" help="Keyboard toggle: OPENS the config overlay when enable_overlay is on, or&#10;toggles ALL map icons on/off when the overlay is disabled. Default: F10."/>
+    <row kind="Rebind" ini-key="toggle_key" config-var="toggleInjectionKey" ini-type="VkKey" default="F10" label="Toggle key" help="Keyboard toggle: OPENS the config overlay when menu_enabled is on, or&#10;toggles ALL map icons on/off when the overlay is disabled. Default: F10."/>
     <row kind="Rebind" ini-key="toggle_gamepad_combo" config-var="toggleGamepadMask" ini-type="GamepadMask" default="Y+R3" label="Toggle gamepad combo" help="Gamepad toggle, same role as toggle_key: opens the overlay, or switches ALL map&#10;icons on/off when the overlay is disabled. In the menu you simply press the buttons&#10;you want. Editing this file by hand takes names joined with '+' (A, B, X, Y, LB, RB,&#10;L3, R3, BACK, START, UP, DOWN, LEFT, RIGHT). Default: Y+R3."/>
     <row kind="Toggle" ini-key="enable_manual_hide" config-var="enableManualHide" ini-type="Bool" default="true" label="Manual marker hide" help="Hover a marker on the world map and press the hide key to hide it. Hidden markers persist and can be restored on the Hidden tab."/>
     <row kind="Rebind" ini-key="hide_marker_key" config-var="hideMarkerKey" ini-type="VkKey" default="Delete" label="Hide-marker key" help="Key that hides the map marker currently under the cursor."/>
-    <row kind="Rebind" ini-key="hide_marker_gamepad" config-var="hideMarkerGamepad" ini-type="GamepadMask" default="RB" label="Hide-marker button" help="Gamepad button that hides the map marker under the cursor (same as the hide-marker key)."/>
+    <row kind="Rebind" ini-key="hide_marker_gamepad" config-var="hideMarkerGamepad" ini-type="GamepadMask" default="none" label="Hide-marker button" help="Gamepad button that hides the map marker under the cursor (same as the hide-marker key). RB is also the map's own tab-switch button, so it is easy to press by accident - set this to &quot;none&quot; to unbind it."/>
     <row kind="Toggle" ini-key="hover_info" config-var="enableHoverInfo" ini-type="Bool" default="true" label="Marker hover info" help="While the map is open, show a small panel on the LEFT telling you how far above or&#10;below you the marker under the cursor sits. Its name is not repeated there - the&#10;game's own popup already shows it."/>
+    <row kind="Number" ini-key="map_panel_offset_percent" config-var="mapPanelOffsetPercent" ini-type="Float" default="100" label="Map panel position" help="Where the marker tooltip and the focus banner sit on the map screen. 100 is the corner they were designed for, 0 is the centre. Above 100 pushes them further left. Applies immediately, no need to reopen the map."/>
   </page>
   <page id="103" kind="layout" title="Debug">
     <row kind="Toggle" ini-key="debug_logging" config-var="debugLogging" ini-type="Bool" default="false" label="Debug logging" help="Enable verbose debug logging (memory addresses, param details, FMG internals)"/>

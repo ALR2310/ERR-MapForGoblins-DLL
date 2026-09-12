@@ -34,6 +34,7 @@
 #include "goblin_config.hpp"
 #include "goblin_native_menu.hpp" // key_swallowed: do not act on the press that just got bound
 #include "goblin_config_schema.hpp"
+#include "goblin_float_ranges.hpp" // slider ranges shared with the in-game menu
 #include "goblin_i18n.hpp"
 #include "goblin_overlay_icons.hpp"
 #include "goblin_map_icons.hpp" // shared DefineBitsLossless2 icon tags (decoded here for the atlas)
@@ -448,8 +449,11 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
             if (goblin::profile_is_vanilla() && e.err_only)
                 continue;
             if (std::strcmp(e.key, "overlay_font_scale") == 0 ||
-                std::strcmp(e.key, "overlay_opacity") == 0)
+                std::strcmp(e.key, "overlay_opacity") == 0 ||
+                std::strcmp(e.key, "map_panel_offset_percent") == 0)
                 continue; // shown as prominent sliders at the top of the Settings tab
+            if (std::strcmp(e.key, "search_hide_collected") == 0)
+                continue; // lives on the Search tab, next to the results it filters
             if (std::strncmp(e.key, "overlay_window_", 15) == 0)
                 continue; // auto-managed window geometry (saved on close) - not a UI control
             if (std::strcmp(e.key, "enable_manual_hide") == 0 ||
@@ -566,6 +570,28 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                 }
                 hovered = hovered || ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
             }
+            else if (e.type == goblin::IniType::Float)
+            {
+                // Until 2026-09-11 there was no Float branch, so these rows fell into the key/combo
+                // rebind branch below and offered "rebind" for a size factor.
+                inline_label();
+                float &value = *static_cast<float *>(e.target);
+                if (const goblin::FloatRange *r = goblin::float_range(e.key))
+                {
+                    ImGui::SetNextItemWidth(inline_ctrl_w());
+                    ImGui::SliderFloat("##k", &value, r->min, r->max, r->format,
+                                       ImGuiSliderFlags_AlwaysClamp);
+                    // The value itself is live while dragging (the marker code reads it every tick);
+                    // the full re-apply runs once, on release, not on every frame of the drag.
+                    if (ImGui::IsItemDeactivatedAfterEdit())
+                        changed = true;
+                }
+                else
+                {
+                    ImGui::TextDisabled("%.2f", value); // no editable range: shown, not offered
+                }
+                hovered = hovered || ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
+            }
             else if (e.type == goblin::IniType::Text)
             {
                 // Read-only. The one Text key is menu_render_mode, and it is ini_only - it decides
@@ -576,7 +602,8 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                 ImGui::TextDisabled("%s", static_cast<std::string *>(e.target)->c_str());
                 hovered = hovered || ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
             }
-            else // VkKey / GamepadMask: name + value + in-place rebind, all on one line
+            else if (e.type == goblin::IniType::VkKey || e.type == goblin::IniType::GamepadMask)
+                // name + value + in-place rebind, all on one line
             {
                 const bool is_key = e.type == goblin::IniType::VkKey;
                 const std::string val =
@@ -636,17 +663,19 @@ void draw_settings_tab()
         if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
         ImGui::TextDisabled("%s", key);
     };
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-    ImGui::SliderFloat(tr::tr(tr::TextId::OverlayTextSize, lang), &goblin::config::fontScale, 0.8f, 3.0f,
-                       "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+    // Ranges from the table the in-game menu reads too (goblin_float_ranges.hpp).
+    auto top_slider = [](const char *label, float *value, const char *key) {
+        const goblin::FloatRange *r = goblin::float_range(key);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+        ImGui::SliderFloat(label, value, r->min, r->max, r->format, ImGuiSliderFlags_AlwaysClamp);
+    };
+    top_slider(tr::tr(tr::TextId::OverlayTextSize, lang), &goblin::config::fontScale, "overlay_font_scale");
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("%s", tr::tr(tr::TextId::OverlayTextSizeTip, lang));
     slider_key("overlay_font_scale");
 
     // Overlay panel opacity (window bg alpha). Persisted to overlay_opacity on close.
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-    ImGui::SliderFloat(tr::tr(tr::TextId::OverlayOpacity, lang), &goblin::config::overlayOpacity, 0.3f, 1.0f,
-                       "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    top_slider(tr::tr(tr::TextId::OverlayOpacity, lang), &goblin::config::overlayOpacity, "overlay_opacity");
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("%s", tr::tr(tr::TextId::OverlayOpacityTip, lang));
     slider_key("overlay_opacity");
@@ -657,10 +686,8 @@ void draw_settings_tab()
     // left edge is identical in all of them, so on every .gfx we have the panels land in the same
     // place. Rather than guess at a mechanism we cannot observe, let the player move them.
     // Read every frame the tooltip draws, so dragging this moves the panel with the map still open.
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-    ImGui::SliderFloat(tr::tr(tr::TextId::MapPanelOffset, lang),
-                       &goblin::config::mapPanelOffsetPercent, -50.0f, 200.0f, "%.0f%%",
-                       ImGuiSliderFlags_AlwaysClamp);
+    top_slider(tr::tr(tr::TextId::MapPanelOffset, lang), &goblin::config::mapPanelOffsetPercent,
+               "map_panel_offset_percent");
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("%s", tr::tr(tr::TextId::MapPanelOffsetTip, lang));
     slider_key("map_panel_offset_percent");
@@ -979,10 +1006,12 @@ static void draw_search_tab()
         s_done_t = ImGui::GetTime();
     }
     // Group open/closed state is per query: new letters mean a new result set, so the tree
-    // starts over (small sets open, large ones collapsed).
+    // starts over - every region open, because the point of typing a name is to see where it is.
+    // (Sets above 60 hits used to start collapsed; at most kMaxHits rows are submitted, and ImGui
+    // draws only the visible ones, on the overlay's own thread.)
     uint32_t qhash = 2166136261u;
     for (const char *c = g_search_buf; *c; ++c) qhash = (qhash ^ static_cast<uint8_t>(*c)) * 16777619u;
-    const bool open_all = res.total <= 60;
+    const bool open_all = true;
 
     ImGui::BeginChild("##searchscroll", ImVec2(0, 0), ImGuiChildFlags_NavFlattened);
     ImGui::PushID(static_cast<int>(qhash));
@@ -2973,6 +3002,8 @@ static void sc2_frontend_loop()
             cte::overlay::present::arm_adoption(game);
             armed = true;
         }
+        if (armed)
+            cte::overlay::present::service_adoption();
 
         poll_gamepad();
         update_menu_toggle();
@@ -2981,6 +3012,10 @@ static void sc2_frontend_loop()
         const bool canvas_ok = canvas.ready && canvas.width > 0 && canvas.height > 0;
 
         const bool open = g_menu_open.load();
+        static bool s_was_open = false;
+        if (s_was_open && !open)
+            cte::overlay::present::log_render_stats(); // the tail of a short open, before the 3 s tick
+        s_was_open = open;
         // The overlay now draws NOTHING but the F10 menu. The hover tooltip, the focus banner and
         // the projected highlight rings were retired on 2026-07-28: all three exist natively (the
         // MfgTip / MfgBanner panels in goblin_maphover.cpp and the glow-icon swap in
@@ -2999,6 +3034,8 @@ static void sc2_frontend_loop()
                          cte::overlay::present::observed_swapchain_creation(),
                          canvas.ready, canvas.width, canvas.height,
                          cte::overlay::present::renderer_healthy());
+            if (open)
+                cte::overlay::present::log_render_stats();
         }
 
         if (!want || !canvas_ok)

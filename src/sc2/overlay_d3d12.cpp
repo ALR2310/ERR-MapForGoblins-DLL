@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1053,6 +1054,46 @@ struct Session::Impl {
     }
 };
 
+std::atomic<const char*> g_last_render_skip{nullptr};
+
+const char* last_render_skip() noexcept {
+    return g_last_render_skip.load(std::memory_order_relaxed);
+}
+
+void* streamline_native(void* proxy) noexcept {
+    using SlGetNativeInterfaceFn = int (*)(void* proxy, void** native);
+    static const SlGetNativeInterfaceFn get_native = [] {
+        HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
+        return interposer ? reinterpret_cast<SlGetNativeInterfaceFn>(
+                                GetProcAddress(interposer, "slGetNativeInterface"))
+                          : nullptr;
+    }();
+    if (!get_native || !proxy) return nullptr;
+    void* native = nullptr;
+    if (get_native(proxy, &native) != 0 || !native || native == proxy) return nullptr;
+    return native;
+}
+
+const char* device_reaches(ID3D12Device* queue_device, ID3D12Device* swap_device) noexcept {
+    if (!queue_device || !swap_device) return nullptr;
+    void* const target = com_identity(swap_device);
+    if (!target) return nullptr;
+    if (com_identity(queue_device) == target) return "same device";
+    // A wrapper device normally hands out the real device's children, so a fence it creates
+    // names the device underneath as its owner.
+    ComPtr<ID3D12Fence> fence;
+    if (SUCCEEDED(queue_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) &&
+        fence) {
+        ComPtr<ID3D12Device> owner;
+        if (SUCCEEDED(fence->GetDevice(IID_PPV_ARGS(&owner))) && owner &&
+            com_identity(owner.Get()) == target)
+            return "fence owner";
+    }
+    if (void* native = streamline_native(queue_device))
+        if (com_identity(static_cast<IUnknown*>(native)) == target) return "Streamline";
+    return nullptr;
+}
+
 Session::Session() : impl_(std::make_unique<Impl>()) {}
 Session::~Session() = default;
 
@@ -1068,12 +1109,12 @@ bool Session::initialize(IDXGISwapChain3* swapchain,
     if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&swap_device))) || !swap_device ||
         FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device))) || !queue_device)
         return false;
-    if (com_identity(swap_device.Get()) != com_identity(queue_device.Get()))
+    if (!device_reaches(queue_device.Get(), swap_device.Get()))
         return false;
     // The renderer's heaps/resources intentionally target node zero.  A
     // linked-adapter implementation needs per-node creation masks and the
     // ResizeBuffers1 queue array tracked per backbuffer; fail closed here.
-    if (swap_device->GetNodeCount() != 1)
+    if (queue_device->GetNodeCount() != 1)
         return false;
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -1116,7 +1157,9 @@ bool Session::initialize(IDXGISwapChain3* swapchain,
         desc.Height = resource_desc.Height;
     }
 
-    impl_->device = swap_device;
+    // Everything is created on the QUEUE's device, the way the game does it: behind a wrapper
+    // layer that is the wrapper, and only command lists it made itself are safe to hand its queue.
+    impl_->device = queue_device;
     impl_->queue = queue;
     impl_->swapchain_identity = com_identity(swapchain);
     impl_->queue_identity = com_identity(queue);
@@ -1193,12 +1236,16 @@ RenderResult Session::render(
     const frame::frame_packet* packet,
     const frame::font_atlas_packet* font,
     ColorMode color_mode) {
+    auto skip = [](const char* why) {
+        g_last_render_skip.store(why, std::memory_order_relaxed);
+        return RenderResult::Skipped;
+    };
     if (!impl_->initialized || !swapchain || !packet || !font ||
         packet->font_generation != font->generation ||
         packet->display_size.x <= 0.0f || packet->display_size.y <= 0.0f)
-        return RenderResult::Skipped;
+        return skip("renderer: no usable packet or font");
     if (packet->vertices.empty() || packet->indices.empty())
-        return RenderResult::Skipped;
+        return skip("renderer: empty geometry");
 
     bool has_draw = false;
     for (const frame::draw_command& command : packet->commands) {
@@ -1213,7 +1260,7 @@ RenderResult Session::render(
             return RenderResult::RecoverableFailure;
         has_draw = true;
     }
-    if (!has_draw) return RenderResult::Skipped;
+    if (!has_draw) return skip("renderer: no draw commands");
 
     const uint32_t slot_index = swapchain->GetCurrentBackBufferIndex();
     if (slot_index >= impl_->slots.size()) return RenderResult::RecoverableFailure;
@@ -1228,14 +1275,14 @@ RenderResult Session::render(
         hdr_bounds = impl_->draw_bounds(*packet);
         if (hdr_bounds.right <= hdr_bounds.left ||
             hdr_bounds.bottom <= hdr_bounds.top)
-            return RenderResult::Skipped;
+            return skip("renderer: empty HDR bounds");
     }
 
     // Never wait in Present.  If the game outruns our tiny overlay queue work,
     // omit one UI frame and preserve game pacing instead of stalling the CPU.
     if (slot.fence_value != 0 &&
         impl_->fence->GetCompletedValue() < slot.fence_value)
-        return RenderResult::Skipped;
+        return skip("renderer: this buffer's previous overlay frame has not completed on the GPU");
 
     slot.transient_uploads.clear();
     impl_->collect_retired();

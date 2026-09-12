@@ -57,9 +57,20 @@ def main():
     MSB_DIR = ERR_MOD_DIR / 'map' / 'MapStudio'
 
     # Step 1: Find painting events in EMEVD (flags 580000-580199)
+    # Every painting is initialised by TWO events, in two different maps:
+    #   PICKUP - where the painting itself lies. Common template 90005632, or a per-map DLC
+    #            template (2046402550, 2047422550, 21002600): args [0, tmpl, flag, entity, textId]
+    #            with textId = flag - 500000 (the painting's own text, 80000..80120).
+    #   REWARD - the painted vista, where the reward appears once the painting is owned.
+    #            Common template 90005633 or a per-map DLC one (2045432550 ...): args
+    #            [0, tmpl, rewardFlag 5803xx/5804xx, flag, entity (the reward's enemy), ...].
+    # The marker names the painting and hides when it is picked up, so it belongs at the PICKUP.
+    # (Taking the first event in file order put 6 of vanilla's 10 on the vista instead - all three
+    # DLC paintings among them - where it showed before the painting was found and vanished on
+    # pickup.) The reward event is only a fallback for a painting with no pickup event.
     print("Scanning EMEVD for painting events...")
-    paintings = []
-    seen_flags = set()
+    pickups = {}
+    rewards = {}
 
     for emevd_path in sorted((ERR_MOD_DIR / 'event').glob('*.emevd.dcx')):
         fname = emevd_path.name.replace('.emevd.dcx', '')
@@ -78,33 +89,20 @@ def main():
                 ints = []
                 for off in range(0, len(raw) - 3, 4):
                     ints.append(struct.unpack_from('<i', raw, off)[0])
-                if len(ints) < 4:
+                if len(ints) < 5:
                     continue
-                template = ints[1]
-                # Template 90005632: params = [0, tmpl, flag, entityId, textId]
-                # Template 90005633: params = [0, tmpl, rewardFlag, flag, entityId, ...]
-                # Also DLC templates (2045432550 etc.) with same layout as 90005633
-                flag = 0
-                entity_id = 0
-                if template == 90005632 and len(ints) >= 5:
-                    flag = ints[2]      # painting collection flag
-                    entity_id = ints[3]  # MSB entity
-                elif len(ints) >= 5:
-                    # 90005633 or DLC: flag at index 3, entity at index 4
-                    candidate_flag = ints[3]
-                    if 580000 <= candidate_flag <= 580199:
-                        flag = candidate_flag
-                        entity_id = ints[4]
+                if 580000 <= ints[2] <= 580199 and ints[4] == ints[2] - 500000 and ints[3] > 0:
+                    pickups.setdefault(ints[2], {'flag': ints[2], 'entity_id': ints[3], 'map_file': fname})
+                elif 580200 <= ints[2] <= 580999 and 580000 <= ints[3] <= 580199 and ints[4] > 0:
+                    rewards.setdefault(ints[3], {'flag': ints[3], 'entity_id': ints[4], 'map_file': fname})
 
-                if 580000 <= flag <= 580199 and entity_id > 0 and flag not in seen_flags:
-                    seen_flags.add(flag)
-                    paintings.append({
-                        'flag': flag,
-                        'entity_id': entity_id,
-                        'map_file': fname,
-                    })
-
-    print(f"  {len(paintings)} painting events found")
+    paintings = list(pickups.values())
+    for flag, r in rewards.items():
+        if flag not in pickups:
+            print(f"  WARNING: painting flag {flag} has no pickup event - placed at its reward ({r['map_file']})")
+            paintings.append(r)
+    print(f"  {len(paintings)} paintings ({len(pickups)} at their pickup, "
+          f"{len(paintings) - len(pickups)} at the reward only)")
 
     # Step 2: Build MSB entity index for positions
     print("Building MSB entity index...")
@@ -174,7 +172,7 @@ def main():
         lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {p["flag"]};')
         # Location text for dungeons - nearest-grace lookup
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
-        loc_id = resolve_location_id_at(map_code, p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0))
+        loc_id = resolve_location_id_at(map_code, x, y, z)
         if loc_id > 0:
             lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
             lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {p["flag"]};')

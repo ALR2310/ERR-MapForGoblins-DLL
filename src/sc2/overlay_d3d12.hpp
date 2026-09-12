@@ -18,6 +18,20 @@ namespace cte::overlay::d3d12 {
 // on the game's first visible Present.
 bool prepare_shaders();
 
+// NVIDIA Streamline's slGetNativeInterface: the object a Streamline proxy wraps, or nullptr when
+// there is no sl.interposer.dll or `proxy` is not one of its proxies. What it returns is never
+// Released (it may carry an extra reference; callers ask once per long-lived object).
+void* streamline_native(void* proxy) noexcept;
+
+// How work recorded on `queue_device` reaches `swap_device`, or nullptr when that is not proven.
+// Frame-generation layers (ERSS-FG measured 2026-09-11) hand the game a wrapper device and queue
+// while its swapchain answers GetDevice with the device underneath, so the two never compare equal
+// although the game renders into that swapchain through exactly that queue every frame.
+const char* device_reaches(ID3D12Device* queue_device, ID3D12Device* swap_device) noexcept;
+
+// Why the most recent Session::render returned Skipped (a static string), or nullptr.
+const char* last_render_skip() noexcept;
+
 enum class ColorMode : uint8_t {
     Sdr,
     ScRgb,

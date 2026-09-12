@@ -6,6 +6,7 @@
 
 #include "goblin_config.hpp"
 #include "goblin_config_schema.hpp"
+#include "goblin_float_ranges.hpp" // slider ranges shared with the overlay
 #include "goblin_i18n.hpp"
 #include "goblin_inject.hpp"
 #include "goblin_build_variants.hpp" // MFG_MENU_ADDON_HOST - do not rely on an undefined macro
@@ -93,37 +94,11 @@ namespace
     // The ini schema stores defaults as text and has no range info, so ranges for the
     // rows a player can step live here, keyed by ini key. Anything not listed is shown
     // read-only (the value is still visible, it just cannot be changed on this screen).
-    struct NumRange
-    {
-        const char *key;
-        float min;
-        float max;
-        float step;
-        const wchar_t *suffix; // printed after the number in the slider's value column
-    };
-    // Ranges mirror the overlay's own sliders (goblin_overlay.cpp): font scale 0.8-3.0
-    // and opacity 0.3-1.0. The remaining Float entries are the overlay WINDOW geometry
-    // (overlay_window_x/y/w/h) - meaningless to edit from the in-game menu, so they stay
-    // read-only Info rows.
-    constexpr NumRange kRanges[] = {
-        {"overlay_font_scale", 0.80f, 3.00f, 0.10f, L""},
-        {"overlay_opacity", 0.30f, 1.00f, 0.05f, L""},
-        // Map panel position, in percent: 0 = centre of the map area, 100 = the corner the panels
-        // were authored for, above 100 = further left. Step 10 gives 26 stops over -50..200, which
-        // is about 69 stage units each - fine enough to place it, and a held arrow sweeps the whole
-        // range in ~2.5 s at the repeat rate. Same range as the overlay's slider, deliberately:
-        // two menus disagreeing about the limits of one setting is a bug report waiting to happen.
-        {"map_panel_offset_percent", -50.0f, 200.0f, 10.0f, L"%"},
-    };
-    const NumRange *range_for(const char *key)
-    {
-        if (!key)
-            return nullptr;
-        for (const auto &r : kRanges)
-            if (std::strcmp(r.key, key) == 0)
-                return &r;
-        return nullptr;
-    }
+    // Ranges come from the table the overlay's sliders read too (goblin_float_ranges.hpp): two menus
+    // disagreeing about the limits of one setting is a bug report waiting to happen. A Float entry
+    // without a range (the overlay WINDOW geometry, overlay_window_x/y/w/h) stays a read-only Info row.
+    using NumRange = goblin::FloatRange;
+    const NumRange *range_for(const char *key) { return goblin::float_range(key); }
 
     // The two ini values with a fixed option list (both mirror the overlay's combos).
     const char *const kLanguages[] = {"auto",    "english", "schinese", "tchinese", "korean",

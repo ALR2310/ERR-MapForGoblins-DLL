@@ -11269,6 +11269,49 @@ void goblin::stall_probe::setup()
         spdlog::warn("[menuprobe] updateTask hook unavailable: {}", e.what());
     }
 
+    // The two attach hooks: ABOVE the menu-mode gate for the same reason as updateTask - they
+    // serve the MAP MARKERS. They sat below it until 2026-09-11, so `menu_render_mode = imgui`
+    // still left the markers invisible after the report-32 fix: the phase byte moved, the factory
+    // pulsed, 7877 sprite-171 tags were in the display list, but no anchor was ever written - no
+    // seed, no CATEGORIES READY, and "[v3view] viewport reconcile has not completed a pass" every
+    // 2 s while the map was open.
+    //
+    // Scaleform attachMovie DAPI bridge (v1.16 FUN_1410e00c0). Its export name
+    // and initializer object describe the ActionScript object that is about to
+    // enter a display-list parent; the nested high-level attach hook records the
+    // actual parent/count while this thread-local context is active.
+    try
+    {
+        modutils::hook<V3AttachMovieFn>(
+            {.aob = "4C 8B DC 4D 89 4B 20 4D 89 43 18 55 56 41 57 49 8D 6B D8 "
+                    "48 81 EC 10 01 00 00 48 8B 41 08 49 8B F1 48 8B 4A 28 4C 8B 78 18 "
+                    "8B 81 90 00 00 00 83 E8 1F 83 F8 05"},
+            v3_attach_movie_detour, o_v3_attach_movie);
+        spdlog::info("[stallprobe] v3 attachMovie bridge spy armed");
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::warn("[stallprobe] v3 attachMovie bridge spy unavailable: {}", e.what());
+    }
+
+    // High-level display-object move/attach API (v1.16 FUN_1410c8440). LOAD-BEARING: the detour
+    // on it is the only writer of the native-marker anchor (v3_note_movie_attach), which the seed,
+    // the tick and the viewport reconcile all read - see the note on v3_attach_detour. It also
+    // feeds two profiler-only records. (An earlier note here said v3_try_visual_move performs an
+    // engine attach through this trampoline; that function had no callers and is gone.)
+    try
+    {
+        modutils::hook<V3AttachFn>(
+            {.aob = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 40 "
+                    "48 8B DA 45 8B F0 48 8B 51 18 48 8B E9 48 8B 4B 38 8B 82 E0 00 00 00"},
+            v3_attach_detour, o_v3_attach);
+        spdlog::info("[stallprobe] v3 high-level attach experiment armed");
+    }
+    catch (const std::exception &e)
+    {
+        spdlog::warn("[stallprobe] v3 high-level attach experiment unavailable: {}", e.what());
+    }
+
     if (!goblin::config::native_menu_enabled())
     {
         // menu_render_mode = imgui: everything from here down exists only to serve the IN-GAME menu
@@ -11443,41 +11486,8 @@ void goblin::stall_probe::setup()
     // the prototype they belonged to is gone (see the note further up this file). Removing them
     // takes three .text scans off every launch.
 
-    // Scaleform attachMovie DAPI bridge (v1.16 FUN_1410e00c0). Its export name
-    // and initializer object describe the ActionScript object that is about to
-    // enter a display-list parent; the nested high-level attach hook records the
-    // actual parent/count while this thread-local context is active.
-    try
-    {
-        modutils::hook<V3AttachMovieFn>(
-            {.aob = "4C 8B DC 4D 89 4B 20 4D 89 43 18 55 56 41 57 49 8D 6B D8 "
-                    "48 81 EC 10 01 00 00 48 8B 41 08 49 8B F1 48 8B 4A 28 4C 8B 78 18 "
-                    "8B 81 90 00 00 00 83 E8 1F 83 F8 05"},
-            v3_attach_movie_detour, o_v3_attach_movie);
-        spdlog::info("[stallprobe] v3 attachMovie bridge spy armed");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[stallprobe] v3 attachMovie bridge spy unavailable: {}", e.what());
-    }
-
-    // High-level display-object move/attach API (v1.16 FUN_1410c8440). LOAD-BEARING: the detour
-    // on it is the only writer of the native-marker anchor (v3_note_movie_attach), which the seed,
-    // the tick and the viewport reconcile all read - see the note on v3_attach_detour. It also
-    // feeds two profiler-only records. (An earlier note here said v3_try_visual_move performs an
-    // engine attach through this trampoline; that function had no callers and is gone.)
-    try
-    {
-        modutils::hook<V3AttachFn>(
-            {.aob = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 40 "
-                    "48 8B DA 45 8B F0 48 8B 51 18 48 8B E9 48 8B 4B 38 8B 82 E0 00 00 00"},
-            v3_attach_detour, o_v3_attach);
-        spdlog::info("[stallprobe] v3 high-level attach experiment armed");
-    }
-    catch (const std::exception &e)
-    {
-        spdlog::warn("[stallprobe] v3 high-level attach experiment unavailable: {}", e.what());
-    }
+    // (The attachMovie bridge and the high-level attach hook moved ABOVE the menu-mode gate -
+    //  they serve the map markers, not the in-game menu; see there.)
 
     // Close-wait job timing (profiler-only; pass-through outside capture windows).
 #if MFG_STALL_PROFILER

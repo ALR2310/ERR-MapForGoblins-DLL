@@ -394,7 +394,9 @@ def main():
                 'clearedEventFlagId': flag,
                 'killEventFlagId': flag,
                 'wmpTextId1': 0,
-                'vanillaPlaceName': npc_name_text.get(name_id, ''),
+                # name_id 0 means "no name": FMG entry 0 exists in some builds and reads
+                # "DLC dummy", which then passed for this boss's name (10 profiles, 2026-09-11).
+                'vanillaPlaceName': npc_name_text.get(name_id, '') if name_id > 0 else '',
             })
 
         out_path = config.DATA_DIR / 'boss_list.json'

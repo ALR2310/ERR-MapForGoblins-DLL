@@ -153,7 +153,8 @@ STAGES = [
                    DATA / 'goods_crafting_ids.json',
                    DATA / 'goods_sorcery_ids.json',
                    DATA / 'goods_incantation_ids.json',
-                   DATA / 'goods_spirit_ash_ids.json'],
+                   DATA / 'goods_spirit_ash_ids.json',
+                   DATA / 'goods_steed_regalia_ids.json'],
           script='extract_goods_categories.py',
           also_scripts=['config.py']),
 
@@ -240,7 +241,8 @@ STAGES = [
                   DATA / 'emevd_lot_mapping.json'],
           outputs=[DATA / 'items_database.json',
                    DATA / 'npc_name_ids.json',
-                   DATA / 'unreachable_msb_lots.json'],
+                   DATA / 'unreachable_msb_lots.json',
+                   DATA / 'great_rune_drops.json'],
           script='extract_all_items.py',
           also_scripts=['unreachable.py'] + COMMON),
 
@@ -269,13 +271,16 @@ STAGES = [
     Stage('generate_loot_massedit',
           inputs=[REPO / 'data' / 'enemy_bloodmsg_mapping.json',
                   REPO / 'data' / 'enemy_names_i18n.json',
+                  REPO / 'data' / 'enemy_model_aliases.json',
                   DATA / 'items_database.json',
                   DATA / 'goods_sort_groups.json',
                   DATA / 'goods_crafting_ids.json',
                   DATA / 'goods_sorcery_ids.json',
                   DATA / 'goods_incantation_ids.json',
                   DATA / 'goods_spirit_ash_ids.json',
+                  DATA / 'goods_steed_regalia_ids.json',
                   DATA / 'boss_list.json',
+                  DATA / 'great_rune_drops.json',
                   DATA / 'enemy_tutorial_mapping.json',
                   DATA / 'tutorial_title_ids.json',
                   DATA / 'tutorial_title_names.json',
@@ -405,6 +410,18 @@ STAGES = [
           script='generate_hostile_npcs.py',
           also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'icon_registry.py', 'map_categories.py']),
 
+    # Enemies wired through the common "strong enemy" templates 90005300/301: they stay dead once
+    # killed, so each gets a marker that hides (or checkmarks) on its kill flag.
+    Stage('generate_strong_enemies',
+          inputs=[REGULATION, MSB_DIR, config.PARAMDEF_DIR, EVENT_DIR,
+                  REPO / 'data' / 'enemy_names_i18n.json',
+                  REPO / 'data' / 'enemy_model_aliases.json',
+                  REPO / 'data' / 'enemy_bloodmsg_mapping.json'],
+          outputs=[MASSEDIT_OUT / 'World - Strong Enemies.MASSEDIT'],
+          script='generate_strong_enemies.py',
+          also_scripts=['generate_hostile_npcs.py', 'generate_loot_massedit.py', 'massedit_common.py',
+                        'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py']),
+
     # Relocating-boss fix (Lansseax): after all marker generators, before bake.
     # Removes the un-collectable duplicate loot at the boss's flee-spawn and
     # ensures a flee-spawn boss marker that clears on the flee flag. Edits the
@@ -421,7 +438,12 @@ STAGES = [
                   DATA / 'item_icon_table.json',
                   DATA / 'english_fallback.json',
                   config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json',
-                  DATA / '_relocating_boss_fix.done'],
+                  DATA / '_relocating_boss_fix.done',
+                  # the hand-maintained headers the generated .cpp implement (the Category
+                  # enum: generate_data's CATEGORY_MAP must name its members)
+                  *[config.PROJECT_DIR / 'src' / h
+                    for h in ('goblin_map_data.hpp', 'goblin_item_icons.hpp',
+                              'goblin_enemy_names.hpp', 'goblin_item_fallback.hpp')]],
           outputs=[GENERATED_CPP / 'goblin_map_data.cpp',
                    GENERATED_CPP / 'goblin_item_icons.cpp',
                    GENERATED_CPP / 'goblin_enemy_names.cpp',

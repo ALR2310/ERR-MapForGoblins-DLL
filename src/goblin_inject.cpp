@@ -441,6 +441,8 @@ static bool is_category_enabled(Category cat)
     case Category::KeyImbuedSwordKeys:   return goblin::config::showImbuedSwordKeys;
     case Category::KeyLarvalTears:       return goblin::config::showLarvalTears;
     case Category::KeyScadutreeFragments: return goblin::config::showScadutreeFragments;
+    case Category::KeyReveredSpiritAshes: return goblin::config::showReveredSpiritAshes;
+    case Category::KeySpectralSteedRegalia: return goblin::config::showSpectralSteedRegalia;
     case Category::KeyGreatRunes:        return goblin::config::showGreatRunes;
     case Category::KeyLostAshes:         return goblin::config::showLostAshes;
     case Category::KeyPotsNPerfumes:     return goblin::config::showPotsNPerfumes;
@@ -472,6 +474,7 @@ static bool is_category_enabled(Category cat)
     case Category::LootStatBoosts:       return goblin::config::showStatBoosts;
     case Category::ReforgedFortunes:     return goblin::config::showFortunes;
     case Category::WorldHostileNPC:      return goblin::config::showHostileNPC;
+    case Category::WorldStrongEnemies:   return goblin::config::showStrongEnemies;
     case Category::MagicIncantations:    return goblin::config::showIncantations;
     case Category::MagicMemoryStones:    return goblin::config::showMemoryStones;
     case Category::MagicPrayerbooks:     return goblin::config::showPrayerbooks;
@@ -523,6 +526,8 @@ const char *goblin::category_config_key(generated::Category cat)
     case C::KeyImbuedSwordKeys: return "show_imbued_sword_keys";
     case C::KeyLarvalTears: return "show_larval_tears";
     case C::KeyScadutreeFragments: return "show_scadutree_fragments";
+    case C::KeyReveredSpiritAshes: return "show_revered_spirit_ashes";
+    case C::KeySpectralSteedRegalia: return "show_spectral_steed_regalia";
     case C::KeyGreatRunes: return "show_great_runes";
     case C::KeyLostAshes: return "show_lost_ashes";
     case C::KeyPotsNPerfumes: return "show_pots_n_perfumes";
@@ -554,6 +559,7 @@ const char *goblin::category_config_key(generated::Category cat)
     case C::LootStatBoosts: return "show_stat_boosts";
     case C::ReforgedFortunes: return "show_fortunes";
     case C::WorldHostileNPC: return "show_hostile_npc";
+    case C::WorldStrongEnemies: return "show_strong_enemies";
     case C::MagicIncantations: return "show_incantations";
     case C::MagicMemoryStones: return "show_memory_stones";
     case C::MagicPrayerbooks: return "show_prayerbooks";
@@ -669,7 +675,7 @@ static void load_focus_file(const std::filesystem::path &path)
                 std::string ckey;
                 long region = -1;
                 if (!(ss >> ckey >> region)) continue;
-                for (int c = 0; c <= static_cast<int>(goblin::generated::Category::WorldInteractables); ++c)
+                for (int c = 0; c < goblin::progress::kCategoryCount; ++c)
                 {
                     const char *k = goblin::category_config_key(static_cast<goblin::generated::Category>(c));
                     if (k && ckey == k) { g_pending_focus_cat = c; break; }
@@ -973,7 +979,12 @@ void goblin::inject_map_entries()
             {
                 int32_t item_id = *reinterpret_cast<int32_t *>(r->b + 0x00);   // lotItemId01
                 int32_t cat     = *reinterpret_cast<int32_t *>(r->b + 0x20);   // lotItemCategory01
-                if (item_id > 0)
+                // Only a lot that now gives a DIFFERENT item (a randomizer) is re-gated. The icon
+                // table holds one category per ITEM, so re-gating an unchanged item folded the
+                // source-split categories back together: every merchant's Bell Bearing went under
+                // show_bell_bearings with the plain bell icon, and show_merchant_bell_bearings did
+                // nothing. The baked textId1 is that same item key for a lot-backed row.
+                if (item_id > 0 && encode_live_item(item_id, cat) != e.data.textId1)
                 {
                     const auto *ic = lookup_item_icon(encode_live_item(item_id, cat));
                     if (ic)
@@ -1300,13 +1311,13 @@ void goblin::inject_map_entries()
             }
         }
 
-        // Kill display mode (bosses / hawks / NPC invaders): green checkmark
+        // Kill display mode (bosses / hawks / NPC invaders / strong enemies): green checkmark
         // vs hide killed. Without this, rows baked with BOTH clearedEventFlagId
         // and textDisableFlagId hide all their text on kill and the icon
         // vanishes before the checkmark can ever show.
         auto cat = all_rows[i].category;
         if (cat == Category::WorldBosses || cat == Category::WorldSpiritspringHawks ||
-            cat == Category::WorldHostileNPC)
+            cat == Category::WorldHostileNPC || cat == Category::WorldStrongEnemies)
         {
             auto *p = reinterpret_cast<from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(
                 new_param_file + data_offset);
@@ -2308,15 +2319,16 @@ void goblin::apply_worldmap_fragment_bypass()
                 static_cast<decltype(cr.p->eventFlagId)>(goblin::flag::AlwaysOn);
 }
 
-// Live re-apply of hide_killed_bosses (boss / spiritspring-hawk / hostile-NPC
-// rows). Re-derives from the baked fields so either mode is reversible.
+// Live re-apply of hide_killed_bosses (boss / spiritspring-hawk / hostile-NPC /
+// strong-enemy rows). Re-derives from the baked fields so either mode is reversible.
 void goblin::apply_kill_display()
 {
     for (auto &cr : g_category_rows)
     {
         if (cr.cat != Category::WorldBosses &&
             cr.cat != Category::WorldSpiritspringHawks &&
-            cr.cat != Category::WorldHostileNPC)
+            cr.cat != Category::WorldHostileNPC &&
+            cr.cat != Category::WorldStrongEnemies)
             continue;
         if (goblin::config::hideKilledBosses)
         {
@@ -2379,7 +2391,9 @@ static void apply_loot_settings()
         else
         {
             int baked = lr.baked_icon;
-            if (do_icons && item > 0)
+            // Same rule as at injection: only an item the lot no longer gives is re-iconed, so a
+            // source-split category (merchant Bell Bearings) keeps its own icon.
+            if (do_icons && item > 0 && encode_live_item(item, cat) != lr.baked_text1)
                 if (const auto *ic = lookup_item_icon(encode_live_item(item, cat)))
                     baked = ic->iconId;
             uint32_t inj = goblin::gfx_probe::injected_iconid(baked); // baked srcIconId -> injected frame

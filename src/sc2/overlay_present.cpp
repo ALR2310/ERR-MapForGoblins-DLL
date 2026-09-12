@@ -13,7 +13,10 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <imgui.h>
+#include <intrin.h>
 #include <wrl/client.h>
+
+#pragma intrinsic(_ReturnAddress)
 
 #include <algorithm>
 #include <array>
@@ -131,6 +134,23 @@ void* com_identity(IUnknown* object) noexcept {
     return result;
 }
 
+// Behind ERSS-FG (4.15, measured 2026-09-11) the game presents a Streamline proxy swapchain
+// (Present resolves into sl.interposer.dll) and submits on ERSS-FG's own wrapper queue
+// (ExecuteCommandLists resolves into ERSS-FG.dll). The proxy swapchain, and the native one behind
+// it, both answer GetDevice with one device; the only direct queue the game submits on answers with
+// ANOTHER - the wrapper device the game created everything on. So a plain identity compare never
+// holds and adoption sat on "waiting for sustained single-queue submit evidence" all session.
+// d3d12::device_reaches proves the wrapper relation instead, and the overlay then renders exactly
+// the way the game does: the presenting swapchain, the game's queue, the game's device.
+// The Streamline unwrapping below stays as a second route for layers whose queue it does know.
+IDXGISwapChain* streamline_native_swapchain(IDXGISwapChain* swapchain) noexcept {
+    return static_cast<IDXGISwapChain*>(d3d12::streamline_native(swapchain));
+}
+
+ID3D12CommandQueue* streamline_native_queue(ID3D12CommandQueue* queue) noexcept {
+    return static_cast<ID3D12CommandQueue*>(d3d12::streamline_native(queue));
+}
+
 uint64_t now_ticks() noexcept {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -229,10 +249,13 @@ private:
     uint32_t depth_ = 0;
 };
 
+// `game_presented`: the swapchain is one whose Present the game's own code was seen calling
+// (adoption via observe_present) - the only case where a queue on a wrapper device is accepted.
 bool bind_swapchain_queue(IDXGISwapChain* swapchain,
                           IUnknown* device_or_queue,
                           uint64_t transaction_id,
-                          uint32_t evidence_depth) noexcept {
+                          uint32_t evidence_depth,
+                          bool game_presented = false) noexcept {
     RetiredQueues retired{};
     size_t retired_count = 0;
     try {
@@ -251,11 +274,20 @@ bool bind_swapchain_queue(IDXGISwapChain* swapchain,
             FAILED(swapchain->GetDevice(IID_PPV_ARGS(&swap_device))) || !swap_device)
             return false;
 
-        void* const queue_device_id = com_identity(queue_device.Get());
+        // Keyed by the SWAPCHAIN's device: that is what the Present path looks the binding up by,
+        // and behind a wrapper layer the queue's own device is a different object (device_reaches).
+        void* const queue_device_id = com_identity(swap_device.Get());
         void* const queue_id = com_identity(queue.Get());
-        if (!queue_id || !queue_device_id ||
-            queue_device_id != com_identity(swap_device.Get())) {
+        const char* const reach = d3d12::device_reaches(queue_device.Get(), swap_device.Get());
+        if (!queue_id || !queue_device_id || !reach) {
             flog("[overlay-v2] rejected swapchain creation queue: device identity mismatch");
+            return false;
+        }
+        if (std::strcmp(reach, "same device") != 0 && !game_presented) {
+            // A creation-time queue on a wrapper device says nothing about which layer's
+            // swapchain the game presents (see observe_present). Pass-through only.
+            flog("[overlay-v2] swapchain queue sits on a wrapper device (%s); pass-through only",
+                 reach);
             return false;
         }
 
@@ -1144,9 +1176,29 @@ bool select_primary(uint64_t generation, HWND hwnd, void* device_identity,
     return g_primary_generation == generation;
 }
 
+// While the menu is open: how many shadowed Presents ran, how many submitted an overlay frame, and
+// the furthest checkpoint the last one reached - the backend otherwise leaves a Present in a dozen
+// silent places, and "adopted, renderer initialized, nothing on screen" needs to say which one.
+// Logged and reset by log_render_stats() on the control thread.
+std::atomic<uint32_t> g_diag_open_presents{0};
+std::atomic<uint32_t> g_diag_open_submitted{0};
+std::atomic<const char*> g_diag_last_stage{nullptr};
+std::atomic<uint32_t> g_diag_last_slot{UINT32_MAX};
+std::atomic<uint32_t> g_diag_slot_changes{0};
+
+struct PresentStageTrace {
+    const char* stage = "entry";
+    ~PresentStageTrace() {
+        if (!g_visible.load(std::memory_order_relaxed)) return;
+        g_diag_open_presents.fetch_add(1, std::memory_order_relaxed);
+        g_diag_last_stage.store(stage, std::memory_order_relaxed);
+    }
+};
+
 void before_present_impl(IDXGISwapChain* base,
                          dxgi_shadow::PresentKind present_kind, UINT flags,
                          const DXGI_PRESENT_PARAMETERS* parameters) {
+    PresentStageTrace trace;
     if (g_stopping.load(std::memory_order_acquire) ||
         !g_renderer_ready.load(std::memory_order_acquire) ||
         (flags & DXGI_PRESENT_TEST) != 0)
@@ -1172,12 +1224,15 @@ void before_present_impl(IDXGISwapChain* base,
     void* device_id = nullptr;
     HWND hwnd = nullptr;
     DXGI_SWAP_CHAIN_DESC1 desc{};
+    trace.stage = "render lock";
     std::unique_lock render_lock(g_render_mutex, std::try_to_lock);
     if (!render_lock.owns_lock()) return;
     PresentRenderCriticalScope present_critical;
 
+    trace.stage = "generation";
     const uint64_t call_generation = dxgi_shadow::generation_token(base);
     if (!call_generation) return;
+    trace.stage = "eligibility";
 
     // The single most valuable line in the backend log: it splits "our vtable
     // shadow is never invoked" (line absent) from "our validation rejects the
@@ -1217,12 +1272,14 @@ void before_present_impl(IDXGISwapChain* base,
         }
         return;
     }
+    trace.stage = "resize/color gate";
     if ((g_resize_gate.depth != 0 &&
          call_generation == g_resize_gate.generation) ||
         (g_color_gate.depth != 0 &&
          call_generation == g_color_gate.generation))
         return;
 
+    trace.stage = "session rebuild pending";
     if (g_session_rebuild_pending && g_session && g_session->gpu_idle()) {
         retire_current_session(retired_sessions, retired_session_count);
         g_session_rebuild_pending = false;
@@ -1230,6 +1287,7 @@ void before_present_impl(IDXGISwapChain* base,
     }
     if (g_session_rebuild_pending) return;
 
+    trace.stage = "swapchain validation";
     const char* describe_reason = nullptr;
     if (!describe_swapchain(base, swapchain3, device, generation, device_id,
                             hwnd, desc, describe_reason)) {
@@ -1252,6 +1310,7 @@ void before_present_impl(IDXGISwapChain* base,
     // Queue identity is part of swapchain identity for D3D12.  Do not publish
     // a usable canvas (and therefore do not capture input) until the exact
     // queue supplied to CreateSwapChain* or ResizeBuffers1 is known.
+    trace.stage = "queue binding";
     queue = queue_for_swapchain(generation, device_id);
     if (!queue) {
         if (g_queue_missing_logged_generation != generation) {
@@ -1264,11 +1323,15 @@ void before_present_impl(IDXGISwapChain* base,
             publish_canvas(hwnd, desc.Width, desc.Height, false, false);
         return;
     }
+    trace.stage = "primary selection";
     if (!select_primary(generation, hwnd, device_id, desc.Width, desc.Height,
                         retired_sessions, retired_session_count))
         return;
 
+    trace.stage = "back-buffer index";
     const uint32_t current_slot = swapchain3->GetCurrentBackBufferIndex();
+    if (current_slot != g_diag_last_slot.exchange(current_slot, std::memory_order_relaxed))
+        g_diag_slot_changes.fetch_add(1, std::memory_order_relaxed);
     if (current_slot >= desc.BufferCount) return;
     bool already_composited = false;
     if (g_pending_composited_buffer.generation != 0) {
@@ -1283,6 +1346,7 @@ void before_present_impl(IDXGISwapChain* base,
         }
     }
 
+    trace.stage = "color encoding";
     const InferredColor color =
         infer_color_mode(generation, desc.Format, hwnd);
     const d3d12::ColorMode color_mode = color.mode;
@@ -1304,8 +1368,10 @@ void before_present_impl(IDXGISwapChain* base,
     // A renderer failure is sticky for this session.  Continue lifecycle and
     // canvas observation, but never repeat allocation/recording failures on
     // every Present.  Pending work or a replacement tuple explicitly rearms.
+    trace.stage = "renderer unhealthy";
     if (!g_renderer_healthy.load(std::memory_order_acquire)) return;
 
+    trace.stage = "session setup";
     // Warm all private device-child state as soon as the primary tuple and
     // encoding are authoritative. Opening the menu then performs no heap/PSO/
     // backbuffer allocation on its first visible Present.
@@ -1353,6 +1419,8 @@ void before_present_impl(IDXGISwapChain* base,
     // consuming the current buffer. Never modify it in that mode. Likewise,
     // null parameters make Present1 invalid, whereas null denotes an ordinary
     // full-frame Present in the base interface.
+    trace.stage = already_composited ? "same buffer still marked as composited"
+                                     : "present flags";
     if ((flags & DXGI_PRESENT_DO_NOT_WAIT) != 0 ||
         (present_kind == dxgi_shadow::PresentKind::Present1 && !parameters) ||
         already_composited)
@@ -1366,11 +1434,13 @@ void before_present_impl(IDXGISwapChain* base,
                        parameters->pScrollOffset != nullptr))
         return;
 
+    trace.stage = "draw packet";
     const auto packet = frame::acquire_frame();
     const auto font = frame::acquire_font_atlas();
     if (!packet || !font || packet->font_generation != font->generation ||
         packet->commands.empty())
         return;
+    trace.stage = "packet size vs back buffer";
 
     // Do not stretch a stale pre-resize UI packet onto a new buffer.  The
     // control thread will publish the correctly sized frame on its next tick.
@@ -1390,10 +1460,16 @@ void before_present_impl(IDXGISwapChain* base,
     const auto expected_h = static_cast<uint32_t>(expected_h_value);
     if (expected_w != desc.Width || expected_h != desc.Height) return;
 
+    trace.stage = "render";
     const d3d12::RenderResult result =
         g_session->render(swapchain3.Get(), packet.get(), font.get(), color_mode);
     if (result == d3d12::RenderResult::Submitted) {
+        trace.stage = "submitted";
+        g_diag_open_submitted.fetch_add(1, std::memory_order_relaxed);
         g_pending_composited_buffer = {generation, current_slot};
+    } else if (result == d3d12::RenderResult::Skipped) {
+        const char* why = d3d12::last_render_skip();
+        trace.stage = why ? why : "renderer skipped";
     } else if (result == d3d12::RenderResult::RecoverableFailure) {
         // No command list was submitted for this result.  Rebuild every
         // renderer-owned object on the next explicit open instead of carrying
@@ -1447,6 +1523,23 @@ void safe_before_present(IDXGISwapChain* swapchain,
 
 void after_present(IDXGISwapChain* swapchain, HRESULT result) noexcept {
     if (g_stopping.load(std::memory_order_acquire)) return;
+    if (SUCCEEDED(result)) {
+        // The downstream Present consumed the buffer the overlay drew into, so the next Present
+        // on the same slot carries a fresh game frame. The marker used to clear only when the
+        // swapchain reported a DIFFERENT back-buffer index - behind a layer that keeps reporting
+        // the same one (a frame-generation proxy can), every frame after the first was taken for
+        // an unconsumed retry and skipped: one overlay frame, then nothing.
+        try {
+            std::unique_lock lock(g_render_mutex, std::try_to_lock);
+            if (lock.owns_lock() && g_pending_composited_buffer.generation != 0 &&
+                g_pending_composited_buffer.generation ==
+                    dxgi_shadow::generation_token(swapchain))
+                g_pending_composited_buffer = {};
+        } catch (...) {
+            note_swallowed_exception(__LINE__);
+        }
+        return;
+    }
     if (result != DXGI_ERROR_DEVICE_REMOVED && result != DXGI_ERROR_DEVICE_RESET)
         return;
     if (g_present_render_critical) {
@@ -1771,9 +1864,31 @@ using ExecuteCommandListsFn =
     void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT,
                              ID3D12CommandList* const*);
 
+// Three observer pairs, one per implementation watched: the probe swapchain's (whatever the
+// factory hands out), the native one behind a Streamline proxy, and the one the GAME's own code
+// was found calling (discovered at run time - see discover_game_present).
 PresentFn g_next_present_observed = nullptr;
 Present1Fn g_next_present1_observed = nullptr;
+PresentFn g_next_native_present_observed = nullptr;
+Present1Fn g_next_native_present1_observed = nullptr;
+PresentFn g_next_game_present_observed = nullptr;
+Present1Fn g_next_game_present1_observed = nullptr;
 ExecuteCommandListsFn g_next_execute_command_lists = nullptr;
+ExecuteCommandListsFn g_next_native_execute_command_lists = nullptr;
+// Set by arm_adoption when a native Present AND a native ExecuteCommandLists sit behind the probe's
+// (a Streamline proxy plus a wrapper queue): adoption then prefers DXGI's own Present, where the
+// frame on screen is final (try_adopt_native). Written once before the observers go live.
+bool g_native_adoption = false;
+std::atomic<uint32_t> g_native_presents_without_queue{0};
+constexpr uint32_t kNativeAdoptionPatience = 600; // native presents before falling back
+
+// Implementations already observed, so discovery never proposes one of them again.
+void* g_observed_present_targets[4] = {};
+// The implementation the game's code calls, packed as address | slot << 56 (slot 8 = Present,
+// 22 = Present1). Published once by a Present thread, installed by the control thread.
+std::atomic<uint64_t> g_game_present_discovery{0};
+std::atomic<uint32_t> g_foreign_presents{0};
+bool g_game_present_hooked = false; // overlay/control thread only
 
 enum class AdoptionState : uint32_t {
     Idle = 0,     // never armed; zero overhead on the normal creation path
@@ -2094,12 +2209,22 @@ constexpr uint32_t kAdoptionMinimumQueueCalls = 128;
 constexpr uint32_t kAdoptionMinimumPresents = 32;
 constexpr uint32_t kAdoptionMaximumInstallAttempts = 64;
 
+void describe_code(const void* p, char* out, size_t cap) noexcept;  // "module+0xRVA"
+
 struct AdoptionQueueEvidence {
     // queue_identity doubles as the slot-published flag: it is stored with
     // release order only after every other field is complete.
     std::atomic<void*> queue_identity{nullptr};
     void* device_identity = nullptr;
     ID3D12CommandQueue* queue = nullptr; // AddRef'd; retained for process life
+    // The queue behind a Streamline proxy (streamline_native_queue) and its device; null when the
+    // observed queue is not one of its proxies. Retained for process life like `queue`.
+    ID3D12CommandQueue* native_queue = nullptr;
+    void* native_device_identity = nullptr;
+    // d3d12::device_reaches(this queue's device, reach_device) once per presenting device; read and
+    // written only by try_adopt_swapchain under g_adoption_try_lock.
+    void* reach_device = nullptr;
+    const char* reach = nullptr;
     std::atomic<uint32_t> calls{0};
 };
 constexpr size_t kMaximumAdoptionQueues = 8;
@@ -2113,6 +2238,11 @@ SRWLOCK g_adoption_queue_insert_lock = SRWLOCK_INIT;
 thread_local ID3D12CommandQueue* g_tls_ecl_cached_pointer = nullptr;
 thread_local AdoptionQueueEvidence* g_tls_ecl_cached_slot = nullptr;
 thread_local void* g_tls_last_direct_queue_identity = nullptr;
+thread_local int g_tls_wrapper_ecl_depth = 0;
+thread_local ID3D12CommandQueue* g_tls_native_cached_queue = nullptr;
+thread_local bool g_tls_native_cached_direct = false;
+thread_local ID3D12CommandQueue* g_tls_last_native_queue = nullptr;
+thread_local bool g_tls_last_native_forwarded = false;
 
 AdoptionState adoption_state() noexcept {
     return static_cast<AdoptionState>(
@@ -2158,6 +2288,14 @@ AdoptionQueueEvidence* record_adoption_queue(
                 slot.device_identity = com_identity(device.Get());
                 slot.queue = queue;
                 queue->AddRef();
+                if (ID3D12CommandQueue* native = streamline_native_queue(queue)) {
+                    ComPtr<ID3D12Device> native_device;
+                    if (SUCCEEDED(native->GetDevice(IID_PPV_ARGS(&native_device))) &&
+                        native_device) {
+                        slot.native_queue = native;  // see streamline_native: never Released
+                        slot.native_device_identity = com_identity(native_device.Get());
+                    }
+                }
                 slot.queue_identity.store(identity, std::memory_order_release);
                 g_adoption_queue_count.store(count + 1,
                                              std::memory_order_release);
@@ -2183,7 +2321,53 @@ void STDMETHODCALLTYPE execute_command_lists_observer(
                 slot->queue_identity.load(std::memory_order_relaxed);
         }
     }
+    // Everything the native ExecuteCommandLists sees while this is on the stack is the game's own
+    // work forwarded by a wrapper queue (native_execute_command_lists_observer).
+    ++g_tls_wrapper_ecl_depth;
     g_next_execute_command_lists(queue, count, lists);
+    --g_tls_wrapper_ecl_depth;
+}
+
+// ── the native ExecuteCommandLists (only when a wrapper queue stands in front of it) ──────
+// Per thread: the last native DIRECT queue submitted to, and whether that submission was the game's
+// own work passing through a wrapper queue or a layer's direct submission. A frame-generation layer
+// fills its present queue itself right before presenting the real swapchain on the same thread -
+// that queue is what try_adopt_native binds (see the native-present section below).
+// Native queues the game's own work was seen passing into through a wrapper queue. Never the
+// queue of a real swapchain behind a frame-generation layer: binding one of these there is exactly
+// the 2026-09-11 freeze (overlay work on the game's queue, unsynchronized with the present queue).
+std::atomic<void*> g_forwarded_native_queues[4] = {};
+
+void remember_forwarded_queue(void* queue) noexcept {
+    for (auto& slot : g_forwarded_native_queues)
+        if (slot.load(std::memory_order_relaxed) == queue) return;
+    for (auto& slot : g_forwarded_native_queues) {
+        void* expected = nullptr;
+        if (slot.compare_exchange_strong(expected, queue, std::memory_order_relaxed)) return;
+        if (expected == queue) return;
+    }
+}
+
+bool is_forwarded_queue(void* queue) noexcept {
+    for (auto& slot : g_forwarded_native_queues)
+        if (slot.load(std::memory_order_relaxed) == queue) return true;
+    return false;
+}
+
+void STDMETHODCALLTYPE native_execute_command_lists_observer(
+    ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    if (adoption_state() == AdoptionState::Pending && queue) {
+        if (queue != g_tls_native_cached_queue) {
+            g_tls_native_cached_queue = queue;
+            g_tls_native_cached_direct = queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+        }
+        if (g_tls_native_cached_direct) {
+            g_tls_last_native_queue = queue;
+            g_tls_last_native_forwarded = g_tls_wrapper_ecl_depth > 0;
+            if (g_tls_last_native_forwarded) remember_forwarded_queue(queue);
+        }
+    }
+    g_next_native_execute_command_lists(queue, count, lists);
 }
 
 // Serializes candidate tracking and the adopt transaction. Contention is
@@ -2199,6 +2383,25 @@ struct AdoptionCandidate {
     bool waiting_logged = false;
 } g_adoption_candidate;
 
+// The proxy -> native pair from streamline_native_swapchain, asked once per proxy (under
+// g_adoption_try_lock, like the candidate).
+IDXGISwapChain* g_streamline_proxy = nullptr;
+IDXGISwapChain* g_streamline_native = nullptr;
+
+// Whether work on `slot`'s queue reaches `device` (the presenting swapchain's), cached per device.
+const char* slot_reaches_locked(AdoptionQueueEvidence& slot, ID3D12Device* device,
+                                void* device_identity) noexcept {
+    if (slot.reach_device != device_identity) {
+        slot.reach_device = device_identity;
+        slot.reach = nullptr;
+        ComPtr<ID3D12Device> queue_device;
+        if (slot.queue && SUCCEEDED(slot.queue->GetDevice(IID_PPV_ARGS(&queue_device))) &&
+            queue_device)
+            slot.reach = d3d12::device_reaches(queue_device.Get(), device);
+    }
+    return slot.reach;
+}
+
 void adoption_failed_locked(const char* reason) noexcept {
     set_adoption_state(AdoptionState::Failed);
     flog("[overlay-v2] [WARN] swapchain adoption disabled: %s", reason);
@@ -2211,6 +2414,20 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
             if (adoption_state() != AdoptionState::Pending ||
                 g_stopping.load(std::memory_order_acquire))
                 break;
+            // Behind a Streamline proxy there are TWO swapchains that could carry the overlay: the
+            // proxy the game presents, and the native one it wraps (streamline_native_swapchain).
+            // The presenting one comes first (under ERSS-FG its queue is ERSS's wrapper, which
+            // reaches the proxy's device - see device_reaches); the native one is only a fallback
+            // for a layer whose queue Streamline itself unwraps. The observer sits on the proxy's
+            // Present, so only the proxy is ever mapped.
+            if (swapchain != g_streamline_proxy) {
+                g_streamline_proxy = swapchain;
+                g_streamline_native = streamline_native_swapchain(swapchain);
+                if (g_streamline_native)
+                    flog("[overlay-v2] adoption: the presenting swapchain is a Streamline proxy; "
+                         "the native swapchain behind it is a second candidate");
+            }
+            IDXGISwapChain* const native_swapchain = g_streamline_native;
             // Chains shadowed by the creation path (or a prior adoption) need
             // nothing further; this also makes the shadow's own downstream
             // Present call a no-op here. The exception is a generation whose
@@ -2254,7 +2471,25 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
             ComPtr<ID3D12CommandQueue> queue;
             if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&queue))))
                 queue.Reset();
+            if (queue) {
+                // What the swapchain handed back, against the queues the game was seen submitting
+                // on: the same object, or one the observer never saw (then nothing proves the
+                // game's frames and this queue are ordered).
+                void* const recovered = com_identity(queue.Get());
+                bool seen = false;
+                const uint32_t published = g_adoption_queue_count.load(std::memory_order_acquire);
+                for (uint32_t index = 0; index < published; ++index)
+                    seen = seen || g_adoption_queues[index].queue_identity.load(
+                                       std::memory_order_acquire) == recovered;
+                void** const vtable = *reinterpret_cast<void***>(queue.Get());
+                char ecl[MAX_PATH + 32];
+                describe_code(vtable ? vtable[10] : nullptr, ecl, sizeof ecl);
+                flog("[overlay-v2] adoption: the swapchain returned its queue %p "
+                     "(ExecuteCommandLists %s); %s the %u queue(s) the game was seen submitting on",
+                     recovered, ecl, seen ? "one of" : "NOT one of", published);
+            }
             bool correlated = false;
+            IDXGISwapChain* target = swapchain;  // the one the shadow and the binding go on
             if (!queue) {
                 if (!is_elden_ring_process()) {
                     adoption_failed_locked(
@@ -2274,20 +2509,48 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                     !device)
                     break;
                 void* const device_identity = com_identity(device.Get());
+                void* native_swapchain_device = nullptr;
+                if (native_swapchain) {
+                    ComPtr<ID3D12Device> native_device;
+                    if (SUCCEEDED(native_swapchain->GetDevice(IID_PPV_ARGS(&native_device))) &&
+                        native_device)
+                        native_swapchain_device = com_identity(native_device.Get());
+                }
                 AdoptionQueueEvidence* match = nullptr;
+                bool match_native_queue = false;      // bind the queue behind the observed one
+                IDXGISwapChain* match_target = nullptr;
                 bool ambiguous = false;
                 const uint32_t published =
                     g_adoption_queue_count.load(std::memory_order_acquire);
                 for (uint32_t index = 0; index < published; ++index) {
                     AdoptionQueueEvidence& slot = g_adoption_queues[index];
-                    if (!slot.queue_identity.load(std::memory_order_acquire) ||
-                        slot.device_identity != device_identity)
+                    if (!slot.queue_identity.load(std::memory_order_acquire))
+                        continue;
+                    // The pairs a queue can make, first match wins: the presenting swapchain with
+                    // the observed queue (its device the swapchain's, or a wrapper over it); the
+                    // native swapchain with the observed queue; the native swapchain with the
+                    // queue Streamline hides behind the observed one.
+                    IDXGISwapChain* pair_target = nullptr;
+                    bool pair_native_queue = false;
+                    if (slot_reaches_locked(slot, device.Get(), device_identity)) {
+                        pair_target = swapchain;
+                    } else if (native_swapchain_device &&
+                               slot.device_identity == native_swapchain_device) {
+                        pair_target = native_swapchain;
+                    } else if (native_swapchain_device && slot.native_queue &&
+                               slot.native_device_identity == native_swapchain_device) {
+                        pair_target = native_swapchain;
+                        pair_native_queue = true;
+                    }
+                    if (!pair_target)
                         continue;
                     if (match) {
                         ambiguous = true;
                         break;
                     }
                     match = &slot;
+                    match_target = pair_target;
+                    match_native_queue = pair_native_queue;
                 }
                 if (ambiguous) {
                     adoption_failed_locked(
@@ -2303,6 +2566,28 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                         candidate.waiting_logged = true;
                         flog("[overlay-v2] adoption: waiting for sustained "
                              "single-queue submit evidence");
+                        // What the wait is made of, once: every direct queue seen so far with its
+                        // device and submit count, against the swapchain's device (and the native
+                        // one behind a Streamline proxy). A queue on "another" device is the
+                        // proxy-vs-native mismatch; a matching one below the count is only early.
+                        flog("[overlay-v2] adoption evidence: presenting swapchain on device %p, "
+                             "native swapchain behind it on device %p, %u direct queue(s) "
+                             "observed%s",
+                             device_identity, native_swapchain_device, published,
+                             g_adoption_queue_overflow.load(std::memory_order_relaxed)
+                                 ? ", overflowed" : "");
+                        for (uint32_t index = 0; index < published; ++index) {
+                            AdoptionQueueEvidence& slot = g_adoption_queues[index];
+                            flog("[overlay-v2]   queue %p on device %p: %u submit(s); reaches "
+                                 "the presenting device: %s; behind it: %s%p on device %p",
+                                 slot.queue_identity.load(std::memory_order_relaxed),
+                                 slot.device_identity,
+                                 slot.calls.load(std::memory_order_relaxed),
+                                 slot.reach ? slot.reach : "no",
+                                 slot.native_queue ? "native queue " : "no Streamline native ",
+                                 static_cast<void*>(slot.native_queue),
+                                 slot.native_device_identity);
+                        }
                     }
                     break;
                 }
@@ -2316,13 +2601,28 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                         "queue than the only observed one");
                     break;
                 }
-                queue = match->queue;
+                // A match through the native queue binds THAT queue: the renderer submits on the
+                // native swapchain's own device.
+                queue = match_native_queue ? match->native_queue : match->queue;
+                target = match_target;
                 correlated = true;
+                if (target != swapchain) {
+                    if (!eligible_shadow_candidate(target)) break;
+                    flog("[overlay-v2] adoption: the observed queue pairs with the native "
+                         "swapchain behind the Streamline proxy");
+                } else if (match->reach && std::strcmp(match->reach, "same device") != 0) {
+                    // Safe only because this swapchain's Present was called by the game's own
+                    // code (observe_present): its buffers are the ones the game renders into
+                    // through this very queue. The 2026-09-11 freeze was a wrapper pairing on a
+                    // swapchain the game never presented.
+                    flog("[overlay-v2] adoption: the game's queue sits on a wrapper device that "
+                         "reaches the swapchain's device (%s)", match->reach);
+                }
             }
             if (!queue) break;
 
             BindingScope binding_scope(g_creation_transaction);
-            if (!install_swapchain_shadow(swapchain)) {
+            if (!install_swapchain_shadow(target)) {
                 if (++candidate.install_attempts >=
                     kAdoptionMaximumInstallAttempts)
                     adoption_failed_locked(
@@ -2330,9 +2630,10 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                         "shadow");
                 break;
             }
-            if (!bind_swapchain_queue(swapchain, queue.Get(),
+            if (!bind_swapchain_queue(target, queue.Get(),
                                       binding_scope.id(),
-                                      binding_scope.depth())) {
+                                      binding_scope.depth(),
+                                      /*game_presented=*/target == swapchain)) {
                 adoption_failed_locked(
                     "the recovered queue failed exact-identity validation");
                 break;
@@ -2350,23 +2651,317 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
     ReleaseSRWLockExclusive(&g_adoption_try_lock);
 }
 
+// ── adoption at DXGI's own Present (frame-generation layers) ────────────────────────────
+// Measured 2026-09-11 under ERSS-FG (FSR frame generation): drawing into the swapchain the game
+// presents submitted 158 of 158 overlay frames and none reached the screen - ERSS-FG builds the
+// frame from command lists it recognises in its ExecuteCommandLists wrapper and hands it to
+// amd_fidelityfx_framegeneration, whose present queue writes the REAL swapchain and presents it.
+// What is on screen is only ever final at that innermost Present, which is where overlays that work
+// under frame generation draw. The earlier freeze drew into that same real swapchain, but through
+// the GAME's queue, unsynchronized with the present queue that owns its buffers.
+// So here the queue is the one the presenting thread itself submitted to last before this Present,
+// provided that submission was not the game's work passing through a wrapper queue, its device is
+// the swapchain's, and the pairing holds for kAdoptionMinimumPresents presents in a row: a layer's
+// present queue, filled right before the Present it feeds, so the overlay lands after its copy on
+// the same queue. Anything else keeps the wait counting; after kNativeAdoptionPatience presents
+// without such a queue, adoption falls back to the swapchain the game calls (observe_present).
+struct NativeCandidate {
+    IDXGISwapChain* swapchain = nullptr;  // continuity keys only
+    ID3D12CommandQueue* queue = nullptr;
+    uint32_t presents = 0;
+    uint32_t install_attempts = 0;
+    bool seen_logged = false;
+} g_native_candidate;
+
+void try_adopt_native(IDXGISwapChain* swapchain) noexcept {
+    ID3D12CommandQueue* queue = g_tls_last_native_queue;
+    bool forwarded = g_tls_last_native_forwarded || (queue && is_forwarded_queue(queue));
+    if (!TryAcquireSRWLockExclusive(&g_adoption_try_lock)) return;
+    try {
+        do {
+            if (adoption_state() != AdoptionState::Pending ||
+                g_stopping.load(std::memory_order_acquire))
+                break;
+            if (dxgi_shadow::generation_token(swapchain) != 0 &&
+                !dxgi_shadow::renderer_retryable(swapchain))
+                break;
+            // Exact first: a DXGI that hands out its creation queue settles it outright.
+            ComPtr<ID3D12CommandQueue> exact;
+            if (SUCCEEDED(swapchain->GetDevice(IID_PPV_ARGS(&exact))) && exact) {
+                static bool s_exact_logged = false;
+                if (!s_exact_logged) {
+                    s_exact_logged = true;
+                    flog("[overlay-v2] native present: DXGI returned the swapchain's own queue %p",
+                         static_cast<void*>(exact.Get()));
+                }
+                queue = exact.Get();
+                forwarded = false;
+            }
+            NativeCandidate& candidate = g_native_candidate;
+            static uint32_t s_transitions_logged = 0;
+            const bool transition = candidate.swapchain != swapchain || candidate.queue != queue ||
+                                    (candidate.presents == 0) != (!queue || forwarded);
+            if (transition && s_transitions_logged < 12) {
+                ++s_transitions_logged;
+                flog("[overlay-v2] native present: swapchain %p, presenting thread's last direct "
+                     "queue %p%s (thread %lu)", static_cast<void*>(swapchain),
+                     static_cast<void*>(queue),
+                     !queue ? " (none)" : forwarded ? " (the game's work via a wrapper)" : "",
+                     GetCurrentThreadId());
+            }
+            if (!queue || forwarded) {
+                candidate.presents = 0;
+                g_native_presents_without_queue.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (candidate.swapchain != swapchain || candidate.queue != queue) {
+                candidate.swapchain = swapchain;
+                candidate.queue = queue;
+                candidate.presents = 1;
+                break;
+            }
+            if (++candidate.presents < kAdoptionMinimumPresents) break;
+
+            ComPtr<ID3D12Device> swap_device;
+            ComPtr<ID3D12Device> queue_device;
+            if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&swap_device))) || !swap_device ||
+                FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device))) || !queue_device ||
+                com_identity(swap_device.Get()) != com_identity(queue_device.Get())) {
+                candidate = {};
+                g_native_presents_without_queue.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (!eligible_shadow_candidate(swapchain)) {
+                g_native_presents_without_queue.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (!candidate.seen_logged) {
+                candidate.seen_logged = true;
+                flog("[overlay-v2] adoption: DXGI's own Present is fed by a layer's direct queue "
+                     "%p on the swapchain's device for %u presents in a row; adopting the real "
+                     "swapchain there", static_cast<void*>(queue), candidate.presents);
+            }
+            BindingScope binding_scope(g_creation_transaction);
+            if (!install_swapchain_shadow(swapchain)) {
+                if (++candidate.install_attempts >= kAdoptionMaximumInstallAttempts)
+                    adoption_failed_locked("the real swapchain repeatedly refused a vtable shadow");
+                break;
+            }
+            if (!bind_swapchain_queue(swapchain, queue, binding_scope.id(),
+                                      binding_scope.depth(), /*game_presented=*/true)) {
+                adoption_failed_locked("the present queue failed exact-identity validation");
+                break;
+            }
+            set_adoption_state(AdoptionState::Adopted);
+            flog("[overlay-v2] adopted the real swapchain at DXGI's own Present (queue evidence: "
+                 "the layer's present queue, filled on the presenting thread)");
+        } while (false);
+    } catch (...) {
+        cte::note_swallowed(__FILE__, __LINE__);
+    }
+    ReleaseSRWLockExclusive(&g_adoption_try_lock);
+}
+
+// ── only the game's own Present is adopted ─────────────────────────────────────────────
+// A swapchain is the game's only if the game's code itself calls its Present. Measured
+// 2026-09-11 under ERSS-FG with FSR frame generation: the game calls Present on ERSS-FG's
+// swapchain object (eldenring.exe `call [rax+40h]` -> ERSS-FG), which hands the frame to
+// amd_fidelityfx_framegeneration, which presents the real DXGI swapchain; the Streamline proxy
+// the probe resolves is a separate object below all that. Adopting that proxy drew into buffers the
+// frame-generation presenter owns, unsynchronized, and froze the picture on the first overlay frame.
+// So an observed Present counts only when its return address lies in the game executable; any
+// other caller is a layer between the game and DXGI, and its stack is used to FIND the
+// implementation the game calls (discover_game_present), which the control thread then observes
+// too. Without layers the game calls DXGI (or a single proxy) directly and nothing changes.
+
+struct ModuleRange {
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+    bool contains(const void* p) const noexcept {
+        const auto a = reinterpret_cast<uintptr_t>(p);
+        return a >= begin && a < end;
+    }
+};
+
+ModuleRange module_range(HMODULE module) noexcept {
+    ModuleRange range;
+    if (!module) return range;
+    const auto* base = reinterpret_cast<const uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return range;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return range;
+    range.begin = reinterpret_cast<uintptr_t>(base);
+    range.end = range.begin + nt->OptionalHeader.SizeOfImage;
+    return range;
+}
+
+bool in_game_executable(const void* p) noexcept {
+    static const ModuleRange range = module_range(GetModuleHandleW(nullptr));
+    return range.contains(p);
+}
+
+bool in_this_module(const void* p) noexcept {
+    static const ModuleRange range = module_range(g_hinst);
+    return range.contains(p);
+}
+
+// Which swapchain method the game's code called, read off the instruction in front of its return
+// address: 8 for `call [reg+40h]` (IDXGISwapChain::Present), 22 for `call [reg+0B0h]`
+// (IDXGISwapChain1::Present1), 0 for anything else (the same layers also carry e.g.
+// GetContainingOutput calls down to DXGI).
+int game_call_slot(const uint8_t* ret) noexcept {
+    if (ret[-3] == 0xFF && (ret[-2] & 0xF8) == 0x50 && ret[-2] != 0x54 && ret[-1] == 0x40)
+        return 8;
+    if (ret[-6] == 0xFF && (ret[-5] & 0xF8) == 0x90 && ret[-5] != 0x94 && ret[-4] == 0xB0 &&
+        ret[-3] == 0 && ret[-2] == 0 && ret[-1] == 0)
+        return 22;
+    return 0;
+}
+
+// Entry point of the function containing `inside`, from the unwind data its module registered;
+// follows chained entries (split function bodies) to the primary one.
+void* function_entry(const void* inside) noexcept {
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION entry =
+        RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(inside), &image_base, nullptr);
+    for (int depth = 0; entry && depth < 8; ++depth) {
+        if (entry->UnwindData & 1u) {  // indirect: points at another RUNTIME_FUNCTION
+            entry = reinterpret_cast<PRUNTIME_FUNCTION>(image_base + (entry->UnwindData & ~1u));
+            continue;
+        }
+        const auto* info = reinterpret_cast<const uint8_t*>(image_base + entry->UnwindData);
+        constexpr uint8_t kChainInfo = 0x4;
+        if (((info[0] >> 3) & kChainInfo) == 0)
+            return reinterpret_cast<void*>(image_base + entry->BeginAddress);
+        const size_t codes = (static_cast<size_t>(info[2]) + 1) & ~size_t{1};
+        entry = reinterpret_cast<PRUNTIME_FUNCTION>(const_cast<uint8_t*>(info + 4 + codes * 2));
+    }
+    return nullptr;
+}
+
+void describe_code(const void* p, char* out, size_t cap) noexcept {
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (p && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                static_cast<LPCSTR>(p), &mod) && mod) {
+        GetModuleFileNameA(mod, name, MAX_PATH);
+        const char* base = std::strrchr(name, '\\');
+        snprintf(out, cap, "%s+0x%llX", base ? base + 1 : name,
+                 static_cast<unsigned long long>(static_cast<const char*>(p) -
+                                                 reinterpret_cast<const char*>(mod)));
+    } else {
+        snprintf(out, cap, "%p", p);
+    }
+}
+
+// Called for a Present that some layer (not the game) made, on that Present's thread. Walks the
+// stack to the first frame in the game executable; when the instruction there is a Present call,
+// the frame above it is inside the implementation the game called, and that implementation is
+// published for the control thread to observe. Bounded: every 16th such Present, 256 walks at most.
+void discover_game_present() noexcept {
+    if (g_game_present_discovery.load(std::memory_order_acquire) != 0) return;
+    const uint32_t seen = g_foreign_presents.fetch_add(1, std::memory_order_relaxed);
+    if (seen % 16 != 0 || seen > 16u * 256u) return;
+    void* frames[62] = {};
+    const USHORT count = RtlCaptureStackBackTrace(0, 62, frames, nullptr);
+    for (USHORT i = 1; i < count; ++i) {
+        if (!in_game_executable(frames[i])) continue;
+        const int slot = game_call_slot(static_cast<const uint8_t*>(frames[i]));
+        const void* callee_frame = frames[i - 1];
+        if (!slot || in_game_executable(callee_frame) || in_this_module(callee_frame)) return;
+        void* const entry = function_entry(callee_frame);
+        if (!entry) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                char callee[MAX_PATH + 32];
+                describe_code(callee_frame, callee, sizeof callee);
+                flog("[overlay-v2] [WARN] adoption: the game's Present runs through %s, which has "
+                     "no unwind entry; that layer cannot be observed", callee);
+            }
+            return;
+        }
+        for (void* known : g_observed_present_targets)
+            if (known == entry) return;
+        const uint64_t packed =
+            reinterpret_cast<uint64_t>(entry) | (static_cast<uint64_t>(slot) << 56);
+        uint64_t expected = 0;
+        if (g_game_present_discovery.compare_exchange_strong(expected, packed,
+                                                             std::memory_order_acq_rel)) {
+            char callee[MAX_PATH + 32], site[MAX_PATH + 32];
+            describe_code(entry, callee, sizeof callee);
+            describe_code(frames[i], site, sizeof site);
+            flog("[overlay-v2] adoption: the game calls %s through a layer at %s (return to %s); "
+                 "observing it", slot == 8 ? "Present" : "Present1", callee, site);
+        }
+        return;
+    }
+}
+
+// `native`: the call came through DXGI's own Present implementation (behind a Streamline proxy).
+void observe_present(IDXGISwapChain* swapchain, UINT flags, const void* caller,
+                     bool native = false) noexcept {
+    if (adoption_state() != AdoptionState::Pending || !swapchain ||
+        (flags & DXGI_PRESENT_TEST) != 0)
+        return;
+    const bool native_first =
+        g_native_adoption &&
+        g_native_presents_without_queue.load(std::memory_order_relaxed) < kNativeAdoptionPatience;
+    if (native && g_native_adoption) {
+        try_adopt_native(swapchain);
+        if (native_first) return;
+    }
+    if (native_first) return;  // the game-called swapchain waits while the native search runs
+    static std::atomic<bool> fallback_logged{false};
+    if (g_native_adoption && !fallback_logged.exchange(true))
+        flog("[overlay-v2] adoption: no layer present queue after %u native presents; falling "
+             "back to the swapchain the game calls", kNativeAdoptionPatience);
+    if (in_game_executable(caller))
+        try_adopt_swapchain(swapchain);
+    else
+        discover_game_present();
+}
+
 HRESULT STDMETHODCALLTYPE present_observer_detour(IDXGISwapChain* swapchain,
                                                   UINT sync_interval,
                                                   UINT flags) {
-    if (adoption_state() == AdoptionState::Pending && swapchain &&
-        (flags & DXGI_PRESENT_TEST) == 0)
-        try_adopt_swapchain(swapchain);
+    observe_present(swapchain, flags, _ReturnAddress());
     return g_next_present_observed(swapchain, sync_interval, flags);
 }
 
 HRESULT STDMETHODCALLTYPE present1_observer_detour(
     IDXGISwapChain1* swapchain, UINT sync_interval, UINT flags,
     const DXGI_PRESENT_PARAMETERS* parameters) {
-    if (adoption_state() == AdoptionState::Pending && swapchain &&
-        (flags & DXGI_PRESENT_TEST) == 0)
-        try_adopt_swapchain(swapchain);
+    observe_present(swapchain, flags, _ReturnAddress());
     return g_next_present1_observed(swapchain, sync_interval, flags,
                                     parameters);
+}
+
+HRESULT STDMETHODCALLTYPE native_present_observer_detour(IDXGISwapChain* swapchain,
+                                                         UINT sync_interval, UINT flags) {
+    observe_present(swapchain, flags, _ReturnAddress(), /*native=*/true);
+    return g_next_native_present_observed(swapchain, sync_interval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE native_present1_observer_detour(
+    IDXGISwapChain1* swapchain, UINT sync_interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS* parameters) {
+    observe_present(swapchain, flags, _ReturnAddress(), /*native=*/true);
+    return g_next_native_present1_observed(swapchain, sync_interval, flags, parameters);
+}
+
+HRESULT STDMETHODCALLTYPE game_present_observer_detour(IDXGISwapChain* swapchain,
+                                                       UINT sync_interval, UINT flags) {
+    observe_present(swapchain, flags, _ReturnAddress());
+    return g_next_game_present_observed(swapchain, sync_interval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE game_present1_observer_detour(
+    IDXGISwapChain1* swapchain, UINT sync_interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS* parameters) {
+    observe_present(swapchain, flags, _ReturnAddress());
+    return g_next_game_present1_observed(swapchain, sync_interval, flags, parameters);
 }
 
 // Resolve the shared Present/Present1/ExecuteCommandLists implementations
@@ -2377,17 +2972,24 @@ HRESULT STDMETHODCALLTYPE present1_observer_detour(
 // the minimum-canvas gates.  Because this mod intercepts CreateSwapChainForHwnd
 // through the factory vtable slot, the probe's own creation dispatches into our
 // detour; g_adoption_probe_in_progress makes that a pass-through no-op.
+// `native_present_target` / `native_present1_target` come back non-null only when the probe is a
+// Streamline proxy: the implementations of the native swapchain behind it, which is what the
+// layers under the game present in the end (and whose stacks lead discovery to the game's call).
+// `native_execute_target` likewise: the ExecuteCommandLists of a queue made on the device underneath
+// a wrapper device (found through a fence's owner, d3d12::device_reaches' test), when that differs.
 bool resolve_adoption_targets(void** present_target, void** present1_target,
-                              void** execute_target) noexcept {
-    // This probe creates a swapchain of its own, and in report 21 it was one of the two creations
-    // that fired into the proxy loop (the stack bottom is arm_adoption -> here). The loop is broken
-    // at the detour now, but there is no reason to keep feeding it: once a loop has been seen, the
-    // adoption route is not worth a creation attempt.
-    if (g_creation_loop_seen.load(std::memory_order_relaxed)) {
-        flog("[overlay-v2] [WARN] skipping the adoption probe: creation re-entry was already "
-             "observed, so another overlay owns this path");
-        return false;
-    }
+                              void** execute_target, void** native_present_target,
+                              void** native_present1_target,
+                              void** native_execute_target) noexcept {
+    // The probe needs nothing but three implementation addresses, so it should not go through a
+    // creation slot anyone intercepts. It first creates its throwaway swapchain FOR COMPOSITION
+    // (factory slot 24): neither this backend nor the proxies it has met (ERSS-FG / Streamline,
+    // report 21) sit on that slot - they take CreateSwapChain (10) and CreateSwapChainForHwnd
+    // (15) - so the creation cannot re-enter anyone's detour, and the swapchain class, hence
+    // Present / Present1, is DXGI's own. Measured 2026-09-11: going through slot 15 under ERSS-FG
+    // looped, the report-21 guard refused the creation and late adoption was lost - no menu.
+    // Wine answers E_NOTIMPL for composition swapchains; there (and anywhere else composition
+    // fails) the HWND probe below remains, but only while no creation loop has been seen.
     g_adoption_probe_in_progress = true;
     HWND hwnd = nullptr;
     bool class_registered = false;
@@ -2408,6 +3010,80 @@ bool resolve_adoption_targets(void** present_target, void** present1_target,
         if (FAILED(device->CreateCommandQueue(&queue_desc,
                                               IID_PPV_ARGS(&queue))) || !queue)
             break;
+
+        ComPtr<IDXGISwapChain1> probe;
+        {
+            DXGI_SWAP_CHAIN_DESC1 desc{};
+            desc.Width = 64;
+            desc.Height = 64;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            desc.BufferCount = 2;
+            desc.Scaling = DXGI_SCALING_STRETCH;           // required for composition
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            const HRESULT hr = factory->CreateSwapChainForComposition(queue.Get(), &desc, nullptr,
+                                                                      &probe);
+            if (FAILED(hr) || !probe) {
+                probe.Reset();
+                flog("[overlay-v2] adoption probe: composition swapchain unavailable (hr 0x%08lX)",
+                     static_cast<unsigned long>(hr));
+            }
+        }
+        if (probe) {
+            void** const swapchain_vtable = *reinterpret_cast<void***>(probe.Get());
+            void** const queue_vtable = *reinterpret_cast<void***>(queue.Get());
+            if (!swapchain_vtable || !queue_vtable) break;
+            *present_target = swapchain_vtable[8];    // IDXGISwapChain::Present
+            *present1_target = swapchain_vtable[22];  // IDXGISwapChain1::Present1
+            *execute_target = queue_vtable[10];       // ID3D12CommandQueue::ExecuteCommandLists
+            ok = *present_target && *present1_target && *execute_target;
+            if (IDXGISwapChain* native = streamline_native_swapchain(probe.Get())) {
+                void** const native_vtable = *reinterpret_cast<void***>(native);
+                if (native_vtable && native_vtable[8] != *present_target) {
+                    *native_present_target = native_vtable[8];
+                    *native_present1_target = native_vtable[22];
+                }
+            }
+            {
+                ComPtr<ID3D12Fence> fence;
+                ComPtr<ID3D12Device> owner;
+                ComPtr<ID3D12CommandQueue> native_queue;
+                if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) &&
+                    fence && SUCCEEDED(fence->GetDevice(IID_PPV_ARGS(&owner))) && owner &&
+                    com_identity(owner.Get()) != com_identity(device.Get()) &&
+                    SUCCEEDED(owner->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&native_queue))) &&
+                    native_queue) {
+                    void** const native_queue_vtable = *reinterpret_cast<void***>(native_queue.Get());
+                    if (native_queue_vtable && native_queue_vtable[10] != *execute_target)
+                        *native_execute_target = native_queue_vtable[10];
+                }
+            }
+            // Where they landed, so a log shows whether the game's own Present can pass through them
+            // (both swapchain kinds are expected to share DXGI's one implementation).
+            char a[MAX_PATH + 32], b[MAX_PATH + 32], c[MAX_PATH + 32], d[MAX_PATH + 32],
+                e[MAX_PATH + 32];
+            describe_code(*present_target, a, sizeof a);
+            describe_code(*present1_target, b, sizeof b);
+            describe_code(*execute_target, c, sizeof c);
+            describe_code(*native_present_target, d, sizeof d);
+            describe_code(*native_execute_target, e, sizeof e);
+            flog("[overlay-v2] adoption probe: implementations resolved from a composition "
+                 "swapchain (no intercepted creation slot involved): Present %s, Present1 %s, "
+                 "ExecuteCommandLists %s; native Present behind it %s, native "
+                 "ExecuteCommandLists behind it %s", a, b, c,
+                 *native_present_target ? d : "(none)", *native_execute_target ? e : "(none)");
+            break;
+        }
+
+        // HWND probe: the one route through an intercepted slot. Once a creation loop has been seen
+        // it would only feed that loop again (report 21's stack bottom was arm_adoption -> here).
+        if (g_creation_loop_seen.load(std::memory_order_relaxed)) {
+            flog("[overlay-v2] [WARN] skipping the HWND adoption probe: creation re-entry was "
+                 "already observed, so another overlay owns that path");
+            break;
+        }
 
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = DefWindowProcW;
@@ -2435,7 +3111,6 @@ bool resolve_adoption_targets(void** present_target, void** present1_target,
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        ComPtr<IDXGISwapChain1> probe;
         if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &desc,
                                                    nullptr, nullptr,
                                                    &probe)) || !probe)
@@ -3015,8 +3690,12 @@ void arm_adoption(HWND game_window_hint) {
     void* present_target = nullptr;
     void* present1_target = nullptr;
     void* execute_target = nullptr;
+    void* native_present_target = nullptr;
+    void* native_present1_target = nullptr;
+    void* native_execute_target = nullptr;
     if (!resolve_adoption_targets(&present_target, &present1_target,
-                                  &execute_target)) {
+                                  &execute_target, &native_present_target,
+                                  &native_present1_target, &native_execute_target)) {
         set_adoption_state(AdoptionState::Failed);
         flog("[overlay-v2] [ERROR] adoption probe could not resolve the "
              "Present/ExecuteCommandLists implementations; late adoption "
@@ -3037,6 +3716,25 @@ void arm_adoption(HWND game_window_hint) {
             execute_target,
             reinterpret_cast<void*>(&execute_command_lists_observer),
             g_next_execute_command_lists, "ExecuteCommandLists observer");
+        if (native_present_target && native_present1_target) {
+            ok &= queue_hook(native_present_target,
+                             reinterpret_cast<void*>(&native_present_observer_detour),
+                             g_next_native_present_observed, "native Present observer");
+            ok &= queue_hook(native_present1_target,
+                             reinterpret_cast<void*>(&native_present1_observer_detour),
+                             g_next_native_present1_observed, "native Present1 observer");
+            if (native_execute_target) {
+                ok &= queue_hook(native_execute_target,
+                                 reinterpret_cast<void*>(&native_execute_command_lists_observer),
+                                 g_next_native_execute_command_lists,
+                                 "native ExecuteCommandLists observer");
+                g_native_adoption = true;
+            }
+        }
+        g_observed_present_targets[0] = present_target;
+        g_observed_present_targets[1] = present1_target;
+        g_observed_present_targets[2] = native_present_target;
+        g_observed_present_targets[3] = native_present1_target;
         ok &= hooks::apply();
         if (!ok) {
             // Partial installs stay resident as pass-through; adoption never
@@ -3052,6 +3750,50 @@ void arm_adoption(HWND game_window_hint) {
     query_nvapi_current_hdr(game_window_hint);
     flog("[overlay-v2] swapchain adoption armed: watching live presents for "
          "the game swapchain");
+}
+
+void log_render_stats() {
+    const uint32_t presents = g_diag_open_presents.exchange(0, std::memory_order_relaxed);
+    const uint32_t submitted = g_diag_open_submitted.exchange(0, std::memory_order_relaxed);
+    const uint32_t slot_changes = g_diag_slot_changes.exchange(0, std::memory_order_relaxed);
+    const char* stage = g_diag_last_stage.load(std::memory_order_relaxed);
+    flog("[overlay-v2] menu open: %u shadowed present(s), %u overlay frame(s) submitted, "
+         "back-buffer index changed %u time(s) (now %u); last present stopped at: %s",
+         presents, submitted, slot_changes,
+         g_diag_last_slot.load(std::memory_order_relaxed), stage ? stage : "(none yet)");
+}
+
+void service_adoption() {
+    // Overlay/control thread only. Installs, once, the observer on the Present implementation the
+    // game's own code was found calling (discover_game_present publishes it from a Present thread;
+    // hooks are never created from inside somebody else's Present).
+    if (!g_adoption_hooks_installed || g_game_present_hooked ||
+        g_stopping.load(std::memory_order_acquire))
+        return;
+    const uint64_t packed = g_game_present_discovery.load(std::memory_order_acquire);
+    if (!packed) return;
+    g_game_present_hooked = true; // one attempt: a failed install stays pass-through
+    void* const target = reinterpret_cast<void*>(packed & 0x00FFFFFFFFFFFFFFull);
+    const int slot = static_cast<int>(packed >> 56);
+    bool ok = true;
+    {
+        hooks::InstallLock install_lock;
+        if (slot == 8)
+            ok &= queue_hook(target, reinterpret_cast<void*>(&game_present_observer_detour),
+                             g_next_game_present_observed, "game Present observer");
+        else
+            ok &= queue_hook(target, reinterpret_cast<void*>(&game_present1_observer_detour),
+                             g_next_game_present1_observed, "game Present1 observer");
+        ok &= hooks::apply();
+    }
+    char where[MAX_PATH + 32];
+    describe_code(target, where, sizeof where);
+    if (ok)
+        flog("[overlay-v2] adoption: now observing the game's own %s at %s",
+             slot == 8 ? "Present" : "Present1", where);
+    else
+        flog("[overlay-v2] [ERROR] could not observe the game's own Present at %s; the overlay "
+             "stays unavailable behind this layer", where);
 }
 
 Canvas canvas() {

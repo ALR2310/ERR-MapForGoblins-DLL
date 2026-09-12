@@ -1105,6 +1105,7 @@ bool WINAPI DllMain(HINSTANCE dll_instance, unsigned int fdw_reason, void *lpv_r
                          goblin::crashdiag::game_timestamp());
         }
         goblin::load_config(folder / "MapForGoblins.ini");
+        (void)goblin::config::menu_mode(); // seals the session's menu mode (see menu_mode)
 
         if (goblin::config::debugLogging)
             spdlog::default_logger()->set_level(spdlog::level::debug);

@@ -59,6 +59,15 @@ bool hooks_installed();
 // null) selects the display for a one-shot vendor HDR state query.
 void arm_adoption(HWND game_window_hint);
 
+// Adoption housekeeping that must not run on a Present thread: when a layer sits between the game
+// and DXGI, the Present implementation the game really calls is discovered from a Present stack
+// and observed from here. Cheap to call every control-loop iteration. Overlay/control thread only.
+void service_adoption();
+
+// One log line: while the menu was open since the last call, how many shadowed Presents ran, how
+// many overlay frames were submitted, and where the last Present left the render path. Resets.
+void log_render_stats();
+
 // Log where the creation-hook prologues (or factory vtable slots) point today
 // and how often the detours have run -- distinguishes "loaded too late" from
 // "hook overwritten by another mod", and names the owning module in the

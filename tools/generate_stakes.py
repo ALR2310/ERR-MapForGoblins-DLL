@@ -30,7 +30,7 @@ def _safe_unlink(path):
 
 from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at, convert_legacy_coords,
-                             is_dlc_plane)
+                             is_dlc_plane, remap_placeholder_xz)
 
 ERR_MOD_DIR = config.require_err_mod_dir()
 _str_type = SysType.GetType('System.String')
@@ -78,12 +78,22 @@ def main():
             x = round(float(p.Position.X), 3)
             y = round(float(p.Position.Y), 3)
             z = round(float(p.Position.Z), 3)
-            key = (area, round(x, 0), round(z, 0))
+            # More than half of the stakes (vanilla: 244 of 453 placements) are stored in a
+            # supertile MSB and named after their fine owner tile; without the remap they baked
+            # the supertile's grid and local coords and landed far from the stake.
+            sgx, sgz = gx, gz
+            moved = remap_placeholder_xz(str(p.Name), map_name, x, z)
+            if moved:
+                sgx, sgz, x, z = moved
+            # Legacy maps: one key per area, so the variants of one map (m11_00 / m11_05,
+            # m21_00 / m21_02) share their stakes. Overworld: every tile has its own local frame.
+            key = ((area, sgx, sgz, round(x, 0), round(z, 0)) if area in OVERWORLD_AREAS
+                   else (area, round(x, 0), round(z, 0)))
             if key in seen:
                 continue
             seen.add(key)
             stakes.append({
-                'area': area, 'gx': gx, 'gz': gz,
+                'area': area, 'gx': sgx, 'gz': sgz,
                 'x': x, 'y': y, 'z': z,
             })
 

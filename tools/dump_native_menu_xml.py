@@ -134,11 +134,11 @@ def layout():
         arrays[m.group(1)] = re.findall(r'"([^"]+)"', m.group(2))
     block = re.search(r"const LayoutPage kLayout\[\] = \{(.*?)\n    \};", txt, re.S).group(1)
     pages = []
-    for line in block.splitlines():
-        m = re.match(r'\s*\{"([^"]+)",\s*(\w+|nullptr),\s*\d+,\s*(\w+|nullptr),\s*\d+,\s*(true|false),\s*(true|false)\}',
-                     line.strip())
-        if not m:
-            continue
+    # Over the whole block, not per line: an entry may wrap, and its counts may be a
+    # sizeof(...)/sizeof(...) expression ("Menu settings"), which the per-line \d+ match skipped -
+    # the page silently vanished from the dump.
+    for m in re.finditer(r'\{"([^"]+)",\s*(\w+|nullptr),\s*[^,{}]+?,\s*(\w+|nullptr),\s*[^,{}]+?,'
+                         r'\s*(true|false),\s*(true|false)\}', block, re.S):
         label, secs, keys, toggle, dump = m.groups()
         pages.append((label, arrays.get(secs, []), arrays.get(keys, []), toggle == "true",
                       dump == "true"))

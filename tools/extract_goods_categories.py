@@ -10,6 +10,8 @@ Outputs (into config.DATA_DIR, profile-aware):
                                  vanilla/overhauls keep enemy-type ashes like "Giant Rat Ashes"
                                  at goodsType 7, which were previously missed. ERR renumbers ashes
                                  into 300000-399999 and matches them by range instead, unaffected.)
+  - goods_steed_regalia_ids.json [ids] the Spectral Steed Regalia goods block (Torrent's
+                                 caparisons, patch 1.17) - see the note at the collection
   - goods_keyitem_ids.json       [ids] goodsType in (1, 12)  (key items + info/notes;
                                  the "Quest - Progression" catch-all set. goodsType 1 = key item
                                  (medallions, needles, tools, letters, rings, prosthetics, eyes...),
@@ -70,7 +72,16 @@ def main():
     if goods is None:
         sys.exit('EquipParamGoods not found in regulation')
 
+    # Torrent's caparisons (Tarnished Pack, game patch 1.17) are key items (goodsType 1), so the
+    # Quest - Progression catch-all used to swallow them. The patch gave them their own goods-id
+    # block, which is what their category keys on: 2009600/610/620 in every build measured
+    # (vanilla, ERR, Convergence), with the block's only other row - 2009500 - a different
+    # goodsType. sortGroupId does NOT work: ERR files them under a group of their own (66), but in
+    # vanilla they sit in group 60 with 153 unrelated items.
+    STEED_REGALIA_IDS = range(2009600, 2009700)
+    STEED_REGALIA_GOODS_TYPE = 1
     sort_groups = {}
+    steed_regalia_ids = []
     by_type = {1: [], 2: [], 3: [], 5: [], 7: [], 8: [], 10: [], 12: [], 16: [], 17: [], 18: []}
     for r in goods.Rows:
         rid = int(r.ID)
@@ -83,6 +94,8 @@ def main():
                 sortg = int(c.Value)
         if gtype == 0:
             sort_groups[rid] = sortg if sortg is not None else 255
+        if rid in STEED_REGALIA_IDS and gtype == STEED_REGALIA_GOODS_TYPE:
+            steed_regalia_ids.append(rid)
         if gtype in by_type:
             by_type[gtype].append(rid)
 
@@ -119,6 +132,7 @@ def main():
     dump('goods_spirit_ash_ids.json', sorted(by_type[7] + by_type[8]))
     dump('goods_keyitem_ids.json', sorted(by_type[1] + by_type[3] + by_type[12]))
     dump('goods_crystal_tear_ids.json', sorted(by_type[10]))
+    dump('goods_steed_regalia_ids.json', sorted(set(steed_regalia_ids)))
     dump('weapon_ammo_ids.json', sorted(set(ammo_ids)))
 
 

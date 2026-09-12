@@ -28,14 +28,55 @@ namespace
         return s;
     }
 
-    // Parse a string value into the entry's typed target variable.
-    void set_from_string(const goblin::IniEntry &e, const std::string &v)
+    template <typename T>
+    void store_if_changed(void *target, const T &value)
+    {
+        T &slot = *static_cast<T *>(target);
+        if (!(slot == value))
+            slot = value;
+    }
+
+    // A pad combo as written in the ini: true with `out` set when it parses, including the explicit
+    // unbind words ("none"/"off"/empty/"0" -> 0), false when the text is not a combo at all.
+    // "none"/"off"/empty must be able to UNBIND a pad button, not fall through to the default.
+    // Reported 2026-08-01: hide_marker_gamepad defaults to RB, which is also the map's own
+    // tab-switch button, so the player hid their markers by accident all session and could not turn
+    // it off - clearing the key left RB in place, because an unparsed value was indistinguishable
+    // from an empty one and both were ignored.
+    bool parse_mask_setting(const std::string &v, uint16_t &out)
+    {
+        std::string t = v;
+        t.erase(0, t.find_first_not_of(" \t"));
+        const size_t last = t.find_last_not_of(" \t");
+        t.erase(last == std::string::npos ? 0 : last + 1);
+        std::string up = t;
+        std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+        if (t.empty() || up == "NONE" || up == "OFF" || up == "0")
+        {
+            out = 0;
+            return true;
+        }
+        out = goblin::parse_gamepad_combo(t);
+        return out != 0;
+    }
+
+    // Parse the value an entry resolves to and store it into the entry's typed target - once, and
+    // only when it differs from what the target holds. A key/combo that does not parse takes the
+    // schema default (what the old defaults-first load left in place).
+    //
+    // Why not "reset everything to defaults, then read the file" (the old apply_defaults): the
+    // overlay reloads the ini on every open while the map, marker and menu threads keep reading these
+    // globals, so for the length of the file read every setting sat at its default in plain view.
+    // Measured 2026-09-11: an imgui-mode F10 over the map met menu_render_mode = "native" in that
+    // window and opened the in-game settings screen with the overlay. Storing only changed values
+    // also means an unchanged string is never rewritten under a reader.
+    void assign_from_string(const goblin::IniEntry &e, const std::string &v)
     {
         using goblin::IniType;
         switch (e.type)
         {
         case IniType::Bool:
-            *static_cast<bool *>(e.target) = (v != "false");
+            store_if_changed(e.target, v != "false");
             break;
         case IniType::U8:
         {
@@ -43,42 +84,30 @@ namespace
             try { val = std::stoi(v); }
             catch (...) { val = 15; }
             if (val < 0 || val > 255) val = 15;
-            *static_cast<uint8_t *>(e.target) = static_cast<uint8_t>(val);
+            store_if_changed(e.target, static_cast<uint8_t>(val));
             break;
         }
         case IniType::VkKey:
         {
             uint32_t vk = goblin::parse_vk_code(v);
-            if (vk) *static_cast<uint32_t *>(e.target) = vk;
+            if (!vk)
+                vk = goblin::parse_vk_code(e.def);
+            if (vk)
+                store_if_changed(e.target, vk);
             break;
         }
         case IniType::GamepadMask:
         {
-            // "none"/"off"/empty must be able to UNBIND a pad button, not fall through to the
-            // default. Reported 2026-08-01: hide_marker_gamepad defaults to RB, which is also the
-            // map's own tab-switch button, so the player hid their markers by accident all session
-            // and could not turn it off - clearing the key left RB in place, because an unparsed
-            // value was indistinguishable from an empty one and both were ignored.
-            std::string t = v;
-            t.erase(0, t.find_first_not_of(" \t"));
-            const size_t last = t.find_last_not_of(" \t");
-            t.erase(last == std::string::npos ? 0 : last + 1);
-            std::string up = t;
-            std::transform(up.begin(), up.end(), up.begin(), ::toupper);
-            if (t.empty() || up == "NONE" || up == "OFF" || up == "0")
-            {
-                *static_cast<uint16_t *>(e.target) = 0;
-                break;
-            }
-            uint16_t m = goblin::parse_gamepad_combo(t);
-            if (m) *static_cast<uint16_t *>(e.target) = m;
+            uint16_t m = 0;
+            if (parse_mask_setting(v, m) || parse_mask_setting(e.def, m))
+                store_if_changed(e.target, m);
             break;
         }
         case IniType::Language:
-            *static_cast<std::string *>(e.target) = goblin::i18n::normalize_language_config(v);
+            store_if_changed(e.target, goblin::i18n::normalize_language_config(v));
             break;
         case IniType::Text:
-            *static_cast<std::string *>(e.target) = v;
+            store_if_changed(e.target, v);
             break;
         case IniType::Float:
         {
@@ -90,30 +119,9 @@ namespace
             float val;
             try { val = std::stof(v); }
             catch (...) { val = 1.0f; }
-            *static_cast<float *>(e.target) = val;
+            store_if_changed(e.target, val);
             break;
         }
-        }
-    }
-
-    // Seed every config variable from its schema default. In the vanilla build
-    // ERR-only entries are force-disabled (so their features stay off even if
-    // an ERR ini is present).
-    void apply_defaults()
-    {
-        for (auto const &sec : goblin::ini_schema())
-        {
-            for (auto const &e : sec.entries)
-            {
-                bool err_only = e.err_only || sec.err_only;
-                if (goblin::profile_is_vanilla() && err_only)
-                {
-                    if (e.type == goblin::IniType::Bool)
-                        *static_cast<bool *>(e.target) = false;
-                    continue;
-                }
-                set_from_string(e, e.def);
-            }
         }
     }
 }
@@ -427,33 +435,39 @@ void goblin::load_config(const std::filesystem::path &ini_path)
     g_ini_path = ini_path;
 
     ensure_ini(ini_path);
-    apply_defaults();
 
     mINI::INIFile file(ini_path.string());
     mINI::INIStructure ini;
-    if (!file.read(ini))
-    {
+    const bool have_file = file.read(ini);
+    if (!have_file)
         spdlog::warn("Failed to read INI file, using defaults");
-        return;
-    }
 
+    // Every entry resolves to ONE final value - the file's, a former key's, or the schema default -
+    // and is stored once (assign_from_string explains why there is no defaults-first pass). In the
+    // vanilla build ERR-only entries are force-disabled, so their features stay off even if an ERR
+    // ini is present.
     const bool include_err = !profile_is_vanilla();
     for (auto const &sec : ini_schema())
     {
-        if (sec.err_only && !include_err) continue;
-        if (!ini.has(sec.name)) continue;
-        auto &cfg = ini[sec.name];
+        const bool section_present = have_file && ini.has(sec.name);
         for (auto const &e : sec.entries)
         {
-            if (e.err_only && !include_err) continue;
-            std::string v;
-            if (cfg.has(e.key))
-                v = cfg.get(e.key);
-            else if (const std::string was = first_present(cfg, e.rename_from); !was.empty())
-                v = cfg.get(was);
-            else
+            if ((e.err_only || sec.err_only) && !include_err)
+            {
+                if (e.type == IniType::Bool)
+                    store_if_changed(e.target, false);
                 continue;
-            set_from_string(e, v);
+            }
+            std::string v = e.def;
+            if (section_present)
+            {
+                auto &cfg = ini[sec.name];
+                if (cfg.has(e.key))
+                    v = cfg.get(e.key);
+                else if (const std::string was = first_present(cfg, e.rename_from); !was.empty())
+                    v = cfg.get(was);
+            }
+            assign_from_string(e, v);
         }
     }
 

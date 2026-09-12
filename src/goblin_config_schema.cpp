@@ -30,7 +30,8 @@ namespace goblin::config
     bool showCelestialDew = true, showCookbooks = true, showCrystalTears = true,
          showGreatRunes = true, showImbuedSwordKeys = true, showLarvalTears = true,
          showLostAshes = true, showPotsNPerfumes = true, showScadutreeFragments = true,
-         showSeedsTears = true, showWhetblades = true;
+         showReveredSpiritAshes = true, showSpectralSteedRegalia = true, showSeedsTears = true,
+         showWhetblades = true;
 
     bool showAmmo = true, showBellBearings = true, showMerchantBellBearings = true,
          showConsumables = true, showGreases = true, showUtilities = true,
@@ -50,7 +51,7 @@ namespace goblin::config
     bool showEmberPieces = true, showItemsAndChanges = true, showFortunes = true,
          showRunePieces = true;
 
-    bool showBosses = true, showGraces = true, showHostileNPC = true,
+    bool showBosses = true, showGraces = true, showHostileNPC = true, showStrongEnemies = true,
          showImpStatues = true, showPaintings = true, showSpiritSprings = true,
          showSpiritspringHawks = true, showStakesOfMarika = true,
          showSummoningPools = true, showKindlingSpirits = true,
@@ -173,7 +174,9 @@ namespace
                 B("show_lost_ashes", showLostAshes, "true", "Lost Ashes of War"),
                 B("show_pots_n_perfumes", showPotsNPerfumes, "true", "Cracked Pots, Ritual Pots, Perfume Bottles"),
                 B("show_scadutree_fragments", showScadutreeFragments, "true", "Scadutree Fragments (DLC blessing upgrade)"),
-                B("show_seeds_tears", showSeedsTears, "true", "Golden Seeds, Sacred Tears, Revered Spirit Ashes"),
+                B("show_revered_spirit_ashes", showReveredSpiritAshes, "true", "Revered Spirit Ashes (DLC spirit ash blessing upgrade)"),
+                B("show_spectral_steed_regalia", showSpectralSteedRegalia, "true", "Spectral Steed Regalia (Torrent's caparisons; they need the Tarnished Pack)"),
+                B("show_seeds_tears", showSeedsTears, "true", "Golden Seeds, Sacred Tears"),
                 B("show_whetblades", showWhetblades, "true", "Whetblades (weapon infusion types)"),
             }},
 
@@ -231,6 +234,8 @@ namespace
                 B("show_bosses", showBosses, "true", "Boss markers (field bosses, dungeon bosses)"),
                 B("show_graces", showGraces, "true", "Sites of Grace"),
                 B("show_hostile_npc", showHostileNPC, "true", "Hostile NPC invader locations"),
+                B("show_strong_enemies", showStrongEnemies, "true",
+                  "Strong enemies that stay dead once killed (scarabs, field mini-bosses, some NPCs)"),
                 B("show_imp_statues", showImpStatues, "true", "Imp Statue (Stonesword Key fog gate) locations"),
                 B("show_paintings", showPaintings, "true", "Painting locations"),
                 B("show_spirit_springs", showSpiritSprings, "true", "Spirit Spring (horse jump) locations"),
@@ -386,16 +391,26 @@ const std::vector<const char *> &goblin::ini_retired_keys()
 //   imgui  - the overlay window; nothing of the in-game menu is injected
 //   dev    - both, the overlay on the hotkey and the in-game menu on F8. Undocumented on purpose:
 //            it exists for working on the two side by side, not as a user-facing choice.
+// Decided ONCE per session, from the ini as DllMain loaded it (dllmain.cpp seals it right after that
+// load). Which menu exists is fixed at startup anyway - the overlay is created or not - and the
+// overlay reloads the ini on every open, where apply_defaults() leaves this key at "native" for the
+// length of the file read. Measured 2026-09-11 in imgui mode: F10 over the map landed in that window,
+// the in-game menu's key check saw native mode, and the native settings screen opened together with
+// the overlay. Re-reading the string there was also an unsynchronized read of a string being rewritten.
 goblin::config::MenuMode goblin::config::menu_mode()
 {
-    const std::string &v = menuRenderMode;
-    if (v == "imgui")
-        return MenuMode::ImGui;
-    if (v == "dev")
-        return MenuMode::Dev;
-    // Anything else - including every legacy drawing mode (surface / layered / swapchain*) - reads as
-    // the default. load_config() rewrites such a value so the file says what is actually in force.
-    return MenuMode::Native;
+    static const MenuMode mode = []
+    {
+        const std::string &v = menuRenderMode;
+        if (v == "imgui")
+            return MenuMode::ImGui;
+        if (v == "dev")
+            return MenuMode::Dev;
+        // Anything else - including every legacy drawing mode (surface / layered / swapchain*) - reads
+        // as the default. load_config() rewrites such a value so the file says what is in force.
+        return MenuMode::Native;
+    }();
+    return mode;
 }
 
 bool goblin::config::native_menu_enabled() { return menu_mode() != MenuMode::ImGui; }

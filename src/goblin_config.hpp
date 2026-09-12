@@ -63,6 +63,8 @@ namespace goblin
         extern bool showImbuedSwordKeys;
         extern bool showLarvalTears;
         extern bool showScadutreeFragments;
+        extern bool showReveredSpiritAshes;
+        extern bool showSpectralSteedRegalia;
         extern bool showGreatRunes;
         extern bool showLostAshes;
         extern bool showPotsNPerfumes;
@@ -96,6 +98,7 @@ namespace goblin
         extern bool showStatBoosts;
         extern bool showFortunes;
         extern bool showHostileNPC;
+        extern bool showStrongEnemies;
 
         // Magic
         extern bool showIncantations;

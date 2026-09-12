@@ -150,10 +150,10 @@ namespace
         out.insert(out.end(), src + t.offset, src + t.offset + t.length);
     }
 
-    // Every character id the movie defines, so we can prove our additions collide with none.
-    // Define tags all start with a u16 character id; that is the only field we need.
-    bool cid_range_free(const uint8_t *src, const std::vector<Tag> &tags, uint16_t lo,
-                        uint16_t hi)
+    // The highest character id the movie defines: ours start one past it, so they collide with none
+    // whatever movie loaded (the stock one, a patched one, an overhaul's). Define tags all start with
+    // a character id; that is the only field we need.
+    uint16_t highest_defined_cid(const uint8_t *src, const std::vector<Tag> &tags)
     {
         // SWF defines plus the GFX EXTENSIONS - 1009 (external image) is by far the most common define
         // tag in these movies and was missing, so the guard used to declare a range "free" while ids in
@@ -164,6 +164,7 @@ namespace
             2,  6,  7,  10, 11, 14, 20, 21, 22, 32, 33, 34, 35, 36, 37, 39, 46, 48, 60, 75, 83,
             84, 87, 90, 91,
             1001, 1003, 1004, 1005, 1006, 1007, 1008, 1009};
+        uint16_t highest = 0;
         for (const Tag &t : tags)
         {
             bool defines = false;
@@ -177,10 +178,47 @@ namespace
                 continue;
             uint16_t cid = 0;
             std::memcpy(&cid, src + t.offset, 2);
-            if (cid >= lo && cid <= hi)
-                return false;
+            if (cid > highest)
+                highest = cid;
         }
-        return true;
+        return highest;
+    }
+
+    // Does the sprite `t` place anything at a depth in [lo, hi]? Our row children go there, so a row
+    // clip that already uses one of those depths is left alone rather than having its own child
+    // replaced. PlaceObject2 = {flags, depth u16, ...}, PlaceObject3 = {flags, flags2, depth u16, ...}.
+    bool sprite_uses_depths(const Tag &t, const uint8_t *src, uint16_t lo, uint16_t hi)
+    {
+        const uint8_t *body = src + t.offset;
+        size_t off = 4; // past cid + frameCount
+        while (off + 2 <= t.length)
+        {
+            const uint16_t head = static_cast<uint16_t>(body[off] | (body[off + 1] << 8));
+            off += 2;
+            const uint16_t code = static_cast<uint16_t>(head >> 6);
+            uint32_t len = head & 0x3F;
+            if (len == 0x3F)
+            {
+                if (off + 4 > t.length)
+                    return true; // unreadable - treat as taken
+                std::memcpy(&len, body + off, 4);
+                off += 4;
+            }
+            if (off + len > t.length)
+                return true;
+            const size_t depth_at = code == 26 ? 1 : code == 70 ? 2 : 0;
+            if (depth_at && len >= depth_at + 2)
+            {
+                uint16_t depth = 0;
+                std::memcpy(&depth, body + off + depth_at, 2);
+                if (depth >= lo && depth <= hi)
+                    return true;
+            }
+            off += len;
+            if (code == 0) // End
+                break;
+        }
+        return false;
     }
 
     // The column-caption block, removed for good. The two tofu headers ("Keyboard" / "Mouse")
@@ -277,10 +315,11 @@ namespace
         return true;
     }
 
-    // Splice our icon characters in and swap the row clip for the version that places them.
-    // Both pieces are generated at build time (tools/generate_menu_icon_tags.py, which
-    // re-parses its own output before emitting it), so all that is left here is to find the
-    // row tag and prove the movie is the one those bytes were built against.
+    // Splice our icon characters in and give the row clip the children that place them.
+    // Our own content comes from the build (tools/generate_menu_icon_tags.py: bitmaps, masks, the
+    // strips, the four row placements) with LOCAL character ids; everything that depends on the movie
+    // is decided here from the movie that actually loaded: the ids start one past its highest, and the
+    // placements go into ITS row clip. Nothing about a stock .gfx is baked in.
     // ONE construction is spliced: a named child per icon, all baked invisible, the chosen one
     // scaled up. The ini key that used to pick between two candidates (`native_menu_icons`) was
     // removed along with the strip-plus-mask variant on 2026-07-29 - it is not in build_schema()
@@ -292,6 +331,8 @@ namespace
     uint16_t logo_cid();
     bool build_logo_define(std::vector<uint8_t> &tag);
     extern bool g_logo_spliced;
+    // One past our icon ids in the movie being rebuilt; set by add_menu_icons before the logo goes in.
+    uint16_t g_logo_cid = 0;
     // ── row density: a tighter pitch, and more row clips ─────────────────────────────
     // The screen shows as many rows as the row pool (sprite 190) has clips - eleven in the left
     // column (Item_0_0 .. Item_10_0), pitched 63.75 px apart between y = 35.3 and y = 673.2 px. The
@@ -303,6 +344,7 @@ namespace
     // rebuilt row clip has. Whether the engine ever ASKS for the added slots (11..14 - four of them,
     // kRowSlots 15 minus kRowAuthored 11) is not assumed: the row-path hook logs the highest slot it
     // is called with, so one run in game settles it.
+    constexpr uint16_t kRowCid = 189;           // the row clip: Item_N_0 in the pool below
     constexpr uint16_t kRowPoolCid = 190;       // KeySetting/ItemList
     constexpr int32_t kRowPitchPx = 49;         // authored 63.75; 14 rows then end where 11 did
     // Measured chain: KeySetting sits at y = 480 px, ItemList at -369.65 px inside it, so row 0
@@ -380,7 +422,7 @@ namespace
             char name[16];
             _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_0", index);
             if (!emit(static_cast<uint16_t>(kRowFirstDepth - kRowDepthStep * index),
-                      goblin::menu_icon_tags::ROW_CID, name, kRowXTwips, row_y_twips(index)))
+                      kRowCid, name, kRowXTwips, row_y_twips(index)))
                 return len;
             // Its right-column partner, so a page that fills both columns keeps its mouse binds.
             _snprintf_s(name, sizeof(name), _TRUNCATE, "Item_%d_1", index);
@@ -460,21 +502,14 @@ namespace
                         std::vector<uint8_t> &out, const char **why)
     {
         namespace mi = goblin::menu_icon_tags;
-        // ONE construction: a named child per icon (the former native_menu_icons = 2). The strip
-        // variant needed its position re-applied every frame, because the engine re-applies the
-        // authored matrix whenever the timeline places an object again.
-        const unsigned char *blob = mi::ICON_BLOB_B;
-        const size_t blob_len = mi::ICON_BLOB_B_LEN;
-        const unsigned char *rowtag = mi::ROW_TAG_B;
-        const size_t rowtag_len = mi::ROW_TAG_B_LEN;
         const Tag *row = nullptr;
         for (const Tag &t : tags)
         {
-            if (t.code != 39 || t.length < 2) // DefineSprite
+            if (t.code != 39 || t.length < 4) // DefineSprite
                 continue;
             uint16_t cid = 0;
             std::memcpy(&cid, src + t.offset, 2);
-            if (cid == mi::ROW_CID)
+            if (cid == kRowCid)
             {
                 row = &t;
                 break;
@@ -485,18 +520,41 @@ namespace
             *why = "row clip not found in this movie";
             return false;
         }
-        if (row->length != mi::ORIG_ROW_BODY_LEN)
+        if (sprite_uses_depths(*row, src, mi::ROW_DEPTH_LO, mi::ROW_DEPTH_HI))
         {
-            *why = "row clip differs from the one the icons were built against";
+            *why = "the row clip already uses the depths our icon and slider children go on";
             return false;
         }
-        // Through logo_cid(), not just LAST_CID: the logo takes the id one past the icon strip, and a
-        // window is only "checked" if the check covers every id we are about to define.
-        if (!cid_range_free(src, tags, mi::FIRST_CID, logo_cid()))
+        // Our ids: one past the movie's highest, then the logo one past ours - so a window is only
+        // "ours" if it is above everything the movie defines, whatever movie it is.
+        const uint32_t base = static_cast<uint32_t>(highest_defined_cid(src, tags)) + 1;
+        if (base + mi::CID_COUNT + 1 > 0xFFFFu)
         {
-            *why = "our character ids are already taken in this movie";
+            *why = "no character ids left above this movie's own";
             return false;
         }
+        g_logo_cid = static_cast<uint16_t>(base + mi::CID_COUNT);
+        auto relocate = [base](const unsigned char *data, size_t len, const uint32_t *relocs,
+                               size_t count) {
+            std::vector<uint8_t> v(data, data + len);
+            for (size_t k = 0; k < count; ++k)
+            {
+                uint16_t id = 0;
+                std::memcpy(&id, v.data() + relocs[k], 2);
+                id = static_cast<uint16_t>(id + base);
+                std::memcpy(v.data() + relocs[k], &id, 2);
+            }
+            return v;
+        };
+        const std::vector<uint8_t> blob =
+            relocate(mi::ICON_BLOB, mi::ICON_BLOB_LEN, mi::ICON_BLOB_CID_RELOCS,
+                     sizeof(mi::ICON_BLOB_CID_RELOCS) / sizeof(mi::ICON_BLOB_CID_RELOCS[0]));
+        const std::vector<uint8_t> places =
+            relocate(mi::ROW_PLACES, mi::ROW_PLACES_LEN, mi::ROW_PLACES_CID_RELOCS,
+                     sizeof(mi::ROW_PLACES_CID_RELOCS) / sizeof(mi::ROW_PLACES_CID_RELOCS[0]));
+        spdlog::info("[ownmovie] menu icons: character ids {}..{} (one past the movie's highest), "
+                     "{} icons + slider into row clip {} ({} bytes)",
+                     base, base + mi::CID_COUNT - 1, mi::ICON_COUNT, kRowCid, row->length);
         // Our defines go immediately before the row clip, which uses them. Both are define
         // tags, so this lands before the movie's first frame either way.
         const size_t row_start = row->offset - (row->long_form ? 6u : 2u);
@@ -505,8 +563,14 @@ namespace
             const size_t start = t.offset - (t.long_form ? 6u : 2u);
             if (start == row_start)
             {
-                out.insert(out.end(), blob, blob + blob_len);
-                out.insert(out.end(), rowtag, rowtag + rowtag_len);
+                out.insert(out.end(), blob.begin(), blob.end());
+                // The loaded row clip itself, with our children at the start of its frame 1 (where
+                // they persist across the row's style frames).
+                if (!emit_sprite_with(out, t, src, places.data(), places.size()))
+                {
+                    *why = "row clip body too short to extend";
+                    return false;
+                }
                 // The logo bitmap joins the icons here: same kind of tag, same guaranteed-valid spot
                 // before the movie's first frame, so the character exists by the time the header
                 // places it.
@@ -591,8 +655,8 @@ namespace
     // innermost placement, so the game keeps its own position and scale for the corner.
     constexpr uint16_t kTitleIconSpriteCid = 199; // the sprite that holds the icon image
     constexpr uint16_t kTitleIconImageCid = 23;   // MENU_FL_Sysytem.tga
-    // One past the range the icon strip reserves, so both live in the same checked window.
-    uint16_t logo_cid() { return static_cast<uint16_t>(goblin::menu_icon_tags::LAST_CID + 1); }
+    // One past our icon ids in this movie (add_menu_icons picks the window above the movie's own).
+    uint16_t logo_cid() { return g_logo_cid; }
 
     // Re-point sprite 199's PlaceObject3 (code 70: flags1, flags2, depth u16, char u16) from the
     // game's icon to our logo. Same-length edit, applied to the finished buffer.

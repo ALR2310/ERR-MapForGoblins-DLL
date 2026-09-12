@@ -1,0 +1,21 @@
+{
+  "_comment": "Enemy models with no name entry of their own, labeled with the name of the base-game model that is the same enemy. Consumed by tools/generate_loot_massedit.py load_enemy_names(): the alias takes the target's name id, so the NpcParam variant digit (model*1000 + variant*100 + 4) still picks the variant name. Identities from the community NpcParam row names / character aliases; each checked against the game data noted.",
+  "c6201": "c4191",
+  "_c6201": "DLC scarabs. Same variant digits as c4191 and the same drops per digit: 62012xxx Ash of War (Ash-of-War Scarab), 62015xxx Somber Smithing Stones (Somber Scarab), 62013xxx (Glintstone Scarab).",
+  "c5960": "c4640",
+  "_c5960": "Ulcerated Tree Spirit (Church District, Belurat, Ellac River).",
+  "c5391": "c4601",
+  "_c5391": "Troll Knight.",
+  "c5390": "c4600",
+  "_c5390": "Troll.",
+  "c5950": "c3460",
+  "_c5950": "Leonine Misbegotten.",
+  "c5920": "c4910",
+  "_c5920": "Magma Wyrm (Dragon's Pit).",
+  "c5620": "c4950",
+  "_c5620": "Tibia Mariner (Charo's Hidden Grave).",
+  "c5800": "c2500",
+  "_c5800": "Crucible Knight Devonia - a Crucible Knight; drops Devonia's Hammer and the Crucible Hammer-Helm.",
+  "c6091": "c6090",
+  "_c6091": "The Moonlight Altar turtles on Miriel's model (unnamed; Miriel himself is labeled from NpcName) - Turtle."
+}

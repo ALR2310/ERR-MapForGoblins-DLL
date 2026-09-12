@@ -39,6 +39,14 @@ if _sort_groups_path.exists():
 #   80 = utility (rainbow stone, glowstone, soap, soft cotton)
 CONSUMABLE_SORT_GROUPS = {20, 50, 70, 80}
 
+# Torrent's caparisons, by their own inventory sort group (extract_goods_categories). They are key
+# items, so goods_sort_groups.json - goodsType 0 only - does not carry them.
+_steed_path = DATA_DIR / 'goods_steed_regalia_ids.json'
+STEED_REGALIA_IDS = set()
+if _steed_path.exists():
+    with open(_steed_path) as _f:
+        STEED_REGALIA_IDS = {int(i) for i in json.load(_f)}
+
 # Prattling Pate IDs - excluded from Consumables/Utilities to avoid
 # double-markers (they have their own dedicated category).
 PATE_IDS = {2200, 2201, 2202, 2203, 2204, 2205, 2206, 2207, 2002150}
@@ -204,9 +212,9 @@ LOOT_CATEGORIES = {
         'startId': 3600000,
     },
     'Key - Seeds Tears Ashes': {
-        # Golden Seeds, Sacred Tears, Revered Spirit Ashes
+        # Golden Seeds, Sacred Tears (Revered Spirit Ash has its own category below)
         'filter': lambda items: any(
-            i['category'] == 1 and i['id'] in (10010, 10020, 2010100)
+            i['category'] == 1 and i['id'] in (10010, 10020)
             for i in items
         ),
         'iconId': 377,
@@ -219,6 +227,26 @@ LOOT_CATEGORIES = {
         ),
         'iconId': 401,
         'startId': 3750000,
+    },
+    'Key - Revered Spirit Ashes': {
+        # the DLC spirit-ash blessing upgrade - the Scadutree Fragment's counterpart
+        'filter': lambda items: any(
+            i['category'] == 1 and i['id'] == 2010100
+            for i in items
+        ),
+        'iconId': 0,       # assigned by icon_registry below
+        'startId': 0,      # assigned by row_id_registry below
+    },
+    'Key - Spectral Steed Regalia': {
+        # Torrent's caparisons (Tarnished Pack, game patch 1.17) - cosmetic, and they used to land
+        # in Quest - Progression. No id list here: EquipParamGoods files them under an inventory
+        # sort group of their own (verified: exactly the three regalia), and the extractor dumps it.
+        'filter': lambda items: any(
+            i['category'] == 1 and i['id'] in STEED_REGALIA_IDS
+            for i in items
+        ),
+        'iconId': 0,       # assigned by icon_registry below
+        'startId': 0,      # assigned by row_id_registry below
     },
     'Key - Whetblades': {
         'filter': lambda items: any(
@@ -671,18 +699,34 @@ for _name, _cfg in LOOT_CATEGORIES.items():
     _cfg['startId'] = _row_id_registry.base(_name)
 
 
+def enemy_instance_keys(rec):
+    """Two ways a record names its enemy, both with the tile's variant suffix dropped
+    (m61_46_47_00 and m61_46_47_10 place the same enemy): its MSB part - a variant may move the
+    part - and its spot - one NPC may be several parts in one place (Igon: c0000_9000/_9001,
+    0.2u apart, one per state). Two records are the same enemy when either key matches."""
+    tile = rec.get('map', '')[:9]
+    pos = ('pos', tile, round(rec.get('x', 0)), round(rec.get('z', 0)))
+    part = ('part', tile, rec['partName']) if rec.get('partName') else pos
+    return part, pos
+
+
 def deduplicate(records):
-    """Remove _00/_10 MSB duplicates by (primary item id, rounded coords)."""
+    """Remove _00/_10 MSB duplicates by (primary item id, rounded coords), and an enemy's drop
+    repeated as the same enemy (enemy_instance_keys): the first record - the _00 tile, by MSB
+    file order - is kept."""
     seen = set()
     unique = []
     dupes = 0
     for rec in records:
         primary_id = rec['items'][0]['id'] if rec['items'] else 0
         key = (primary_id, round(rec['x'], 1), round(rec['y'], 1), round(rec['z'], 1))
-        if key in seen:
+        enemy_keys = ([(primary_id,) + k for k in enemy_instance_keys(rec)]
+                      if rec.get('source') == 'enemy' else [])
+        if key in seen or any(k in seen for k in enemy_keys):
             dupes += 1
             continue
         seen.add(key)
+        seen.update(enemy_keys)
         unique.append(rec)
     return unique, dupes
 
@@ -716,14 +760,22 @@ def _model_map_from_i18n():
 def load_enemy_names():
     """Enemy model -> name-id mapping. ERR uses its own extracted mapping; other
     profiles derive it from the profile-independent enemy-name table so their
-    enemy labels resolve the same way."""
+    enemy labels resolve the same way. Either way, models with no name of their own
+    borrow the base-game model that is the same enemy (data/enemy_model_aliases.json:
+    the DLC scarabs c6201 -> c4191 and the like)."""
+    names = None
     path = DATA_DIR / 'enemy_tutorial_mapping.json'
     if path.exists():
         with open(path) as f:
-            d = json.load(f)
-        if d:
-            return d
-    return _model_map_from_i18n()
+            names = json.load(f) or None
+    names = names or _model_map_from_i18n()
+    alias_path = config.PROJECT_DIR / 'data' / 'enemy_model_aliases.json'
+    if alias_path.exists():
+        with open(alias_path, encoding='utf-8') as f:
+            for model, target in json.load(f).items():
+                if not model.startswith('_') and model not in names and target in names:
+                    names[model] = names[target]
+    return names
 
 ENEMY_NAMES = load_enemy_names()
 
@@ -1032,16 +1084,25 @@ def main():
     # icons. The shared flag is the lot getItemFlagId, set when the set is obtained, so
     # all pieces' markers disappear together correctly. Probabilistic drops (with a
     # nothing slot) have no flag and were already removed by the event-flag filter above.
+    # "One enemy" is counted with the tile's variant suffix dropped (enemy_instance_keys):
+    # m61_46_47_00 and m61_46_47_10 carry the same c5240_9088, and keying the map name WITH its
+    # variant counted that single enemy twice - which dropped 11 of vanilla's 20 flagged Pot
+    # Shadow lots (Antiquity Scholar's Cookbook [1] among them). One enemy = one part OR one spot.
     from collections import Counter
     flag_counts = Counter(r.get('eventFlag', 0) for r in db)
-    flag_positions = {}
+    flag_parts, flag_spots = {}, {}
     for r in db:
-        flag_positions.setdefault(r.get('eventFlag', 0), set()).add(
-            (r.get('map'), round(r.get('x', 0)), round(r.get('z', 0))))
+        part, spot = enemy_instance_keys(r)
+        flag_parts.setdefault(r.get('eventFlag', 0), set()).add(part)
+        flag_spots.setdefault(r.get('eventFlag', 0), set()).add(spot)
+
+    def one_enemy(flag):
+        return len(flag_parts[flag]) == 1 or len(flag_spots[flag]) == 1
+
     before = len(db)
     db = [r for r in db if r.get('source') != 'enemy'
           or flag_counts[r['eventFlag']] == 1
-          or (r.get('guaranteed') and len(flag_positions[r.get('eventFlag', 0)]) == 1)]
+          or (r.get('guaranteed') and one_enemy(r.get('eventFlag', 0)))]
     print(f'  {len(db)} after filtering shared enemy flags (-{before - len(db)})')
 
     # ERR-only loot categories: their item IDs don't exist in vanilla, so they
@@ -1193,33 +1254,59 @@ def main():
     # ── Great Runes: dropped by story bosses ──
     print('\n=== Key - Great Runes ===')
 
-    # Great Rune item ID → boss vanillaPlaceName substring
-    GREAT_RUNE_BOSSES = {
-        191: 'Godrick the Grafted',
-        192: 'Starscourge Radahn',
-        193: 'Morgott',
-        194: 'Rykard',
-        195: 'Mohg, Lord of Blood',
-        196: 'Malenia',
-    }
-
-    boss_by_name = {}
+    # No rune/boss table: extract_all_items derives the runes and their award flags from the
+    # build's own EMEVD (common event 1100, "Defeat boss_obtain item" - a flag-triggered award
+    # with no position, which is why these need the boss's spot). Here each award flag is matched
+    # to the boss whose death event sets it, by the defeat flag set in the same event.
+    # The old table matched by English boss name and lost runes wherever the names were not those
+    # words (measured 2026-09-11: all six missing in Golden Age 3.6.1, which ships Chinese text
+    # under msg/engus; Malenia in Throne, Radahn in VINS 1.9.1, each because the boss had no name).
+    boss_by_flag = {}
     for b in boss_list:
-        boss_by_name[b['vanillaPlaceName']] = b
+        for key in ('clearedEventFlagId', 'killEventFlagId'):
+            if b.get(key, 0) > 0:
+                boss_by_flag.setdefault(b[key], b)
+
+    rune_drops_path = DATA_DIR / 'great_rune_drops.json'
+    rune_drops = []
+    if rune_drops_path.exists():
+        with open(rune_drops_path, encoding='utf-8') as f:
+            rune_drops = json.load(f)
+    else:
+        print('  WARNING: great_rune_drops.json not found - run extract_all_items.py')
 
     lines = []
     row_id = _row_id_registry.base("Key - Great Runes")  # z-order slot; see row_id_registry
     gr_count = 0
-    for rune_id, boss_name in sorted(GREAT_RUNE_BOSSES.items()):
-        # Find boss
+    seen_runes = set()
+    for drop in sorted(rune_drops, key=lambda d: d['item']):
+        rune_id = drop['item']
+        if rune_id in seen_runes:
+            continue  # one marker per rune even if the award is called from two maps
+        # The award flag is set by the boss's death event: look for a boss whose defeat flag that
+        # same event sets. A boss in the event's OWN map wins - Morgott's Leyndell event also sets
+        # Margit's Stormveil flag (one character, two fights), and without the map check the rune
+        # landed on Margit.
         boss = None
-        for bname, b in boss_by_name.items():
-            if boss_name.lower() in bname.lower():
-                boss = b
+        for pass_map_only in (True, False):
+            for setter in drop.get('setters', ()):
+                for flag in setter.get('flags', ()):
+                    if flag == drop.get('awardFlag') or flag not in boss_by_flag:
+                        continue
+                    candidate = boss_by_flag[flag]
+                    if pass_map_only and candidate.get('map') != setter.get('map'):
+                        continue
+                    boss = candidate
+                    break
+                if boss:
+                    break
+            if boss:
                 break
         if not boss:
-            print(f'  WARNING: boss not found for rune {rune_id} "{boss_name}"')
+            print(f'  WARNING: no boss sets flag {drop.get("awardFlag")} for rune {rune_id} '
+                  f'"{drop.get("name", "")}" (awarded in {drop.get("map", "?")})')
             continue
+        seen_runes.add(rune_id)
 
         area = boss['areaNo']
         gx = boss.get('gridX', 0)

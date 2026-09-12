@@ -17,7 +17,7 @@ namespace goblin::watch { void pump(); }
 #include "generated_shared/goblin_map_icons.hpp" // one DefineBitsLossless2 tag per custom map icon
 #include "generated_shared/goblin_logo.hpp"       // runtime-injectable MapForGoblins logo (bitmap + matrix)
 #include "goblin_own_movie.hpp"                    // log_stack (observation: who parses the world map)
-#include "generated/goblin_item_icons.hpp"       // goblin::generated::ANON_ICON_ID
+#include "goblin_item_icons.hpp"       // goblin::generated::ANON_ICON_ID
 #include "goblin_inject.hpp"   // goblin::remap_injected_icons (point markers at our injected frames)
 #include "goblin_maphover.hpp" // map_dialog() - the V3 spike only fires while the map is open
 #include "goblin_stall_probe.hpp"

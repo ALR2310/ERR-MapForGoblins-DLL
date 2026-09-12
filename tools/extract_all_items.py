@@ -347,6 +347,11 @@ def main():
     weapon_db = param_to_dict(wparam, {'wepType', 'sortId'})
     print(f'  {len(weapon_db)} weapons')
 
+    print('--- EquipParamCustomWeapon ---')
+    cwparam = read_param(bnd, 'EquipParamCustomWeapon', paramdefs)
+    custom_weapon_db = param_to_dict(cwparam, {'baseWepId'}) if cwparam else {}
+    print(f'  {len(custom_weapon_db)} custom weapons')
+
     print('--- EquipParamGoods ---')
     gparam = read_param(bnd, 'EquipParamGoods', paramdefs)
     goods_db = param_to_dict(gparam, {'goodsType', 'sortId'})
@@ -593,36 +598,40 @@ def main():
     SUFFIX_SCALE = {'01': 2, '02': 4, '12': 4}
     FINE_TILE_SIZE = 256
     _prefix_re = re.compile(r'^m(\d{2})_(\d{2})_(\d{2})_(\d{2})-')
-    remapped = 0
-    for tr in treasures:
-        m = _prefix_re.match(tr.get('partName', ''))
-        if not m: continue
-        own_area, own_gx, own_gz, own_p3 = (int(g) for g in m.groups())
-        cur_map = tr['map']
-        # Skip if partName already matches the MSB (regular asset)
-        if cur_map.startswith(f'm{own_area:02d}_{own_gx:02d}_{own_gz:02d}_{own_p3:02d}'):
-            continue
-        # Only handle the same-area placeholder case (m60→m60, m61→m61).
-        # Cross-area cases (m34_NN → m60_XX, legacy dungeons) need
-        # WorldMapLegacyConvParam handling and are out of scope here.
-        if own_area != tr['areaNo']: continue
-        suffix = cur_map[-2:]  # e.g. '02'
-        scale = SUFFIX_SCALE.get(suffix)
-        if scale is None: continue
-        agg_size = FINE_TILE_SIZE * scale
-        # Local-coord offset from placeholder origin to owner origin.
-        # Both tiles are center-origin in local coords.
-        offset_x = tr['p1'] * agg_size + agg_size / 2 \
-                 - own_gx * FINE_TILE_SIZE - FINE_TILE_SIZE / 2
-        offset_z = tr['p2'] * agg_size + agg_size / 2 \
-                 - own_gz * FINE_TILE_SIZE - FINE_TILE_SIZE / 2
-        tr['x'] += offset_x
-        tr['z'] += offset_z
-        tr['p1'] = own_gx
-        tr['p2'] = own_gz
-        tr['map'] = f'm{own_area:02d}_{own_gx:02d}_{own_gz:02d}_{own_p3:02d}'
-        remapped += 1
-    print(f'    Remapped {remapped} placeholder records to fine-grid owner tiles')
+
+    def remap_placeholders(records):
+        remapped = 0
+        for tr in records:
+            m = _prefix_re.match(tr.get('partName', ''))
+            if not m: continue
+            own_area, own_gx, own_gz, own_p3 = (int(g) for g in m.groups())
+            cur_map = tr['map']
+            # Skip if partName already matches the MSB (regular asset)
+            if cur_map.startswith(f'm{own_area:02d}_{own_gx:02d}_{own_gz:02d}_{own_p3:02d}'):
+                continue
+            # Only handle the same-area placeholder case (m60→m60, m61→m61).
+            # Cross-area cases (m34_NN → m60_XX, legacy dungeons) need
+            # WorldMapLegacyConvParam handling and are out of scope here.
+            if own_area != tr['areaNo']: continue
+            suffix = cur_map[-2:]  # e.g. '02'
+            scale = SUFFIX_SCALE.get(suffix)
+            if scale is None: continue
+            agg_size = FINE_TILE_SIZE * scale
+            # Local-coord offset from placeholder origin to owner origin.
+            # Both tiles are center-origin in local coords.
+            offset_x = tr['p1'] * agg_size + agg_size / 2 \
+                     - own_gx * FINE_TILE_SIZE - FINE_TILE_SIZE / 2
+            offset_z = tr['p2'] * agg_size + agg_size / 2 \
+                     - own_gz * FINE_TILE_SIZE - FINE_TILE_SIZE / 2
+            tr['x'] += offset_x
+            tr['z'] += offset_z
+            tr['p1'] = own_gx
+            tr['p2'] = own_gz
+            tr['map'] = f'm{own_area:02d}_{own_gx:02d}_{own_gz:02d}_{own_p3:02d}'
+            remapped += 1
+        return remapped
+
+    print(f'    Remapped {remap_placeholders(treasures)} placeholder records to fine-grid owner tiles')
 
     # ── EMEVD: template event drops (scarabs, mini-bosses, etc.) ──
     print('\n=== Scanning EMEVD for template event drops ===')
@@ -640,7 +649,7 @@ def main():
     # 90005881-90005885 are boss-state machines with no item drop).
     #
     # Offsets:
-    #   Scarab/enemy drops:               entity@8,  lot@16
+    #   Scarab/enemy drops:               entity@12, lot@16  (X0_4 flag, X4_4 char, X8_4 lot)
     #   Boss rewards (90005860+):         entity@16, lot@24
     #   NPC quest rewards (90005750):     entity@8,  lot@16
     #   NPC invasion rewards (90005774):  entity@8,  lot@12
@@ -650,9 +659,14 @@ def main():
     #   Larval Tears (90005390):          entity@8,  lot@28
     #   NPC quest reward variant 90005753: entity@8, lot@16 (asset-tied; e.g. Volcanic Storm)
     TEMPLATE_EVENTS = {
-        # Scarab/enemy drops
-        90005300: (8, 16, 20),
-        90005301: (8, 16, 20),
+        # Scarab/enemy drops. common_func: SetEventFlag(X0_4) + AwardItems(X8_4) once
+        # CharacterDead(X4_4) - the character is X4_4 (args@12). Reading args@8 took the kill
+        # flag, which only works where the flag happens to equal the character's EntityID: in
+        # vanilla 7 of 304 calls differ - 5 drops were lost (the flag names no part) and 2 went
+        # to ANOTHER enemy that carries the flag's number (m61_47_39: the Giant Hippopotamus's
+        # Scadutree Fragment sat on the Demi-Human Swordmaster underground).
+        90005300: (12, 16, 20),
+        90005301: (12, 16, 20),
         # Boss rewards (field bosses, dungeon bosses).
         # 90005860/61: boss entity = X8_4 (args@16), award lot = X16_4 (args@24).
         # 90005880 has a DIFFERENT layout: boss entity = X12_4 (args@20), lot = X16_4
@@ -699,6 +713,39 @@ def main():
     # as the marker's hide flag instead of the lot flag.
     SCARAB_EVENTS = {90005300, 90005301}
 
+    # Invader "first kill" drops (90005768): X0_4 = the invader's kill flag, X4_4 = the lot awarded
+    # on the FIRST kill, X12_4 = the lot on a later kill (an event value, X20_4, counts the kills),
+    # X8_4 / X16_4 = those lots' flags. It names no character: the invader is the X12_4 of the
+    # 90005792 invader-defeat call in the same file with the same kill flag. Vanilla: Fire Knight
+    # Queelign, Belurat (m20_00) and m61_47_46 - Crusade Insignia first, Ash of War: Flame Skewer
+    # after. Both awards are AwardItems(IncludingClients) with no 2004:76, so like the scarab
+    # template the lots' own flags are not set; the kill flag hides the markers (defeatFlag).
+    INVADER_DEFEAT, FIRST_KILL_DROP = 90005792, 90005768
+    # Templates whose award sets no lot flag, so every lot they hand out (base and chained sub-lots
+    # alike) hides on the template's own kill flag, captured as defeatFlag.
+    KILL_FLAG_HIDES = SCARAB_EVENTS | {FIRST_KILL_DROP}
+    invader_char = {}      # (emevd map, kill flag) -> character EntityID
+    first_kill_drops = []  # (emevd map, kill flag, first-kill lot, later lot)
+
+    # ── Boss drops awarded BY FLAG (Great Runes) ───────────────────────────────────────────
+    # Common event 1100 "Defeat boss_obtain item" waits on a flag and awards one or two lots.
+    # Nothing in it says WHERE, so the position-driven paths above can never place it - which is
+    # why the six Great Runes used to need a hand-written rune->boss table. Collected here, in the
+    # one pass that already reads every EMEVD; generate_loot_massedit resolves the flag to a boss
+    # (the boss's own death event sets it alongside that boss's defeat flag, which boss_list.json
+    # keys bosses by). The Divine Tower event pairs the INACTIVE rune a boss drops with the
+    # RESTORED one it hands back, so a build that skips the tower step (The Convergence drops the
+    # restored rune directly) needs no special case.
+    BOSS_ITEM_EVENT = 1100
+    TOWER_EVENT = 90005110
+    GREAT_RUNE_GOODS_TYPE = 15  # EquipParamGoods.goodsType of a restored Great Rune
+    boss_item_calls = []   # (map_name, award flag, [lots])
+    tower_pairs = []       # (inactive rune item, restored lot)
+    # award flag -> [(map of the EMEVD that sets it, the flags that event sets ON)]. The map
+    # matters: Margit and Morgott are one character, so the Leyndell event that awards Morgott's
+    # rune sets Margit's Stormveil flag too, and only the map tells the two bosses apart.
+    flag_setters = {}
+
     emevd_dir = ERR_MOD_DIR / 'event'
     emevd_calls = []  # (entityId, lotId, map_name, eventId, defeatFlag)
 
@@ -713,26 +760,75 @@ def main():
             continue
 
         for event in emevd.Events:
+            flags_set_on = []
             for instr in event.Instructions:
-                if int(instr.Bank) != 2000:
+                bank = int(instr.Bank)
+                if bank == 2003 and int(instr.ID) in (66, 69):  # Set[NetworkConnected]EventFlag
+                    a = bytes(instr.ArgData)
+                    if len(a) >= 12:
+                        flag_id, state = struct.unpack_from('<ii', a, 4)
+                        if state == 1 and flag_id > 0:
+                            flags_set_on.append(flag_id)
+                    continue
+                if bank != 2000:
                     continue
                 args = bytes(instr.ArgData)
                 if len(args) < 8:
                     continue
                 event_id = struct.unpack_from('<i', args, 4)[0]
+                if event_id == BOSS_ITEM_EVENT and len(args) >= 20:
+                    award_flag, lot_a, lot_b = struct.unpack_from('<iii', args, 8)
+                    if award_flag > 0:
+                        boss_item_calls.append((map_name, award_flag,
+                                                [l for l in (lot_a, lot_b) if l > 0]))
+                    continue
+                if event_id == TOWER_EVENT and len(args) >= 28:
+                    restored_lot, taken_item = struct.unpack_from('<ii', args, 20)
+                    if taken_item > 0 and restored_lot > 0:
+                        tower_pairs.append((taken_item, restored_lot))
+                    continue
+                if event_id == INVADER_DEFEAT and len(args) >= 24:
+                    kill_flag, char = struct.unpack_from('<I', args, 8)[0], struct.unpack_from('<I', args, 20)[0]
+                    if kill_flag > 0 and char > 0:
+                        invader_char.setdefault((map_name, kill_flag), char)
+                if event_id == FIRST_KILL_DROP and len(args) >= 24:
+                    kill_flag, first_lot, _f1, later_lot = struct.unpack_from('<Iiii', args, 8)
+                    if kill_flag > 0:
+                        first_kill_drops.append((map_name, kill_flag, first_lot, later_lot))
+                    continue
                 if event_id not in TEMPLATE_EVENTS:
                     continue
                 entity_off, lot_off, min_len = TEMPLATE_EVENTS[event_id]
                 if len(args) < min_len:
                     continue
-                entity_id = struct.unpack_from('<i', args, entity_off)[0]
+                # EntityIDs are unsigned: DLC ones pass 2^31 (2246390200...), and a signed read
+                # turned them negative, so the `> 0` check below dropped the call.
+                entity_id = struct.unpack_from('<I', args, entity_off)[0]
                 lot_id = struct.unpack_from('<i', args, lot_off)[0]
                 # Extract defeat/kill flag (offset 8 = X0_4) for boss events AND
-                # scarab drops - both SetEventFlag(X0_4) on death.
-                defeat_flag = (struct.unpack_from('<i', args, 8)[0]
+                # scarab drops - both SetEventFlag(X0_4) on death. Unsigned, like the entity: DLC
+                # flags pass 2^31 too (m61_51_45 golem: 2251450280), and a signed read made the
+                # `> 0` checks drop the flag, so its drops hid on lot flags that never get set.
+                defeat_flag = (struct.unpack_from('<I', args, 8)[0]
                                if event_id in BOSS_EVENTS or event_id in SCARAB_EVENTS else 0)
                 if lot_id > 0 and entity_id > 0:
                     emevd_calls.append((entity_id, lot_id, map_name, event_id, defeat_flag))
+            if flags_set_on:
+                entry = (map_name, sorted(set(flags_set_on)))
+                for flag_id in flags_set_on:
+                    flag_setters.setdefault(flag_id, []).append(entry)
+
+    unresolved_first_kill = 0
+    for map_name, kill_flag, first_lot, later_lot in first_kill_drops:
+        char = invader_char.get((map_name, kill_flag))
+        if not char:
+            unresolved_first_kill += 1
+            continue
+        for lot in (first_lot, later_lot):
+            if lot > 0:
+                emevd_calls.append((char, lot, map_name, FIRST_KILL_DROP, kill_flag))
+    print(f'  {len(first_kill_drops)} invader first-kill drop calls ({unresolved_first_kill} with no '
+          f'matching {INVADER_DEFEAT} character in their file)')
 
     print(f'  {len(emevd_calls)} template event calls with lot IDs')
 
@@ -1162,12 +1258,25 @@ def main():
             num = lot.get(f'lotItemNum0{slot}', 0)
             if item_id <= 0 or cat <= 0:
                 continue
+            # Category 6 = Custom Weapon: the id is an EquipParamCustomWeapon row (a weapon
+            # handed out pre-set with an Ash of War / upgrade level), not a weapon id. Every
+            # consumer downstream keys on categories 1-5, so a category-6 item matched no loot
+            # category and its marker was dropped (vanilla Backhand Blade, lot 2047420700).
+            # Record it as its base weapon; the custom row id stays alongside.
+            custom_id = 0
+            if cat == 6:
+                base = custom_weapon_db.get(item_id, {}).get('baseWepId', 0)
+                if base > 0:
+                    custom_id, item_id, cat = item_id, base, 2
             name = name_dbs.get(cat, {}).get(item_id, '')
             broad_cat, sub_cat = categorize_item(cat, item_id, goods_db, weapon_db)
-            items.append({
+            item = {
                 'id': item_id, 'category': cat, 'num': num,
                 'name': name, 'broad_category': broad_cat, 'sub_category': sub_cat,
-            })
+            }
+            if custom_id:
+                item['customWeaponId'] = custom_id
+            items.append(item)
         return items
 
     def lot_is_guaranteed(lot):
@@ -1183,6 +1292,12 @@ def main():
             if iid == 0 and bp > 0:
                 return False
         return True
+
+    # The placeholder remap first ran before the EMEVD passes appended their drops; an award
+    # event's enemy can sit in a supertile MSB too (vanilla: the DLC Furnace Golems in
+    # m61_11_09_02 ..., the c4191/c4503 drops in m60_24_28_01 / m60_13_14_02), whose coarse
+    # coords baked unmapped. Already-remapped records are skipped by the prefix check.
+    print(f'  Remapped {remap_placeholders(treasures)} late (EMEVD) placeholder records to fine-grid owner tiles')
 
     for tr in treasures:
         lot_id = tr['itemLotId']
@@ -1244,8 +1359,11 @@ def main():
         # Clients) with no 2004:76 registration, so the lot's getItemFlagId is never
         # set in-game - the marker would never hide. Use the kill flag X0_4 the
         # template SetEventFlag's on death (captured as defeatFlag) as the hide flag.
-        if tr.get('emevdEventId') in (90005300, 90005301) and tr.get('defeatFlag'):
-            event_flag = tr['defeatFlag']
+        # Invader first-kill drops (90005768) award the same way; their defeatFlag is the kill flag.
+        kill_flag_hide = tr['defeatFlag'] if (tr.get('emevdEventId') in KILL_FLAG_HIDES
+                                              and tr.get('defeatFlag')) else 0
+        if kill_flag_hide:
+            event_flag = kill_flag_hide
         items = extract_lot_items(base_lot)
 
         # For sub-lots with their own getItemFlagId, create separate records
@@ -1265,7 +1383,9 @@ def main():
                     'x': round(tr['x'], 3), 'y': round(tr['y'], 3), 'z': round(tr['z'], 3),
                     'areaNo': tr['areaNo'], 'gridX': gridX, 'gridZ': gridZ,
                     'dispMask': get_disp_mask(tr['areaNo']),
-                    'itemLotId': sub_lot_id, 'eventFlag': sub_flag,
+                    # the chained sub-lot is awarded by the same call, so its own flag is no more
+                    # set than the base lot's (vanilla: Queelign's Prayer Room Key, 400696)
+                    'itemLotId': sub_lot_id, 'eventFlag': kill_flag_hide or sub_flag,
                     'partName': tr['partName'],
                     'items': sub_items,
                     'primary_category': sub_items[0]['broad_category'],
@@ -1341,19 +1461,7 @@ def main():
 
         event_flag = lot.get('getItemFlagId', 0)
 
-        items = []
-        for slot in range(1, 9):
-            item_id = lot.get(f'lotItemId0{slot}', 0)
-            cat = lot.get(f'lotItemCategory0{slot}', 0)
-            num = lot.get(f'lotItemNum0{slot}', 0)
-            if item_id <= 0 or cat <= 0:
-                continue
-            name = name_dbs.get(cat, {}).get(item_id, '')
-            broad_cat, sub_cat = categorize_item(cat, item_id, goods_db, weapon_db)
-            items.append({
-                'id': item_id, 'category': cat, 'num': num,
-                'name': name, 'broad_category': broad_cat, 'sub_category': sub_cat,
-            })
+        items = extract_lot_items(lot)
 
         if not items:
             continue
@@ -1423,6 +1531,55 @@ def main():
     with open(npcname_path, 'w', encoding='utf-8') as f:
         json.dump({str(k): v for k, v in npc_to_name_id.items()}, f, indent=2)
     print(f'Saved {len(npc_to_name_id)} NpcParam→NpcName mappings to {npcname_path.name}')
+
+    # Sidecar: the Great Runes, with the flag that awards them and the flags set beside it.
+    # generate_loot_massedit turns each into a marker on the boss that sets those flags.
+    def lot_run(first_lot):
+        """A lot and the consecutive rows it continues into (vanilla parks the rune in +1,
+        behind the boss's remembrance)."""
+        for offset in range(8):
+            lot_def = (item_lots.get(first_lot + offset) or
+                       item_lots_enemy.get(first_lot + offset))
+            if lot_def is None:
+                if offset:
+                    break
+                continue
+            yield lot_def
+
+    restored_runes = {rid for rid, row in goods_db.items()
+                      if int(row.get('goodsType', 0) or 0) == GREAT_RUNE_GOODS_TYPE}
+    inactive_to_restored = {}
+    for taken_item, restored_lot in tower_pairs:
+        for lot_def in lot_run(restored_lot):
+            for it in extract_lot_items(lot_def):
+                if it['category'] == 1 and it['id'] in restored_runes:
+                    inactive_to_restored.setdefault(taken_item, it['id'])
+    rune_ids = restored_runes | set(inactive_to_restored)
+    rune_drops = []
+    for map_name, award_flag, lots in boss_item_calls:
+        for lot_id in lots:
+            for lot_def in lot_run(lot_id):
+                for it in extract_lot_items(lot_def):
+                    if it['category'] != 1 or it['id'] not in rune_ids:
+                        continue
+                    rune_drops.append({
+                        # The marker is labelled with the RESTORED rune (the name the player
+                        # knows); the inactive one the boss drops reads the same in every FMG.
+                        'item': inactive_to_restored.get(it['id'], it['id']),
+                        'droppedItem': it['id'],
+                        'name': it['name'],
+                        'awardFlag': award_flag,
+                        'lot': lot_id,
+                        'map': map_name,
+                        'setters': [{'map': m, 'flags': fl}
+                                    for m, fl in flag_setters.get(award_flag, ())],
+                    })
+    runes_path = OUTPUT_DIR / 'great_rune_drops.json'
+    with open(runes_path, 'w', encoding='utf-8') as f:
+        json.dump(rune_drops, f, indent=2, ensure_ascii=False)
+    print(f'Saved {len(rune_drops)} Great Rune drop(s) to {runes_path.name} '
+          f'({len(restored_runes)} restored rune goods, {len(inactive_to_restored)} paired with '
+          f'a Divine Tower exchange)')
 
     out_path = OUTPUT_DIR / 'items_database.json'
     with open(out_path, 'w', encoding='utf-8') as f:

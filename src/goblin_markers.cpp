@@ -246,6 +246,8 @@ const char *category_name(generated::Category c)
         case C::KeyImbuedSwordKeys: return "Key - Imbued Sword Keys";
         case C::KeyLarvalTears: return "Key - Larval Tears";
         case C::KeyScadutreeFragments: return "Key - Scadutree Fragments";
+        case C::KeyReveredSpiritAshes: return "Key - Revered Spirit Ashes";
+        case C::KeySpectralSteedRegalia: return "Key - Spectral Steed Regalia";
         case C::KeyGreatRunes: return "Key - Great Runes";
         case C::KeyLostAshes: return "Key - Lost Ashes";
         case C::KeyPotsNPerfumes: return "Key - Pots n Perfumes";
@@ -289,6 +291,7 @@ const char *category_name(generated::Category c)
         case C::ReforgedRunePieces: return "Reforged - Rune Pieces";
         case C::WorldGraces: return "World - Graces";
         case C::WorldHostileNPC: return "World - Hostile NPC";
+        case C::WorldStrongEnemies: return "World - Strong Enemies";
         case C::WorldImpStatues: return "World - Imp Statues";
         case C::WorldMaps: return "World - Maps";
         case C::WorldPaintings: return "World - Paintings";

@@ -18,9 +18,9 @@
 // count changes (see rebuild_if_stale), never per frame.
 namespace goblin::progress
 {
-    // Number of Category enum values (contiguous 0..N from goblin_map_data.hpp).
+    // Number of Category enum values (contiguous 0..N from goblin_map_data.hpp; its LAST member).
     constexpr int kCategoryCount =
-        static_cast<int>(generated::Category::WorldInteractables) + 1;
+        static_cast<int>(generated::Category::KeySpectralSteedRegalia) + 1;
 
     struct CatCount
     {

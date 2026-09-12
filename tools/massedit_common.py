@@ -1,6 +1,7 @@
 """Shared utilities for MASSEDIT generator scripts."""
 
 import json
+import re
 from pathlib import Path
 
 import config
@@ -97,6 +98,30 @@ def convert_legacy_coords(area, gx, gz, x, z):
         return da, dgx, dgz, round(x + ox, 3), round(z + oz, 3)
     return area, gx, gz, x, z
 
+
+# Cross-tile placeholder remap (mirrors extract_all_items.py). Some assets live in a COARSE
+# aggregate "supertile" MSB (suffix _01/_02/_12) but encode their real fine owner tile in the
+# part-name prefix ("m61_48_44_00-AEG099_060_9000" stored in m61_12_11_02). Its Position is in
+# supertile-local coords; baked as-is, the marker carries the supertile's grid and lands far off.
+_SUFFIX_SCALE = {'01': 2, '02': 4, '12': 4}
+_PART_PREFIX_RE = re.compile(r'^m(\d{2})_(\d{2})_(\d{2})_(\d{2})-')
+
+
+def remap_placeholder_xz(part_name, msb_stem, x, z):
+    """(gx, gz, x, z) in the fine owner tile for a part stored in a supertile MSB, or None when
+    the part is already in its own tile (or the case is out of scope: no prefix, cross-area)."""
+    pm = _PART_PREFIX_RE.match(part_name or '')
+    if not pm:
+        return None
+    own_area, own_gx, own_gz, _ = (int(g) for g in pm.groups())
+    ph_area, ph_gx, ph_gz = (int(v) for v in msb_stem[1:].split('_')[:3])
+    scale = _SUFFIX_SCALE.get(msb_stem[-2:])
+    if scale is None or own_area != ph_area:
+        return None
+    agg = 256 * scale
+    return (own_gx, own_gz,
+            round(x + ph_gx * agg + agg / 2 - own_gx * 256 - 128, 3),
+            round(z + ph_gz * agg + agg / 2 - own_gz * 256 - 128, 3))
 
 
 def resolve_location_id(map_name):

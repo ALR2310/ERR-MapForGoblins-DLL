@@ -242,7 +242,7 @@ STAGES = [
           outputs=[DATA / 'items_database.json',
                    DATA / 'npc_name_ids.json',
                    DATA / 'unreachable_msb_lots.json',
-                   DATA / 'great_rune_drops.json'],
+                   DATA / 'boss_flag_drops.json'],
           script='extract_all_items.py',
           also_scripts=['unreachable.py'] + COMMON),
 
@@ -280,7 +280,7 @@ STAGES = [
                   DATA / 'goods_spirit_ash_ids.json',
                   DATA / 'goods_steed_regalia_ids.json',
                   DATA / 'boss_list.json',
-                  DATA / 'great_rune_drops.json',
+                  DATA / 'boss_flag_drops.json',
                   DATA / 'enemy_tutorial_mapping.json',
                   DATA / 'tutorial_title_ids.json',
                   DATA / 'tutorial_title_names.json',

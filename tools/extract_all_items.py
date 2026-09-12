@@ -354,7 +354,7 @@ def main():
 
     print('--- EquipParamGoods ---')
     gparam = read_param(bnd, 'EquipParamGoods', paramdefs)
-    goods_db = param_to_dict(gparam, {'goodsType', 'sortId'})
+    goods_db = param_to_dict(gparam, {'goodsType', 'sortId', 'iconId'})
     print(f'  {len(goods_db)} goods')
 
     print('--- EquipParamProtector ---')
@@ -1548,38 +1548,60 @@ def main():
 
     restored_runes = {rid for rid, row in goods_db.items()
                       if int(row.get('goodsType', 0) or 0) == GREAT_RUNE_GOODS_TYPE}
+    # The rune shelf in the inventory: the icon block the restored runes occupy holds exactly them
+    # plus the Great Rune of the Unborn (Rennala's, a key item by goodsType) - measured in vanilla,
+    # ERR, Convergence and VINS. That is how the Unborn joins the category without an id list.
+    rune_icons = {int(goods_db[r].get('iconId', 0) or 0) for r in restored_runes}
+    rune_icons.discard(0)
+    icon_band = range(min(rune_icons), max(rune_icons) + 1) if rune_icons else range(0)
+    rune_ids = set(restored_runes) | {rid for rid, row in goods_db.items()
+                                      if int(row.get('iconId', 0) or 0) in icon_band}
     inactive_to_restored = {}
     for taken_item, restored_lot in tower_pairs:
         for lot_def in lot_run(restored_lot):
             for it in extract_lot_items(lot_def):
                 if it['category'] == 1 and it['id'] in restored_runes:
                     inactive_to_restored.setdefault(taken_item, it['id'])
-    rune_ids = restored_runes | set(inactive_to_restored)
-    rune_drops = []
+    rune_ids |= set(inactive_to_restored)
+
+    # Every item these flag-awarded calls hand out, not just the runes: the marker generator
+    # places the rest on the same boss through the ordinary loot categories.
+    drops = []
     for map_name, award_flag, lots in boss_item_calls:
+        items = []
+        seen_items = set()
         for lot_id in lots:
             for lot_def in lot_run(lot_id):
                 for it in extract_lot_items(lot_def):
-                    if it['category'] != 1 or it['id'] not in rune_ids:
+                    key = (it['category'], it['id'])
+                    if key in seen_items:
                         continue
-                    rune_drops.append({
-                        # The marker is labelled with the RESTORED rune (the name the player
-                        # knows); the inactive one the boss drops reads the same in every FMG.
-                        'item': inactive_to_restored.get(it['id'], it['id']),
-                        'droppedItem': it['id'],
-                        'name': it['name'],
-                        'awardFlag': award_flag,
-                        'lot': lot_id,
-                        'map': map_name,
-                        'setters': [{'map': m, 'flags': fl}
-                                    for m, fl in flag_setters.get(award_flag, ())],
-                    })
-    runes_path = OUTPUT_DIR / 'great_rune_drops.json'
-    with open(runes_path, 'w', encoding='utf-8') as f:
-        json.dump(rune_drops, f, indent=2, ensure_ascii=False)
-    print(f'Saved {len(rune_drops)} Great Rune drop(s) to {runes_path.name} '
-          f'({len(restored_runes)} restored rune goods, {len(inactive_to_restored)} paired with '
-          f'a Divine Tower exchange)')
+                    seen_items.add(key)
+                    entry = dict(it)
+                    if it['category'] == 1:
+                        entry['goodsType'] = int(goods_db.get(it['id'], {}).get('goodsType', 0) or 0)
+                        if it['id'] in rune_ids:
+                            entry['greatRune'] = True
+                            # Label with the RESTORED rune (the name the player knows); the
+                            # inactive one a boss drops reads the same in every FMG.
+                            entry['labelItem'] = inactive_to_restored.get(it['id'], it['id'])
+                    items.append(entry)
+        if not items:
+            continue
+        drops.append({
+            'awardFlag': award_flag,
+            'lots': lots,
+            'map': map_name,
+            'items': items,
+            'setters': [{'map': m, 'flags': fl} for m, fl in flag_setters.get(award_flag, ())],
+        })
+    drops_path = OUTPUT_DIR / 'boss_flag_drops.json'
+    with open(drops_path, 'w', encoding='utf-8') as f:
+        json.dump(drops, f, indent=2, ensure_ascii=False)
+    rune_calls = sum(1 for d in drops if any(i.get('greatRune') for i in d['items']))
+    print(f'Saved {len(drops)} flag-awarded boss drop(s) to {drops_path.name} '
+          f'({rune_calls} with a Great Rune; {len(restored_runes)} restored rune goods, '
+          f'{len(inactive_to_restored)} paired with a Divine Tower exchange)')
 
     out_path = OUTPUT_DIR / 'items_database.json'
     with open(out_path, 'w', encoding='utf-8') as f:

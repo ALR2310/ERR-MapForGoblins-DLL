@@ -146,6 +146,13 @@ RUNE_ARC_ID = 150 if config.PROFILE == 'err' else 190
 # Which item names go into which file, with iconId and start row ID
 # Filter by item goodsId or item name
 # Equipment categories use ItemLotParam category (2=weapon, 3=armour, 4=accessory, 5=gem)
+# ERR-only loot categories: their item IDs don't exist in vanilla, so they
+# would only ever produce empty files there. Skip them in the vanilla profile.
+ERR_ONLY_CATS = {'Reforged - Items', 'Reforged - Fortunes', 'Reforged - Sealed Curios'}
+
+# Talisman Pouch: a key item by goodsType, a talisman thing by meaning (it is the slot itself).
+TALISMAN_POUCH_IDS = {10040}
+
 LOOT_CATEGORIES = {
     'Key - Celestial Dew': {
         'filter': lambda items: any(i['id'] == 2130 and i['category'] == 1 for i in items),
@@ -347,8 +354,13 @@ LOOT_CATEGORIES = {
         # consumable, if one ever appears, out of the talisman bucket.
         # NOTE: excludes "Physick Remnant"s - those craft Flask of Wondrous Physick crystal tears,
         # not talismans (per the Convergence docs), so they are routed to Key - Crystal Tears.
+        # The Talisman Pouch (goods 10040) rides along: it is what talismans are worn in, and as a
+        # key item it would otherwise sit in the Quest - Progression catch-all. Its two drops are
+        # boss rewards (Margit, Godfrey), which only became markers once the flag-awarded boss
+        # drops were placed.
         'filter': lambda items: any(
             i['category'] == 4
+            or (i['category'] == 1 and i['id'] in TALISMAN_POUCH_IDS)
             or (i['category'] == 1 and i.get('broad_category') == 'key_item'
                 and 'remnant' in (i.get('name') or '').lower()
                 and 'physick' not in (i.get('name') or '').lower())
@@ -871,6 +883,85 @@ def resolve_enemy_tutorial_id(enemy_model, npc_param_id, vanilla_place_name=None
     return base_id
 
 
+REMEMBRANCE_GOODS_TYPE = 3   # EquipParamGoods.goodsType of a boss Remembrance
+
+
+def boss_for_award_flag(drop, boss_by_flag):
+    """The boss whose death event sets this award flag. A boss in the setter event's OWN map wins:
+    Morgott's Leyndell event also sets Margit's Stormveil flag (one character, two fights)."""
+    for map_must_match in (True, False):
+        for setter in drop.get('setters', ()):
+            for flag in setter.get('flags', ()):
+                if flag == drop.get('awardFlag') or flag not in boss_by_flag:
+                    continue
+                boss = boss_by_flag[flag]
+                if map_must_match and boss.get('map') != setter.get('map'):
+                    continue
+                return boss
+    return None
+
+
+def category_of_item(item):
+    """The loot category a single item would land in, by the same filters the writer uses."""
+    for cat_name, spec in LOOT_CATEGORIES.items():
+        if config.PROFILE != 'err' and cat_name in ERR_ONLY_CATS:
+            continue
+        try:
+            if spec['filter']([item]):
+                return cat_name
+        except Exception:
+            continue
+    return None
+
+
+def boss_flag_drop_records(boss_by_flag):
+    """Markers for the drops common event 1100 awards on a boss's death flag (collected by
+    extract_all_items). The award carries no position, so the boss's own spot is the marker's.
+    One record per (boss, category), so a boss that drops an armour set is one marker, not four.
+    Left out: Remembrances (handed over together with the Great Rune - a second marker on the
+    same boss says nothing new) and the Great Runes themselves, which have their own category."""
+    path = DATA_DIR / 'boss_flag_drops.json'
+    if not path.exists():
+        print('  WARNING: boss_flag_drops.json not found - run extract_all_items.py')
+        return []
+    with open(path, encoding='utf-8') as f:
+        drops = json.load(f)
+    records = []
+    unresolved = 0
+    for drop in drops:
+        boss = boss_for_award_flag(drop, boss_by_flag)
+        if not boss:
+            unresolved += 1
+            continue
+        kill_flag = boss.get('killEventFlagId', 0) or boss.get('clearedEventFlagId', 0)
+        by_category = {}
+        for item in drop.get('items', ()):
+            if item.get('greatRune') or item.get('goodsType') == REMEMBRANCE_GOODS_TYPE:
+                continue
+            cat_name = category_of_item(item)
+            if cat_name:
+                by_category.setdefault(cat_name, []).append(item)
+        for cat_name, items in by_category.items():
+            records.append({
+                'map': boss.get('map', ''),
+                'x': boss.get('x', 0.0), 'y': boss.get('y', 0.0), 'z': boss.get('z', 0.0),
+                'areaNo': boss.get('areaNo', 0),
+                'gridX': boss.get('gridX', 0), 'gridZ': boss.get('gridZ', 0),
+                'itemLotId': (drop.get('lots') or [0])[0],
+                'eventFlag': kill_flag,
+                'partName': '',
+                'items': items,
+                'primary_category': items[0].get('broad_category', ''),
+                'source': 'boss_flag_award',
+                'guaranteed': True,
+                'lotParam': 'map',
+                'partBucket': 'live',
+            })
+    print(f'  {len(records)} boss-reward marker(s) from {len(drops)} flag-awarded drop(s)'
+          + (f'; {unresolved} award(s) had no boss' if unresolved else ''))
+    return records
+
+
 def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
     """Write MASSEDIT file + slots JSON from records.
 
@@ -1058,6 +1149,18 @@ def main():
         db = json.load(f)
     print(f'  {len(db)} records')
 
+    # Boss rewards that the game awards on a death flag, with no position of their own: give them
+    # the boss's spot and let the ordinary categories below claim them (boss_flag_drop_records).
+    boss_by_flag = {}
+    _boss_list_path_early = DATA_DIR / 'boss_list.json'
+    if _boss_list_path_early.exists():
+        with open(_boss_list_path_early, encoding='utf-8') as f:
+            for b in json.load(f):
+                for key in ('clearedEventFlagId', 'killEventFlagId'):
+                    if b.get(key, 0) > 0:
+                        boss_by_flag.setdefault(b[key], b)
+    db += boss_flag_drop_records(boss_by_flag)
+
     # Switched-chest gating: derive from the FULL record set (positions/pairs must be
     # complete, before the eventFlag/source filters below).
     global SWITCH_GATE
@@ -1105,9 +1208,6 @@ def main():
           or (r.get('guaranteed') and one_enemy(r.get('eventFlag', 0)))]
     print(f'  {len(db)} after filtering shared enemy flags (-{before - len(db)})')
 
-    # ERR-only loot categories: their item IDs don't exist in vanilla, so they
-    # would only ever produce empty files there. Skip them in the vanilla profile.
-    ERR_ONLY_CATS = {'Reforged - Items', 'Reforged - Fortunes', 'Reforged - Sealed Curios'}
 
     # First-match-wins: each record is claimed by the FIRST category (in dict
     # order) whose filter matches it, so a later catch-all (Quest - Progression)
@@ -1168,6 +1268,12 @@ def main():
         boss_list = []
         print('  WARNING: boss_list.json not found')
 
+    # model -> a NpcName id some placement of that model carries, for the unnamed ones below.
+    boss_name_by_model = {}
+    for _b in boss_list:
+        if _b.get('npcNameId', 0) > 0 and _b.get('enemyModel'):
+            boss_name_by_model.setdefault(_b['enemyModel'], _b['npcNameId'])
+
     lines = []
     row_id = _row_id_registry.base("World - Bosses")  # z-order slot; see row_id_registry
     boss_count = 0
@@ -1206,11 +1312,24 @@ def main():
         tutorial_id = resolve_enemy_tutorial_id(enemy_model, npc_param, vanilla_place_name)
         if vanilla_place_name and tutorial_id != resolve_enemy_tutorial_id(enemy_model, npc_param):
             text_matched += 1
+        # Never point a marker at a name nothing can resolve: the id comes from the model+variant
+        # formula, and the entry may exist in neither the build's codex nor the enemy-name table
+        # this mod injects. Both count as resolvable - the avatars (c4810 / c5230) have no codex
+        # entry in any profile but ARE named by the injected table, so the guard must not drop them.
+        if (tutorial_id > 0 and (TUTORIAL_IDS or ENEMY_NAMES_I18N)
+                and tutorial_id not in TUTORIAL_IDS
+                and str(tutorial_id) not in ENEMY_NAMES_I18N):
+            tutorial_id = 0
+        # Same enemy elsewhere: another placement of the SAME model usually has a proper NpcName
+        # (the avatars above are named on their other spots), so borrow it before giving up.
+        name_id = rec.get('npcNameId', 0)
+        if tutorial_id <= 0 and name_id <= 0:
+            name_id = boss_name_by_model.get(enemy_model, 0)
         if tutorial_id > 0:
             lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {tutorial_id + 900000000};')
-        elif rec.get('npcNameId', 0) > 0:
+        elif name_id > 0:
             # Vanilla: standard boss name from NpcName (every HP-bar boss has one)
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {rec["npcNameId"] + 700000000};')
+            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {name_id + 700000000};')
         else:
             # Fallback: PlaceName ID from ERR WorldMapPointParam, else the
             # generic BloodMsg word "boss" (vanilla, localized)
@@ -1261,50 +1380,31 @@ def main():
     # The old table matched by English boss name and lost runes wherever the names were not those
     # words (measured 2026-09-11: all six missing in Golden Age 3.6.1, which ships Chinese text
     # under msg/engus; Malenia in Throne, Radahn in VINS 1.9.1, each because the boss had no name).
-    boss_by_flag = {}
-    for b in boss_list:
-        for key in ('clearedEventFlagId', 'killEventFlagId'):
-            if b.get(key, 0) > 0:
-                boss_by_flag.setdefault(b[key], b)
-
-    rune_drops_path = DATA_DIR / 'great_rune_drops.json'
-    rune_drops = []
-    if rune_drops_path.exists():
-        with open(rune_drops_path, encoding='utf-8') as f:
-            rune_drops = json.load(f)
+    drops_path = DATA_DIR / 'boss_flag_drops.json'
+    all_drops = []
+    if drops_path.exists():
+        with open(drops_path, encoding='utf-8') as f:
+            all_drops = json.load(f)
     else:
-        print('  WARNING: great_rune_drops.json not found - run extract_all_items.py')
+        print('  WARNING: boss_flag_drops.json not found - run extract_all_items.py')
+    # One entry per rune: the item to LABEL the marker with (the restored rune) and its award.
+    rune_drops = []
+    for drop in all_drops:
+        for item in drop.get('items', ()):
+            if item.get('greatRune'):
+                rune_drops.append((item.get('labelItem', item['id']), item.get('name', ''), drop))
 
     lines = []
     row_id = _row_id_registry.base("Key - Great Runes")  # z-order slot; see row_id_registry
     gr_count = 0
     seen_runes = set()
-    for drop in sorted(rune_drops, key=lambda d: d['item']):
-        rune_id = drop['item']
+    for rune_id, rune_name, drop in sorted(rune_drops, key=lambda d: d[0]):
         if rune_id in seen_runes:
             continue  # one marker per rune even if the award is called from two maps
-        # The award flag is set by the boss's death event: look for a boss whose defeat flag that
-        # same event sets. A boss in the event's OWN map wins - Morgott's Leyndell event also sets
-        # Margit's Stormveil flag (one character, two fights), and without the map check the rune
-        # landed on Margit.
-        boss = None
-        for pass_map_only in (True, False):
-            for setter in drop.get('setters', ()):
-                for flag in setter.get('flags', ()):
-                    if flag == drop.get('awardFlag') or flag not in boss_by_flag:
-                        continue
-                    candidate = boss_by_flag[flag]
-                    if pass_map_only and candidate.get('map') != setter.get('map'):
-                        continue
-                    boss = candidate
-                    break
-                if boss:
-                    break
-            if boss:
-                break
+        boss = boss_for_award_flag(drop, boss_by_flag)
         if not boss:
             print(f'  WARNING: no boss sets flag {drop.get("awardFlag")} for rune {rune_id} '
-                  f'"{drop.get("name", "")}" (awarded in {drop.get("map", "?")})')
+                  f'"{rune_name}" (awarded in {drop.get("map", "?")})')
             continue
         seen_runes.add(rune_id)
 

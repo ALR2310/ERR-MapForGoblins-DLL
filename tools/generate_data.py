@@ -312,14 +312,16 @@ def load_piece_metadata(massedit_dir):
 
 
 def _load_lot_linkage():
-    """row_id(int) -> (lotId, lotType) from generate_loot_massedit's side file."""
+    """row_id(int) -> (lotId, lotType, aggregate) from generate_loot_massedit's side file.
+    Older side files carry two numbers; those markers are not aggregates."""
     import config
     p = config.DATA_DIR / 'loot_lot_linkage.json'
     if not p.exists():
         return {}
     with open(p, encoding='utf-8') as f:
         raw = json.load(f)
-    return {int(k): (int(v[0]), int(v[1])) for k, v in raw.items()}
+    return {int(k): (int(v[0]), int(v[1]), int(v[2]) if len(v) > 2 else 0)
+            for k, v in raw.items()}
 
 
 def generate_map_data_cpp(entries, output_path, geom_slots=None, orig_xz=None):
@@ -372,20 +374,26 @@ def generate_map_data_cpp(entries, output_path, geom_slots=None, orig_xz=None):
             slot = meta.get('geom_slot', -1) if isinstance(meta, dict) else meta
             suffix = meta.get('name_suffix', -1) if isinstance(meta, dict) else -1
             obj_name = meta.get('object_name', '') if isinstance(meta, dict) else ''
-            lot_id, lot_type = lot_linkage.get(row_id, (0, 0))
+            lot_id, lot_type, lot_aggregate = lot_linkage.get(row_id, (0, 0, 0))
             name_field = f'"{obj_name}"' if obj_name else 'nullptr'
             # real_posX/real_posZ = pre-de-overlap MSB-true coords (fall back to the
             # possibly-shifted display pos if not snapshotted) for collected tracking.
             rx, rz = orig_xz.get(row_id, (fields.get("posX", "0"), fields.get("posZ", "0")))
-            # A piece whose display position was moved onto its pickup target carries the
-            # MSB position of the asset itself in the slots side file - that is where the
-            # live CSWorldGeomIns sits, so that is what collected-tracking must match.
+            # That pair (which already carries the interior coord shift) is the DISPLAY
+            # anchor. Tracking starts from the same place but a piece whose display position
+            # was moved onto its pickup target carries the MSB position of the asset itself
+            # in the slots side file - that is where the live CSWorldGeomIns sits, so that
+            # is what collected-tracking must match. The two are emitted separately: feeding
+            # the MSB position back into the display anchor moved the marker itself.
+            dx, dz = rx, rz
             if isinstance(meta, dict) and 'msb_x' in meta and 'msb_z' in meta:
                 rx, rz = meta['msb_x'], meta['msb_z']
             rx = format_value("real_posX", "f", str(rx))
             rz = format_value("real_posZ", "f", str(rz))
+            dx = format_value("display_posX", "f", str(dx))
+            dz = format_value("display_posZ", "f", str(dz))
             f.write(f"    }}, Category::{category}, {slot}, {suffix}, {name_field}, "
-                    f"{lot_id}u, {lot_type}, {rx}, {rz}}},\n")
+                    f"{lot_id}u, {lot_type}, {lot_aggregate}, {rx}, {rz}, {dx}, {dz}}},\n")
 
         f.write("};\n\n")
         f.write("} // namespace goblin::generated\n")

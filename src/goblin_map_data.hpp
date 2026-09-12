@@ -96,7 +96,12 @@ struct MapEntry
     // Source item-lot linkage for live-loot mode (read getItemFlagId/item from
     // memory at runtime → randomizer-compatible). 0/0 = not lot-backed.
     uint32_t lotId;       // ItemLotParam row id (0 = none)
-    uint8_t  lotType;     // 0 = none, 1 = ItemLotParam_map (pref), 2 = ItemLotParam_enemy (pref)
+    uint8_t  lotType;     // 0 = none, 1 = ItemLotParam_map (pref), 2 = ItemLotParam_enemy
+    // 1 = this marker stands for SEVERAL of that lot's items (a boss's reward, split into
+    // one marker per category), so the lot is not its address: slot 1 belongs to whichever
+    // category came first. Live labels and live hide-flags skip it and the baked label and
+    // the boss's own kill flag stand; the spoiler-free icon and label still apply.
+    uint8_t  lotAggregate;
     // REAL (pre-de-overlap) MSB-local X/Z. data.posX/posZ may be spiral-shifted by
     // the de-overlap pass so stacked icons read separately; collected-geometry
     // tracking must match the LIVE CSWorldGeomMan instance at its true coordinates,
@@ -104,6 +109,14 @@ struct MapEntry
     // data.posX/posZ for any row the de-overlap didn't move.
     float real_posX;
     float real_posZ;
+    // Pre-de-overlap DISPLAY position: where this marker wants to sit on the map before the
+    // offline pass spiralled stacked icons apart. Separate from real_pos because the two
+    // diverge: a relocated piece displays at its pickup spot but its geometry - what
+    // collected tracking has to find - stayed at the MSB position, and Roundtable Hold rows
+    // carry an interior shift that display needs and tracking must not have. The live
+    // de-overlap and the native marker path start from THIS pair.
+    float display_posX;
+    float display_posZ;
 };
 
 extern const MapEntry MAP_ENTRIES[];

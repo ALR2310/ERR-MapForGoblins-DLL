@@ -20,7 +20,8 @@
 #include "goblin_mapproject.hpp" // read_view/to_map for the native reticle-hover proxy
 #include "goblin_overlay.hpp"
 #include "goblin_progress.hpp"   // region_place_id (tag each CategoryRow for focus)
-#include "goblin_search.hpp"     // pick_many: a restored pick focus goes back through the search's own set
+#include "goblin_search.hpp"     // replace_picks/forget_picks: a restored or dropped pick focus
+                                 // goes through the search's own set, never around it
 #include "goblin/goblin_map_flags.hpp"
 #include "from/params.hpp"
 #include "from/paramdef/WORLD_MAP_POINT_PARAM_ST.hpp"
@@ -97,19 +98,22 @@ struct CategoryRow
     bool focus_text;         // true while focus fabricated a label on a textless row
     bool picked;             // member of the search-pick focus set (set_focus_rows)
     uint64_t hide_key;       // stable manual-hide key (stable_hide_key of the baked entry)
+    uint64_t hide_key_v2;    // the same marker's pre-2.1.4 key, to migrate a v2 file once
     uint8_t native_area;
     uint8_t native_layer;
     uint16_t native_gx;
     uint16_t native_gz;
     // Where this marker is DRAWN, and where it actually is. They differ when it shares a spot with
-    // others: see the de-overlap below, which recomputes native_px/native_pz from real_px/real_pz for
+    // others: see the de-overlap below, which recomputes native_px/native_pz from anchor_px/anchor_pz for
     // the markers that are visible RIGHT NOW. Everything that positions anything - the icon factory's
     // snapshot, the hover pick, the highlight rings - reads native_px, so the spread reaches all of
     // them without any of them knowing about it.
     float native_px;
     float native_pz;
-    float real_px;
-    float real_pz;
+    // Pre-de-overlap display anchor (MapEntry::display_pos, or the row's own position for the
+    // game's rows). Never the tracking position.
+    float anchor_px;
+    float anchor_pz;
 };
 
 // textEnableFlagId1..8 of a row, as a pointer array (the paramdef has them as
@@ -183,6 +187,7 @@ static inline bool row_in_focus(const CategoryRow &cr, int focus)
 struct HiddenMeta { int32_t textId; uint16_t iconId; int32_t region; uint8_t cat; };
 static std::map<uint64_t, HiddenMeta> g_manual_hidden;
 static std::map<uint64_t, HiddenMeta> g_hidden_v1_pending;  // legacy keys read from a v1 file, migrated once rows exist
+static std::map<uint64_t, HiddenMeta> g_hidden_v2_pending;  // same, for a v2 file (pre-2.1.4 key)
 static std::mutex g_manual_hidden_mtx;
 static std::filesystem::path g_hidden_dir;   // folder holding the per-slot hide files
 static std::filesystem::path g_hidden_file;  // current slot's file (persist target)
@@ -209,16 +214,9 @@ static uint64_t marker_key_v1(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
     return h;
 }
 
-// The v2 key, from the BAKED entry (not the live row), by what identifies the marker across
-// builds and data updates. An object or lot that ERR moves keeps its key, so it stays hidden.
-//   1. MSB object (pieces, material nodes, kindling): tile + part name. Twins that share a
-//      part name in one tile share the key - the engine fuses them too (GEOF).
-//   2. Item lot: type + lot id. A map lot is one pickup; an enemy lot is shared by every
-//      enemy of that kind, so it also takes the tile and the position at 1u.
-//   3. The flag that hides it: clearedEventFlagId (bosses, hostile NPCs, hawks), else
-//      textDisableFlagId1 (graces, pools, statues, maps, paintings, gestures, great runes).
-//   4. Tile + category + real position at 0.5u (spirit springs, stakes of Marika only).
-static uint64_t stable_hide_key(const goblin::generated::MapEntry &e)
+// The v2 key: kept ONLY to migrate files written by 2.1.3 and earlier (see hide_key_v3 below
+// for why it had to change). Never write this one.
+static uint64_t hide_key_v2(const goblin::generated::MapEntry &e)
 {
     uint64_t h = 1469598103934665603ull;  // FNV-1a
     auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
@@ -260,6 +258,82 @@ static uint64_t stable_hide_key(const goblin::generated::MapEntry &e)
         mix('p');
         mix_tile();
         mix(static_cast<uint64_t>(e.category));
+        mix_pos(2.0f);
+    }
+    return h;
+}
+
+// The v3 key, from the BAKED entry (not the live row), by what identifies the marker across
+// builds and data updates. An object or lot that ERR moves keeps its key, so it stays hidden.
+//   1. MSB object (pieces, material nodes, kindling): tile + part name + category + position.
+//      The position is here because a part name is NOT unique in a tile: ERR has two
+//      AEG099_821_9000 rune pieces in 60/43/52 that are 258 units apart, and without it they
+//      were one identity - picking one in the search and reloading selected both. Twins at the
+//      SAME spot still share the key, which is right: the engine fuses them too (GEOF).
+//   2. Item lot: type + lot id + category + tile + position at 1u.
+//   3. The flag that hides it: clearedEventFlagId (bosses, hostile NPCs, hawks), else
+//      textDisableFlagId1 (graces, pools, statues, maps, paintings, gestures, great runes),
+//      again with category + tile + position.
+//   4. Tile + category + real position at 0.5u (spirit springs, stakes of Marika only).
+//
+// WHY v3: v2 keyed a map lot on type + lot id alone, so every marker fed by one lot was one
+// identity - hiding Loretta's War Sickle also hid Loretta's Mastery, and restoring a saved
+// pick focus on one of them selected both. Same for the two flag branches, where a boss's
+// several reward categories all carry its kill flag. Counted over the baked rows of all ten
+// profiles, v2 left 32 to 80 colliding keys each (77 to 181 rows); v3 leaves 4 to 18 (8 to
+// 36 rows), and what remains is genuinely co-located same-category rows of one source.
+// Every branch takes the position (real_pos, the pre-de-overlap source position), so the key
+// follows the object rather than where the icon ended up. It does mean a data update that
+// MOVES a source moves its key and un-hides that one marker; that is the same trade the lot
+// and flag branches already made, and it is the only thing that separates same-name twins.
+static uint64_t stable_hide_key(const goblin::generated::MapEntry &e)
+{
+    uint64_t h = 1469598103934665603ull;  // FNV-1a
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    auto mix_tile = [&]() {
+        mix(static_cast<uint64_t>(e.data.areaNo));
+        mix(static_cast<uint64_t>(e.data.gridXNo));
+        mix(static_cast<uint64_t>(e.data.gridZNo));
+    };
+    auto mix_pos = [&](float scale) {
+        mix(static_cast<uint64_t>(static_cast<int64_t>(std::llround(e.real_posX * scale))));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(std::llround(e.real_posZ * scale))));
+    };
+    mix(3);  // key version
+    mix(static_cast<uint64_t>(e.category));
+    if (e.object_name && e.object_name[0])
+    {
+        mix('o');
+        mix_tile();
+        for (const char *c = e.object_name; *c; ++c) mix(static_cast<uint8_t>(*c));
+        mix_pos(1.0f);
+    }
+    else if (e.lotId != 0 && e.lotType != 0)
+    {
+        mix('l');
+        mix(e.lotType);
+        mix(e.lotId);
+        mix_tile();
+        mix_pos(1.0f);
+    }
+    else if (e.data.clearedEventFlagId != 0)
+    {
+        mix('c');
+        mix(e.data.clearedEventFlagId);
+        mix_tile();
+        mix_pos(1.0f);
+    }
+    else if (e.data.textDisableFlagId1 != 0)
+    {
+        mix('d');
+        mix(e.data.textDisableFlagId1);
+        mix_tile();
+        mix_pos(1.0f);
+    }
+    else
+    {
+        mix('p');
+        mix_tile();
         mix_pos(2.0f);
     }
     return h;
@@ -323,6 +397,11 @@ struct LotBackedRow
     uint8_t *ptr;
     uint32_t lotId;
     uint8_t lotType;
+    // MapEntry::lotAggregate: this marker is one CATEGORY of a multi-item award, so the lot
+    // does not address its item. Live labels and live hide-flags skip it (slot 1 of that lot
+    // is some other category's item, and the award lands on the boss's kill flag, which is
+    // what the baked flags already say). The spoiler-free icon and label still apply.
+    bool aggregate;
     int baked_icon;        // iconId as baked (restored when live-loot/anon off)
     int32_t baked_text1;   // textId1 as baked (the item-name label)
     unsigned baked_dis[8]; // textDisableFlagId1..8 as baked
@@ -622,19 +701,49 @@ void goblin::set_focus_rows(const std::vector<uint64_t> &original_row_ids)
 bool goblin::focus_rows_active() { return g_focus_pick.load(); }
 size_t goblin::focus_rows_count() { return g_focus_pick_count.load(); }
 
+// "#mfg-hidden v3" -> 3, for an EXACT header line. -1 = not a header of this kind, so the
+// caller can tell "no header at all" (that is v1) from "a header this build does not know".
+// Exact on purpose: a prefix test read "#mfg-hidden v30" as v3 and a future "v4" as no header
+// at all, which fed a v4 file's keys to the v1 migration and then saved the wreckage back
+// over it.
+static int header_version(const std::string &line, const char *prefix)
+{
+    const size_t n = std::strlen(prefix);
+    if (line.size() <= n || line.compare(0, n, prefix) != 0) return -1;
+    size_t i = n;
+    int v = 0;
+    while (i < line.size() && line[i] >= '0' && line[i] <= '9')
+    {
+        if (v < 1000000) v = v * 10 + (line[i] - '0');  // saturate; still >> any real version
+        ++i;
+    }
+    if (i == n) return -1;  // the prefix, then no digits
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) ++i;
+    return i == line.size() ? v : -1;  // trailing junk: not a header we wrote
+}
+
 // ---- Focus persistence -------------------------------------------------------
-// File: `#mfg-focus v2`, then either one `category <config_key> <region>` line or one
+// File: `#mfg-focus v3`, then either one `category <config_key> <region>` line or one
 // `pick <stable_hide_key>` line per picked row. Keys are the same stable identities the manual
 // hides use, so a build or data update (or an object ERR moved) keeps the focus intact.
-static constexpr const char *kFocusHeaderV2 = "#mfg-focus v2";
+// A v2 file is read the same way but matched against the row's OLD key; the next save writes
+// v3. Where an old key covered several markers the restore selects all of them - exactly what
+// that file already meant, since the old key could not tell them apart.
+static constexpr const char *kFocusHeaderPrefix = "#mfg-focus v";
+static constexpr const char *kFocusHeaderV3 = "#mfg-focus v3";
+static constexpr int kFocusVersion = 3;
+static bool g_pending_focus_picks_are_v2 = false;
+// A focus file written by a NEWER build: we neither read it nor write over it, so switching
+// back to that build finds it intact.
+static bool g_focus_file_unreadable = false;
 
 static void persist_focus()
 {
-    if (g_focus_file.empty()) return;
+    if (g_focus_file.empty() || g_focus_file_unreadable) return;
     try
     {
         std::ofstream f(g_focus_file, std::ios::trunc);
-        f << kFocusHeaderV2 << '\n';
+        f << kFocusHeaderV3 << '\n';
         if (g_focus_pick.load())
         {
             for (const auto &cr : g_category_rows)
@@ -655,11 +764,24 @@ static void load_focus_file(const std::filesystem::path &path)
     g_pending_focus_cat = -1;
     g_pending_focus_region = -1;
     g_pending_focus_picks.clear();
+    g_pending_focus_picks_are_v2 = false;
+    g_focus_file_unreadable = false;
     try
     {
         std::ifstream f(path);
         std::string line;
-        if (!std::getline(f, line) || line.rfind(kFocusHeaderV2, 0) != 0) return;
+        if (!std::getline(f, line)) return;
+        const int fv = header_version(line, kFocusHeaderPrefix);
+        if (fv > kFocusVersion)
+        {
+            spdlog::warn("[focus] {} was written by a newer build (v{}); leaving it alone",
+                         path.filename().string(), fv);
+            g_focus_file_unreadable = true;
+            return;
+        }
+        if (fv == 3) g_pending_focus_picks_are_v2 = false;
+        else if (fv == 2) g_pending_focus_picks_are_v2 = true;
+        else return;  // no header, or a version that never existed: not ours to read
         while (std::getline(f, line))
         {
             std::istringstream ss(line);
@@ -700,13 +822,16 @@ static bool restore_focus_pending()
     {
         std::vector<uint64_t> ids;
         for (const auto &cr : g_category_rows)
-            if (cr.original_row_id && g_pending_focus_picks.count(cr.hide_key))
+            if (cr.original_row_id &&
+                g_pending_focus_picks.count(g_pending_focus_picks_are_v2 ? cr.hide_key_v2
+                                                                        : cr.hide_key))
                 ids.push_back(cr.original_row_id);
         spdlog::info("[focus] restored pick focus: {} saved key(s), {} matched a marker",
                      g_pending_focus_picks.size(), ids.size());
         g_pending_focus_picks.clear();
+        g_pending_focus_picks_are_v2 = false;
         if (ids.empty()) { persist_focus(); return false; }
-        goblin::search::pick_many(ids, true);  // set_focus_rows + reapply + highlight
+        goblin::search::replace_picks(ids);  // set_focus_rows + reapply + highlight
         return true;
     }
     spdlog::info("[focus] restored category focus: category={} region={}", g_pending_focus_cat,
@@ -820,9 +945,20 @@ static bool row_marker_info(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p,
 static void refresh_deoverlap(int layer);  // defined with the de-overlap, further down
 static std::vector<uint8_t> g_vis;   // per row index; 1 = on screen right now
 static int g_vis_layer = -1;         // which layer that answer was for (-1 = none yet)
+// ONE lock over the layout state: g_vis, g_vis_layer, the de-overlap's occupancy grid and the
+// native_px/native_pz the refresh writes. The refresh runs on the map thread (the marker manager's
+// merges and the per-frame hover pick) AND on the manual-hide hotkey thread (Delete -> the overlay's
+// native_hover_row -> native_reticle_row -> a snapshot, whenever its 200 ms copy is stale). The hover
+// pick's own cache lock covers only that path; the merges never took it, so two refreshes could run
+// at once - one reassigning g_vis while the other indexed it, both growing the same cell vectors.
+// Held by every public reader below and across the whole snapshot; released before anything that
+// could re-enter (nothing under it calls back into this file's public entry points).
+static std::mutex g_layout_mtx;
+static std::vector<goblin::HighlightPoint> focus_highlight_points_locked();
 
 bool goblin::display_position(const void *rowptr, float &px, float &pz)
 {
+    std::lock_guard<std::mutex> lk(g_layout_mtx);
     for (const auto &cr : g_category_rows)
     {
         if (static_cast<const void *>(cr.p) != rowptr) continue;
@@ -835,6 +971,13 @@ bool goblin::display_position(const void *rowptr, float &px, float &pz)
 
 std::vector<goblin::HighlightPoint> goblin::focus_highlight_points()
 {
+    std::lock_guard<std::mutex> lk(g_layout_mtx);
+    return focus_highlight_points_locked();
+}
+
+static std::vector<goblin::HighlightPoint> focus_highlight_points_locked()
+{
+    using goblin::HighlightPoint;
     std::vector<HighlightPoint> out;
     const int focus = g_focus_category;
     if (!focus_active()) return out;
@@ -926,11 +1069,16 @@ void goblin::inject_map_entries()
         Category category;
         uint32_t lotId;    // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;   // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
-        // MSB-true position, before the offline de-overlap spiralled the baked one. The live
-        // de-overlap spreads from THIS, so it never spirals an already-spiralled position.
-        float real_px;
-        float real_pz;
+        bool lotAggregate; // the lot backs several markers; not this one's address
+        // The baked DISPLAY anchor: where the marker wants to sit, before the offline
+        // de-overlap spiralled the baked position. The live de-overlap spreads from THIS, so
+        // it never spirals an already-spiralled position. NOT the geometry position - that
+        // one (MapEntry::real_pos) is for collected tracking and can be somewhere else
+        // entirely for a relocated piece.
+        float anchor_px;
+        float anchor_pz;
         uint64_t hide_key; // stable manual-hide key (stable_hide_key of the baked entry)
+        uint64_t hide_key_v2; // the same marker's pre-2.1.4 key (migration only)
     };
 
     // Live-loot icons (config::liveLootIcons): a randomized lot may now hold an
@@ -973,8 +1121,10 @@ void goblin::inject_map_entries()
         {
             live_icon_override[e.row_id] = goblin::generated::ANON_ICON_ID;
         }
-        else if (goblin::config::liveLootIcons && is_lot && lot_reader.ok())
+        else if (goblin::config::liveLootIcons && is_lot && !e.lotAggregate && lot_reader.ok())
         {
+            // Not for an aggregate: slot 1 of that lot is whichever category came first, so
+            // re-gating this marker by it would move, say, the armour marker under Armaments.
             if (RawItemLotRow *r = lot_reader.row(lotId, lotType))
             {
                 int32_t item_id = *reinterpret_cast<int32_t *>(r->b + 0x00);   // lotItemId01
@@ -1007,7 +1157,9 @@ void goblin::inject_map_entries()
         // unrelated markers whose baked category happened to be Armaments.
         // (Spoiler-free and non-lot rows leave gate_cat == e.category.)
         entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType,
-                           e.real_posX, e.real_posZ, stable_hide_key(e)});
+                           e.lotAggregate != 0,
+                           e.display_posX, e.display_posZ, stable_hide_key(e),
+                           hide_key_v2(e)});
     }
 
     spdlog::info("Adding {} map entries ({} live-recategorized, live-loot table ready={})",
@@ -1141,9 +1293,12 @@ void goblin::inject_map_entries()
         uint64_t original_row_id;  // pre-remap id (matches locationOverrides keys); 0 for vanilla rows
         uint32_t lotId;            // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;           // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
-        float real_px;             // MSB-true position (see InjectedEntry)
-        float real_pz;
+        bool lotAggregate;         // see InjectedEntry
+        float anchor_px;           // display anchor (see InjectedEntry); only ours has one
+        float anchor_pz;
+        bool has_anchor;           // false for the game's own rows: read the row instead
         uint64_t hide_key;         // stable manual-hide key (0 for vanilla rows)
+        uint64_t hide_key_v2;      // pre-2.1.4 key of the same marker (0 for vanilla rows)
     };
 
     std::vector<RowSource> all_rows;
@@ -1153,13 +1308,15 @@ void goblin::inject_map_entries()
     {
         auto *data = old_param_file + old_table->rows[i].param_offset;
         all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false, {}, 0, 0, 0,
-                            0.0f, 0.0f, 0});  // vanilla rows: filled from the row itself below
+                            false, 0.0f, 0.0f, false, 0, 0});  // vanilla rows: from the row below
     }
     for (auto &entry : entries)
     {
         all_rows.push_back({entry.row_id, reinterpret_cast<const uint8_t *>(entry.data),
                             entry.is_piece, entry.is_kindling, entry.category, entry.original_row_id,
-                            entry.lotId, entry.lotType, entry.real_px, entry.real_pz, entry.hide_key});
+                            entry.lotId, entry.lotType, entry.lotAggregate,
+                            entry.anchor_px, entry.anchor_pz, true,
+                            entry.hide_key, entry.hide_key_v2});
     }
 
     std::sort(all_rows.begin(), all_rows.end(),
@@ -1211,13 +1368,12 @@ void goblin::inject_map_entries()
             // away from the real one. Take the real coordinates as the truth and let the live
             // de-overlap decide the display position; starting from the baked one would spiral a
             // spiral.
-            cr.real_px = all_rows[i].real_px != 0.0f || all_rows[i].real_pz != 0.0f
-                             ? all_rows[i].real_px : wp->posX;
-            cr.real_pz = all_rows[i].real_px != 0.0f || all_rows[i].real_pz != 0.0f
-                             ? all_rows[i].real_pz : wp->posZ;
-            cr.native_px = cr.real_px;
-            cr.native_pz = cr.real_pz;
+            cr.anchor_px = all_rows[i].has_anchor ? all_rows[i].anchor_px : wp->posX;
+            cr.anchor_pz = all_rows[i].has_anchor ? all_rows[i].anchor_pz : wp->posZ;
+            cr.native_px = cr.anchor_px;
+            cr.native_pz = cr.anchor_pz;
             cr.hide_key = all_rows[i].hide_key;
+            cr.hide_key_v2 = all_rows[i].hide_key_v2;
             unsigned *en[8];
             enable_flag_ptrs(wp, en);
             for (int k = 0; k < 8; ++k) cr.baked_enable[k] = *en[k];
@@ -1249,6 +1405,7 @@ void goblin::inject_map_entries()
             lb.ptr = rp;
             lb.lotId = all_rows[i].lotId;
             lb.lotType = all_rows[i].lotType;
+            lb.aggregate = all_rows[i].lotAggregate;
             lb.baked_icon = wp->iconId;
             lb.baked_text1 = wp->textId1;
             unsigned *bfls[8] = {&wp->textDisableFlagId1, &wp->textDisableFlagId2,
@@ -1548,15 +1705,37 @@ namespace
         float ax, az;  // origin of the lattice it belongs to
     };
 
+    // A cell is the WHOLE tile identity plus the cell indices, compared field by field. The first
+    // version folded these into one 64-bit number with `tile << 26`, and the tile's area sits in bits
+    // 40..47 - shifted clean off the top. Every legacy dungeon has gridX = gridZ = 0, so m10 and m15
+    // (and every such pair) shared cells and compared their LOCAL coordinates as if they were one
+    // map: 141 ERR / 93 vanilla marker pairs less than a spacing apart in different dungeons, each
+    // pushing the other aside for a neighbour it does not have.
+    struct CellKey
+    {
+        uint64_t tile;
+        int32_t cx, cz;
+        bool operator==(const CellKey &o) const { return tile == o.tile && cx == o.cx && cz == o.cz; }
+    };
+    struct CellKeyHash
+    {
+        size_t operator()(const CellKey &k) const
+        {
+            uint64_t h = k.tile * 0x9E3779B97F4A7C15ull;
+            h ^= (static_cast<uint64_t>(static_cast<uint32_t>(k.cx)) << 32) |
+                 static_cast<uint32_t>(k.cz);
+            h ^= h >> 29;
+            h *= 0xBF58476D1CE4E5B9ull;
+            h ^= h >> 32;
+            return static_cast<size_t>(h);
+        }
+    };
+
     struct Occupancy
     {
-        std::unordered_map<uint64_t, std::vector<Placed>> cells;
+        std::unordered_map<CellKey, std::vector<Placed>, CellKeyHash> cells;
 
-        static uint64_t key(uint64_t tile, int32_t cx, int32_t cz)
-        {
-            return (tile << 26) ^ (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 13) ^
-                   static_cast<uint64_t>(static_cast<uint32_t>(cz) & 0x1FFFu);
-        }
+        static CellKey key(uint64_t tile, int32_t cx, int32_t cz) { return CellKey{tile, cx, cz}; }
 
         template <class Fn>
         void around(uint64_t tile, float x, float z, Fn &&fn) const
@@ -1636,8 +1815,8 @@ static void refresh_deoverlap(int layer)
     for (size_t i = 0; i < g_category_rows.size(); ++i)
     {
         CategoryRow &cr = g_category_rows[i];
-        cr.native_px = cr.real_px;
-        cr.native_pz = cr.real_pz;
+        cr.native_px = cr.anchor_px;
+        cr.native_pz = cr.anchor_pz;
         if (native_row_visible(cr, layer, focus)) { g_vis[i] = 1; ++shown; }
     }
 
@@ -1657,7 +1836,7 @@ static void refresh_deoverlap(int layer)
         if (cr.baked_dis1 == 0 || !goblin::flag_is_set(cr.baked_dis1)) continue;
         const uint64_t tile = (static_cast<uint64_t>(cr.native_area) << 40) |
                               (static_cast<uint64_t>(cr.native_gx) << 20) | cr.native_gz;
-        occ.take(tile, cr.real_px, cr.real_pz, cr.real_px, cr.real_pz);
+        occ.take(tile, cr.anchor_px, cr.anchor_pz, cr.anchor_px, cr.anchor_pz);
         ++native_seeded;
     }
     size_t moved = 0, crowded = 0;
@@ -1668,18 +1847,18 @@ static void refresh_deoverlap(int layer)
         if (cr.native_area == 99) continue;  // parked/hidden coordinate trick
         const uint64_t tile = (static_cast<uint64_t>(cr.native_area) << 40) |
                               (static_cast<uint64_t>(cr.native_gx) << 20) | cr.native_gz;
-        if (occ.free_at(tile, cr.real_px, cr.real_pz))
+        if (occ.free_at(tile, cr.anchor_px, cr.anchor_pz))
         {
             // Nothing near it: it stands where it really is, and becomes the anchor of a lattice for
             // anything that arrives here later.
-            occ.take(tile, cr.real_px, cr.real_pz, cr.real_px, cr.real_pz);
+            occ.take(tile, cr.anchor_px, cr.anchor_pz, cr.anchor_px, cr.anchor_pz);
             continue;
         }
         ++crowded;
         // Join the lattice of whoever is already standing here, so a crowd comes out as one grid
         // rather than as overlapping grids of its own members.
-        float ax = cr.real_px, az = cr.real_pz;
-        occ.anchor_at(tile, cr.real_px, cr.real_pz, ax, az);
+        float ax = cr.anchor_px, az = cr.anchor_pz;
+        occ.anchor_at(tile, cr.anchor_px, cr.anchor_pz, ax, az);
         constexpr int kMaxCandidates = 96;
         bool placed = false;
         for (int k = 1; k < kMaxCandidates && !placed; ++k)
@@ -1694,7 +1873,7 @@ static void refresh_deoverlap(int layer)
             placed = true;
             ++moved;
         }
-        if (!placed) occ.take(tile, cr.real_px, cr.real_pz, ax, az);  // give up rather than search forever
+        if (!placed) occ.take(tile, cr.anchor_px, cr.anchor_pz, ax, az);  // give up rather than search forever
     }
     g_vis_layer = layer;
     // Timed, not assumed: this runs on the map UI thread, so its cost is the thing to know. Said on
@@ -1723,6 +1902,9 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer,
     // until the switch goes on again and the next merge re-reads the real visibility.
     const bool hidden = icons_hidden();
     if (hidden && !include_hidden) return out;
+    // The layout lock is held from the refresh to the end of the loop: the loop reads g_vis and the
+    // native_px/pz the refresh just wrote, and a second refresh on the other thread would move both.
+    std::lock_guard<std::mutex> layout_lk(g_layout_mtx);
     out.reserve(g_category_rows.size());
     const int focus = g_focus_category;
     // Pull crowded markers apart FIRST, from the set that is visible on this layer right now, so the
@@ -1772,7 +1954,7 @@ std::vector<goblin::NativeMarkerPoint> goblin::native_marker_snapshot(int layer,
         goblin::gfx_probe::injected_iconid(static_cast<int>(goblin::generated::HIGHLIGHT_ICON_ID));
     if (ring_frame && !g_category_rows.empty() && g_category_rows[0].p)
     {
-        const std::vector<HighlightPoint> pts = focus_highlight_points();
+        const std::vector<HighlightPoint> pts = focus_highlight_points_locked();  // layout lock is held
         // DEMAND vs POOL. The pool is fixed at NATIVE_RING_POOL and the point list is not capped,
         // so a focus set larger than the pool silently leaves its tail unringed. Reported when the
         // demand changes (the snapshot runs ~5x a second, so logging every pass would be noise):
@@ -1959,10 +2141,10 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
     // refresh a cached copy at the same 200ms cadence the native manager uses.
     // Positions are static; 200ms-stale visibility on a hover test is invisible.
     // THIS CACHE IS SHARED BY TWO THREADS and must be locked. It is read from the map dialog's
-    // per-frame update (our hover detour calls this) and from the overlay thread (the hover info
-    // panel calls it too). Unlocked, the 200ms refresh below move-assigns the vector - freeing the
-    // old buffer - while the other thread is iterating it or refreshing it as well: the same block
-    // gets freed twice and the heap trips. That is a real crash, caught in the act:
+    // per-frame update (our hover detour calls this) and from the manual-hide hotkey thread (Delete
+    // asks which marker is under the reticle). Unlocked, the 200ms refresh below move-assigns the
+    // vector - freeing the old buffer - while the other thread is iterating it or refreshing it as
+    // well: the same block gets freed twice and the heap trips. That is a real crash, caught in the act:
     //   placename_detour -> native_reticle_row -> vector::operator=(&&) -> free_base -> ntdll
     //   reported 0xC0000374 (heap corruption), and map tiles rendered transparent alongside it.
     // A function-local static is thread-safe to INITIALIZE, never to use.
@@ -1971,19 +2153,32 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
     static std::vector<NativeMarkerPoint> cache;
     static int cache_layer = -1;
     static std::chrono::steady_clock::time_point cache_at{};
-    // Map-space position per row, resolved ONCE and kept for the session. Under the same lock as
-    // the snapshot, and outliving it on purpose: the snapshot is thrown away and rebuilt every
-    // 200 ms, the positions in it never move.
+    // Map-space position per row, kept across snapshots and re-resolved only when the row's local
+    // position changes. Under the same lock as the snapshot, and outliving it on purpose: the
+    // snapshot is thrown away and rebuilt every 200 ms, the positions in it almost never move.
     //
     // The loop below used to call mapproject::to_map for all ~7,100 rows on EVERY frame, and for
     // any row outside the overworld that is a call into the engine's world->map converter. Report
     // 19: twelve access violations a second down that path, because the converter is reached
     // through a cached CS::WorldMapViewModel that dies with the map generation. Positions are
-    // static, so re-asking the engine per frame bought nothing and paid in faults - and the
+    // nearly static, so re-asking the engine per frame bought nothing and paid in faults - and the
     // freshness gate that now guards the converter would otherwise drop every legacy-dungeon
-    // marker out of the hover test whenever the game had not converted recently. Resolve once,
-    // keep the answer, and let a row that could not be resolved try again on the next refresh.
-    static std::unordered_map<uint64_t, std::pair<float, float>> projected;
+    // marker out of the hover test whenever the game had not converted recently.
+    //
+    // "Nearly": the live de-overlap moves a marker when a neighbour appears or goes (a category
+    // switch, a focus, a pickup), and the first version of this resolved each row ONCE for the
+    // session, so after such a change the pick still measured from where the icon used to be -
+    // the cursor sat on one marker and the tooltip (and the Delete hide) named the one beside it.
+    // Each entry remembers the local position it was resolved from; a row whose position differs
+    // is re-resolved. One that cannot be resolved right now keeps its previous answer - an
+    // 8-unit-stale spot beats a marker that cannot be hovered at all - and its remembered
+    // position stays the old one, so the next refresh asks again.
+    struct Projected
+    {
+        float src_px, src_pz;  // the local position this answer was resolved from
+        float mx, mz;          // map space
+    };
+    static std::unordered_map<uint64_t, Projected> projected;
     std::lock_guard<std::mutex> cache_lock(cache_mutex);
     const auto now = std::chrono::steady_clock::now();
     if (layer != cache_layer ||
@@ -1994,11 +2189,13 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         cache_at = now;
         for (const auto &p : cache)
         {
-            if (!p.rowptr || projected.count(p.original_row_id))
+            if (!p.rowptr) continue;
+            auto known = projected.find(p.original_row_id);
+            if (known != projected.end() && known->second.src_px == p.px && known->second.src_pz == p.pz)
                 continue;
             float mx = 0.0f, mz = 0.0f;
             if (goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz))
-                projected.emplace(p.original_row_id, std::make_pair(mx, mz));
+                projected[p.original_row_id] = Projected{p.px, p.pz, mx, mz};
         }
     }
     float ax = 0.0f, ay = 0.0f;
@@ -2012,8 +2209,8 @@ void *goblin::native_reticle_row(float *out_dist2, float *out_map_x, float *out_
         if (!p.visible || !p.rowptr) continue;
         const auto hit = projected.find(p.original_row_id);
         if (hit == projected.end()) continue; // not resolvable yet; retried on the next refresh
-        const float mx = hit->second.first;
-        const float mz = hit->second.second;
+        const float mx = hit->second.mx;
+        const float mz = hit->second.mz;
         const float dx = (mx - ax) * zoom;
         const float dy = (mz - ay) * zoom;
         const float d2 = dx * dx + dy * dy;
@@ -2137,7 +2334,15 @@ void goblin::clear_manual_hidden()
 // still denotes in THIS build (same live position/text/icon), re-keys it, and drops the
 // rest - those are exactly the entries whose icon had already come back and been hidden
 // again under a fresh key, i.e. the duplicates the user saw in the list.
-static constexpr const char *kHiddenHeaderV2 = "#mfg-hidden v2";
+// v3 (2.1.4) changed the key itself, not the line format - see stable_hide_key. A v2 file is
+// read into g_hidden_v2_pending and re-keyed by migrate_hidden_v2() against the rows of THIS
+// build. That migration is exact: both keys are computed from the same baked entry, so a
+// stored v2 key resolves to every marker it used to mean, which is what it hid.
+static constexpr const char *kHiddenHeaderPrefix = "#mfg-hidden v";
+static constexpr const char *kHiddenHeaderV3 = "#mfg-hidden v3";
+static constexpr int kHiddenVersion = 3;
+// A hide file written by a NEWER build: not read, and not written over either.
+static bool g_hidden_file_unreadable = false;
 
 void goblin::save_manual_hidden(const std::filesystem::path &path)
 {
@@ -2145,7 +2350,7 @@ void goblin::save_manual_hidden(const std::filesystem::path &path)
     try
     {
         std::ofstream f(path, std::ios::trunc);
-        f << kHiddenHeaderV2 << '\n';
+        f << kHiddenHeaderV3 << '\n';
         for (const auto &[k, m] : g_manual_hidden)
             f << k << ' ' << m.textId << ' ' << m.iconId << ' ' << m.region << ' '
               << static_cast<int>(m.cat) << '\n';
@@ -2160,19 +2365,34 @@ void goblin::load_manual_hidden(const std::filesystem::path &path)
     {
         std::ifstream f(path);
         std::string line;
-        bool v2 = false, first = true;
+        int version = 1;  // no header at all = v1
+        bool first = true;
+        g_hidden_file_unreadable = false;
         while (std::getline(f, line))
         {
             if (first)
             {
                 first = false;
-                if (line.rfind(kHiddenHeaderV2, 0) == 0) { v2 = true; continue; }
+                const int hv = header_version(line, kHiddenHeaderPrefix);
+                if (hv > kHiddenVersion)
+                {
+                    // From a newer build. Load nothing (its keys mean nothing here) and block
+                    // the persist target, so the next save cannot replace it with our view.
+                    spdlog::warn("[hide] {} was written by a newer build (v{}); leaving it alone",
+                                 path.filename().string(), hv);
+                    g_hidden_file_unreadable = true;
+                    return;
+                }
+                if (hv > 0) { version = hv; continue; }
+                // No header: a v1 file, and THIS line is already data - fall through.
             }
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ss(line);
             uint64_t k; long tid, icon, region, cat;
             if (!(ss >> k >> tid >> icon >> region >> cat)) continue;
-            auto &target = v2 ? g_manual_hidden : g_hidden_v1_pending;
+            auto &target = version == 3 ? g_manual_hidden
+                         : version == 2 ? g_hidden_v2_pending
+                                        : g_hidden_v1_pending;
             target[k] = HiddenMeta{static_cast<int32_t>(tid), static_cast<uint16_t>(icon),
                                    static_cast<int32_t>(region), static_cast<uint8_t>(cat)};
         }
@@ -2180,7 +2400,39 @@ void goblin::load_manual_hidden(const std::filesystem::path &path)
     catch (...) {}
 }
 
-// v1 -> v2, once the injected rows exist to resolve the legacy keys against. Returns true when
+// v2 -> v3, once the injected rows exist. One stored v2 key can resolve to SEVERAL current
+// markers - that is the collision v3 exists to end - and all of them are hidden, because all
+// of them were hidden under the old key. Returns true when the set changed.
+static bool migrate_hidden_v2()
+{
+    size_t matched_keys = 0, added = 0, dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
+        if (g_hidden_v2_pending.empty()) return false;
+        if (g_category_rows.empty()) return false;  // rows not injected yet; try again next poll
+        std::set<uint64_t> seen;
+        for (const auto &cr : g_category_rows)
+        {
+            if (!cr.p || !cr.hide_key_v2) continue;
+            auto it = g_hidden_v2_pending.find(cr.hide_key_v2);
+            if (it == g_hidden_v2_pending.end()) continue;
+            seen.insert(it->first);
+            if (g_manual_hidden.emplace(cr.hide_key,
+                                        HiddenMeta{cr.p->textId1, cr.p->iconId, cr.region_id,
+                                                   static_cast<uint8_t>(cr.cat)}).second)
+                ++added;
+        }
+        matched_keys = seen.size();
+        dropped = g_hidden_v2_pending.size() - matched_keys;
+        g_hidden_v2_pending.clear();
+    }
+    spdlog::info("[hide] hide file re-keyed to v3: {} stored key(s) matched a current marker "
+                 "({} marker(s) hidden), {} matched none and were dropped",
+                 matched_keys, added, dropped);
+    return true;
+}
+
+// v1 -> v3, once the injected rows exist to resolve the legacy keys against. Returns true when
 // the hidden set changed (caller persists + reapplies visibility).
 static bool migrate_hidden_v1()
 {
@@ -2212,7 +2464,10 @@ static bool migrate_hidden_v1()
 }
 
 void goblin::set_hidden_dir(const std::filesystem::path &dir) { g_hidden_dir = dir; }
-void goblin::persist_manual_hidden() { if (!g_hidden_file.empty()) save_manual_hidden(g_hidden_file); }
+void goblin::persist_manual_hidden()
+{
+    if (!g_hidden_file.empty() && !g_hidden_file_unreadable) save_manual_hidden(g_hidden_file);
+}
 
 // GameMan .data slot, resolved by AOB (patch-resilient; NOT a hardcoded RVA - the static
 // slot moves on every game update). Pinned by the getter idiom
@@ -2258,7 +2513,9 @@ bool goblin::sync_hidden_slot()
         // Same character: the pending work is a legacy hide file whose keys could not be
         // resolved at load time, or a saved focus, both waiting for the injected rows.
         bool changed = false;
-        if (migrate_hidden_v1())
+        const bool from_v1 = migrate_hidden_v1();
+        const bool from_v2 = migrate_hidden_v2();  // both, never short-circuited
+        if (from_v1 || from_v2)
         {
             persist_manual_hidden();
             changed = true;
@@ -2272,26 +2529,48 @@ bool goblin::sync_hidden_slot()
         std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
         g_manual_hidden.clear();
         g_hidden_v1_pending.clear();
+        g_hidden_v2_pending.clear();
     }
+    // Collected-geometry memory is per character too. Its sticky carry-forward keeps a row hidden
+    // until the live object is seen alive, which after a switch meant everything A had picked up
+    // stayed hidden for B until B walked onto the tile. The next poll rebuilds it from B's save.
+    goblin::collected::forget_session_state();
     // The focus belongs to the character too: drop the old one WITHOUT writing it into the new
     // character's file (no persist target while it is cleared), then load the new one.
     g_focus_file.clear();
     g_focus_restore_pending = false;
+    g_pending_focus_picks.clear();
+    // The search module keeps its own copy of the tick set, and set_focus_category() below
+    // only clears the MAP's side of it. Left behind, it would be unioned with the character
+    // we are switching TO (restore_focus_pending -> replace_picks) and saved into their file.
+    goblin::search::forget_picks();
     if (focus_active())
         set_focus_category(-1);
     if (slot >= 0 && !g_hidden_dir.empty())
     {
-        g_hidden_file = g_hidden_dir / ("MapForGoblins_hidden_s" + std::to_string(slot) + ".txt");
-        load_manual_hidden(g_hidden_file);  // per-character set (empty file -> empty set)
-        size_t legacy = 0;
+        if (goblin::config::enableManualHide)
         {
-            std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
-            legacy = g_hidden_v1_pending.size();
+            g_hidden_file = g_hidden_dir / ("MapForGoblins_hidden_s" + std::to_string(slot) + ".txt");
+            load_manual_hidden(g_hidden_file);  // per-character set (empty file -> empty set)
+            size_t legacy = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
+                legacy = g_hidden_v1_pending.size() + g_hidden_v2_pending.size();
+            }
+            spdlog::info("[hide] active save slot {} -> {} ({} hidden loaded, {} legacy key(s) to migrate)",
+                         slot, g_hidden_file.filename().string(), manual_hidden_count(), legacy);
+            const bool from_v1 = migrate_hidden_v1();
+            const bool from_v2 = migrate_hidden_v2();  // both, never short-circuited
+            if (from_v1 || from_v2)
+                persist_manual_hidden();
         }
-        spdlog::info("[hide] active save slot {} -> {} ({} hidden loaded, {} legacy key(s) to migrate)",
-                     slot, g_hidden_file.filename().string(), manual_hidden_count(), legacy);
-        if (migrate_hidden_v1())
-            persist_manual_hidden();
+        else
+        {
+            // Manual hide is off: no hide file is read or written, and the set stays empty so
+            // is_manually_hidden() keeps returning false. The FOCUS below is a separate feature
+            // and is per character regardless.
+            g_hidden_file.clear();
+        }
         g_focus_file = g_hidden_dir / ("MapForGoblins_focus_s" + std::to_string(slot) + ".txt");
         load_focus_file(g_focus_file);
         restore_focus_pending();  // applies now if the rows exist, else on a later poll
@@ -2368,7 +2647,12 @@ static void apply_loot_settings()
     for (auto &lr : g_lot_backed_rows)
     {
         auto *p = reinterpret_cast<from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(lr.ptr);
-        RawItemLotRow *row = have_lots ? lots.row(lr.lotId, lr.lotType) : nullptr;
+        // An aggregate marker (one category of a boss's award) is not addressed by the lot:
+        // reading slot 1 of it would relabel this marker with another category's item and
+        // pin its hide flag to that item's pickup. Keep the baked label and the baked kill
+        // flag; the spoiler-free icon and label below still apply, they say nothing specific.
+        const bool live = !lr.aggregate;
+        RawItemLotRow *row = have_lots && live ? lots.row(lr.lotId, lr.lotType) : nullptr;
         int32_t item = 0, cat = 0;
         if (row)
         {
@@ -2393,7 +2677,7 @@ static void apply_loot_settings()
             int baked = lr.baked_icon;
             // Same rule as at injection: only an item the lot no longer gives is re-iconed, so a
             // source-split category (merchant Bell Bearings) keeps its own icon.
-            if (do_icons && item > 0 && encode_live_item(item, cat) != lr.baked_text1)
+            if (do_icons && live && item > 0 && encode_live_item(item, cat) != lr.baked_text1)
                 if (const auto *ic = lookup_item_icon(encode_live_item(item, cat)))
                     baked = ic->iconId;
             uint32_t inj = goblin::gfx_probe::injected_iconid(baked); // baked srcIconId -> injected frame
@@ -2410,7 +2694,7 @@ static void apply_loot_settings()
             int32_t label = lr.baked_text1;
             if (anon)
                 label = ANON_LABEL_TEXTID;
-            else if (do_labels && item > 0)
+            else if (do_labels && live && item > 0)
             {
                 int32_t enc = encode_live_item(item, cat);
                 if (enc > 0) label = enc;
@@ -2426,7 +2710,7 @@ static void apply_loot_settings()
                             &p->textDisableFlagId5, &p->textDisableFlagId6,
                             &p->textDisableFlagId7, &p->textDisableFlagId8};
         uint32_t flag = 0;
-        if (do_flags && row)
+        if (do_flags && live && row)
         {
             flag = *reinterpret_cast<uint32_t *>(row->b + 0x80);
             if (flag == 0)
@@ -2436,7 +2720,7 @@ static void apply_loot_settings()
             }
         }
         for (int i = 0; i < 8; ++i)
-            *fls[i] = (do_flags && flag && *tids[i] > 0 && lr.baked_dis[i] != 0)
+            *fls[i] = (do_flags && live && flag && *tids[i] > 0 && lr.baked_dis[i] != 0)
                           ? flag
                           : lr.baked_dis[i]; // else restore baked
     }
@@ -2678,11 +2962,13 @@ void goblin::refresh_loot_from_itemlot()
     int updated = 0, relabeled = 0, not_found = 0, no_flag = 0;
     for (auto &lr : g_lot_backed_rows)
     {
-        RawItemLotRow *row = read_row(lr.lotId, lr.lotType);
-        if (!row) { not_found++; continue; }
+        // See apply_loot_settings: an aggregate marker keeps its baked label and flags.
+        const bool live = !lr.aggregate;
+        RawItemLotRow *row = live ? read_row(lr.lotId, lr.lotType) : nullptr;
+        if (!row && live) { not_found++; continue; }
         auto *p = reinterpret_cast<from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(lr.ptr);
 
-        if (do_flags)
+        if (do_flags && live)
         {
             uint32_t flag = *reinterpret_cast<uint32_t *>(row->b + 0x80);  // lot-wide getItemFlagId
             if (flag == 0)
@@ -2731,7 +3017,7 @@ void goblin::refresh_loot_from_itemlot()
                 if (p->textId1 != anon) { p->textId1 = anon; relabeled++; }
             }
         }
-        else if (do_labels)
+        else if (do_labels && live)
         {
             // Relabel the item-name slot (textId1) to whatever the lot now gives.
             if (item_slot)

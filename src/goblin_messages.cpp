@@ -128,6 +128,17 @@ static std::string detect_language()
     return lang.empty() ? "english" : lang;
 }
 
+// Which language the enemy names we inject into PlaceName are written in. ui_language decides,
+// so a marker label reads the same language as the menus; on "auto" that IS the game language.
+// The mod's own nine languages are a subset of the fifteen the name table carries, so the ones
+// ui_language cannot name (japanese, italian, polish, ...) are only reachable through auto.
+static std::string label_language()
+{
+    const std::string configured = goblin::i18n::normalize_language_config(goblin::config::uiLanguage);
+    // normalize_language_config already speaks the same tokens as STEAM_TO_MSGBND below.
+    return configured == "auto" ? detect_language() : configured;
+}
+
 // Map a Steam game-language string (from detect_language) to an index into the
 // embedded enemy-name table's ENEMY_NAME_LANGS (msgbnd codes). Falls back to 0
 // (engus) for anything unmapped.
@@ -135,7 +146,7 @@ static int enemy_name_lang_index(const std::string &steam_lang)
 {
     static const std::pair<const char *, const char *> STEAM_TO_MSGBND[] = {
         {"english", "engus"}, {"japanese", "jpnjp"}, {"german", "deude"},
-        {"french", "frafr"}, {"italian", "itait"}, {"koreana", "korkr"},
+        {"french", "frafr"}, {"italian", "itait"}, {"koreana", "korkr"}, {"korean", "korkr"},
         {"polish", "polpl"}, {"brazilian", "porbr"}, {"portuguese", "porbr"},
         {"russian", "rusru"}, {"spanish", "spaes"}, {"latam", "spaar"},
         {"thai", "thath"}, {"schinese", "zhocn"}, {"tchinese", "zhotw"},
@@ -538,8 +549,8 @@ void goblin::setup_messages()
 {
     using namespace goblin::generated;
 
-    auto lang = detect_language();
-    spdlog::debug("Detected language: {}", lang);
+    auto lang = label_language();
+    spdlog::debug("Label language: {}", lang);
 
     std::vector<NewEntry> new_entries;
 

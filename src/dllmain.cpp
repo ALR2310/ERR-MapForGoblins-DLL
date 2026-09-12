@@ -911,12 +911,14 @@ static void setup_mod()
     // above past the worldmap movie load on fast Proton boots, which breaks icons).
     safe_init_step(&init_from_params, "from::params::initialize");
 
-    // Manual hides are PER CHARACTER: the set lives in MapForGoblins_hidden_s<slot>.txt.
-    // We only register the folder here; the watcher loop loads the active character's file
-    // (and reloads on a character switch) via goblin::sync_hidden_slot(), because the save
-    // slot is unknown until a character is loaded (the first map open is always after that).
-    if (goblin::config::enableManualHide)
-        goblin::set_hidden_dir(g_mod_folder);
+    // Manual hides AND the search/category focus are PER CHARACTER: the sets live in
+    // MapForGoblins_hidden_s<slot>.txt and MapForGoblins_focus_s<slot>.txt. We only register
+    // the folder here; the watcher loop loads the active character's files (and reloads on a
+    // character switch) via goblin::sync_hidden_slot(), because the save slot is unknown until
+    // a character is loaded (the first map open is always after that). Registered whichever
+    // way enable_manual_hide is set: it used to gate this, which silently left the focus with
+    // no folder - so it was neither per character nor remembered - whenever hides were off.
+    goblin::set_hidden_dir(g_mod_folder);
 
     safe_init_step(&init_collected,       "collected::initialize");
     safe_init_step(&init_kindling,        "kindling::initialize");
@@ -1053,24 +1055,25 @@ static void setup_mod()
             safe_apply_category_visibility_seh();
         }
 
+        // Per-character state: on a save-slot (character) switch, load that character's
+        // focus (and, when the feature is on, their hidden set) and reapply visibility.
+        // BEFORE the prune below, not after: on the tick a switch happens, prune would
+        // still be holding the previous character's focus while reading the new one's
+        // collected/flag state, and would write that verdict into the PREVIOUS character's
+        // file. Runs whichever way enable_manual_hide is set - the focus is its own feature.
+        try
+        {
+            if (goblin::sync_hidden_slot())
+                safe_apply_category_visibility_seh();
+        }
+        catch (...)
+        {
+        }
+
         // Auto-clear a category focus once its last shown marker is gone (in-world pickup,
         // flag, GEOF, etc.) so a stale "showing only ..." highlight doesn't stick around.
         if (goblin::prune_focus_if_empty())
             safe_apply_category_visibility_seh();
-
-        // Per-character manual hides: on a save-slot (character) switch, load that
-        // character's hidden set and reapply visibility.
-        if (goblin::config::enableManualHide)
-        {
-            try
-            {
-                if (goblin::sync_hidden_slot())
-                    safe_apply_category_visibility_seh();
-            }
-            catch (...)
-            {
-            }
-        }
     }
 }
 

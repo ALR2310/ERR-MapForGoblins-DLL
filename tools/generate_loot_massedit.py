@@ -955,6 +955,7 @@ def boss_flag_drop_records(boss_by_flag):
                 'items': items,
                 'primary_category': items[0].get('broad_category', ''),
                 'source': 'boss_flag_award',
+                'lotAggregate': True,  # one marker per category, not one per lot slot
                 'guaranteed': True,
                 'lotParam': 'map',
                 'partBucket': 'live',
@@ -969,8 +970,11 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
 
     If lot_linkage (dict) is given, records each marker's source item-lot so the
     DLL can read the LIVE getItemFlagId/item from memory at runtime (live-loot /
-    randomizer compatibility): lot_linkage[row_id] = [lotId, lotType] where
-    lotType 1=ItemLotParam_map (treasure/emevd), 2=ItemLotParam_enemy.
+    randomizer compatibility): lot_linkage[row_id] = [lotId, lotType, aggregate] where
+    lotType 1=ItemLotParam_map (treasure/emevd), 2=ItemLotParam_enemy, and aggregate=1
+    marks a marker that stands for SEVERAL of the lot's items (a boss's reward, split
+    into one marker per category). For those the lot is not an address: slot 1 of it is
+    some other category's item, so live labels and live hide-flags must leave them alone.
     """
     lines = []
     row_id = start_id
@@ -997,7 +1001,8 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
                     _lt = 1
                 else:
                     _lt = 2 if rec.get('source') == 'enemy' else 1
-                lot_linkage[row_id] = [int(_lot), _lt]
+                lot_linkage[row_id] = [int(_lot), _lt,
+                                       1 if rec.get('lotAggregate') else 0]
 
         # Primary item ID for localized text, offset-encoded by item category:
         #   cat=1 (goods):    id as-is         → DLL reads GoodsName FMG

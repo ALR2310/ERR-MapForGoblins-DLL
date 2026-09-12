@@ -62,7 +62,14 @@ namespace goblin::search
     bool is_picked(uint64_t key);
     void set_picked(uint64_t key, bool on);
     void pick_many(const std::vector<uint64_t> &keys, bool on); // one map re-apply for the batch
+    // Make the set EXACTLY these keys. Restoring a character's saved focus has to replace, not
+    // add: pick_many() unions, so a switch from a character with picks to one with picks handed
+    // the second character both sets and then wrote the union into their file.
+    void replace_picks(const std::vector<uint64_t> &keys);
     void clear_picks();
+    // Drop the set without touching the map or the focus file. For a character switch, where
+    // the caller is already clearing the focus and has deliberately un-set the persist target.
+    void forget_picks();
     size_t pick_count();
     std::vector<uint64_t> picks();
 

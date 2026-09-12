@@ -120,11 +120,10 @@ namespace goblin::i18n
 
     Language language_from_steam(std::string_view steam_language);
     Language language_from_config(std::string_view config_value);
+    // The language EVERY surface of the mod speaks: the overlay, the in-game menu, the map
+    // tooltip and the ini comments. Resolves ui_language, with "auto" reading the Steam game
+    // language once and caching it.
     Language current_language();
-    // The GAME'''s language (Steam), ignoring the ui_language override. The native menu uses this on
-    // purpose: it is drawn by the game itself, next to the game'''s own screens, so a player who set
-    // ui_language for the overlay must not end up with a menu in a different language from the game.
-    Language game_language();
 
     // Raw Steam game-language token (e.g. "russian"), or "" if Steam is unavailable.
     std::string steam_game_language();

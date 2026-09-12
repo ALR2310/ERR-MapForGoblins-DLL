@@ -19,6 +19,12 @@ namespace goblin::collected
     /// Re-read GEOF/WGM from memory. Returns delta (newly hidden count).
     int refresh();
 
+    /// Drop everything refresh() has accumulated for the character that was loaded until now.
+    /// Called on a save-slot switch: the sticky carry-forward in refresh() keeps a row collected
+    /// until its live object is seen alive, and that memory belongs to ONE character. Left in
+    /// place, whatever A picked up stayed hidden for B until B stood on the tile.
+    void forget_session_state();
+
     bool is_row_collected(uint64_t row_id);
 
     /// Same as is_row_collected, but takes the ORIGINAL MAP_ENTRIES row_id and

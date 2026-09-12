@@ -219,14 +219,14 @@ void goblin::ensure_ini(const std::filesystem::path &ini_path)
     };
 
     // The comments in the file we are about to write are localized, so the language has to be read
-    // BEFORE the schema pass. Both spellings are accepted: a file from an older build still says
-    // ui_language, and it is renamed by the same pass that writes the new one.
-    std::string language_value = goblin::config::overlayUiLanguage;
+    // BEFORE the schema pass. Both spellings are accepted: a file from the two builds in between
+    // says overlay_ui_language, and it is renamed by the same pass that writes the new one.
+    std::string language_value = goblin::config::uiLanguage;
     if (had)
     {
         for (auto const &sp : existing)
         {
-            for (const char *key : {"overlay_ui_language", "ui_language"})
+            for (const char *key : {"ui_language", "overlay_ui_language"})
                 if (sp.second.has(key))
                 {
                     language_value = sp.second.get(key);

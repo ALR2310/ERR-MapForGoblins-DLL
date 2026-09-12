@@ -156,12 +156,7 @@ Language goblin::i18n::language_from_config(std::string_view config_value)
 
 Language goblin::i18n::current_language()
 {
-    return language_from_config(goblin::config::overlayUiLanguage);
-}
-
-Language goblin::i18n::game_language()
-{
-    return cached_auto_language();
+    return language_from_config(goblin::config::uiLanguage);
 }
 
 const char *goblin::i18n::language_code(Language language)

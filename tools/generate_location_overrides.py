@@ -243,15 +243,21 @@ COORD_SHIFTS={(11,10):(-2195.0,-352.0)}
 # ---- parse baked cpp ----
 CPP=str(config.GENERATED_DIR / "goblin_map_data.cpp")
 txt=open(CPP,encoding="utf-8").read()
-# split per entry: "{<id>ull, {" ... "}, Category::<cat>, <geom>, <suffix>, "name"|nullptr, <lotId>u, <lotType>, <real_posX>f, <real_posZ>f},"
-# Trailing tail is optional for backward compat: the lotId/lotType pair, and (newer) the
-# real_posX/real_posZ floats that follow it - so the regex matches old AND current emits.
-ENTRY=re.compile(r"\{(\d+)ull,\s*\{(.*?)\},\s*Category::(\w+),\s*(-?\d+),\s*(-?\d+),\s*(?:nullptr|\"([^\"]*)\")(?:,\s*\d+u?,\s*\d+(?:,\s*-?[\d.]+f?,\s*-?[\d.]+f?)?)?\}", re.DOTALL)
+# split per entry: "{<id>ull, {" ... "}, Category::<cat>, <geom>, <suffix>, "name"|nullptr, <tail...>},"
+# Everything after the object name is swallowed without being spelled out: that tail has grown
+# three times (lotId/lotType, then real_pos, then lotAggregate + display_pos) and each time an
+# exact pattern silently matched NOTHING, which wrote an empty override table and broke the
+# build with a zero-size array. Anything that is not a brace belongs to this entry's tail.
+ENTRY=re.compile(r"\{(\d+)ull,\s*\{(.*?)\},\s*Category::(\w+),\s*(-?\d+),\s*(-?\d+),\s*(?:nullptr|\"([^\"]*)\")(?:,[^{}]*?)?\}", re.DOTALL)
 def fget(body,name):
     m=re.search(r"\."+name+r"\s*=\s*(-?[\d.]+)f?", body)
     return m.group(1) if m else None
 
 entries=[]
+if not ENTRY.search(txt):
+    raise SystemExit(
+        f"ERROR: no entries parsed out of {CPP} - the emitted row shape changed and this\n"
+        f"       regex no longer matches it. Refusing to write an empty override table.")
 for m in ENTRY.finditer(txt):
     rid=int(m.group(1)); body=m.group(2)
     def gi(n):

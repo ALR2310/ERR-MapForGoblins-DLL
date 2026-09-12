@@ -35,10 +35,10 @@
 namespace
 {
     namespace tr = goblin::i18n;
-    // The menu is the GAME's screen, so it speaks the GAME's language - not ui_language, which
-    // belongs to the overlay (our own window). Every lookup below passes this explicitly, because
-    // the i18n defaults resolve to current_language(), which honours the override.
-    inline tr::Language mlang() { return tr::game_language(); }
+    // ui_language covers this screen too (it used to follow the game's language alone). Every
+    // lookup below still passes it explicitly rather than leaning on the i18n default, so the
+    // whole menu is built from ONE reading of the setting even if it changes mid-build.
+    inline tr::Language mlang() { return tr::current_language(); }
     using goblin::nmenu::Row;
     using goblin::nmenu::RowKind;
 
@@ -555,10 +555,10 @@ namespace
     const char *const kCompatSections[] = {"Compatibility"};
     const char *const kDebugSections[] = {"Debug"};
     // The menu-settings page: only what actually concerns the menu and the hotkeys.
-    // ui_language is deliberately NOT here: the menu follows the game's language (see mlang()), so
-    // offering the overlay's language override on a game-drawn screen would only be confusing. It
-    // stays available in the ini and on the overlay, where it is our own window and does apply.
+    // ui_language leads: this screen now speaks it too (see mlang()), so the row that changes it
+    // has to be reachable from the screen it changes.
     const char *const kMenuSettingKeys[] = {
+        "ui_language",
         "enable_toggle_hotkey", "toggle_key",          "toggle_gamepad_combo",
         "enable_manual_hide",   "hide_marker_key",     "hide_marker_gamepad", "hover_info",
         // Right after hover_info on purpose: it positions the very panels that setting turns on,

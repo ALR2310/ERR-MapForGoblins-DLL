@@ -1103,6 +1103,24 @@ int goblin::collected::refresh()
     return delta;
 }
 
+void goblin::collected::forget_session_state()
+{
+    // Same thread as refresh() (the dllmain poll loop runs both, the slot sync after the refresh),
+    // so the unlocked carry-forward walk in refresh() never runs against this clear; the lock is
+    // for the readers on other threads. The next refresh() rebuilds the set from the NEW
+    // character's GEOF/WGM alone, with nothing of the previous one to carry forward.
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_collected_mutex);
+        dropped = g_collected_rows.size();
+        g_collected_rows.clear();
+        g_collected_count = 0;
+    }
+    g_unmatched_count = 0;
+    if (dropped > 0)
+        spdlog::info("[COLLECTED] character switch: {} row(s) of the previous character released", dropped);
+}
+
 // ─── queries ────────────────────────────────────────────────────────
 
 bool goblin::collected::is_row_collected(uint64_t row_id)

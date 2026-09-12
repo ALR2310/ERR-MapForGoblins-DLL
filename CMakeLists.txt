@@ -102,13 +102,17 @@ add_library( MapForGoblins SHARED
   src/goblin/goblin_map_flags.hpp
   src/goblin/goblin_map_tiles.hpp
   src/goblin/goblin_map_exceptions.hpp
-  ${GEN_DIR}/goblin_map_data.hpp
+  # These four headers are hand-maintained and live in src/; only their .cpp is baked per
+  # profile (and includes them as "../<name>.hpp"). generate_data.py stopped mirroring them
+  # into the bake dir, so naming the bake copy here made a first build of a profile that has
+  # no stale copy fail at configure time with "Cannot find source file".
+  src/goblin_map_data.hpp
   ${GEN_DIR}/goblin_map_data.cpp
-  ${GEN_DIR}/goblin_item_icons.hpp
+  src/goblin_item_icons.hpp
   ${GEN_DIR}/goblin_item_icons.cpp
-  ${GEN_DIR}/goblin_enemy_names.hpp
+  src/goblin_enemy_names.hpp
   ${GEN_DIR}/goblin_enemy_names.cpp
-  ${GEN_DIR}/goblin_item_fallback.hpp
+  src/goblin_item_fallback.hpp
   ${GEN_DIR}/goblin_item_fallback.cpp
   ${GEN_DIR}/goblin_location_alt.hpp
   ${GEN_DIR}/goblin_location_alt.cpp
@@ -349,7 +353,8 @@ target_include_directories(MapForGoblins PRIVATE ${CMAKE_BINARY_DIR}/generated)
 configure_file(${CMAKE_SOURCE_DIR}/src/version.rc.in
                ${CMAKE_BINARY_DIR}/generated/version.rc @ONLY)
 target_sources(MapForGoblins PRIVATE ${CMAKE_BINARY_DIR}/generated/version.rc)
-# Resolve bare `#include "goblin_map_data.hpp"` etc. to the active bake dir.
+# Resolve a bare `#include "goblin_region_map.hpp"` (and the other genuinely generated
+# headers) to the active bake dir.
 target_include_directories(MapForGoblins PRIVATE ${GEN_DIR})
 
 # MapForGoblins.ini is no longer copied: build.bat generates it per profile in

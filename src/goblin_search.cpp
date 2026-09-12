@@ -47,9 +47,20 @@ namespace
     std::shared_ptr<const goblin::search::Results> g_results; // null = nothing cached
 
     std::set<uint64_t> g_picks;
-    // apply_picks() is in flight: the pick set is ahead of the map for a moment, and the
-    // consistency sweep in query() must not read that as "the filter was lifted elsewhere".
-    std::atomic<bool> g_applying{false};
+    // How many changes to the set are on their way to the map. The pick set is ahead of the
+    // map for that moment, and the consistency sweep in query() must not read that as "the
+    // filter was lifted elsewhere". A COUNTER, not a flag, for two reasons: it is raised in
+    // the same critical section that changed the set, so no window exists between publishing
+    // the set and marking it in flight (a restored focus was dropped there); and two changes
+    // can overlap, where the first one finishing must not clear the mark for the second.
+    std::atomic<int> g_applying{0};
+
+    // Raised by a mutator before it releases g_mtx; apply_picks() lowers it when the map has
+    // caught up.
+    struct ApplyingGuard
+    {
+        ~ApplyingGuard() { g_applying.fetch_sub(1, std::memory_order_release); }
+    };
 
     std::wstring to_lower(const wchar_t *w)
     {
@@ -241,7 +252,8 @@ std::shared_ptr<const goblin::search::Results> goblin::search::query(std::string
     if (stale) build_index();
     // Picks exist iff the pick focus is on the map. The filter can be lifted elsewhere (the
     // Progress "reset" row, a category focus replacing it): then the picks are stale and go.
-    if (!g_picks.empty() && !goblin::focus_rows_active() && !g_applying.load())
+    if (!g_picks.empty() && !goblin::focus_rows_active() &&
+        g_applying.load(std::memory_order_acquire) == 0)
         g_picks.clear();
     const bool only_uncollected = goblin::config::searchHideCollected;
     const uint64_t now = GetTickCount64();
@@ -267,15 +279,16 @@ bool goblin::search::is_picked(uint64_t key)
 namespace
 {
     // Push the pick set to the map. Outside the module lock: the focus machinery is inject's.
+    // The caller must already have raised g_applying inside the critical section where it
+    // changed the set - this only takes ownership of that raise.
     void apply_picks()
     {
+        ApplyingGuard done;
         std::vector<uint64_t> p;
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             p.assign(g_picks.begin(), g_picks.end());
-            g_applying.store(true);
         }
-        struct Done { ~Done() { g_applying.store(false); } } done;
         if (p.empty())
         {
             if (!goblin::focus_rows_active()) return; // nothing of ours to lift
@@ -293,6 +306,7 @@ void goblin::search::set_picked(uint64_t key, bool on)
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         if (on) g_picks.insert(key); else g_picks.erase(key);
+        g_applying.fetch_add(1, std::memory_order_relaxed);
     }
     apply_picks();
 }
@@ -303,6 +317,18 @@ void goblin::search::pick_many(const std::vector<uint64_t> &keys, bool on)
         std::lock_guard<std::mutex> lk(g_mtx);
         for (uint64_t k : keys)
             if (on) g_picks.insert(k); else g_picks.erase(k);
+        g_applying.fetch_add(1, std::memory_order_relaxed);
+    }
+    apply_picks();
+}
+
+void goblin::search::replace_picks(const std::vector<uint64_t> &keys)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_picks.clear();
+        g_picks.insert(keys.begin(), keys.end());
+        g_applying.fetch_add(1, std::memory_order_relaxed);
     }
     apply_picks();
 }
@@ -312,8 +338,15 @@ void goblin::search::clear_picks()
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_picks.clear();
+        g_applying.fetch_add(1, std::memory_order_relaxed);
     }
     apply_picks();
+}
+
+void goblin::search::forget_picks()
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_picks.clear();
 }
 
 size_t goblin::search::pick_count()

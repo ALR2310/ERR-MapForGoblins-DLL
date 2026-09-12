@@ -167,8 +167,8 @@ namespace goblin
         // In-game config overlay (Dear ImGui on a DX12 hook). Opens with the
         // toggle key. Set false if a DX-hook conflict (Steam overlay/RTSS/etc.)
         // or a GPU driver issue makes the game unstable.
-        extern std::string overlayUiLanguage; // OVERLAY menu language (ini overlay_ui_language);
-                                              // the in-game menu follows the GAME language
+        extern std::string uiLanguage; // language of everything the mod writes (ini ui_language):
+                                       // in-game menu, overlay, map tooltip, this file's comments
         // (Three lines describing an ini key `native_menu_icons` - how the in-game menu draws
         //  category icons - stood here, in the present tense, directly above an unrelated field, so
         //  they read as ITS documentation. That key was removed on 2026-07-29 along with the second

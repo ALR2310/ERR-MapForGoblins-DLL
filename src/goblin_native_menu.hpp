@@ -27,11 +27,9 @@ namespace goblin::nmenu
         // the grid claims left/right too and walks to the neighbouring row, and on a one-row
         // list its own bounds refuse the move. See build_value() and form_update_detour.
         Slider,      // numeric config value, stepped on its own screen via slider_step()
-        // NOT CURRENTLY REACHABLE (checked 2026-07-31, still true 2026-08-04): Enum and
-        // ValueOption - with them kPageValue, build_value() and kLanguages. kind_of() only ever
-        // runs on keys that a page lists, and the one Language key (ui_language) sits in the
-        // schema's "Menu & Hotkeys" section which no page enters. The machinery works - it is a
-        // page short. Either list such a key on a page or delete the branches; do not assume live.
+        // LIVE since 2026-09-12: ui_language, the one Language key, now heads the Menu settings
+        // page, so Enum / ValueOption / build_value() / kLanguages are all on a reachable path.
+        // (They sat written but unreachable from 2026-07-31, when no page listed a Language key.)
         Enum,        // value from a fixed list, decide opens its value page
         ValueOption, // one choice ON a value page; decide applies it and returns
         Rebind,      // hotkey, decide opens the "press a key" page

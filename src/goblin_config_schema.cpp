@@ -79,7 +79,7 @@ namespace goblin::config
          patchCampIcons = true, patchMerchantIcons = true,
          hideDungeonIconsOnClear = false;
 
-    std::string overlayUiLanguage = "auto"; // key overlay_ui_language (was ui_language)
+    std::string uiLanguage = "auto"; // key ui_language (was overlay_ui_language for two versions)
     std::string menuRenderMode = "native"; // native | imgui (| dev, undocumented)
     float fontScale = 1.0f;  // overlay text size multiplier (live io.FontGlobalScale)
     bool menuEnabled = true; // key menu_enabled (was enable_menu, was enable_overlay)
@@ -311,11 +311,20 @@ namespace
                          "Editable HERE ONLY: neither menu offers it, because it decides which menu" "\n"
                          "exists. Change needs a game restart.",
                          false, "overlay_render_mode", true},
-                IniEntry{"overlay_ui_language", IniType::Language, &cfg::overlayUiLanguage, "auto",
-                         "Language of the OVERLAY menu: auto, english, schinese, tchinese, korean,\n"
-                         "russian, german, french, spanish. auto follows the Steam game language;\n"
-                         "unrecognized languages fall back to English. The in-game menu ignores this\n"
-                         "and always follows the GAME language.", false, "ui_language"},
+                IniEntry{"ui_language", IniType::Language, &cfg::uiLanguage, "auto",
+                         "Language of everything this mod writes: the in-game menu, the overlay menu,\n"
+                         "the map tooltip and this file's own comments. auto follows the Steam game\n"
+                         "language; unrecognized languages fall back to English.\n"
+                         "Values: auto, english, schinese, tchinese, korean, russian, german, french,\n"
+                         "spanish.\n"
+                         "Item and place names on the markers come from the game itself and always\n"
+                         "stay in the game's language, because the game loads only that one. The\n"
+                         "in-game menu is drawn with the GAME's font: Chinese or Korean picked in a\n"
+                         "European copy of the game shows as blank boxes there, while the overlay\n"
+                         "carries its own font and renders them. Enemy names on the markers, and that\n"
+                         "overlay font, are prepared while the game loads, so they follow a change\n"
+                         "only after a restart.",
+                         false, "overlay_ui_language"},
                 IniEntry{"overlay_font_scale", IniType::Float, &cfg::fontScale, "1.0",
                          "Overlay menu text size multiplier (1.0 = default). Raise on 4K / high-DPI\nscreens if the menu text is too small. Also adjustable live from the slider at\nthe top of the overlay's Settings tab.", false, nullptr},
                 IniEntry{"overlay_opacity", IniType::Float, &cfg::overlayOpacity, "1.0",

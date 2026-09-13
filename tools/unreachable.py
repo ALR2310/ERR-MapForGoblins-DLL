@@ -86,6 +86,13 @@ UNCONDITIONAL = {
     # 34.3) - Y identical to vanilla, but sits under the terrain in ERR
     # (reshaped ground); confirmed in-game (2026-06).
     ('m60_51_39_00', 'AEG099_653_9001'),
+    # Valkyrie's Prosthesis chest in Mt. Gelmir tile m60_39_54 - ERR lowers it
+    # into the ground (Y 733.52 -> 730.01, dy -3.5, just over MIN_DROP, so the
+    # conditional list would be one data tweak away from losing it) and gives
+    # the weapon from the nearby boss instead; confirmed in-game (2026-09-13).
+    # Unconditional so the chest marker stays out even if ERR raises the chest
+    # back while the weapon keeps coming from the boss.
+    ('m60_39_54_00', 'AEG099_630_9000'),
 }
 
 # Entries whose displacement is checked in any direction (abs dy > threshold),

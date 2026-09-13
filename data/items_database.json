@@ -406396,34 +406396,6 @@
  },
  {
   "map": "m60_39_54_00",
-  "x": -98.928,
-  "y": 730.011,
-  "z": 66.494,
-  "areaNo": 60,
-  "gridX": 39,
-  "gridZ": 54,
-  "dispMask": "dispMask00",
-  "itemLotId": 1039540300,
-  "eventFlag": 1039547300,
-  "partName": "AEG099_630_9000",
-  "items": [
-   {
-    "id": 8977,
-    "category": 1,
-    "num": 1,
-    "name": "Valkyrie's Prosthesis",
-    "broad_category": "consumable",
-    "sub_category": "consumable"
-   }
-  ],
-  "primary_category": "consumable",
-  "source": "treasure",
-  "guaranteed": true,
-  "lotParam": "map",
-  "partBucket": "live"
- },
- {
-  "map": "m60_39_54_00",
   "x": -98.944,
   "y": 733.507,
   "z": 66.513,

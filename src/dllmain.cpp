@@ -960,11 +960,15 @@ static void setup_mod()
         spdlog::info("Icon toggle hotkey: VK 0x{:X}", goblin::config::toggleInjectionKey);
     }
 
-    if (goblin::config::enableManualHide)
+    // Started whichever way enable_manual_hide is set: the loop re-reads the setting on every
+    // tick and idles while it is off, and the setting is a checkbox in both menus. Starting it
+    // only when the setting was on at launch left the hide key dead for a player who switched
+    // the feature on from the menu - the checkbox took, nothing listened - until a restart.
     {
         std::thread([] { goblin::crashdiag::note_own_thread();
                          manual_hide_hotkey_loop(); }).detach();
-        spdlog::info("Manual marker-hide hotkey: VK 0x{:X}", goblin::config::hideMarkerKey);
+        spdlog::info("Manual marker-hide hotkey: VK 0x{:X} ({})", goblin::config::hideMarkerKey,
+                     goblin::config::enableManualHide ? "on" : "off until enabled");
     }
 
     // The watcher is the single owner of the WorldMapPointParam state - it

@@ -830,7 +830,11 @@ static bool restore_focus_pending()
                      g_pending_focus_picks.size(), ids.size());
         g_pending_focus_picks.clear();
         g_pending_focus_picks_are_v2 = false;
-        if (ids.empty()) { persist_focus(); return false; }
+        // Nothing matched: leave the FILE alone. This used to persist here, which rewrote the
+        // character's focus as a bare header the moment its keys failed to resolve - a v2 file
+        // on a v3 build, or a source that moved in a data update - destroying a selection a
+        // later build could still have read. The next focus the player sets overwrites it anyway.
+        if (ids.empty()) return false;
         goblin::search::replace_picks(ids);  // set_focus_rows + reapply + highlight
         return true;
     }
@@ -2513,6 +2517,31 @@ bool goblin::sync_hidden_slot()
         // Same character: the pending work is a legacy hide file whose keys could not be
         // resolved at load time, or a saved focus, both waiting for the injected rows.
         bool changed = false;
+        // The manual-hide setting is a checkbox in both menus, so it can flip while a character
+        // is loaded. The hide file is attached only on a character switch, so a flip to ON left
+        // the hotkey working against an empty set with no persist target: the character's saved
+        // hides never applied, and every new one was gone at exit. Attach the file on the flip
+        // to ON; drop it (and the set - is_manually_hidden() stays honest) on the flip to OFF.
+        if (slot >= 0 && !g_hidden_dir.empty())
+        {
+            if (goblin::config::enableManualHide && g_hidden_file.empty())
+            {
+                g_hidden_file = g_hidden_dir / ("MapForGoblins_hidden_s" + std::to_string(slot) + ".txt");
+                load_manual_hidden(g_hidden_file);
+                spdlog::info("[hide] manual hide switched on -> {} ({} hidden loaded)",
+                             g_hidden_file.filename().string(), manual_hidden_count());
+                changed = true;
+            }
+            else if (!goblin::config::enableManualHide && !g_hidden_file.empty())
+            {
+                g_hidden_file.clear();
+                std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
+                g_manual_hidden.clear();
+                g_hidden_v1_pending.clear();
+                g_hidden_v2_pending.clear();
+                changed = true;
+            }
+        }
         const bool from_v1 = migrate_hidden_v1();
         const bool from_v2 = migrate_hidden_v2();  // both, never short-circuited
         if (from_v1 || from_v2)

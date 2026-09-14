@@ -255,15 +255,27 @@ def main():
                 'defeatFlag': defeat_flag, 'partName': part_name,
             })
 
-    # Dedup per (map, rounded_coords) - multiple invader variants stacked
-    # at the same EMEVD trigger spot would otherwise produce overlapping
-    # markers. Keep the first (which is usually the canonical placement).
+    # Dedup per (tile, rounded_coords) and per (tile, entity) - multiple invader variants
+    # stacked at the same EMEVD trigger spot would otherwise produce overlapping markers.
+    # Keep the first (which is usually the canonical placement).
+    #
+    # "Tile", not the MSB name: a tile with a story variant (m61_44_46_00 and _10, the
+    # Sealing Tree burn) places the same NPC, with the same entity and defeat flag, in both
+    # MSBs. Keyed by MSB name they came out as two markers - Hornsent, Moore and Queelign each
+    # stood twice, an offline spiral apart, and both copies answered the same kill.
+    def tile_of(map_name):
+        parts = map_name.split('_')
+        return '_'.join(parts[:3]) if len(parts) >= 4 else map_name
+
     seen = set()
     uniq = []
     for r in records:
-        key = (r['map'], round(r['x'], 1), round(r['z'], 1))
-        if key in seen: continue
-        seen.add(key)
+        tile = tile_of(r['map'])
+        keys = [(tile, round(r['x'], 1), round(r['z'], 1))]
+        if r['entity'] > 0:
+            keys.append((tile, 'entity', r['entity']))
+        if any(k in seen for k in keys): continue
+        seen.update(keys)
         uniq.append(r)
     records = uniq
     records.sort(key=lambda r: (r['area'], r['gx'], r['gz'], r['x'], r['z']))

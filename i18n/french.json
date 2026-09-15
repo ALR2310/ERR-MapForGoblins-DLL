@@ -120,6 +120,10 @@
     "entry_labels": {
         "require_map_fragments": "Exiger les fragments de carte",
         "location_emphasis": "Mise en avant du lieu",
+        "location_emphasis_own_scale": "Lieu actuel : taille des marqueurs",
+        "location_emphasis_other_scale": "Autres lieux : taille des marqueurs",
+        "location_emphasis_other_fade": "Autres lieux : atténuation",
+        "location_emphasis_other_cool": "Autres lieux : teinte froide",
         "show_armaments": "Armes",
         "show_armour": "Armures",
         "show_ashes_of_war": "Cendres de guerre",
@@ -217,6 +221,10 @@
     "entry_comments": {
         "require_map_fragments": "Exiger la découverte du fragment de carte avant d'afficher les icônes de cette zone",
         "location_emphasis": "Les marqueurs de la carte où vous vous trouvez sont plus grands; ceux qui semblent seulement proches (un donjon sous vos pieds, ou la surface au-dessus) sont plus petits. Rien n'est jamais masqué.",
+        "location_emphasis_own_scale": "Taille des marqueurs du lieu où vous vous trouvez (1.0 = inchangée).",
+        "location_emphasis_other_scale": "Taille des marqueurs de tous les autres lieux (1.0 = inchangée).",
+        "location_emphasis_other_fade": "Degré d'atténuation des marqueurs des autres lieux (1.0 = aucune, 0.2 = maximale). Ils restent visibles et cliquables, juste plus discrets.",
+        "location_emphasis_other_cool": "À quel point les marqueurs des autres lieux tirent vers une teinte froide en plus de l'atténuation (0.0 = couleur intacte, 1.0 = maximum).",
         "show_armaments": "Armes, boucliers, arcs, sceptres, etc.",
         "show_armour": "Pièces d'armure (casques, torse, gantelets, jambes)",
         "show_ashes_of_war": "Cendres de guerre (compétences d'arme)",

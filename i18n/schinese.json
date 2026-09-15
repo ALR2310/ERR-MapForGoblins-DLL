@@ -120,6 +120,10 @@
     "entry_labels": {
         "require_map_fragments": "需要地图碎片",
         "location_emphasis": "当前区域强调",
+        "location_emphasis_own_scale": "当前区域：标记大小",
+        "location_emphasis_other_scale": "其他区域：标记大小",
+        "location_emphasis_other_fade": "其他区域：淡化",
+        "location_emphasis_other_cool": "其他区域：冷色调",
         "show_armaments": "武器",
         "show_armour": "防具",
         "show_ashes_of_war": "战灰",
@@ -217,6 +221,10 @@
     "entry_comments": {
         "require_map_fragments": "需要先发现对应区域的地图碎片，才显示该区域图标。",
         "location_emphasis": "你所在地图的标记会画得更大；只是看起来在附近的标记（脚下的地下城，或其上方的地表）会画得更小。不会隐藏任何标记。",
+        "location_emphasis_own_scale": "你所在区域的标记大小（1.0 = 不变）。",
+        "location_emphasis_other_scale": "其他所有区域的标记大小（1.0 = 不变）。",
+        "location_emphasis_other_fade": "其他区域标记的淡化程度（1.0 = 不淡化，0.2 = 最淡）。它们仍然可见、可点击，只是不那么显眼。",
+        "location_emphasis_other_cool": "在淡化之外，其他区域标记偏向冷色的程度（0.0 = 颜色不变，1.0 = 最强）。",
         "show_armaments": "武器、盾牌、弓、杖等。",
         "show_armour": "防具部位（头盔、胸甲、臂甲、腿甲）。",
         "show_ashes_of_war": "战灰（武器战技）。",

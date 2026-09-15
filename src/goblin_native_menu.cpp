@@ -522,6 +522,10 @@ namespace
     {
         const size_t n = goblin::manual_hidden_count();
         goblin::clear_manual_hidden();
+        // Written down like the other two unhide paths (the overlay's and the per-row one). This
+        // one never was: the list emptied, the file kept every entry, and the next launch
+        // brought all of them back hidden (2026-09-15, five markers on slot 1).
+        goblin::persist_manual_hidden();
         goblin::reapply_live_settings();
         spdlog::info("[nmenu] unhid {} manually hidden markers", n);
     }

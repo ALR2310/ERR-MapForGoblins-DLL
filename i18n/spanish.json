@@ -120,6 +120,10 @@
     "entry_labels": {
         "require_map_fragments": "Requerir fragmentos de mapa",
         "location_emphasis": "Énfasis de ubicación",
+        "location_emphasis_own_scale": "Ubicación actual: tamaño de marcadores",
+        "location_emphasis_other_scale": "Otras ubicaciones: tamaño de marcadores",
+        "location_emphasis_other_fade": "Otras ubicaciones: atenuación",
+        "location_emphasis_other_cool": "Otras ubicaciones: tono frío",
         "show_armaments": "Armamento",
         "show_armour": "Armadura",
         "show_ashes_of_war": "Cenizas de Guerra",
@@ -217,6 +221,10 @@
     "entry_comments": {
         "require_map_fragments": "Requerir el descubrimiento del fragmento de mapa antes de mostrar iconos en esa zona",
         "location_emphasis": "Los marcadores del mapa en el que estás se dibujan más grandes; los que solo parecen cercanos (una mazmorra bajo tus pies, o la superficie sobre ella) más pequeños. Nunca se oculta nada.",
+        "location_emphasis_own_scale": "Tamaño de los marcadores de la ubicación en la que estás (1.0 = sin cambios).",
+        "location_emphasis_other_scale": "Tamaño de los marcadores de todas las demás ubicaciones (1.0 = sin cambios).",
+        "location_emphasis_other_fade": "Cuánto se atenúan los marcadores de otras ubicaciones (1.0 = nada, 0.2 = al máximo). Siguen visibles y clicables, solo más discretos.",
+        "location_emphasis_other_cool": "Cuánto se llevan los marcadores de otras ubicaciones hacia un tono frío además de la atenuación (0.0 = color intacto, 1.0 = máximo).",
         "show_armaments": "Armas, escudos, arcos, báculos, etc.",
         "show_armour": "Piezas de armadura (yelmos, pecho, guanteletes, piernas)",
         "show_ashes_of_war": "Cenizas de Guerra (habilidades de arma)",

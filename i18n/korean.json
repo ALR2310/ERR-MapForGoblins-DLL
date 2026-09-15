@@ -120,6 +120,10 @@
     "entry_labels": {
         "require_map_fragments": "지도 조각 필요",
         "location_emphasis": "현재 위치 강조",
+        "location_emphasis_own_scale": "현재 위치: 마커 크기",
+        "location_emphasis_other_scale": "다른 위치: 마커 크기",
+        "location_emphasis_other_fade": "다른 위치: 흐리게",
+        "location_emphasis_other_cool": "다른 위치: 차가운 색조",
         "show_armaments": "무기",
         "show_armour": "방어구",
         "show_ashes_of_war": "전회",
@@ -217,6 +221,10 @@
     "entry_comments": {
         "require_map_fragments": "해당 지역의 지도 조각을 발견하기 전까지 아이콘 표시 안 함",
         "location_emphasis": "현재 머물러 있는 맵의 마커는 크게, 가까워 보일 뿐인 마커(발 아래 던전이나 그 위 지상)는 작게 표시됩니다. 숨기는 것은 없습니다.",
+        "location_emphasis_own_scale": "현재 있는 위치의 마커 크기 (1.0 = 변화 없음).",
+        "location_emphasis_other_scale": "다른 모든 위치의 마커 크기 (1.0 = 변화 없음).",
+        "location_emphasis_other_fade": "다른 위치의 마커를 얼마나 흐리게 할지 (1.0 = 그대로, 0.2 = 가장 흐림). 여전히 보이고 클릭할 수 있으며, 덜 눈에 띌 뿐입니다.",
+        "location_emphasis_other_cool": "흐리게 처리에 더해 다른 위치의 마커를 얼마나 차가운 색조로 바꿀지 (0.0 = 색 그대로, 1.0 = 최대).",
         "show_armaments": "무기, 방패, 활, 지팡이 등",
         "show_armour": "방어구 (투구, 갑옷, 장갑, 각반)",
         "show_ashes_of_war": "전회 (무기 기술)",

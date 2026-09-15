@@ -120,6 +120,10 @@
     "entry_labels": {
         "require_map_fragments": "Kartenfragmente erforderlich",
         "location_emphasis": "Ortshervorhebung",
+        "location_emphasis_own_scale": "Aktueller Ort: Markergröße",
+        "location_emphasis_other_scale": "Andere Orte: Markergröße",
+        "location_emphasis_other_fade": "Andere Orte: Abdunkeln",
+        "location_emphasis_other_cool": "Andere Orte: kalter Farbton",
         "show_armaments": "Waffen",
         "show_armour": "Rüstung",
         "show_ashes_of_war": "Kriegsaschen",
@@ -217,6 +221,10 @@
     "entry_comments": {
         "require_map_fragments": "Erfordert das Entdecken des Kartenfragments, bevor Symbole in diesem Gebiet angezeigt werden",
         "location_emphasis": "Marker der Karte, auf der du dich befindest, werden größer gezeichnet; Marker, die nur nahe wirken (ein Verlies unter dir oder die Oberfläche darüber), kleiner. Es wird nie etwas ausgeblendet.",
+        "location_emphasis_own_scale": "Größe der Marker des Ortes, an dem du dich befindest (1.0 = unverändert).",
+        "location_emphasis_other_scale": "Größe der Marker aller anderen Orte (1.0 = unverändert).",
+        "location_emphasis_other_fade": "Wie stark die Marker anderer Orte abgedunkelt werden (1.0 = gar nicht, 0.2 = am stärksten). Sie bleiben sichtbar und anklickbar, nur zurückhaltender.",
+        "location_emphasis_other_cool": "Wie stark die Marker anderer Orte zusätzlich zum Abdunkeln ins Kalte gezogen werden (0.0 = Farbe unverändert, 1.0 = am stärksten).",
         "show_armaments": "Waffen, Schilde, Bögen, Stecken usw.",
         "show_armour": "Rüstungsteile (Helme, Brust, Armschienen, Beinschienen)",
         "show_ashes_of_war": "Kriegsaschen (Waffenfertigkeiten)",

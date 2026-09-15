@@ -184,7 +184,12 @@ static inline bool row_in_focus(const CategoryRow &cr, int focus)
 // announces, else the flag that clears it, else (springs, stakes) its tile + position.
 // apply_category_visibility() ANDs this in, so a hidden marker's icon disappears live and
 // stays hidden on reload. Unhide/clear via the overlay.
-struct HiddenMeta { int32_t textId; uint16_t iconId; int32_t region; uint8_t cat; };
+// `seq` orders the set by WHEN each marker was hidden: the Hidden list shows the newest first,
+// so the one just removed is at the top instead of somewhere in key order, and the file is
+// written oldest-first so the order survives a restart (the loader numbers lines as they come).
+struct HiddenMeta { int32_t textId; uint16_t iconId; int32_t region; uint8_t cat; uint32_t seq = 0; };
+static uint32_t g_hidden_seq = 0;                 // last seq handed out; under g_manual_hidden_mtx
+static uint32_t next_hidden_seq() { return ++g_hidden_seq; }
 static std::map<uint64_t, HiddenMeta> g_manual_hidden;
 static std::map<uint64_t, HiddenMeta> g_hidden_v1_pending;  // legacy keys read from a v1 file, migrated once rows exist
 static std::map<uint64_t, HiddenMeta> g_hidden_v2_pending;  // same, for a v2 file (pre-2.1.4 key)
@@ -2273,7 +2278,7 @@ goblin::ManualHideResult goblin::toggle_hovered_marker(void *rowptr)
         else
         {
             g_manual_hidden[k] = HiddenMeta{cr.p->textId1, cr.p->iconId, cr.region_id,
-                                            static_cast<uint8_t>(cr.cat)};
+                                            static_cast<uint8_t>(cr.cat), next_hidden_seq()};
             r.now_hidden = true;
         }
         return r;
@@ -2314,8 +2319,16 @@ std::vector<goblin::HiddenMarkerInfo> goblin::manual_hidden_snapshot()
     std::vector<HiddenMarkerInfo> out;
     std::lock_guard<std::mutex> lk(g_manual_hidden_mtx);
     out.reserve(g_manual_hidden.size());
-    for (const auto &[k, m] : g_manual_hidden)
-        out.push_back(HiddenMarkerInfo{k, m.textId, m.iconId, m.region, m.cat});
+    // Newest hide first: the marker the player just removed sits at the top of the Hidden
+    // list, where it is looked for. Key order (the map's) told nothing.
+    std::vector<const std::pair<const uint64_t, HiddenMeta> *> rows;
+    rows.reserve(g_manual_hidden.size());
+    for (const auto &kv : g_manual_hidden) rows.push_back(&kv);
+    std::sort(rows.begin(), rows.end(),
+              [](const auto *a, const auto *b) { return a->second.seq > b->second.seq; });
+    for (const auto *kv : rows)
+        out.push_back(HiddenMarkerInfo{kv->first, kv->second.textId, kv->second.iconId,
+                                       kv->second.region, kv->second.cat});
     return out;
 }
 
@@ -2355,7 +2368,12 @@ void goblin::save_manual_hidden(const std::filesystem::path &path)
     {
         std::ofstream f(path, std::ios::trunc);
         f << kHiddenHeaderV3 << '\n';
-        for (const auto &[k, m] : g_manual_hidden)
+        // Oldest first: the loader numbers lines in order, so this is what keeps the Hidden
+        // list's newest-first order across a restart. Same format as before, just ordered.
+        std::vector<std::pair<uint64_t, HiddenMeta>> rows(g_manual_hidden.begin(), g_manual_hidden.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto &a, const auto &b) { return a.second.seq < b.second.seq; });
+        for (const auto &[k, m] : rows)
             f << k << ' ' << m.textId << ' ' << m.iconId << ' ' << m.region << ' '
               << static_cast<int>(m.cat) << '\n';
     }
@@ -2398,7 +2416,8 @@ void goblin::load_manual_hidden(const std::filesystem::path &path)
                          : version == 2 ? g_hidden_v2_pending
                                         : g_hidden_v1_pending;
             target[k] = HiddenMeta{static_cast<int32_t>(tid), static_cast<uint16_t>(icon),
-                                   static_cast<int32_t>(region), static_cast<uint8_t>(cat)};
+                                   static_cast<int32_t>(region), static_cast<uint8_t>(cat),
+                                   next_hidden_seq()};  // file order = hide order (oldest first)
         }
     }
     catch (...) {}
@@ -2423,7 +2442,7 @@ static bool migrate_hidden_v2()
             seen.insert(it->first);
             if (g_manual_hidden.emplace(cr.hide_key,
                                         HiddenMeta{cr.p->textId1, cr.p->iconId, cr.region_id,
-                                                   static_cast<uint8_t>(cr.cat)}).second)
+                                                   static_cast<uint8_t>(cr.cat), next_hidden_seq()}).second)
                 ++added;
         }
         matched_keys = seen.size();
@@ -2454,7 +2473,7 @@ static bool migrate_hidden_v1()
             seen.insert(it->first);
             if (g_manual_hidden.emplace(cr.hide_key,
                                         HiddenMeta{cr.p->textId1, cr.p->iconId, cr.region_id,
-                                                   static_cast<uint8_t>(cr.cat)}).second)
+                                                   static_cast<uint8_t>(cr.cat), next_hidden_seq()}).second)
                 ++added;
         }
         matched_keys = seen.size();

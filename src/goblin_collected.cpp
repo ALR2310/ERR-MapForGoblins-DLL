@@ -772,6 +772,15 @@ void goblin::collected::register_param_ptr(uint64_t row_id, void *param_data)
     g_param_ptrs[row_id] = {p, p[0x20]};  // save original areaNo
 }
 
+bool goblin::collected::original_area_no(uint64_t row_id, uint8_t &area_out)
+{
+    auto it = g_param_ptrs.find(row_id);
+    if (it == g_param_ptrs.end())
+        return false;
+    area_out = it->second.original_areaNo;
+    return true;
+}
+
 // ─── refresh from memory (real-time update) ─────────────────────────
 
 int goblin::collected::refresh()
@@ -860,18 +869,36 @@ int goblin::collected::refresh()
                     auto pt = g_entry_positions.find(row_id);
                     if (pt == g_entry_positions.end()) continue;
                     auto [ex, ey, ez] = pt->second;
+                    // Two candidates per row: the nearest instance of the model, and the
+                    // nearest instance whose MSB name carries THIS row's slot.
                     const WGMSnapshot::SlotInst *best = nullptr;
                     float best_d2 = 1e18f;
+                    const WGMSnapshot::SlotInst *named = nullptr;
+                    float named_d2 = 1e18f;
                     for (auto *in : insts)
                     {
                         float dx = in->px - ex, dz = in->pz - ez;
                         float d2 = dx * dx + dz * dz;
                         if (d2 < best_d2) { best_d2 = d2; best = in; }
+                        if (in->suffix_slot == slot && d2 < named_d2) { named_d2 = d2; named = in; }
                     }
                     // Same physical node: baked real coords match the live MsbPart
                     // position to well under 1u. Reject a far "nearest" (the row's own
                     // instance hasn't spawned - don't cross-match to another node's).
-                    if (!best || best_d2 > 16.0f)
+                    //
+                    // Within that radius the same-named instance wins over the merely
+                    // nearest one. Twins - several rows of ONE model at ONE MSB position
+                    // (ERR m30_13 AEG099_821_9000/_9001; 13 such groups, 27 rows, in the err
+                    // bake) - otherwise all resolve to whichever instance the map yields
+                    // first, and picking up one of them hid every twin's marker
+                    // (2026-09-14: row 805, the _9001 relocated onto its pickup target,
+                    // vanished the moment _9000 was collected).
+                    if (named && named_d2 <= 16.0f)
+                    {
+                        best = named;
+                        best_d2 = named_d2;
+                    }
+                    else if (!best || best_d2 > 16.0f)
                     {
                         // Nothing at the baked position. The asset may have moved (a game/mod
                         // update relocating it, or a marker placed on a pickup target away
@@ -880,15 +907,8 @@ int goblin::collected::refresh()
                         // baked from, NOT the engine's geom_idx (the formula that failed for
                         // lilies). Nearest same-named instance wins; duplicate-named twins
                         // share one collected key in the engine anyway.
-                        best = nullptr;
-                        best_d2 = 1e18f;
-                        for (auto *in : insts)
-                        {
-                            if (in->suffix_slot != slot) continue;
-                            float dx = in->px - ex, dz = in->pz - ez;
-                            float d2 = dx * dx + dz * dz;
-                            if (d2 < best_d2) { best_d2 = d2; best = in; }
-                        }
+                        best = named;
+                        best_d2 = named_d2;
                         if (!best) continue;
                     }
                     if (best->alive) demonstrably_alive_rows.insert(row_id);
@@ -1233,23 +1253,30 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
                 snprintf(buf, sizeof(buf), "        WGM: tile loaded, %zu instance(s) of %s (%zu tracked total):\n",
                          rows.size(), geof_prefix.c_str(), total);
                 o << buf;
-                // Same rule as refresh(): nearest within 4u, else the nearest instance whose
-                // MSB name carries this row's slot.
+                // Same rule as refresh(): the nearest instance whose MSB name carries this
+                // row's slot if it lies within 4u; else the nearest instance within 4u; else
+                // the same-named instance at any distance.
                 const Row *byname = nullptr;
-                if (rows.empty() || rows.front().d > 4.0f)
-                    for (const auto &r : rows)
-                        if (r.in->suffix_slot == e->geom_slot && (!byname || r.d < byname->d)) byname = &r;
+                for (const auto &r : rows)
+                    if (r.in->suffix_slot == e->geom_slot && (!byname || r.d < byname->d)) byname = &r;
+                const bool named_near = byname && byname->d <= 4.0f;
+                const bool pos_match = !named_near && !rows.empty() && rows.front().d <= 4.0f;
                 for (size_t i = 0; i < rows.size() && i < 8; ++i)
                 {
                     const auto &r = rows[i];
                     const char *outcome = "";
-                    if (i == 0 && r.d <= 4.0f)
+                    if (named_near && byname == &r)
+                        outcome = r.in->alive ? "  <- match (same name-slot, within 4u): ALIVE"
+                                              : "  <- match (same name-slot, within 4u): dead -> collected";
+                    else if (named_near && i == 0)
+                        outcome = "  <- nearest, but a same-named twin within 4u takes precedence";
+                    else if (pos_match && i == 0)
                         outcome = r.in->alive ? "  <- match: ALIVE" : "  <- match: dead -> collected";
                     else if (i == 0 && !byname)
                         outcome = "  <- nearest, but > 4u, and no instance is named with this row's slot: NO MATCH";
                     else if (i == 0)
                         outcome = "  <- nearest, but > 4u: position match fails, name-slot fallback below";
-                    if (byname == &r)
+                    if (!named_near && !pos_match && byname == &r)
                         outcome = byname->in->alive ? "  <- name-slot match: ALIVE"
                                                     : "  <- name-slot match: dead -> collected";
                     snprintf(buf, sizeof(buf),

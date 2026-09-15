@@ -25,5 +25,9 @@ namespace goblin::kindling
     /// Same trick as goblin::collected - write 0x20 = 99 to hide, restore original.
     void register_param_ptr(uint64_t row_id, void *param_data);
 
+    /// The areaNo a registered kindling row had before hiding wrote 99 over it (live row id);
+    /// false when the row is not a registered kindling row. Used by the marker dump.
+    bool original_area_no(uint64_t row_id, uint8_t &area_out);
+
     int collected_count();
 };

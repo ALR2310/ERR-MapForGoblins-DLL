@@ -755,6 +755,15 @@ int goblin::kindling::refresh()
     return delta;
 }
 
+bool goblin::kindling::original_area_no(uint64_t row_id, uint8_t &area_out)
+{
+    auto it = g_param_ptrs.find(row_id);
+    if (it == g_param_ptrs.end())
+        return false;
+    area_out = it->second.original_areaNo;
+    return true;
+}
+
 bool goblin::kindling::is_row_collected(uint64_t row_id)
 {
     std::lock_guard<std::mutex> lock(g_collected_rows_mutex);

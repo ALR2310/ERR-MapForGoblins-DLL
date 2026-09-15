@@ -34,6 +34,11 @@ namespace goblin::collected
 
     void register_param_ptr(uint64_t row_id, void *param_data);
 
+    /// The areaNo a registered piece row had BEFORE hiding wrote 99 over it (live row id).
+    /// False when the row is not a registered piece row. The marker dump needs it to project a
+    /// hidden row back onto the map instead of losing it under "(area 99, gx N)".
+    bool original_area_no(uint64_t row_id, uint8_t &area_out);
+
     int collected_count();
     int skipped_count();
 

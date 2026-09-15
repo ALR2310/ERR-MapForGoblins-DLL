@@ -867,7 +867,9 @@ void goblin::setup_messages()
     if (goblin::config::liveLootLabels)
     {
         copy_fmg_all_layered(goods_slots, 500000000, "GoodsName", false);
-        copy_fmg_all_layered(weapon_slots, 100000000, "WeaponName", true);
+        // Ammo is +100M like every other weapon now (encode_live_item and the icon table agree);
+        // the "ids >= 50M stay raw" rule went with it - it also caught the 60M-68M DLC weapons.
+        copy_fmg_all_layered(weapon_slots, 100000000, "WeaponName", false);
         copy_fmg_all_layered(protector_slots, 200000000, "ProtectorName", false);
         copy_fmg_all_layered(accessory_slots, 300000000, "AccessoryName", false);
         copy_fmg_all_layered(gem_slots, 400000000, "GemName", false);

@@ -14,6 +14,7 @@
 #include "goblin_status_line.hpp"
 #include "goblin_i18n.hpp"
 #include "goblin_collected.hpp"
+#include "goblin_kindling.hpp"
 #include "goblin_config.hpp"
 #include "goblin_inject.hpp"
 #include "goblin_messages.hpp"
@@ -337,6 +338,10 @@ struct NearbyEntry
     // world X/Z, are the inputs to `dist` on the very next line, which IS printed.
     float dist;
     bool is_ours;             // true = a marker this mod injected (vs vanilla/overhaul)
+    // Live areaNo == 99: collected (piece) or kindling tracking hid this row in place. The
+    // entry is projected through the ORIGINAL areaNo so it still appears in the list.
+    bool hidden_collected;
+    bool hidden_kindling;
 };
 
 // Classify a marker's textId slots into loot / location / drop-source by their
@@ -433,8 +438,28 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
         {
             uint64_t row_id = entry.first;
             auto &row = entry.second;
+            // A row hidden by collected/kindling tracking has areaNo = 99 written over it in the
+            // live param; project it through the areaNo it was registered with, or it drops out
+            // of this list as "could not be placed (area 99)" with no status - which is how the
+            // m30_13 twin piece (2026-09-14) went missing from a dump taken right on top of it.
+            uint8_t area = row.areaNo;
+            bool hidden_collected = false, hidden_kindling = false;
+            if (area == 99)
+            {
+                uint8_t orig = 0;
+                if (goblin::collected::original_area_no(row_id, orig))
+                {
+                    area = orig;
+                    hidden_collected = true;
+                }
+                else if (goblin::kindling::original_area_no(row_id, orig))
+                {
+                    area = orig;
+                    hidden_kindling = true;
+                }
+            }
             float ewx, ewz;
-            if (!compute_world_coords(row.areaNo, row.gridXNo, row.gridZNo,
+            if (!compute_world_coords(area, row.gridXNo, row.gridZNo,
                                       row.posX, row.posZ, ewx, ewz))
             {
                 // Not silently. A row we cannot place is a row the dump does not mention at all, and
@@ -454,9 +479,10 @@ static std::vector<NearbyEntry> find_nearby_overworld(float mapX, float mapZ, fl
             out.push_back({
                 row_id, &row, item_tid, loc_tid, enemy_tid,
                 row.textDisableFlagId1,
-                row.iconId, row.areaNo, row.gridXNo, row.gridZNo,
+                row.iconId, area, row.gridXNo, row.gridZNo,
                 row.posX, row.posY, row.posZ, std::sqrt(d2),
-                ourset.count(&row) != 0
+                ourset.count(&row) != 0,
+                hidden_collected, hidden_kindling
             });
         }
     }
@@ -552,10 +578,15 @@ static int dump_impl(std::ostream &f, DumpSel sel)
         {
             std::snprintf(tile, sizeof(tile), "m%02u_%02u_%02u", n.area, n.gx, n.gz);
             bool hidden_by_flag = n.disable_flag1 && is_flag_set(n.disable_flag1);
-            bool hidden_by_mod = n.is_ours && goblin::collected::is_original_row_collected(n.row_id);
-            const char *status = hidden_by_flag  ? "hidden(flag)"
-                               : hidden_by_mod   ? "hidden(collected)"
-                                                 : "visible";
+            // The live areaNo == 99 write is the ground truth for a mod-hidden row (the set
+            // lookup by id was consulted here before, but such a row never reached this list:
+            // area 99 has no projection). Keep the set lookup as a second opinion.
+            bool hidden_by_mod = n.hidden_collected ||
+                                 (n.is_ours && goblin::collected::is_row_collected(n.row_id));
+            const char *status = hidden_by_flag       ? "hidden(flag)"
+                               : hidden_by_mod        ? "hidden(collected)"
+                               : n.hidden_kindling    ? "hidden(kindling)"
+                                                      : "visible";
             f << "        dist=" << std::fixed << std::setprecision(1) << n.dist
               << "  " << tile
               << "  icon=" << n.icon_id

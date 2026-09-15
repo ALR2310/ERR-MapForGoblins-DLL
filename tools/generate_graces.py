@@ -19,7 +19,7 @@ clr.AddReference(str(config.SOULSFORMATS_DLL))
 import SoulsFormats
 
 from extract_all_items import load_paramdefs, read_param, param_to_dict
-from massedit_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS
+from massedit_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS, resolve_location_id_at
 from unreachable import is_unreachable_grace
 
 ERR_MOD_DIR = config.require_err_mod_dir()
@@ -33,6 +33,18 @@ paramdefs = load_paramdefs()
 # them would be a nameless/null icon. Skip any grace whose tile has no MSB.
 _MSB_DIR = ERR_MOD_DIR / 'map' / 'MapStudio'
 EXISTING_TILES = {p.name[:12] for p in _MSB_DIR.glob('m*.msb.dcx')}  # 'm12_02_00_00'
+
+# PlaceName ids this profile's FMG actually carries. A grace whose BonfireWarpParam textId1 has
+# no string (Throne ER: grace rid with textId1 60200000 in Stormveil) would be a text-less
+# marker - the DLL's sanitizer clears the id and the engine draws no icon - so such a grace
+# is labelled with its location instead, and skipped only when even that cannot be resolved.
+def _placename_ids():
+    p = config.DATA_DIR / 'PlaceName_engus.json'
+    if not p.exists():
+        return set()
+    with open(p, encoding='utf-8') as f:
+        return {int(k) for k in json.load(f)}
+PLACENAME_IDS = _placename_ids()
 
 
 def main():
@@ -120,6 +132,17 @@ def main():
         # lighting and Dreambrew, our marker overlaps with vanilla icon -
         # small cosmetic price for correct post-Dreambrew hiding.
         disable_flag = 1035469430 if rid == 62354601 else flag
+        if PLACENAME_IDS and tid1 not in PLACENAME_IDS:
+            loc = resolve_location_id_at(tile, float(row.get('posX', 0.0)), float(row.get('posY', 0.0)),
+                                         float(row.get('posZ', 0.0)))
+            if loc <= 0:
+                # Overworld tile with no interior location: the BloodMsg vocabulary word
+                # "grace" (32032, +950M encoding), which every language has.
+                print(f"  grace {rid}: textId1={tid1} has no PlaceName string and no location at {tile}, labelled 'grace'")
+                tid1 = 950000000 + 32032
+            else:
+                print(f"  grace {rid}: textId1={tid1} has no PlaceName string, labelled with location {loc}")
+                tid1 = loc
         lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {tid1};')
         lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {disable_flag};')
         lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 2;')

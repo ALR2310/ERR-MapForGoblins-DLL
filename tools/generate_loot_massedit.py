@@ -1484,8 +1484,15 @@ def main():
     # marker so randomized loot shows the right icon under its own toggle.
     # Key = offset-encoded item id (identical to the marker textId encoding).
     def _encode_item(iid, cat):
+        # cat 2 is ALWAYS +100M, ammo included - the same rule CATEGORY_OFFSETS applies to the
+        # marker textId. This used to keep ids >= 50M raw as "ammo", but the DLC weapons sit at
+        # 60M-68M (193 of them: Dryleaf Arts 60500000, Rakshasa's Great Katana 66520000, the
+        # Tarnished Pack's Idus Sword 67530000 ...), so their icon-table key never matched the
+        # marker's textId: no English fallback for them (blank in a language whose FMG lacks the
+        # name - three Tarnished Pack weapons on a Chinese client, 2026-09-15), and live loot
+        # treated every one as "a different item than baked".
         if cat == 1: return iid + 500000000          # goods
-        if cat == 2: return iid if iid >= 50000000 else iid + 100000000  # ammo / weapon
+        if cat == 2: return iid + 100000000          # weapon, ammo included
         if cat == 3: return iid + 200000000          # protector
         if cat == 4: return iid + 300000000          # accessory
         if cat == 5: return iid + 400000000          # gem (ash of war)
@@ -1493,8 +1500,21 @@ def main():
 
     with open(DB_PATH, encoding='utf-8') as f:
         _raw_db = json.load(f)
+    # Boss awards too: the items the kill-flag award events hand out (boss_flag_drops.json) are
+    # not placed loot, so they are not in items_database - but they DO get markers (one per
+    # category on the boss), and this table is the only English name those markers can fall
+    # back on. Without them an overhaul's custom award (VINS: Blade of Kingship, Sparking
+    # Odachi, Vow of the Beast Lord, 11 items) had no string in a non-English client, the DLL
+    # cleared the marker's only text and the marker was never drawn (2026-09-15).
+    _award_recs = []
+    _bfd = DATA_DIR / 'boss_flag_drops.json'
+    if _bfd.exists():
+        with open(_bfd, encoding='utf-8') as f:
+            _drops = json.load(f)
+        _drops = _drops if isinstance(_drops, list) else list(_drops.values())
+        _award_recs = [{'items': d.get('items', [])} for d in _drops if isinstance(d, dict)]
     icon_table = {}  # encoded_key -> [iconId, category_name, english_name]
-    for rec in _raw_db:
+    for rec in list(_raw_db) + _award_recs:
         for it in rec.get('items', []):
             cat = it.get('category', 0)
             iid = it.get('id', 0)

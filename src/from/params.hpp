@@ -146,6 +146,45 @@ template <typename T> class ParamTableSequence
     {
     }
 
+    // The same lookup as operator[], but a MISS is an answer, not an event: returns nullptr
+    // and logs nothing. For callers that expect absent rows - the live-loot reader asks about
+    // every baked lot, and a randomizer's regulation lacks hundreds of them (196 on one seed,
+    // 530 error lines per launch through operator[]'s log-and-throw).
+    T *find(uint64_t id)
+    {
+        ptrdiff_t begin_index = 0;
+        ptrdiff_t end_index = param_table->num_rows - 1;
+        while (begin_index <= end_index)
+        {
+            auto index = (end_index + begin_index) / 2;
+            auto row = &param_table->rows[index];
+            if (row->row_id < id)
+                begin_index = index + 1;
+            else if (row->row_id > id)
+                end_index = index - 1;
+            else
+                return get_row_data(param_table, row);
+        }
+        for (auto i = 0; i < param_table->num_rows; i++)
+        {
+            auto index1 = begin_index - i;
+            auto index2 = begin_index + i;
+            if (index1 >= 0 && index1 < param_table->num_rows)
+            {
+                auto row = &param_table->rows[index1];
+                if (row->row_id == id)
+                    return get_row_data(param_table, row);
+            }
+            if (index2 >= 0 && index2 < param_table->num_rows)
+            {
+                auto row = &param_table->rows[index2];
+                if (row->row_id == id)
+                    return get_row_data(param_table, row);
+            }
+        }
+        return nullptr;
+    }
+
     T &operator[](uint64_t id)
     {
         // Binary search for the param row, assuming all rows are sorted

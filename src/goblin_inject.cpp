@@ -444,8 +444,11 @@ struct LotReader
         // versa) - that returned the wrong item and shuffled the live-loot icons.
         // On a miss we return nullptr (marker keeps its baked icon). The other
         // param is consulted only when the intended one failed to load entirely.
-        if (pref) { try { return &(*pref)[lot_id]; } catch (...) { return nullptr; } }
-        if (other) { try { return &(*other)[lot_id]; } catch (...) {} }
+        // find(), not operator[]: a missing lot is the expected answer under a randomizer (196
+        // of them on one seed), and operator[] logged every miss as an error before throwing -
+        // 530 error lines per launch that said nothing new.
+        if (pref) return pref->find(lot_id);
+        if (other) return other->find(lot_id);
         return nullptr;
     }
 };
@@ -457,7 +460,11 @@ inline int32_t encode_live_item(int32_t item_id, int32_t cat)
     switch (cat)
     {
         case 1: return item_id + 500000000;                                       // goods
-        case 2: return (item_id >= 50000000) ? item_id : item_id + 100000000;     // ammo / weapon
+        // Weapons AND ammo: +100M, the rule the baked textId uses. Keeping ids >= 50M raw as
+        // "ammo" also caught every DLC weapon (60M-68M), so encode(live) never equalled the
+        // baked textId for those and the live-loot path relabelled unchanged items; the icon
+        // table (generate_loot_massedit._encode_item) now uses this same rule.
+        case 2: return item_id + 100000000;                                       // weapon / ammo
         case 3: return item_id + 200000000;                                       // protector
         case 4: return item_id + 300000000;                                       // accessory
         case 5: return item_id + 400000000;                                       // gem (ash of war)

@@ -13,6 +13,8 @@
 #include <cstring>
 #include <functional>
 #include <set>
+#include <cstdio>
+#include <map>
 #include <spdlog/spdlog.h>
 #include <deque>
 #include <string>
@@ -1336,6 +1338,10 @@ void goblin::setup_messages()
     // their ORIGINAL encoded baked_text1 (captured at inject) for classification.
     {
         int remapped = 0, blank_high = 0;
+        // WHICH ids stayed unmapped, once each: a count alone ("38 high ids") could not say
+        // whether a profile had lost boss names, statue prompts or subtitle words, and each of
+        // those is fixed in a different generator.
+        std::map<int32_t, int> unmapped;
         for (uint8_t *rp : goblin::injected_row_ptrs())
         {
             auto *p = reinterpret_cast<from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(rp);
@@ -1346,11 +1352,24 @@ void goblin::setup_messages()
                 if (*t <= 0) continue;
                 int32_t nv = goblin::remap_textid(*t);
                 if (nv != *t) { *t = nv; remapped++; }
-                else if (*t >= 50000000) blank_high++;  // a high (encoded) id we did NOT copy -> would be blank
+                else if (*t >= 50000000) { blank_high++; ++unmapped[*t]; }  // a high (encoded) id we did NOT copy -> would be blank
             }
         }
         spdlog::info("[FMG] remapped {} live marker textId slots to fresh ids ({} high ids left unmapped/blank-risk)",
                      remapped, blank_high);
+        if (!unmapped.empty())
+        {
+            std::string list;
+            int shown = 0;
+            for (const auto &[id, n] : unmapped)
+            {
+                if (shown++ == 32) { list += " ..."; break; }
+                char buf[40];
+                snprintf(buf, sizeof buf, "%s%dx%d", list.empty() ? "" : " ", id, n);
+                list += buf;
+            }
+            spdlog::info("[FMG] unmapped ids ({} distinct): {}", unmapped.size(), list);
+        }
     }
 
     // Final safety pass: strip any marker textId that didn't end up with a real

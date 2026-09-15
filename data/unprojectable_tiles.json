@@ -1,0 +1,36 @@
+{
+  "_comment": "Tiles the game's world-map converter refuses: a marker there is never drawn (the engine answers 'cannot convert' and the DLL skips it), so generate_data.py drops the rows instead of baking them. Keyed by profile ('*' = every profile). Never a whole vanilla area: 'm32_*' would take the tunnels (m32_00..m32_11) with it - Golden Age's custom maps are the HIGH grid numbers of areas 32 and 46, listed one by one. 'm32_*' = whole area, 'm32_68' = that tile (gz 00), 'm32_68_01' = a specific tile. Source of truth is the [v3native] projection summary the DLL logs at CATEGORIES READY: add a tile only after it shows up there.",
+  "goldenage": [
+    "m32_60",
+    "m32_61",
+    "m32_62",
+    "m32_63",
+    "m32_64",
+    "m32_65",
+    "m32_67",
+    "m32_68",
+    "m32_69",
+    "m32_70",
+    "m46_05",
+    "m46_07",
+    "m46_09",
+    "m46_50",
+    "m46_60",
+    "m42_01"
+  ],
+  "vanilla": [
+    "m42_01"
+  ],
+  "convergence3": [
+    "m42_01"
+  ],
+  "erte": [
+    "m42_01"
+  ],
+  "err": [
+    "m31_90"
+  ],
+  "graceborne": [
+    "m42_01"
+  ]
+}

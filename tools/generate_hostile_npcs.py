@@ -37,6 +37,7 @@ def _safe_unlink(path):
         pass
 
 
+from npcname_known import npcname_resolvable
 from massedit_common import (OUT_DIR, DATA_DIR, UNDERGROUND_AREAS, DLC_AREAS,
                              OVERWORLD_AREAS, get_disp_mask, resolve_location_id_at)
 
@@ -284,6 +285,7 @@ def main():
     row_id = __import__("row_id_registry").base("World - Hostile NPC")  # z-order slot; see row_id_registry
     named = 0
     flagged = 0
+    unnamed_ids = set()  # NpcParam.nameId values no NpcName FMG resolves (generic word used)
     for r in records:
         disp = get_disp_mask(r['area'])
         lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("hostile_npc")};')
@@ -299,9 +301,19 @@ def main():
 
         # textId1: NPC name via NpcName FMG (resolved at runtime by
         # goblin_messages.cpp using the +700000000 offset convention).
-        if r['nameId'] > 0:
+        # Only an id that HAS a string: NpcParam.nameId can point at nothing (Golden Age
+        # 3.6.8, id 135700 on three rows) and a marker whose only text resolves to nothing
+        # is cleared by the DLL's sanitizer and never drawn. Such a row gets the generic
+        # "strong foe" word instead, which every language has.
+        if r['nameId'] > 0 and npcname_resolvable(r['nameId']):
             lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {r["nameId"] + 700000000};')
             named += 1
+            # textDisableFlagId1: hide NPC name once defeated
+            if r['defeatFlag'] > 0:
+                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {r["defeatFlag"]};')
+        elif r['nameId'] > 0:
+            unnamed_ids.add(r['nameId'])
+            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {950000000 + 30003};')
             # textDisableFlagId1: hide NPC name once defeated
             if r['defeatFlag'] > 0:
                 lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {r["defeatFlag"]};')
@@ -326,6 +338,8 @@ def main():
     with open(out, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
     print(f'Written {len(records)} hostile NPC markers ({named} with name, {flagged} with defeat flag) to {out.name}')
+    if unnamed_ids:
+        print(f'  {len(unnamed_ids)} NpcName id(s) with no string in this profile, labelled "strong foe": {sorted(unnamed_ids)}')
 
 
 if __name__ == '__main__':

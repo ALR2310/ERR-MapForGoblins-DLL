@@ -223,10 +223,15 @@ def main():
         if part['y'] != 0:
             lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {part["y"]:.3f};')
         lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {part["z"]:.3f};')
-        # Label "Examine statue" - ActionButtonText[7041] via +800M offset.
-        # goblin_messages.cpp copies this from menu.msgbnd at runtime so
-        # the text follows the player's selected game language.
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {800000000 + 7041};')
+        # Label via ActionButtonText (+800M offset); goblin_messages.cpp copies it from
+        # menu.msgbnd at runtime so the text follows the player's game language.
+        # 7041 "Examine statue" exists only in ERR's ActionButtonText. Every other profile
+        # (vanilla and the overhauls) has no such entry, so the marker's only text resolved
+        # to nothing, the DLL's sanitizer cleared it, and all 16 statue markers were never
+        # drawn there ("cleared 16 dangling textId(s)" on every vanilla open). Those use the
+        # game's own 1000 "Examine", present in every language.
+        statue_text = 7041 if config.PROFILE == 'err' else 1000
+        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {800000000 + statue_text};')
         if flag > 0:
             lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {flag};')
         # Location subtitle for non-overworld tiles (most are overworld though).

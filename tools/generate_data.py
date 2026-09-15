@@ -603,6 +603,50 @@ def main():
     entries = parse_massedit_files(massedit_dir)
     print(f"Total unique entries: {len(entries)}")
 
+    # Tiles the game's world-map converter refuses (custom overhaul maps with no
+    # WorldMapLegacyConvParam route to the overworld, and a few vanilla tiles the engine
+    # itself declines). A marker there is never drawn - the engine answers "cannot convert"
+    # and the DLL skips it, 111 rows on Golden Age 3.6.8 - so it is dropped here instead of
+    # being baked, counted as "failed" on every map open and hiding real failures.
+    # Patterns per profile live in data/unprojectable_tiles.json: "m32_68" is one tile
+    # (gz 00 implied), "m32_68_01" a specific one, "m32_*" a whole area. Rows dropped here
+    # are listed once per bake.
+    def _load_unprojectable():
+        p = project_dir / "data" / "unprojectable_tiles.json"
+        if not p.exists():
+            return []
+        with open(p, encoding="utf-8") as f:
+            table = json.load(f)
+        return [str(x) for x in list(table.get(config.PROFILE, [])) + list(table.get("*", []))]
+
+    def _tile_blocked(tile, patterns):
+        # tile = "mAA_GX_GZ"
+        for pat in patterns:
+            if pat.endswith("_*"):
+                if tile.startswith(pat[:-1]):
+                    return True
+            elif pat.count("_") == 1:
+                if tile == pat + "_00":
+                    return True
+            elif tile == pat:
+                return True
+        return False
+
+    _unproj = _load_unprojectable()
+    if _unproj:
+        _dropped = {}
+        for rid in list(entries.keys()):
+            f = entries[rid]
+            if f.get("areaNo", "0") in ("60", "61", "99"):
+                continue
+            tile = "m%02d_%02d_%02d" % (int(f.get("areaNo", "0")), int(f.get("gridXNo", "0")), int(f.get("gridZNo", "0")))
+            if _tile_blocked(tile, _unproj):
+                _dropped[tile] = _dropped.get(tile, 0) + 1
+                entries.pop(rid)
+        if _dropped:
+            print(f"Dropped {sum(_dropped.values())} rows on tiles the engine cannot project: "
+                  + ", ".join(f"{t}={n}" for t, n in sorted(_dropped.items())))
+
     # Snapshot REAL (MSB-true) X/Z BEFORE the de-overlap pass shifts them. Collected-
     # geometry tracking (goblin_collected) matches a marker to its live CSWorldGeomMan
     # instance by position; the spiral de-overlap below can move a tracked node up to

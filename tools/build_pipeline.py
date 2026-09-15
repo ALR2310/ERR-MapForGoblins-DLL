@@ -290,9 +290,11 @@ STAGES = [
                    MASSEDIT_OUT / 'Quest - Progression.MASSEDIT',
                    MASSEDIT_OUT / 'World - Bosses.MASSEDIT',
                    DATA / 'loot_lot_linkage.json',
-                   DATA / 'item_icon_table.json'],
+                   DATA / 'item_icon_table.json',
+                   DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
+                   REPO / 'data' / 'npc_name_text_map.json'],
           script='generate_loot_massedit.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'icon_registry.py', 'map_categories.py']),
+          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'npcname_known.py']),
 
     Stage('generate_pieces_massedit',
           inputs=[DATA / 'ItemLotParam_map.csv',
@@ -405,10 +407,12 @@ STAGES = [
     Stage('generate_hostile_npcs',
           inputs=[REGULATION, MSB_DIR, config.PARAMDEF_DIR, EVENT_DIR,
                   DATA / 'items_database.json',
+                  DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
+                  REPO / 'data' / 'npc_name_text_map.json',
                   REPO / 'data' / 'quest_invader_overrides.json'],
           outputs=[MASSEDIT_OUT / 'World - Hostile NPC.MASSEDIT'],
           script='generate_hostile_npcs.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'icon_registry.py', 'map_categories.py']),
+          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'npcname_known.py']),
 
     # Enemies wired through the common "strong enemy" templates 90005300/301: they stay dead once
     # killed, so each gets a marker that hides (or checkmarks) on its kill flag.
@@ -437,6 +441,7 @@ STAGES = [
           inputs=[MASSEDIT_OUT, DATA / 'loot_lot_linkage.json',
                   DATA / 'item_icon_table.json',
                   DATA / 'english_fallback.json',
+                  REPO / 'data' / 'unprojectable_tiles.json',          # tiles dropped before the bake
                   config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json',
                   DATA / '_relocating_boss_fix.done',
                   # the hand-maintained headers the generated .cpp implement (the Category

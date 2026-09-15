@@ -631,6 +631,11 @@ namespace
         // this movie yet). Split 2026-08-05, when opens started reporting failed=5035 and 6091
         // against failed=1 on a healthy one.
         uint32_t failed_project = 0;  // mapproject::to_map said no
+        // ...and WHERE: per tile (area<<16 | gx<<8 | gz), so a profile whose count is not the
+        // known one can be read off the log instead of guessed at from three capped warnings.
+        // Reported once per open at CATEGORIES READY, only when the set differs from the
+        // last one printed.
+        std::map<uint32_t, uint32_t> failed_project_tiles;
         uint32_t failed_charid = 0;   // no injected character for this icon
         // The three ways a request that got PAST those two can still come back empty. They all
         // fed one `failed` and their logs are capped at four lines each, so a build that lost
@@ -3700,6 +3705,26 @@ namespace
                 // The RM2 traffic goes on the HEALTHY line too, not only on the starved one: a
                 // number with nothing to compare it against says nothing, and the whole question
                 // is why one open gets 7877 sprite-171 executions and the next gets 10.
+                // Where the projection failures are, once per distinct set: the tiles the
+                // engine's converter refuses are a property of the profile's data, and this
+                // line is what data/unprojectable_tiles.json is maintained from.
+                if (!g_v3_native.failed_project_tiles.empty())
+                {
+                    std::string tiles;
+                    for (const auto &[key, n] : g_v3_native.failed_project_tiles)
+                    {
+                        char buf[48];
+                        snprintf(buf, sizeof buf, "%sm%02u_%02u_%02u=%u", tiles.empty() ? "" : " ",
+                                 key >> 16, (key >> 8) & 0xFF, key & 0xFF, n);
+                        tiles += buf;
+                    }
+                    static std::string s_last_tiles;
+                    if (tiles != s_last_tiles)
+                    {
+                        s_last_tiles = tiles;
+                        spdlog::info("[v3native] projection refused by the engine, by tile: {}", tiles);
+                    }
+                }
                 spdlog::info("[v3native] CATEGORIES READY: layer={} "
                              "created={} failed={} (project={} charId={} noNode={} "
                              "notMaterialized={} attach={}) wrongCtx={} "
@@ -8786,6 +8811,9 @@ namespace
             {
                 ++g_v3_native.failed;
                 ++g_v3_native.failed_project;
+                ++g_v3_native.failed_project_tiles[(static_cast<uint32_t>(point.area) << 16) |
+                                                   (static_cast<uint32_t>(point.gx & 0xFF) << 8) |
+                                                   static_cast<uint32_t>(point.gz & 0xFF)];
                 // NOT OUR ARITHMETIC - the ENGINE's own converter declined this tile. Identified
                 // 2026-08-05 after `failed=1 (project=1)` showed up on 47 of 47 opens: it is
                 // always vanilla row 6000197, a Stake of Marika at area 42 grid (1,0), the only

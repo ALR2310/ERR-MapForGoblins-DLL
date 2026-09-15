@@ -803,6 +803,7 @@ def load_npc_name_ids():
     return {}
 
 NPC_NAME_IDS = load_npc_name_ids()
+from npcname_known import npcname_resolvable  # NpcName ids this profile can resolve
 
 
 def load_bloodmsg_words():
@@ -1087,7 +1088,12 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
         npc_name_id = NPC_NAME_IDS.get(npc_param, 0)
         next_text_slot = 2
 
-        # Slot 2 - named-NPC name if available, else dungeon location.
+        # Slot 2 - named-NPC name if available, else dungeon location. Only an id the profile's
+        # NpcName FMG actually carries: NpcParam.nameId can point at nothing (Golden Age 3.6.8,
+        # id 135700), and the DLL clears a text slot it cannot resolve - the drop then simply
+        # loses the "who drops it" line, so it falls through to the location subtitle here.
+        if npc_name_id > 0 and not npcname_resolvable(npc_name_id):
+            npc_name_id = 0
         if npc_name_id > 0:
             npc_text_id = npc_name_id + 700000000  # NpcName FMG offset
             lines.append(f'param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {npc_text_id};')

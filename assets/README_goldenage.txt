@@ -17,25 +17,26 @@ slightly off until this mod is updated too.
 ============================================================
 Install (into an existing Golden Age install)
 ============================================================
-Golden Age runs on ModEngine2 (Start_GoldenAge.bat).
+Golden Age runs on Mod Engine 3 (Start_GoldenAge.me3).
 1. Copy MapForGoblins.dll and MapForGoblins.ini into your Golden Age
-   folder (next to Start_GoldenAge.bat and config_eldenring.toml).
-2. Open config_eldenring.toml in a text editor and, under [modengine],
-   add the DLL to the external_dlls list:
-       external_dlls = [
+   folder (next to Start_GoldenAge.me3).
+2. Open Start_GoldenAge.me3 in a text editor and add the DLL to the
+   natives list:
+       natives = [
            ...existing entries...,
-           "MapForGoblins.dll",
+           { path = "MapForGoblins.dll" },
        ]
-3. Launch via Start_GoldenAge.bat as usual.
+3. Launch via Start_GoldenAge.me3 as usual.
 
 ============================================================
 Updating from an older version
 ============================================================
 Replace MapForGoblins.dll with this one (keep your MapForGoblins.ini -
-new options are added automatically). This version uses no gfx file: if
-you set up an older version, you can DELETE the old MapForGoblins asset
-folder (the "menu" folder / 02_120_worldmap.gfx) and remove its "mods"
-entry from config_eldenring.toml - only the external_dlls entry is needed.
+new options are added automatically). A Golden Age update can replace
+Start_GoldenAge.me3 - if the mod stops loading, re-add the natives entry
+from step 2. If you set up a much older version on ModEngine2, you can
+DELETE the old MapForGoblins asset folder (the "menu" folder /
+02_120_worldmap.gfx); only the DLL and the ini are needed now.
 
 ============================================================
 Settings & notes

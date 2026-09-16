@@ -1,6 +1,6 @@
 Map For Goblins - DLL Edition v%VERSION%
 For VANILLA Elden Ring (base game + Shadow of the Erdtree).
-~6900 loot & world-map icons. No regulation.bin changes.
+~7400 loot & world-map icons. No regulation.bin changes.
 Pure DLL - no gfx or other extra files.
 
 This package contains just two files:

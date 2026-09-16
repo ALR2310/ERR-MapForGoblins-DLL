@@ -17,25 +17,25 @@ slightly off until this mod is updated too.
 ============================================================
 Install (into an existing Elden Vins install)
 ============================================================
-Elden Vins runs on ModEngine2 (Launch ELDEN VINS.bat / ELDEN VINS.exe).
-1. Copy MapForGoblins.dll and MapForGoblins.ini into your "ELDEN VINS"
-   folder (next to config_eldenring.toml and Launch ELDEN VINS.bat).
-2. Open config_eldenring.toml in a text editor and, under [modengine],
-   add the DLL to the external_dlls list:
-       external_dlls = [
-           ...existing entries...,
-           "MapForGoblins.dll",
-       ]
-3. Launch via Launch ELDEN VINS.bat (or ELDEN VINS.exe) as usual.
+Elden Vins runs on Mod Engine 3 (the "ELDEN VINS.me3" profile).
+1. Copy MapForGoblins.dll and MapForGoblins.ini into the mod\dll folder
+   of your "ELDEN VINS" install (next to the other DLLs there).
+2. Open "ELDEN VINS.me3" in a text editor and add a native for the DLL
+   (anywhere among the other [[natives]] entries):
+       [[natives]]
+       path = "mod/dll/MapForGoblins.dll"
+3. Launch via "ELDEN VINS.me3" as usual.
 
 ============================================================
 Updating from an older version
 ============================================================
 Replace MapForGoblins.dll with this one (keep your MapForGoblins.ini -
-new options are added automatically). This version uses no gfx file: if
-you set up an older version, you can DELETE the old MapForGoblins asset
-folder (the "menu" folder / 02_120_worldmap.gfx) and remove its "mods"
-entry from config_eldenring.toml - only the external_dlls entry is needed.
+new options are added automatically). An Elden Vins update can replace
+"ELDEN VINS.me3" - if the mod stops loading, re-add the natives entry
+from step 2. If you set up a much older version on ModEngine2, you can
+DELETE the old MapForGoblins asset folder (the "menu" folder /
+02_120_worldmap.gfx) and its external_dlls entry; only the DLL and the
+ini are needed now.
 
 ============================================================
 Settings & notes

@@ -95,6 +95,14 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 namespace
 {
 using XInputGetState_t = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
+// Our OWN reference on the xinput module (LoadLibrary, never GetModuleHandle): report 42 -
+// a 2.1.3 player's game died executing free memory from our gamepad poll, i.e. the function
+// behind pXInputGetState was gone. With a held reference the module we resolved cannot be
+// unloaded under us; the guarded call below covers the case where the chain behind it can.
+HMODULE g_xinput_module = nullptr;
+// Set on the first fault inside an XInputGetState call: gamepad polling stops for the session
+// (keyboard hotkeys keep working) instead of taking the process down.
+std::atomic<bool> g_pad_poll_dead{false};
 XInputGetState_t pXInputGetState = nullptr; // resolved once on the overlay thread
 XInputGetState_t o_XInputGetState = nullptr; // trampoline: OUR poll reads the real pad
                                              // through this; the hook feeds the GAME a
@@ -225,6 +233,17 @@ uint16_t g_rebind_pad_accum = 0;          // gamepad buttons accumulated this re
 
 // Last input device, for control hints: 0 = keyboard/mouse, 1 = gamepad.
 std::atomic<int> g_last_input{0};
+
+// Mouse-wheel notches seen by the raw-input hook and not yet handed to ImGui.
+//
+// Everything else about the mouse is POLLED in sc2_feed_mouse - position from GetCursorPos,
+// buttons from GetAsyncKeyState - because the overlay deliberately takes no focus and owns no
+// window. The wheel cannot be polled: Windows exposes it only as a message or as raw input, and
+// the raw-input hook below was already zeroing usButtonData to keep the game from scrolling
+// underneath the menu, so the notches were being thrown away before anything could use them. The
+// hook runs on the game's input thread, so it only accumulates here; sc2_feed_mouse drains it on
+// the thread that owns the ImGui IO.
+std::atomic<int> g_wheel_raw{0};
 
 // Hotkey state read straight from the OS (callers gate on window focus). Read
 // GetAsyncKeyState directly - it worked for years; a key-state table missed F10.
@@ -1860,10 +1879,65 @@ const goblin::overlay_icons::IconCell *find_icon_cell(const char *key)
     return nullptr;
 }
 
+// The XInputGetState call under an SEH net. Report 42 (2.1.3): the call executed FREE memory -
+// eldenring.exe imports xinput1_4 statically so the module itself cannot unload, but the chain
+// behind our trampoline can (another mod hooked XInputGetState before us and was unloaded, or a
+// proxy xinput). x64 unwinding treats a bad RIP as a leaf, so the fault comes back to this frame
+// and the process lives; the caller retires gamepad polling for the session. Plain C in here on
+// purpose: no objects with destructors may live in a __try frame.
+static int xinput_fault_filter(EXCEPTION_POINTERS *ep, uintptr_t *where)
+{
+    if (ep && ep->ExceptionRecord)
+        *where = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static bool xinput_call_guarded(XInputGetState_t fn, DWORD idx, XINPUT_STATE *st, DWORD *rc,
+                                uintptr_t *fault)
+{
+    __try
+    {
+        *rc = fn(idx, st);
+        return true;
+    }
+    __except (xinput_fault_filter(GetExceptionInformation(), fault))
+    {
+        return false;
+    }
+}
+// Name the owner of a faulting address for the log: a live module, or "unmapped" when the page
+// is free (the report-42 shape), so a field log says which DLL went away.
+static std::string xinput_fault_owner(uintptr_t where)
+{
+    HMODULE m = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(where), &m) && m)
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(m, path, MAX_PATH);
+        const char *base = strrchr(path, '\\');
+        return base ? base + 1 : path;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(where), &mbi, sizeof mbi) && mbi.State == MEM_FREE)
+        return "unmapped (a module that was unloaded)";
+    return "no module";
+}
+static void xinput_retire(const char *site, uintptr_t where)
+{
+    if (g_pad_poll_dead.exchange(true))
+        return;
+    spdlog::warn("[OVERLAY] {}: XInputGetState faulted at 0x{:X} ({}); gamepad polling is off "
+                 "for this session, keyboard hotkeys keep working",
+                 site, where, xinput_fault_owner(where));
+}
+
 // ── Gamepad nav: poll directly (no hook). Picks the first active controller. ──
 void poll_gamepad()
 {
     g_pad_ok = false;
+    if (g_pad_poll_dead.load(std::memory_order_relaxed))
+        return;
     // Read the REAL pad through the trampoline (o_) if we hooked XInputGetState; the hook
     // returns "disconnected" to the GAME while the menu is open, but not through o_.
     XInputGetState_t xget = o_XInputGetState ? o_XInputGetState : pXInputGetState;
@@ -1872,7 +1946,14 @@ void poll_gamepad()
     for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
     {
         XINPUT_STATE state{};
-        if (xget(idx, &state) == ERROR_SUCCESS)
+        DWORD rc = ERROR_DEVICE_NOT_CONNECTED;
+        uintptr_t fault = 0;
+        if (!xinput_call_guarded(xget, idx, &state, &rc, &fault))
+        {
+            xinput_retire("poll", fault);
+            return;
+        }
+        if (rc == ERROR_SUCCESS)
         {
             g_pad = state.Gamepad;
             g_pad_ok = true;
@@ -2556,6 +2637,12 @@ UINT WINAPI hk_GetRawInputData(HRAWINPUT hri, UINT cmd, LPVOID data, PUINT size,
         }
         if (ri->header.dwType == RIM_TYPEMOUSE)
         {
+            // Take the wheel before neutralising the record: this is the only place it exists.
+            // usButtonData carries a SIGNED delta in WHEEL_DELTA units, so it must be read as a
+            // short - as a USHORT every scroll-down becomes a large positive number.
+            if (menu && (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL))
+                g_wheel_raw.fetch_add(static_cast<short>(ri->data.mouse.usButtonData),
+                                      std::memory_order_relaxed);
             ri->data.mouse.lLastX = 0;
             ri->data.mouse.lLastY = 0;
             ri->data.mouse.usButtonFlags = 0;
@@ -2708,7 +2795,18 @@ static uint16_t combo_bits_to_hide(WORD held, WORD &force_on)
 
 DWORD WINAPI hk_XInputGetState(DWORD idx, XINPUT_STATE *state)
 {
-    DWORD r = o_XInputGetState(idx, state);
+    // The GAME's thread is in here. The same dead chain that report 42 hit from our poll thread
+    // would hit the game's call next, so the trampoline call gets the same net: a fault answers
+    // "no controller" and retires the pad for the session instead of ending the process.
+    if (g_pad_poll_dead.load(std::memory_order_relaxed))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    DWORD r = ERROR_DEVICE_NOT_CONNECTED;
+    uintptr_t fault = 0;
+    if (!xinput_call_guarded(o_XInputGetState, idx, state, &r, &fault))
+    {
+        xinput_retire("game call", fault);
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
     if (r != ERROR_SUCCESS || !state)
         return r;
     if (g_menu_open.load())
@@ -2949,6 +3047,10 @@ static void sc2_feed_mouse(HWND game)
     io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
     io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
     io.AddMouseButtonEvent(2, (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
+    // The wheel, drained from what the raw-input hook collected since the last frame. One ImGui
+    // notch is one WHEEL_DELTA; accumulating first means a fast flick still lands whole.
+    if (const int wheel = g_wheel_raw.exchange(0, std::memory_order_relaxed))
+        io.AddMouseWheelEvent(0.0f, static_cast<float>(wheel) / static_cast<float>(WHEEL_DELTA));
 }
 
 static void sc2_frontend_loop()
@@ -3112,14 +3214,24 @@ void overlay_thread()
     }
     pXInputGetState = nullptr;
     {
+        // LoadLibraryA on every candidate, first hit wins. On a module that is already loaded
+        // (the game imports xinput1_4 statically) this only adds our reference and returns the
+        // same HMODULE; on one that is not, it loads it. Either way the module we hand a pointer
+        // and a hook into cannot be unloaded while we hold it (report 42).
         const char *xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
         for (const char *d : xdlls)
-            if (HMODULE h = GetModuleHandleA(d))
+            if (HMODULE h = LoadLibraryA(d))
+            {
                 if (auto p = reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState")))
-                { pXInputGetState = p; break; }
-        if (!pXInputGetState)
-            if (HMODULE h = LoadLibraryA("xinput1_4.dll"))
-                pXInputGetState = reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
+                {
+                    pXInputGetState = p;
+                    g_xinput_module = h;
+                    spdlog::info("[OVERLAY] XInputGetState from {} at 0x{:X}", d,
+                                 reinterpret_cast<uintptr_t>(p));
+                    break;
+                }
+                FreeLibrary(h); // no export here: give the reference back and try the next name
+            }
     }
     // Hook XInputGetState so the game sees a disconnected pad while the menu is open (no
     // gamepad leak). Done here (not in setup) because the xinput DLL is resolved above;
@@ -3441,19 +3553,24 @@ void goblin::overlay::setup()
         if (g_running.exchange(true))
             return;
         std::thread([] {
+            // LoadLibraryA on every candidate, first hit wins: on the statically imported
+            // xinput1_4 this only adds OUR reference (same HMODULE back), so the module our
+            // pointer and hook live in cannot be unloaded while we hold it (report 42).
             const char *xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
             for (const char *d : xdlls)
-                if (HMODULE h = GetModuleHandleA(d))
+                if (HMODULE h = LoadLibraryA(d))
+                {
                     if (auto fn = reinterpret_cast<XInputGetState_t>(
                             GetProcAddress(h, "XInputGetState")))
                     {
                         pXInputGetState = fn;
+                        g_xinput_module = h;
+                        spdlog::info("[OVERLAY] XInputGetState from {} at 0x{:X}", d,
+                                     reinterpret_cast<uintptr_t>(fn));
                         break;
                     }
-            if (!pXInputGetState)
-                if (HMODULE h = LoadLibraryA("xinput1_4.dll"))
-                    pXInputGetState =
-                        reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
+                    FreeLibrary(h); // no export: hand the reference back, try the next name
+                }
             if (!pXInputGetState)
             {
                 spdlog::info("[OVERLAY] no XInput: gamepad hotkeys are keyboard-only this run");

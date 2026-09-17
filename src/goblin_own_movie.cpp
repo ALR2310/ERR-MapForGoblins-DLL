@@ -1373,6 +1373,7 @@ namespace
     // about to run is ours - the only parse of this content since the startup preload.
     constexpr const char *kOurMovieName = "02_160_MfgSettings";
     constexpr const wchar_t *kOurMovieNameW = L"02_160_MfgSettings";
+    constexpr const wchar_t *kMenuGameNameW = L"02_160_KeyConfiguration";
     // The world map's movie, same trick, different reason (2026-09-07): our map icons are injected
     // WHILE 02_120 parses (frames into sprite 171, bitmaps into the load context), so a DLL that
     // arrives after the game's parse - a late injector, a fast boot - has no icons and no way to add
@@ -1418,6 +1419,13 @@ namespace
     PathFmtFn *o_path_fmt = nullptr;
     std::string g_worldmap_game_url;            // UTF-8, as the opener will see it
     std::atomic<bool> g_worldmap_game_url_ready{false};
+    // Same capture for the menu (2026-09-17, report 42). Hand-building the game's URL from ours by
+    // string substitution is only right when the resolved path IS the plain mount path. Under me3
+    // 0.13 the reporter's resolver hands out opaque tokens (`\me3??51`), and the file sits under
+    // THAT - so our `data0:/menu/02_160_keyconfiguration.gfx` opened nothing in either casing while
+    // his world map, which replays the recorded URL, opened fine in the same session.
+    std::string g_menu_game_url;
+    std::atomic<bool> g_menu_game_url_ready{false};
 
     // POD-only (SEH): the wide string a resolved DLString holds - data at +8 (heap pointer when the
     // capacity at +0x20 exceeds 7), length at +0x18 - narrowed into `out`.
@@ -1439,6 +1447,34 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return -1;
+        }
+    }
+
+    // POD-only (SEH): is this descriptor the GAME's own menu movie? Watching for it is what lets the
+    // URL be recorded at the STARTUP PRELOAD, long before any menu open - so the alias already holds
+    // the right URL the first time the player presses the key, and the fallback never has to fire.
+    int is_game_menu_desc(const MovieDesc *desc)
+    {
+        __try
+        {
+            return desc && desc->name && wcscmp(desc->name, kMenuGameNameW) == 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    // POD-only (SEH): is this descriptor ours for the menu?
+    int is_our_menu_desc(const MovieDesc *desc)
+    {
+        __try
+        {
+            return desc && desc->name && wcscmp(desc->name, kOurMovieNameW) == 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
         }
     }
 
@@ -1473,6 +1509,43 @@ namespace
             else
                 spdlog::warn("[ownmovie] could not read the game's world-map URL from the resolver");
             // then ours, assigned over the same out string (the resolver assigns, it does not construct)
+        }
+        // The menu, the same way and for the same reason. Ours is the only name the alias has to
+        // map, so recording what the GAME's name resolves to here is the only way to learn the URL
+        // the file actually sits under - the mount prefix, the case, and me3's token if it took the
+        // path over. Building it from ours by substitution is a guess, and on the report-42 rig it
+        // was the wrong one.
+        if (is_our_menu_desc(desc) && !g_menu_game_url_ready.load(std::memory_order_acquire))
+        {
+            MovieDesc game = *desc;
+            game.name = kMenuGameNameW;
+            o_path_fmt(out, &game);
+            char narrow[256] = {};
+            if (read_dlstring_narrow(out, narrow, sizeof(narrow)) > 0)
+            {
+                g_menu_game_url = narrow;
+                g_menu_game_url_ready.store(true, std::memory_order_release);
+                spdlog::info("[ownmovie] the game's menu movie resolves to '{}' - our URL will alias onto it",
+                             narrow);
+            }
+            else
+                spdlog::warn("[ownmovie] could not read the game's menu URL from the resolver");
+        }
+        // The game resolving its OWN menu movie: the same URL, for free, and at the startup preload
+        // rather than at the first key press. Taken from the resolver's own output, so there is
+        // nothing to reconstruct and no second call to make.
+        if (is_game_menu_desc(desc) && !g_menu_game_url_ready.load(std::memory_order_acquire))
+        {
+            void *r = o_path_fmt(out, desc);
+            char narrow[256] = {};
+            if (read_dlstring_narrow(out, narrow, sizeof(narrow)) > 0)
+            {
+                g_menu_game_url = narrow;
+                g_menu_game_url_ready.store(true, std::memory_order_release);
+                spdlog::info("[ownmovie] the game resolved its own menu movie to '{}' - recorded for the alias",
+                             narrow);
+            }
+            return r;
         }
         return o_path_fmt(out, desc);
     }
@@ -1537,6 +1610,23 @@ namespace
                              kGameWorldMapName, kOurWorldMapName,
                              req == 1 ? "made" : req == 0 ? "skipped" : "FAULTED");
             return o_name_to_def(menuman, out, &copy);
+        }
+        // Our MENU name arrives here too - it is the job's load step asking for the definition our
+        // re-pointed job wants. This is the one place the engine hands us the CSMenuMan the file
+        // request needs; asking with the pointer the menu-update detour caches instead FAULTED on
+        // every open of report 42's run, because that is not the object this call reads its list
+        // from. A request made here puts the game's own 02_160 in the repository before the alias
+        // below looks for it.
+        if (is_our_menu_desc(desc))
+        {
+            MovieDesc game = *desc;
+            game.name = kMenuGameNameW;
+            const int req = request_game_file(menuman, &game);
+            static std::atomic<int> s_menu_logged{0};
+            if (s_menu_logged.fetch_add(1) < 2)
+                spdlog::info("[ownmovie] menu asked for '{}' - the game's file requested: {}",
+                             kOurMovieName,
+                             req == 1 ? "made" : req == 0 ? "skipped" : "FAULTED");
         }
         return o_name_to_def(menuman, out, desc);
     }
@@ -1715,17 +1805,18 @@ namespace
         return n;
     }
 
-    void dump_repo_for(const char *url)
+    void dump_repo_for(const char *url, const char *when = "after an empty answer for")
     {
         static std::atomic<int> s_dumps{0};
-        if (s_dumps.fetch_add(1) >= 3) return;
+        if (s_dumps.fetch_add(1) >= 6) return;
         if (!g_repo_slot) g_repo_slot = repo_slot_from_opener(g_open_file_fn);
         static RepoEntry entries[24];
         uint32_t buckets = 0, nodes = 0;
         const int n = walk_repo(entries, 24, &buckets, &nodes);
-        spdlog::info("[ownmovie] repository after an empty answer for '{}': slot 0x{:X}, {} bucket(s), "
+        spdlog::info("[ownmovie] repository {} '{}': slot 0x{:X}, {} bucket(s), "
                      "{} node(s), {} with '02_1' in the path{}",
-                     url, g_repo_slot, buckets, nodes, n < 0 ? 0 : n, n < 0 ? " (walk failed)" : "");
+                     when, url, g_repo_slot, buckets, nodes, n < 0 ? 0 : n,
+                     n < 0 ? " (walk failed)" : "");
         for (int i = 0; i < n; ++i)
         {
             char narrow[96];
@@ -1734,6 +1825,17 @@ namespace
             narrow[k] = 0;
             spdlog::info("[ownmovie]   '{}' blob=0x{:X} size={}", narrow, entries[i].blob, entries[i].size);
         }
+    }
+
+    // Both the opener alias (on an empty answer) and any caller that finds the route unusable end
+    // up here. Idempotent: the first call logs, the rest are silent.
+    void retire_separate(const char *why)
+    {
+        if (!g_alias_armed.exchange(false, std::memory_order_acq_rel))
+            return;
+        spdlog::warn("[ownmovie] separate menu definition retired ({}) - our screens now share the "
+                     "game's own 02_160 definition",
+                     why ? why : "no reason given");
     }
 
     void *open_file_detour(void *opener, const char *url, int a, int b)
@@ -1775,6 +1877,8 @@ namespace
                 std::string real;
                 if (!al.menu_parse && g_worldmap_game_url_ready.load(std::memory_order_acquire))
                     real = g_worldmap_game_url; // whatever the game's own resolution produced (me3 token, or the vanilla path)
+                else if (al.menu_parse && g_menu_game_url_ready.load(std::memory_order_acquire))
+                    real = g_menu_game_url; // likewise for the menu - recorded, never rebuilt
                 else
                 {
                     real.assign(url, static_cast<size_t>(hit - url));
@@ -1787,8 +1891,38 @@ namespace
                 void *file = o_open_file(opener, real.c_str(), a, b);
                 spdlog::info("[ownmovie] opener asked for '{}' - answered with the game's '{}' (flags {} {}): {}",
                              url, real, a, b, file ? "file" : "NOTHING");
+                // The name went in lower-cased because that is how the mount step hands URLs over
+                // and how the repository keys them. The DIRECT DEVICE route does not fold case
+                // though - it hashes the bytes as given - so on an install serving this out of the
+                // packed archive rather than a UXM-unpacked folder, the lower-cased name can hash to
+                // nothing while the authored one resolves. One retry, failure path only.
+                if (!file && al.menu_parse)
+                {
+                    std::string authored(url, static_cast<size_t>(hit - url));
+                    authored += al.game;
+                    authored += hit + std::strlen(al.ours);
+                    file = o_open_file(opener, authored.c_str(), a, b);
+                    spdlog::info("[ownmovie] retried with the authored casing '{}': {}", authored,
+                                 file ? "file" : "NOTHING");
+                }
                 if (!file)
+                {
                     dump_repo_for(real.c_str());
+                    // Nothing came back, so the definition our name would have been cached under
+                    // cannot be built and the screen this open was for will never come up. The
+                    // request we make at the re-point should have put the game's file in the
+                    // repository by now; if it lands late, the NEXT press finds it, so one empty
+                    // answer is not enough to give up on. A second one is: from there the route is
+                    // retired, the next open leaves the game's name on the job, and the screen
+                    // shares the game's own definition - what every build before 2.1.4 did.
+                    if (al.menu_parse)
+                    {
+                        g_alias_pending.store(0, std::memory_order_release);
+                        static std::atomic<int> s_empty{0};
+                        if (s_empty.fetch_add(1) >= 1)
+                            retire_separate("the game's own movie file did not open under our name, twice");
+                    }
+                }
                 return file;
             }
         }
@@ -2027,6 +2161,8 @@ void goblin::own_movie::install()
 bool goblin::own_movie::available() { return g_ready.load(std::memory_order_acquire); }
 
 const wchar_t *goblin::own_movie::menu_movie_name() { return kOurMovieNameW; }
+
+void goblin::own_movie::retire_separate_movie(const char *why) { retire_separate(why); }
 bool goblin::own_movie::separate_movie_armed() { return g_alias_armed.load(std::memory_order_acquire); }
 void goblin::own_movie::log_stack(const char *tag) { log_stack_impl(tag); }
 const wchar_t *goblin::own_movie::worldmap_movie_name() { return kOurWorldMapNameW; }

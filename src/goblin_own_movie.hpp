@@ -55,6 +55,11 @@ namespace goblin::own_movie
     // to load, so the caller leaves the game's name in place and the old shared-parse transform
     // applies (bleeding into the player's screen, but working).
     bool separate_movie_armed();
+    // Retires the separate definition for the rest of the session: the caller then leaves the
+    // game's name on the job and the screen shares the game's own definition. Called when the
+    // aliased open comes back empty, so a rig whose device route refuses the file gets the old
+    // shared-definition menu instead of no menu at all.
+    void retire_separate_movie(const char *why);
 
     // THE WORLD MAP'S OWN DEFINITION (2026-09-07). The map's icons are injected while 02_120 parses,
     // which made the mod sensitive to the injection moment: a DLL arriving after the game's parse had

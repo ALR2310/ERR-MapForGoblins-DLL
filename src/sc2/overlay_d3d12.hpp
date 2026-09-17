@@ -46,6 +46,13 @@ enum class ColorEvidence : uint8_t {
     AssumedFromFormat,
     Dxgi,
     NvidiaNvapi,
+    // The DISPLAY's own colour space, read back from IDXGIOutput6::GetDesc1 for the output the
+    // swapchain presents to. Vendor-neutral, and the only evidence there is on a non-NVIDIA card
+    // whose swapchain was created before our hooks went in (report 42's AMD + 10-bit rig).
+    DxgiOutput,
+    // Nothing proved it. A last-resort guess, so the overlay is visible-and-possibly-mis-encoded
+    // instead of permanently absent. Always logged when it is used.
+    AssumedFallback,
 };
 
 enum class RenderResult : uint8_t {

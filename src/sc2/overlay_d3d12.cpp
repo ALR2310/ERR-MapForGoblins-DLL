@@ -70,6 +70,8 @@ const char* color_evidence_name(ColorEvidence evidence) noexcept {
     case ColorEvidence::AssumedFromFormat: return "ASSUMED_FROM_FORMAT";
     case ColorEvidence::Dxgi: return "DXGI";
     case ColorEvidence::NvidiaNvapi: return "NVIDIA_NVAPI";
+    case ColorEvidence::DxgiOutput: return "DXGI_OUTPUT";
+    case ColorEvidence::AssumedFallback: return "ASSUMED_FALLBACK";
     default: return "unknown";
     }
 }

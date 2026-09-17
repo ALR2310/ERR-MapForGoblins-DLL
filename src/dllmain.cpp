@@ -994,90 +994,132 @@ static void setup_mod()
         bool fast_phase = elapsed < std::chrono::seconds(30);
         std::this_thread::sleep_for(fast_phase ? std::chrono::milliseconds(100) : std::chrono::seconds(2));
 
-        // Second and last inventory pass, once the frame-generation overlays and the other loader
-        // DLLs have finished arriving - at init they are simply not there yet. Writes nothing if
-        // the count is unchanged.
-        if (!fast_phase && !modules_rechecked)
-        {
-            modules_rechecked = true;
-            goblin::crashdiag::log_modules("t+30s");
-        }
-
-        // Faults our own reads raised since the last poll. Printed whether or not the map is
-        // open - the map being CLOSED is exactly the window that had no instrument at all.
-        if (std::string faults = goblin::crashdiag::fault_report(); !faults.empty())
-            spdlog::warn("[faults] {}", faults);
-
+        // NOTHING IN A TICK MAY UNWIND OUT OF setup_mod. This function does not return after
+        // "Initialization complete" - it lives in this loop for the whole session - so a throw
+        // here used to land in the DllMain catch, which read it as an init failure and tore the
+        // mod down: MinHook uninstalled, trampolines freed under running worker threads, the
+        // logger shut down while they were still writing to it. Report 43 lost two whole
+        // sessions that way, 30 s in, to one unconvertible module file name. A tick that fails
+        // is a tick that failed; it is not a reason to dismantle a working session.
         try
         {
-            int newly = safe_refresh_seh();
-            if (first_read && newly > 0)
+
+            // Second and last inventory pass, once the frame-generation overlays and the other loader
+            // DLLs have finished arriving - at init they are simply not there yet. Writes nothing if
+            // the count is unchanged.
+            if (!fast_phase && !modules_rechecked)
             {
-                spdlog::info("Initial state: {} pieces hidden",
-                             goblin::collected::collected_count());
-                first_read = false;
+                modules_rechecked = true;
+                // Guarded because this walks paths that came from OTHER people's DLLs. Report 43: a
+                // module whose file name had no mapping in the machine's ANSI code page threw out of
+                // here, unwound the whole loop below out of setup_mod, and the catch in DllMain then
+                // deinitialised MinHook under running worker threads - the mod died 30 s into every
+                // session over one log line. The conversion no longer throws, and this is the belt to
+                // that pair of braces: an inventory line is never worth the session.
+                try
+                {
+                    goblin::crashdiag::log_modules("t+30s");
+                }
+                catch (const std::exception &e)
+                {
+                    spdlog::warn("[modules] t+30s inventory skipped: {}", e.what());
+                }
+            }
+
+            // Faults our own reads raised since the last poll. Printed whether or not the map is
+            // open - the map being CLOSED is exactly the window that had no instrument at all.
+            if (std::string faults = goblin::crashdiag::fault_report(); !faults.empty())
+                spdlog::warn("[faults] {}", faults);
+
+            try
+            {
+                int newly = safe_refresh_seh();
+                if (first_read && newly > 0)
+                {
+                    spdlog::info("Initial state: {} pieces hidden",
+                                 goblin::collected::collected_count());
+                    first_read = false;
+                }
+            }
+            catch (...)
+            {
+            }
+
+            try
+            {
+                safe_kindling_refresh_seh();
+            }
+            catch (...)
+            {
+            }
+
+            try
+            {
+                safe_gfx_tick_seh(); // icon collision self-heal + diagnostics (overlay-independent)
+            }
+            catch (...)
+            {
+            }
+
+            try
+            {
+                safe_flag_or_pairs_seh();
+            }
+            catch (...)
+            {
+            }
+
+            // When the collected set changes, refresh the live visibility gate so
+            // collected pieces/nodes/kindling hide (and revealed ones reappear) on
+            // the OPEN map without a reopen. Category-toggle changes come in via the
+            // overlay (reapply_live_settings); this covers in-world collection.
+            int cc = goblin::collected::collected_count();
+            int kc = goblin::kindling::collected_count();
+            if (cc != prev_collected || kc != prev_kindling)
+            {
+                prev_collected = cc;
+                prev_kindling = kc;
+                safe_apply_category_visibility_seh();
+            }
+
+            // Per-character state: on a save-slot (character) switch, load that character's
+            // focus (and, when the feature is on, their hidden set) and reapply visibility.
+            // BEFORE the prune below, not after: on the tick a switch happens, prune would
+            // still be holding the previous character's focus while reading the new one's
+            // collected/flag state, and would write that verdict into the PREVIOUS character's
+            // file. Runs whichever way enable_manual_hide is set - the focus is its own feature.
+            try
+            {
+                if (goblin::sync_hidden_slot())
+                    safe_apply_category_visibility_seh();
+            }
+            catch (...)
+            {
+            }
+
+            // Auto-clear a category focus once its last shown marker is gone (in-world pickup,
+            // flag, GEOF, etc.) so a stale "showing only ..." highlight doesn't stick around.
+            if (goblin::prune_focus_if_empty())
+                safe_apply_category_visibility_seh();
+        }
+        catch (const std::exception &e)
+        {
+            static int s_tick_errors = 0;
+            if (s_tick_errors < 3)
+            {
+                ++s_tick_errors;
+                spdlog::warn("[tick] a poll tick failed and was skipped: {}", e.what());
             }
         }
         catch (...)
         {
+            static int s_tick_unknown = 0;
+            if (s_tick_unknown < 3)
+            {
+                ++s_tick_unknown;
+                spdlog::warn("[tick] a poll tick failed and was skipped (unknown exception)");
+            }
         }
-
-        try
-        {
-            safe_kindling_refresh_seh();
-        }
-        catch (...)
-        {
-        }
-
-        try
-        {
-            safe_gfx_tick_seh(); // icon collision self-heal + diagnostics (overlay-independent)
-        }
-        catch (...)
-        {
-        }
-
-        try
-        {
-            safe_flag_or_pairs_seh();
-        }
-        catch (...)
-        {
-        }
-
-        // When the collected set changes, refresh the live visibility gate so
-        // collected pieces/nodes/kindling hide (and revealed ones reappear) on
-        // the OPEN map without a reopen. Category-toggle changes come in via the
-        // overlay (reapply_live_settings); this covers in-world collection.
-        int cc = goblin::collected::collected_count();
-        int kc = goblin::kindling::collected_count();
-        if (cc != prev_collected || kc != prev_kindling)
-        {
-            prev_collected = cc;
-            prev_kindling = kc;
-            safe_apply_category_visibility_seh();
-        }
-
-        // Per-character state: on a save-slot (character) switch, load that character's
-        // focus (and, when the feature is on, their hidden set) and reapply visibility.
-        // BEFORE the prune below, not after: on the tick a switch happens, prune would
-        // still be holding the previous character's focus while reading the new one's
-        // collected/flag state, and would write that verdict into the PREVIOUS character's
-        // file. Runs whichever way enable_manual_hide is set - the focus is its own feature.
-        try
-        {
-            if (goblin::sync_hidden_slot())
-                safe_apply_category_visibility_seh();
-        }
-        catch (...)
-        {
-        }
-
-        // Auto-clear a category focus once its last shown marker is gone (in-world pickup,
-        // flag, GEOF, etc.) so a stale "showing only ..." highlight doesn't stick around.
-        if (goblin::prune_focus_if_empty())
-            safe_apply_category_visibility_seh();
     }
 }
 
@@ -1125,9 +1167,25 @@ bool WINAPI DllMain(HINSTANCE dll_instance, unsigned int fdw_reason, void *lpv_r
             }
             catch (std::runtime_error const &e)
             {
+                // NO TEARDOWN HERE, deliberately. This catch has called
+                // modutils::deinitialize() + spdlog::shutdown() since the first commit, back when
+                // setup_mod really did only set things up and nothing of ours was running yet. It
+                // has not meant that since v1.0.18 put worker threads behind hooks: by the time
+                // anything throws, the pad-poll, hotkey and watcher threads are live, and both
+                // calls pull the ground out from under them. MH_Uninitialize frees the trampoline
+                // blocks, and a thread that CACHED a trampoline pointer - the overlay's
+                // XInputGetState is one - calls into freed memory on its next tick; that is the
+                // `execute` fault on a FREE 64 KB region in report 43, and the same signature in
+                // report 42. spdlog::shutdown() is the same mistake with the logger.
+                //
+                // Neither call buys anything either. A failure before any hook is installed leaves
+                // MinHook with nothing to uninstall, and a failure after is exactly when
+                // uninstalling is unsafe. The process-detach path below still deinitialises, which
+                // is the right place: by then the other threads are gone.
+                //
+                // The loop in setup_mod now guards its own ticks as well, so reaching here at all
+                // means a genuine failure on the way up.
                 spdlog::error("mod init failed: {}", e.what());
-                modutils::deinitialize();
-                spdlog::shutdown();
             } });
     }
     else if (fdw_reason == DLL_PROCESS_DETACH && lpv_reserved != nullptr)

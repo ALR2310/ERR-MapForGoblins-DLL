@@ -269,11 +269,57 @@ namespace
     // clamped). Harmless as a 1.2-unit shift, but it made the log claim a clamp on a display that
     // needs none - and a diagnostic that cries wolf is worse than none.
     //
-    // This is a floor, not the real answer. The real answer needs the visible rect from an actual
-    // ultrawide machine - the "[maphover] map bounds:" line, logged once per session - because
-    // without it there is no way to know whether that edge is even reported correctly under the
-    // fix. Ask for that log before tuning anything here further.
+    // RESOLVED 2026-09-17 by two measurements from the reporter's ultrawide rig, and the answer is
+    // that the INSET SCALES WITH THE VISIBLE RECT. It is not a constant and it is not a clamp.
+    //
+    // The floor below was tried first and the reporter's own result killed it: with the slider at
+    // 80 he reports the panel lands about right, and 80 puts it at x = -307.2. A floor at the stage
+    // edge would have parked it at 0 - 307 units, a sixth of the stage width, to the RIGHT of the
+    // place he says is correct. His result also disproves the premise the floor rested on: x = -307
+    // is plainly ON his screen, so the authored 1920x1080 stage is NOT the display bound under the
+    // fix; the rendering extends past it. (The parsed stage size is still 1920x1080 - that fact was
+    // right, the conclusion drawn from it was not.)
+    //
+    // What does fit: the rect's left overhang is a property of the rect, so it scales with it.
+    //     16:9      inset 270      -> x = -267.2 + 270.0 = +2.8    (known good)
+    //     ultrawide inset 270*2.0  -> x = -907.1 + 539.9 = -367.2
+    // His slider moves in steps of 165 units, so "about right at 80" means the true ideal lies in
+    // (-472, -142); -367 sits inside that band and 0 does not. That is as far as two samples can
+    // settle it - the residual is the slider's job, and at pct=100 he should now be close enough
+    // not to need it.
+    //
+    // kPanelMinStageX is kept ONLY as the record of an idea that the field disproved. It is not
+    // applied, and it should not be reinstated without a display on which x<0 is genuinely clipped.
+    //
+    // THAT LOG ARRIVED 2026-09-17 (report 42, Ultrawide Fix + me3 0.13), and it says the edge IS
+    // reported, and reported far out:
+    //     ultrawide  left=-907.10004 top=-503.25 right=2932.338 bottom=1278.7499  (3839.44 x 1782.00)
+    //     16:9 here  left=-267.2     top=-152.25 right=1652.8242 bottom=927.7537  (1920.02 x 1080.00)
+    // The rect is 2.0x wider and 1.65x taller, and its VERTICAL CENTRE is 387.75 on both - which is
+    // exactly why the reports are always horizontal and never vertical. At pct=100 that put the
+    // panel at left+270 = -637.1, i.e. 637 units left of the stage origin, and the reporter saw the
+    // panels leave the screen to the left.
+    //
+    // The floor below is what should have caught that, and it did not: IT WAS DECLARED AND NEVER
+    // APPLIED. The percentage function that replaced the old clamping path did not carry it over,
+    // so this constant sat unused while the comment above went on describing behaviour the build
+    // did not have. It is applied in panel_left_x now. On 16:9 the wanted value is +2.8, above the
+    // floor, so nothing there changes.
     constexpr float kPanelMinStageX = 0.0f;
+
+    // The authored visible width the 270 was tuned against (this rig measures 1920.0242 - the .0242
+    // is float noise on the same 1920).
+    constexpr float kAuthoredVisibleWidth = 1920.0f;
+
+    // The inset in the units of whatever rect we were handed. On 16:9 the scale is 1.0 and this is
+    // the old constant to within 0.004 of a unit; on the reporter's ultrawide it is 2.0.
+    float panel_left_inset(float visible_left, float visible_right)
+    {
+        const float width = visible_right - visible_left;
+        if (!(width > 200.0f && width < 20000.0f))
+            return kPanelLeftInset; // not the pair we think it is - the tuned constant, unscaled
+        return kPanelLeftInset * (width / kAuthoredVisibleWidth);
+    }
 
     // Where the panels sit horizontally, as a percentage the player can move.
     //
@@ -295,7 +341,7 @@ namespace
     // so moving the slider shows up on the next frame with the map still open.
     float panel_left_x(float visible_left, float visible_right)
     {
-        const float authored = visible_left + kPanelLeftInset;
+        const float authored = visible_left + panel_left_inset(visible_left, visible_right);
         const float centre = (visible_left + visible_right) * 0.5f;
         float pct = goblin::config::mapPanelOffsetPercent;
         if (!(pct > -1000.0f && pct < 1000.0f))
@@ -305,8 +351,10 @@ namespace
         if (x != s_logged)
         {
             s_logged = x;
-            spdlog::info("[maphover] panel x: visibleLeft={} centre={} authored={} pct={} used={}",
-                         visible_left, centre, authored, pct, x);
+            spdlog::info("[maphover] panel x: visibleLeft={} centre={} authored={} (inset {}) "
+                         "pct={} used={}",
+                         visible_left, centre, authored,
+                         panel_left_inset(visible_left, visible_right), pct, x);
         }
         return x;
     }

@@ -343,6 +343,32 @@ namespace
         return false;
     }
 
+    // The module's file name as UTF-8, and NOTHING it can throw.
+    //
+    // This used to be `std::filesystem::path(full).filename().string()`, which converts to the
+    // system ANSI code page and throws std::system_error when a character has no mapping there.
+    // Report 43 (2026-09-17, a Traditional Chinese / cp950 machine) hit exactly that on the t+30s
+    // inventory pass, and the cost was completely out of proportion to a log line: the throw
+    // unwound out of setup_mod, the DllMain catch called modutils::deinitialize(), MinHook freed
+    // its trampoline blocks, and the gamepad poll thread - still running - called through a freed
+    // trampoline and took an execute fault on a 64 KB FREE region. The whole mod went down, twice,
+    // 30 seconds into the session, because one late-loading DLL had a character in its file name
+    // that cp950 cannot represent. Both sessions in that report died at init+30s to the second.
+    //
+    // CP_UTF8 with no flags never fails this way (no WC_ERR_INVALID_CHARS), the log file is UTF-8
+    // anyway, and an unconvertible name now costs its own characters rather than the session.
+    std::string module_name_utf8(const wchar_t *full)
+    {
+        const wchar_t *base = wcsrchr(full, L'\\');
+        base = base ? base + 1 : full;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, base, -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 1)
+            return std::string("<unnamed>");
+        std::string out(static_cast<size_t>(n - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, base, -1, out.data(), n, nullptr, nullptr);
+        return out;
+    }
+
     using EnumModulesFn = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
 
     EnumModulesFn resolve_enum_modules()
@@ -394,7 +420,7 @@ void goblin::crashdiag::log_modules(const char *tag)
         char buf[512];
         // wsprintfA does not bound-check, and a file name is only bounded by MAX_PATH - so the
         // one field that comes from outside gets clipped before it reaches the buffer.
-        std::string name = std::filesystem::path(full).filename().string();
+        std::string name = module_name_utf8(full);
         if (name.size() > 96)
             name.resize(96);
         int len = wsprintfA(buf, "  %-32s v%u.%u.%u.%u base=", name.c_str(),

@@ -579,6 +579,7 @@ std::vector<ColorObservation> g_color_observations;
 uint64_t g_primary_generation = 0;
 HWND g_primary_hwnd = nullptr;
 uint64_t g_color_unknown_logged_generation = 0;
+uint64_t g_color_guess_logged_generation = 0;
 // Diagnostics for the otherwise-silent shadow-to-primary path.  All are
 // written only under g_render_mutex.
 uint64_t g_present_reached_logged_generation = 0;
@@ -871,6 +872,76 @@ struct InferredColor {
     d3d12::ColorEvidence evidence = d3d12::ColorEvidence::Dxgi;
 };
 
+// The colour space of the OUTPUT the swapchain presents to, straight from DXGI - no vendor SDK.
+//
+// This is the evidence that was missing on report 42's rig: AMD (so the nvapi observer never loads)
+// plus a swapchain created before our hooks (so there is no creation observation), which left a
+// 10-bit buffer with nothing to prove its encoding and the canvas permanently unavailable. The
+// display itself knows, and IDXGIOutput6::GetDesc1 reports it on any vendor.
+//
+// Two ways in, because GetContainingOutput refuses on a composition swapchain - which is exactly
+// what a frame-generation or overlay layer hands us: ask the swapchain first, then fall back to the
+// monitor under the window. Cached per (window, monitor): this runs inside Present, and the answer
+// only changes when the user toggles HDR, which also changes the monitor handle or forces a resize.
+bool display_color_space(IDXGISwapChain3* swapchain, HWND hwnd,
+                         DXGI_COLOR_SPACE_TYPE* out) noexcept {
+    if (!out) return false;
+
+    static std::mutex s_cache_lock;
+    static HMONITOR s_cached_monitor = nullptr;
+    static DXGI_COLOR_SPACE_TYPE s_cached_space = DXGI_COLOR_SPACE_CUSTOM;
+    static bool s_cached_valid = false;
+
+    const HMONITOR monitor =
+        hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    {
+        std::lock_guard<std::mutex> guard(s_cache_lock);
+        if (s_cached_valid && monitor && monitor == s_cached_monitor) {
+            *out = s_cached_space;
+            return true;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+    if (swapchain) (void)swapchain->GetContainingOutput(&output);
+
+    if (!output && monitor) {
+        // Composition swapchains have no containing output; find the monitor ourselves.
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            for (UINT a = 0; !output && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND;
+                 ++a) {
+                Microsoft::WRL::ComPtr<IDXGIOutput> candidate;
+                for (UINT o = 0; adapter->EnumOutputs(o, &candidate) != DXGI_ERROR_NOT_FOUND; ++o) {
+                    DXGI_OUTPUT_DESC desc{};
+                    if (SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor == monitor) {
+                        output = candidate;
+                        break;
+                    }
+                    candidate.Reset();
+                }
+                adapter.Reset();
+            }
+        }
+    }
+    if (!output) return false;
+
+    Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+    if (FAILED(output.As(&output6)) || !output6) return false; // pre-Windows-10-1703
+    DXGI_OUTPUT_DESC1 desc1{};
+    if (FAILED(output6->GetDesc1(&desc1))) return false;
+
+    {
+        std::lock_guard<std::mutex> guard(s_cache_lock);
+        s_cached_monitor = monitor;
+        s_cached_space = desc1.ColorSpace;
+        s_cached_valid = true;
+    }
+    *out = desc1.ColorSpace;
+    return true;
+}
+
 d3d12::ColorMode dxgi_color_mode(DXGI_COLOR_SPACE_TYPE color_space,
                                   DXGI_FORMAT format) noexcept {
     if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
@@ -908,8 +979,8 @@ static_assert(nvapi_color_mode(5, DXGI_FORMAT_R10G10B10A2_UNORM) ==
 static_assert(nvapi_color_mode(2, DXGI_FORMAT_R16G16B16A16_FLOAT) ==
               d3d12::ColorMode::ScRgb);
 
-InferredColor infer_color_mode(uint64_t generation, DXGI_FORMAT format,
-                               HWND hwnd) {
+InferredColor infer_color_mode(uint64_t generation, DXGI_FORMAT format, HWND hwnd,
+                               IDXGISwapChain3* swapchain) {
     const ColorObservation* dxgi_observation = nullptr;
     for (const auto& item : g_color_observations) {
         if (item.generation == generation && item.known) {
@@ -932,14 +1003,40 @@ InferredColor infer_color_mode(uint64_t generation, DXGI_FORMAT format,
                 d3d12::ColorEvidence::Dxgi};
     }
 
-    // Reaching this fallback means a detected nested wrapper prevented
-    // authoritative creation/color observation. The containing output and
-    // buffer format are not proof of that wrapper's current encoding, so
-    // FP16/R10 fail closed.
-    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-        format == DXGI_FORMAT_R10G10B10A2_UNORM)
-        return {};
-    return {d3d12::ColorMode::Sdr, d3d12::ColorEvidence::AssumedFromFormat};
+    // Neither observer had anything, which is the normal state on a non-NVIDIA card whose
+    // swapchain predates our hooks. Ask the display. An SDR desktop is proof enough that what we
+    // draw will be read as SDR, and an HDR desktop names the encoding outright; only a pairing that
+    // makes no sense (dxgi_color_mode -> Unknown) falls through.
+    DXGI_COLOR_SPACE_TYPE display_space = DXGI_COLOR_SPACE_CUSTOM;
+    if (display_color_space(swapchain, hwnd, &display_space)) {
+        const d3d12::ColorMode mode = dxgi_color_mode(display_space, format);
+        if (mode != d3d12::ColorMode::Unknown)
+            return {mode, d3d12::ColorEvidence::DxgiOutput};
+    }
+
+    // An 8-bit buffer cannot be either HDR encoding, so this one is safe as it always was.
+    if (format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        format != DXGI_FORMAT_R10G10B10A2_UNORM)
+        return {d3d12::ColorMode::Sdr, d3d12::ColorEvidence::AssumedFromFormat};
+
+    // LAST RESORT. This used to `return {}`, which fails closed - correct in the abstract, and in
+    // practice it meant report 42's player had no menu at all, for ever, with no setting to
+    // override it. A wrong encoding is a menu that looks wrong and can be reported; a refusal is a
+    // menu that is not there. So guess, take the guess that is right far more often (an FP16 chain
+    // is essentially always scRGB, anything else SDR), and say so in the log every time.
+    const d3d12::ColorMode guess = format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                                       ? d3d12::ColorMode::ScRgb
+                                       : d3d12::ColorMode::Sdr;
+    if (g_color_guess_logged_generation != generation) {
+        g_color_guess_logged_generation = generation;
+        flog("[overlay-v2] colour encoding unproven for generation %llu (buffer %u, display space "
+             "%d): drawing as %s. If the overlay looks washed out or over-bright, that is this "
+             "guess being wrong - say so and it can be pinned.",
+             static_cast<unsigned long long>(generation), static_cast<unsigned>(format),
+             static_cast<int>(display_space),
+             guess == d3d12::ColorMode::ScRgb ? "scRGB" : "SDR");
+    }
+    return {guess, d3d12::ColorEvidence::AssumedFallback};
 }
 
 bool valid_game_window(HWND hwnd) noexcept {
@@ -1348,7 +1445,7 @@ void before_present_impl(IDXGISwapChain* base,
 
     trace.stage = "color encoding";
     const InferredColor color =
-        infer_color_mode(generation, desc.Format, hwnd);
+        infer_color_mode(generation, desc.Format, hwnd, swapchain3.Get());
     const d3d12::ColorMode color_mode = color.mode;
     const bool color_known = color_mode != d3d12::ColorMode::Unknown;
     publish_canvas(hwnd, desc.Width, desc.Height,

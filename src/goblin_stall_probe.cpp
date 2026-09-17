@@ -1577,6 +1577,9 @@ namespace
     std::vector<uintptr_t> g_park_slots;      // written by the scan thread, then published
     std::atomic<bool> g_park_slots_built{false}; // release-stored AFTER g_park_slots is final
     std::atomic<bool> g_park_scan_started{false};
+    // Set when a scan came back EMPTY (the manager slot was not populated yet); the launcher
+    // waits at least 5 s before trying again, so an early launch cannot spin the scan thread.
+    std::atomic<uint64_t> g_park_scan_last_empty_ms{0};
     uintptr_t g_park_slot = 0;          // learned once a walk actually matched
 
     // ── park-probe reads: validate-then-read, with NEGATIVE verdicts cached ─────────────────────
@@ -1719,6 +1722,19 @@ namespace
             }
         }
         }
+        if (found.empty())
+        {
+            // Nothing matched: the launch was too early for the manager slot (the scan now
+            // starts at the first phase-byte read, in the main menu) or RTTI did not resolve.
+            // Do NOT publish an empty list as "built" - that would latch the expiry walk off for
+            // the whole session. Leave the door open for the next launch point instead.
+            g_park_scan_last_empty_ms.store(GetTickCount64(), std::memory_order_relaxed);
+            g_park_scan_started.store(false, std::memory_order_release);
+            spdlog::info("[v3park] no candidate manager slot yet ({} vtable filter, {} ms); "
+                         "will look again",
+                         vt_sys ? "by" : "NO", GetTickCount64() - t0);
+            return;
+        }
         g_park_slots = std::move(found); // the tick reads this only after the release below
         g_park_slots_built.store(true, std::memory_order_release);
         spdlog::info("[v3park] {} candidate manager slot(s) ({} vtable filter) in {} ms off-frame; "
@@ -1726,12 +1742,21 @@ namespace
                      g_park_slots.size(), vt_sys ? "by" : "NO", GetTickCount64() - t0);
     }
 
-    // Non-blocking launcher: called from the map-open edge (so the scan finishes while the map
-    // is still being looked at) and again from the expire tick as the net for a close that
-    // arrives before any open ever ticked. Never costs the calling frame more than an exchange.
+    // Non-blocking launcher. Called from the FIRST valid phase-byte read (the main menu, minutes
+    // before any map), from every map-open edge, and from the expire tick as the net for a close
+    // that arrives before any of those. Never costs the calling frame more than an exchange.
+    //
+    // Why the first phase read and not the open edge alone (2026-09-16, Convergence + ERR): the
+    // scan takes 0.3..5.2 s depending on the machine, and it used to start only when the first map
+    // opened. A close inside that window could not expire the parked entry, so a quick reopen
+    // reused the movie with our children already freed and the map came up EMPTY until the next
+    // slow reopen. Starting in the main menu puts the whole loading screen between the scan and
+    // the first map; the empty-result retry covers a launch that is still too early.
     void v3_park_build_slots()
     {
         if (g_park_slots_built.load(std::memory_order_acquire)) return;
+        const uint64_t last_empty = g_park_scan_last_empty_ms.load(std::memory_order_relaxed);
+        if (last_empty && GetTickCount64() - last_empty < 5000) return;
         if (g_park_scan_started.exchange(true)) return;
         std::thread(v3_park_scan_worker).detach();
     }
@@ -1744,7 +1769,19 @@ namespace
         // No frame is charged while the scan thread is still running: on a machine where the
         // scan outlives 600 frames the walk would otherwise disarm before its list ever existed.
         if (!g_park_slots_built.load(std::memory_order_acquire))
+        {
+            // Say so ONCE per armed movie: this is the exact state behind "the map came up empty
+            // on a quick reopen" - the parked entry survives because the shortlist is not there.
+            static uintptr_t s_not_ready_for = 0;
+            if (s_not_ready_for != want)
+            {
+                s_not_ready_for = want;
+                spdlog::info("[v3park] shortlist not ready at close for movie 0x{:X}; "
+                             "a reopen before it lands may come up empty",
+                             want);
+            }
             return;
+        }
         if (++g_park_frames > 600)   // ~10 s of frames: the entry is not there, stop looking
         {
             g_park_target.store(0, std::memory_order_relaxed);
@@ -7361,6 +7398,10 @@ namespace
         {
             done = -2;
         }
+        // (The game's own 02_160 file is requested in goblin_own_movie's name_to_def detour, not
+        //  here: this function has no CSMenuMan of its own, and the one the menu-update detour
+        //  caches is not the object that call reads its list from - asking with it FAULTED on every
+        //  open of report 42's run.)
         return done;
     }
 
@@ -8455,6 +8496,11 @@ namespace
                              raw == 0 ? "gone"
                                       : (raw == 1 ? "idle/closing"
                                                   : ((prev == 0 || prev == 0xFF) ? "open" : "focus")));
+            // The FIRST valid phase read: the menu manager answers, so the Scaleform system it
+            // sits on exists too. Start the park shortlist scan here, in the main menu, minutes
+            // before the first map - the open edge below stays as the second launch point.
+            if (prev == 0xFF && raw != 0xFF)
+                v3_park_build_slots();
             // The OPEN edge, and the only place g_v3_map_closed is ever cleared. One writer per
             // direction: the engine's byte going non-zero means a dialog exists again.
             if (prev == 0 && raw != 0 && raw != 0xFF)
@@ -8462,10 +8508,8 @@ namespace
                 g_v3_map_closed.store(false, std::memory_order_release);
                 g_v3_open = V3OpenCost{}; // per-open cost accounting starts here
                 g_open_dialog_ms.store(GetTickCount64(), std::memory_order_relaxed);
-                // Prewarm the park shortlist on a background thread while the map is being
-                // looked at, so the close that arms the walk finds it already built. Launched
-                // here rather than at init because the Scaleform manager slot must be populated,
-                // and an open map proves it is.
+                // Second launch point for the park shortlist scan (the first is the phase read
+                // above): a no-op once the list exists, a retry if the early scan found nothing.
                 v3_park_build_slots();
             }
             // While the map is closed is exactly when the parked entry exists and the engine is

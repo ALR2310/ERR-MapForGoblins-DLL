@@ -11,7 +11,7 @@ Outputs (into config.DATA_DIR, profile-aware):
         profile these tables are small and the enemy mapping near-empty
         (vanilla enemy labels come from NpcName / BloodMsg instead).
 
-Consumed by generate_loot_massedit.py / generate_pieces_massedit.py for
+Consumed by generate_loot.py / generate_pieces.py for
 enemy-drop name lines.
 """
 import sys

@@ -21,6 +21,11 @@
 // param row the engine relayouts on open (the slow map-open path), and hiding is limited to what the
 // param's flags can express. Keep it building - it is the fallback if the native path ever regresses
 // badly on a new game patch, and it is the only path that needs no Scaleform hooks at all.
+// ONE known regression in this mode since 2026-09-18: de-overlap. Spreading stacked icons apart is
+// done live, on the native children (refresh_deoverlap in goblin_inject.cpp), and there used to be a
+// second, generation-time pass that spiralled the baked param positions. The baked one only ever
+// duplicated work the live pass redid from scratch, so it was retired - which leaves THIS path with
+// coincident markers drawn on top of each other. Cosmetic, and the trade was deliberate.
 #ifndef MFG_LEGACY_PIN_MARKERS
 #define MFG_LEGACY_PIN_MARKERS 0
 #endif

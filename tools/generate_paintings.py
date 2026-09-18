@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Paintings.MASSEDIT from EMEVD painting template events + MSB positions."""
+"""Generate World - Paintings.rows from EMEVD painting template events + MSB positions."""
 
 import sys
 import io
@@ -10,6 +10,7 @@ import struct
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -29,7 +30,7 @@ def _safe_unlink(path):
         pass
 
 
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at)
 
 ERR_MOD_DIR = config.require_err_mod_dir()
@@ -133,8 +134,8 @@ def main():
                         round(float(p.Position.Z), 3),
                     )
 
-    # Step 3: Resolve positions and generate MASSEDIT
-    lines = []
+    # Step 3: Resolve positions and generate rows
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Paintings")  # z-order slot; see row_id_registry
     count = 0
     for p in sorted(paintings, key=lambda p: p['flag']):
@@ -152,37 +153,34 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("paintings")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("paintings"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {x:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = x
         if y != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {y:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {z:.3f};')
+            fields['posY'] = y
+        fields['posZ'] = z
         # Painting name from GoodsName FMG
         flag = p['flag']
         if flag >= 580100:
             goods_id = 2008200 + (flag - 580100) // 10
         else:
             goods_id = 8200 + (flag - 580000) // 10
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {500000000 + goods_id};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {p["flag"]};')
+        fields['textId1'] = 500000000 + goods_id
+        fields['textDisableFlagId1'] = p['flag']
         # Location text for dungeons - nearest-grace lookup
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
         loc_id = resolve_location_id_at(map_code, x, y, z)
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {p["flag"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+            fields['textId2'] = loc_id
+            fields['textDisableFlagId2'] = p['flag']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
         count += 1
 
-    out_path = OUT_DIR / 'World - Paintings.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Paintings.rows')
     print(f"Written {count} entries to {out_path.name}")
 
 

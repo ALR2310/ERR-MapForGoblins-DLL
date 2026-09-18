@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Custom map-icon iconIds, derived from the single category table in map_categories.py.
 
-Generators ask `iconid("<slug>")` or `iconid_for_name("<MASSEDIT name>")`; nothing hard-codes a frame
+Generators ask `iconid("<slug>")` or `iconid_for_name("<category name>")`; nothing hard-codes a frame
 number. The iconId is just a lookup key the DLL remaps to a runtime-injected frame (value-agnostic;
 we ship no gfx) - so its VALUE only has to be unique and < ICON_MAP_SIZE=1024.
 
@@ -42,7 +42,7 @@ for _slug, _png in _mc.EXTRA_ICONS:
 # even when they rebuild on different cadences. (Adding/removing a slug still renumbers - but that's a
 # full rebuild anyway.)
 _index = {s: i for i, s in enumerate(sorted(ICON_ORDER))}
-_NAME_TO_SLUG = {f: s for f, s, _ in _mc.CATEGORIES}          # MASSEDIT file -> icon slug
+_NAME_TO_SLUG = {f: s for f, s, _ in _mc.CATEGORIES}          # row file -> icon slug
 _PNG = {}                                                     # slug -> png basename (None = composed)
 for _f, _slug, _png in _mc.CATEGORIES:
     if _png and _slug not in _PNG:
@@ -67,7 +67,7 @@ def iconid(slug):
 
 
 def iconid_for_name(name):
-    """MASSEDIT/category human name -> iconId (via the table; _norm fallback for unknown names)."""
+    """category human name -> iconId (via the table; _norm fallback for unknown names)."""
     return iconid(_NAME_TO_SLUG.get(name) or _norm(name))
 
 

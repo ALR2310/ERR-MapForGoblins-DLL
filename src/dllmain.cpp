@@ -19,6 +19,7 @@
 #include "goblin_inject.hpp"
 #include "goblin_kindling.hpp"
 #include "goblin_logic.hpp"
+#include "goblin_map_blob.hpp" // load_map_data(), which every MAP_ENTRIES reader depends on
 #include "goblin_markers.hpp"
 #include "goblin_messages.hpp"
 #include "goblin_status_line.hpp"
@@ -116,6 +117,7 @@ static bool seh_invoke_void(InitFn fn)
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+static void init_map_data()         { goblin::generated::load_map_data(); }
 static void init_modutils()         { modutils::initialize(); }
 static void init_from_params()      { from::params::initialize(); }
 static void init_collected()        { goblin::collected::initialize(); }
@@ -886,6 +888,11 @@ static void setup_mod()
     // under the loader lock is a deadlock risk. See scratch/user_reports/ERSS_CONFLICT_HANDOFF.md.
     try { cte::overlay::present::capture_creation_entrypoints(); }
     catch (...) { /* a missing snapshot only costs the loop-break's best branch */ }
+
+    // Expand the packed marker table before ANY step can read MAP_ENTRIES. It is a single inflate
+    // plus one pass over the records (a few ms), and until it runs the table is empty, so this has
+    // to come ahead of every other init rather than be done lazily by whichever reader is first.
+    safe_init_step(&init_map_data,    "generated::load_map_data");
 
     safe_init_step(&init_modutils,    "modutils::initialize");
 

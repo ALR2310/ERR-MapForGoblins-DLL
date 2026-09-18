@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Stakes of Marika.MASSEDIT from MSB AEG099_060 assets."""
+"""Generate World - Stakes of Marika.rows from MSB AEG099_060 assets."""
 
 import sys
 import io
@@ -9,6 +9,7 @@ import tempfile
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -28,7 +29,7 @@ def _safe_unlink(path):
         pass
 
 
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at, convert_legacy_coords,
                              is_dlc_plane, remap_placeholder_xz)
 
@@ -100,8 +101,8 @@ def main():
     stakes.sort(key=lambda s: (s['area'], s['gx'], s['gz']))
     print(f"  {len(stakes)} unique stakes")
 
-    # Generate MASSEDIT
-    lines = []
+    # Generate rows
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Stakes of Marika")  # z-order slot; see row_id_registry
     for s in stakes:
         area = s['area']
@@ -115,29 +116,26 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("stakes_of_marika")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("stakes_of_marika"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {s["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = s['x']
         if s['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {s["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {s["z"]:.3f};')
+            fields['posY'] = s['y']
+        fields['posZ'] = s['z']
         # Tutorial text 301540 = "Stakes of Marika"
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = 900301540;')
+        fields['textId1'] = 900301540
         # Location name for dungeons - nearest-grace lookup
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
         loc_id = resolve_location_id_at(map_code, s["x"], s.get("y", 0.0), s["z"])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+            fields['textId2'] = loc_id
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
 
-    out_path = OUT_DIR / 'World - Stakes of Marika.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Stakes of Marika.rows')
     print(f"Written {len(stakes)} entries to {out_path.name}")
 
 

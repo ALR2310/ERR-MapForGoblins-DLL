@@ -19,7 +19,7 @@ Outputs (into config.DATA_DIR, profile-aware):
                                  claimed by a more-specific category (first-match-wins) and the
                                  'Map:' fragments handled by the World - Maps generator.)
 
-Consumed by generate_loot_massedit.py category filters. Rules were derived by
+Consumed by generate_loot.py category filters. Rules were derived by
 matching the previously-committed tables against EquipParamGoods: ash/craft
 matched their goodsType sets exactly; sorcery/incantation/sort_groups matched
 on goodsType with only since-added rows differing (the old tables were a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show textId slot usage stats for all generated MASSEDIT files.
+"""Show textId slot usage stats for all generated row files.
 Reports how many entries have location name, enemy name, or both."""
 
 import re
@@ -7,27 +7,26 @@ import sys
 import io
 import os
 import glob
+sys.path.insert(0, os.path.dirname(__file__))
+import rowsink
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-MASSEDIT_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'massedit_generated')
+ROWS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'rows_generated')
 
 total_all = loc_all = enemy_all = both_all = 0
 
-for fpath in sorted(glob.glob(os.path.join(MASSEDIT_DIR, '*.MASSEDIT'))):
-    fname = os.path.basename(fpath).replace('.MASSEDIT', '')
+for fpath in sorted(glob.glob(os.path.join(ROWS_DIR, '*.rows'))):
+    fname = os.path.basename(fpath).replace('.rows', '')
 
     rows = {}
-    for line in open(fpath):
-        m = re.match(r'param WorldMapPointParam: id (\d+):', line)
-        if not m:
-            continue
-        rid = int(m.group(1))
-        if rid not in rows:
-            rows[rid] = []
-        tm = re.search(r'textId(\d): = (\d+)', line)
-        if tm:
-            rows[rid].append((int(tm.group(1)), int(tm.group(2))))
+    for rid, fields in rowsink.read(fpath):
+        slots = []
+        for slot in range(1, 9):
+            v = fields.get(f'textId{slot}')
+            if v:
+                slots.append((slot, int(v)))
+        rows[rid] = slots
 
     total = len(rows)
     has_loc = has_enemy = has_both = 0

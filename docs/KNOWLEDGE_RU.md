@@ -31,8 +31,7 @@ DLL-мод для Elden Ring Reforged (ERR). Добавляет ~9000 иконо
 | `goblin_config.cpp` | Парсинг INI (mINI), 60+ переключателей категорий + debug_logging, парсинг VK-кода хоткея |
 | `goblin_markers.cpp` | Дамп бикон/стамп-массивов из памяти по хоткею (F9, **включён по умолчанию**); показывает на экране подтверждающий баннер кодекса (Markers dumped / Marker dump failed). Читает стабильную цепочку указателей `*(exe+0x3D5DF38)->+0x68->beacons+0x118/stamps+0x1B8` (не скан памяти) |
 | `goblin_kindling.cpp` | Модуль Kindling Spirits (`Category::WorldKindlingSpirits`); определение живости каждого духа через скан кучи на объекты-условия `CS::EcTestDistance` |
-| `goblin_massedit.cpp` | Runtime-парсер MASSEDIT файлов (альтернативный путь загрузки из `dll/offline/massedit/`) |
-| `generated/goblin_map_data.cpp` | Автосгенерированный массив из MASSEDIT файлов (~9000 записей) |
+| `goblin_map_blob.cpp` + `generated/goblin_map_blob_data.cpp` | Таблица маркеров (~9000 записей): упаковывается и сжимается на этапе генерации, разворачивается один раз при старте в массив `MapEntry` из `goblin_map_data.hpp` |
 | `generated/goblin_legacy_conv.hpp` | Автосгенерированная таблица dungeon→overworld конверсии координат (из WorldMapLegacyConvParam) |
 | `modutils.cpp` | AOB-сканер (Pattern16), хуки (MinHook), утилиты для работы с памятью |
 | `from/params.cpp` | Работа с SoloParamRepository -- поиск и итерация по Param таблицам |
@@ -114,23 +113,23 @@ MSB файлы + regulation.bin + EMEVD
         +-- scan_emevd_awards.py    -->  emevd_lot_mapping.json
         +-- enrich_fallback_with_emevd.py (in-place апгрейд неразрешённых записей)
         |
-        +-- generate_loot_massedit.py    -->  50+ Loot/Equipment/Key/Quest/Magic MASSEDIT
-        +-- generate_pieces_massedit.py  -->  Rune/Ember MASSEDIT + _slots.json
-        +-- generate_material_nodes.py   -->  Loot - Material Nodes MASSEDIT
+        +-- generate_loot.py    -->  50+ Loot/Equipment/Key/Quest/Magic .rows
+        +-- generate_pieces.py  -->  Rune/Ember .rows + _slots.json
+        +-- generate_material_nodes.py   -->  Loot - Material Nodes .rows
         +-- generate_graces.py, generate_summoning_pools.py, generate_spirit_springs.py,
         |   generate_imp_statues.py, generate_stakes.py, generate_paintings.py,
-        |   generate_maps.py             -->  MASSEDIT мировой инфраструктуры
+        |   generate_maps.py             -->  .rows мировой инфраструктуры
         +-- generate_gestures.py         -->  жесты (через сканирование common event 90005570)
         +-- generate_hostile_npcs.py     -->  инвейдеры (через NpcParam.teamType=24 + MSB)
-        +-- generate_kindling_spirits_massedit.py -->  Kindling Spirits MASSEDIT
-        +-- extract_seal_puzzles.py, generate_seal_puzzles.py -->  seal puzzles MASSEDIT
-        +-- generate_hero_tomb_statues.py -->  статуи hero tomb MASSEDIT
+        +-- generate_kindling_spirits.py -->  Kindling Spirits .rows
+        +-- extract_seal_puzzles.py, generate_seal_puzzles.py -->  seal puzzles .rows
+        +-- generate_hero_tomb_statues.py -->  статуи hero tomb .rows
         +-- generate_boss_list.py        -->  список боссов
         +-- build_grace_index.py         -->  индекс мест благодати
         +-- (сканы gathering-нод)        -->  данные material/gathering нод
         |
         v
-  generate_data.py  -->  goblin_map_data.cpp + goblin_legacy_conv.hpp
+  generate_data.py  -->  goblin_map_blob_data.cpp + goblin_legacy_conv.hpp
                           (MapEntry.geom_slot вшит для каждого piece)
         |
         v
@@ -394,7 +393,7 @@ ERR-специфичные event ID:
 | `rune_pieces.json` | 1164 позиций AEG099_821 с InstanceID (после дедупа ~1113) |
 | `ember_pieces.json` | 314 позиций AEG099_822 с InstanceID |
 | `new_fmg_entries.json` | Новые текстовые записи для FMG |
-| `comparison_report.json` | Сравнение MASSEDIT с items_database |
+| `comparison_report.json` | Сравнение сгенерированных строк с items_database |
 
 ### Диагностические JSON (Rune Pieces исследование)
 | Файл | Содержит |
@@ -428,7 +427,7 @@ msb = _msbe_read_str.Invoke(None, Array[Object]([path_to_msb_dcx]))
 В SoulsFormats класс `EMEVD.Instruction` использует `.ID` для номера инструкции (не `.Index`).
 
 ### dispMask / pad2_0 путаница
-В MASSEDIT `pad2_0: = 1` соответствует `dispMask02` (бит 2 байта 0x18). Это DLC слой карты (area 61). Для overworld (area 60) используется `dispMask00`.
+В сгенерированной строке `pad2_0 = 1` соответствует `dispMask02` (бит 2 байта 0x18). Это DLC слой карты (area 61). Для overworld (area 60) используется `dispMask00`.
 
 ### Позиция игрока -- неверные оффсеты
 ChrModules+0x68 (PhysMod)+0x70 давал (0,0,0). Правильная цепочка: ChrModules+0xC0 (SubModule)+0x40 дает реальные мировые координаты.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Summoning Pools.MASSEDIT from SignPuddleParam + MSB position matching."""
+"""Generate World - Summoning Pools.rows from SignPuddleParam + MSB position matching."""
 
 import sys
 import io
@@ -10,6 +10,7 @@ import math
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -30,7 +31,7 @@ def _safe_unlink(path):
 
 
 from extract_all_items import load_paramdefs, read_param, param_to_dict
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at)
 
 ERR_MOD_DIR = config.require_err_mod_dir()
@@ -181,8 +182,8 @@ def main():
     if dropped:
         print(f"  Deduplicated {dropped} overlapping pool(s)")
 
-    # Step 5: Generate MASSEDIT
-    lines = []
+    # Step 5: Generate rows
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Summoning Pools")  # z-order slot; see row_id_registry
     count = 0
     for pool in deduped:
@@ -197,34 +198,31 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("summoning_pools")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("summoning_pools"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {pool["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = pool['x']
         if pool['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {pool["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {pool["z"]:.3f};')
+            fields['posY'] = pool['y']
+        fields['posZ'] = pool['z']
         # Use SignPuddleParam row ID (670XXX) as activation flag - EMEVD sets these
         # textDisableFlagId1 hides text when pool activated → engine hides icon without text
         if pool['rid'] > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {pool["rid"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = 900301690;')
+            fields['textDisableFlagId1'] = pool['rid']
+        fields['textId1'] = 900301690
         map_code = f'm{pool["area"]:02d}_{pool["gx"]:02d}_{pool["gz"]:02d}_00'
         loc_id = resolve_location_id_at(map_code, pool["x"], pool.get("y", 0.0), pool["z"])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
             if pool['rid'] > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {pool["rid"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+                fields['textDisableFlagId2'] = pool['rid']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
         count += 1
 
-    out_path = OUT_DIR / 'World - Summoning Pools.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Summoning Pools.rows')
     print(f"Written {count} entries to {out_path.name}")
 
 

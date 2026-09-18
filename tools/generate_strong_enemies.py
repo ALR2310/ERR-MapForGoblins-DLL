@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate World - Strong Enemies.MASSEDIT - every enemy the game wires through the common
+Generate World - Strong Enemies.rows - every enemy the game wires through the common
 "strong enemy" templates, 90005300 / 90005301 (common_func: 【共通】強敵リスポン処理).
 
 Both templates are the same logic: on death SetEventFlag(X0_4) and AwardItems(X8_4); on every map
@@ -23,8 +23,9 @@ import tempfile
 from collections import Counter
 
 import config
+import rowsink
 import generate_hostile_npcs as H   # pythonnet/SoulsFormats readers, invader team filter
-from massedit_common import (OUT_DIR, OVERWORLD_AREAS, DLC_AREAS, get_disp_mask,
+from marker_common import (OUT_DIR, OVERWORLD_AREAS, DLC_AREAS, get_disp_mask,
                              resolve_location_id_at, remap_placeholder_xz)
 import SoulsFormats
 from System import Array, Object, Type as SysType
@@ -116,7 +117,7 @@ def enemy_label(model, npc, name_id):
     and failing those, the blood-message word "strong foe"."""
     if name_id > 0:
         return name_id + 700000000
-    import generate_loot_massedit as L
+    import generate_loot as L
     tid = L.resolve_enemy_tutorial_id(model, npc)
     if tid > 0:
         return tid + 900000000
@@ -172,34 +173,30 @@ def main():
 
     icon = __import__('icon_registry').iconid_for_name(CATEGORY)
     row_id = __import__('row_id_registry').base(CATEGORY)
-    lines = []
+    sink = rowsink.RowSink()
     for r in records:
-        pre = f'param WorldMapPointParam: id {row_id}:'
-        lines.append(f'{pre} iconId: = {icon};')
-        lines.append(f'{pre} {get_disp_mask(r["area"], r["gx"])}: = 1;')
-        lines.append(f'{pre} areaNo: = {r["area"]};')
+        fields = {'iconId': icon, get_disp_mask(r["area"], r["gx"]): 1, 'areaNo': r['area']}
         if r['area'] in OVERWORLD_AREAS or r['area'] in DLC_AREAS or r['gx'] > 0:
-            lines.append(f'{pre} gridXNo: = {r["gx"]};')
-            lines.append(f'{pre} gridZNo: = {r["gz"]};')
-        lines.append(f'{pre} posX: = {r["x"]:.3f};')
+            fields['gridXNo'] = r['gx']
+            fields['gridZNo'] = r['gz']
+        fields['posX'] = r['x']
         if r['y'] != 0.0:
-            lines.append(f'{pre} posY: = {r["y"]:.3f};')
-        lines.append(f'{pre} posZ: = {r["z"]:.3f};')
+            fields['posY'] = r['y']
+        fields['posZ'] = r['z']
         if r['label']:
-            lines.append(f'{pre} textId1: = {r["label"]};')
-            lines.append(f'{pre} textDisableFlagId1: = {r["flag"]};')
+            fields['textId1'] = r['label']
+            fields['textDisableFlagId1'] = r['flag']
         loc_id = resolve_location_id_at(r['map'], r['x'], r['y'], r['z'])
         if loc_id > 0:
-            lines.append(f'{pre} textId2: = {loc_id};')
-            lines.append(f'{pre} textDisableFlagId2: = {r["flag"]};')
+            fields['textId2'] = loc_id
+            fields['textDisableFlagId2'] = r['flag']
         # Checkmark vs hide on the kill flag - the DLL picks per hide_killed_bosses, as for bosses.
-        lines.append(f'{pre} clearedEventFlagId: = {r["flag"]};')
-        lines.append(f'{pre} selectMinZoomStep: = 1;')
+        fields['clearedEventFlagId'] = r['flag']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
 
-    out = OUT_DIR / f'{CATEGORY}.MASSEDIT'
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out = sink.write(OUT_DIR / f'{CATEGORY}.rows')
     models = Counter(r['model'] for r in records)
     print(f'{len(calls)} strong-enemy template calls -> {len(records)} markers '
           f'({sum(r["named"] for r in records)} named, {sum(1 for r in records if not r["label"])} unlabeled)')

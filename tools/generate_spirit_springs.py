@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Spirit Springs.MASSEDIT and World - Spiritspring Hawks.MASSEDIT
+"""Generate World - Spirit Springs.rows and World - Spiritspring Hawks.rows
 from MSB MountJumps/LockedMountJumps regions and c4210 hawk enemies."""
 
 import sys
@@ -11,6 +11,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
 import icon_registry
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -30,7 +31,7 @@ def _safe_unlink(path):
         pass
 
 
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at)
 from unreachable import is_unreachable_in_err
 
@@ -52,9 +53,9 @@ def rfb(rm, data, suf='.bin'):
     return r
 
 
-def write_massedit(entries, out_name, icon_id, text_id, start_row, zoom=1):
-    """Write a MASSEDIT file from a list of entry dicts."""
-    lines = []
+def write_rows(entries, out_name, icon_id, text_id, start_row, zoom=1):
+    """Write a row file from a list of entry dicts."""
+    sink = rowsink.RowSink()
     row_id = start_row
     for e in entries:
         area = e['area']
@@ -68,30 +69,27 @@ def write_massedit(entries, out_name, icon_id, text_id, start_row, zoom=1):
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {icon_id};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': icon_id, disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {e["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = e['x']
         if e['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {e["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {e["z"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {text_id};')
+            fields['posY'] = e['y']
+        fields['posZ'] = e['z']
+        fields['textId1'] = text_id
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
         loc_id = resolve_location_id_at(map_code, e["x"], e.get("y", 0.0), e["z"])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
         flag = e.get('flag', 0)
         if flag > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: clearedEventFlagId: = {flag};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = {zoom};')
+            fields['clearedEventFlagId'] = flag
+        fields['selectMinZoomStep'] = zoom
+        sink.add(row_id, fields)
         row_id += 1
 
-    out_path = OUT_DIR / out_name
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    sink.write(OUT_DIR / out_name)
     return len(entries)
 
 
@@ -207,18 +205,18 @@ def main():
     print(f"  {len(springs)} spirit springs, {len(hawks)} spiritspring hawks")
 
     # Write Spirit Springs (icon 404 = MENU_MAP_Range, tutorialId 301620 = "Spiritspring Jumping")
-    n = write_massedit(springs, 'World - Spirit Springs.MASSEDIT',
+    n = write_rows(springs, 'World - Spirit Springs.rows',
                        icon_id=icon_registry.iconid("spirit_springs"), text_id=900301620,
                        start_row=__import__("row_id_registry").base("World - Spirit Springs"))
-    print(f"Written {n} springs to World - Spirit Springs.MASSEDIT")
+    print(f"Written {n} springs to World - Spirit Springs.rows")
 
     # Write Hawks (icon 439 - custom image MENU_ItemIcon_03273; textId
     # 904210304 = "167. Spiritspring Stormhawk")
     # clearedEventFlagId = hawk EntityID (set when hawk killed = spring unlocked)
-    n = write_massedit(hawks, 'World - Spiritspring Hawks.MASSEDIT',
+    n = write_rows(hawks, 'World - Spiritspring Hawks.rows',
                        icon_id=icon_registry.iconid("spiritspring_hawks"), text_id=904210304,
                        start_row=__import__("row_id_registry").base("World - Spiritspring Hawks"))
-    print(f"Written {n} hawks to World - Spiritspring Hawks.MASSEDIT")
+    print(f"Written {n} hawks to World - Spiritspring Hawks.rows")
 
 
 if __name__ == '__main__':

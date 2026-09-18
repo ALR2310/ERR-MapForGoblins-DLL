@@ -206,7 +206,7 @@ other gathering nodes - AEG099_821 has a pickUpItemLotParamId chain (primary goo
 Trace 800011), AEG099_822 → Ember Trace 850011. EMEVD event 1045630910 is a warp/teleport
 interaction (WarpPlayer) and event 1045632900 toggles asset enable-state
 (ChangeAssetEnableState over 1045631100…) - neither event awards the piece. The mod
-generates 821/822 specially in generate_pieces_massedit.py.
+generates 821/822 specially in generate_pieces.py.
 
 ### Runes (currency)
 
@@ -284,7 +284,7 @@ Naming is counterintuitive:
 - `data/aeg099_item_mapping.json` - AEG099 mapping (285 models)
 - `data/aeg463_item_mapping.json` - AEG463 DLC mapping (36 models)
 - `data/all_gathering_nodes_final.json` - all AEG099+AEG463 positions from MSBs (21824 nodes: 17082 AEG099 + 4742 AEG463; count drifts with each MSB re-extraction)
-- `data/massedit_generated/` - auto-generated MASSEDIT files
+- `data/rows_generated/` - the generated marker rows (binary, one file per category)
 
 ## How to regenerate
 
@@ -312,4 +312,4 @@ The one-time nodes (`isEnableRepick && isHiddenOnRepick`) feed
   runtime `collected::refresh()`.
 
 Note: AEG099_821 / AEG099_822 (Rune / Ember Pieces) are excluded here and
-handled separately by `generate_pieces_massedit.py`.
+handled separately by `generate_pieces.py`.

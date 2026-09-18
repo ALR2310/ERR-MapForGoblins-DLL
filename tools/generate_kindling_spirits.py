@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Kindling Spirits.MASSEDIT from kindling_spirits.json.
+"""Generate World - Kindling Spirits.rows from kindling_spirits.json.
 
 ERR drops 5 KindlingSpirit_* SFX-regions in m60_45_37_00. Picking up all
 five between two Site-of-Grace rests grants Incantation 6610 ("Kindling
@@ -15,14 +15,15 @@ in-run hiding by reading SFX-region state and writing `areaNo = 99` on
 collected rows - same trick as material_nodes but keyed off SFX state
 instead of CSWorldGeomMan.
 
-Output: data/massedit_generated/World - Kindling Spirits.MASSEDIT
+Output: data/rows_generated/World - Kindling Spirits.rows
         + _slots.json with entity_id metadata for the DLL.
 """
 
 import json
 from pathlib import Path
 
-from massedit_common import OUT_DIR
+import rowsink
+from marker_common import OUT_DIR
 
 
 # textId routing (see goblin_messages.cpp): goods_id + 500_000_000 → GoodsName FMG
@@ -38,7 +39,7 @@ PERMANENT_FLAG = 1045377500
 import row_id_registry
 START_ROW_ID = row_id_registry.base("World - Kindling Spirits")
 
-# Icon 385 = Incantation (matches Magic - Incantations.MASSEDIT). The
+# Icon 385 = Incantation (matches Magic - Incantations.rows). The
 # award is Goods 6610 "Kindling Spirit" incantation, so this category
 # belongs visually with incantation pickups, not gathering nodes (which
 # use iconId 397).
@@ -65,7 +66,7 @@ def main():
 
     text_id = KINDLING_GOODS_ID + GOODS_NAME_OFFSET   # 500006610 → "Kindling Spirit"
 
-    lines = []
+    sink = rowsink.RowSink()
     slots = {}
     for i, sp in enumerate(spirits):
         rid = START_ROW_ID + i
@@ -77,19 +78,22 @@ def main():
         z = float(sp["z"])
 
         # m60 = base-game overworld → dispMask00
-        lines.append(f"param WorldMapPointParam: id {rid}: iconId: = {ICON_ID};")
-        lines.append(f"param WorldMapPointParam: id {rid}: dispMask00: = 1;")
-        lines.append(f"param WorldMapPointParam: id {rid}: areaNo: = {area};")
-        lines.append(f"param WorldMapPointParam: id {rid}: gridXNo: = {gx};")
-        lines.append(f"param WorldMapPointParam: id {rid}: gridZNo: = {gz};")
-        lines.append(f"param WorldMapPointParam: id {rid}: posX: = {x:.3f};")
-        lines.append(f"param WorldMapPointParam: id {rid}: posY: = {y:.3f};")
-        lines.append(f"param WorldMapPointParam: id {rid}: posZ: = {z:.3f};")
-        lines.append(f"param WorldMapPointParam: id {rid}: textId1: = {text_id};")
-        # Permanent fallback: hide all 5 once incantation is acquired.
-        # In-run per-spirit hide is driven by goblin::kindling::refresh().
-        lines.append(f"param WorldMapPointParam: id {rid}: textDisableFlagId1: = {PERMANENT_FLAG};")
-        lines.append(f"param WorldMapPointParam: id {rid}: selectMinZoomStep: = 1;")
+        fields = {
+            "iconId": ICON_ID,
+            "dispMask00": 1,
+            "areaNo": area,
+            "gridXNo": gx,
+            "gridZNo": gz,
+            "posX": x,
+            "posY": y,
+            "posZ": z,
+            "textId1": text_id,
+            # Permanent fallback: hide all 5 once incantation is acquired.
+            # In-run per-spirit hide is driven by goblin::kindling::refresh().
+            "textDisableFlagId1": PERMANENT_FLAG,
+            "selectMinZoomStep": 1,
+        }
+        sink.add(rid, fields)
 
         # Pass entity_id and slot to the DLL via the side-car JSON. The
         # DLL reads MAP_ENTRY metadata to build its tracking table - same
@@ -103,10 +107,8 @@ def main():
             "object_name": f"KindlingSpirit_{int(sp['slot']):04d}",  # parsable name
         }
 
-    massedit_path = out_dir / "World - Kindling Spirits.MASSEDIT"
-    with open(massedit_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"Written {len(spirits)} entries to {massedit_path.name}")
+    out_path = sink.write(out_dir / "World - Kindling Spirits.rows")
+    print(f"Written {len(spirits)} entries to {out_path.name}")
 
     slots_path = out_dir / "World - Kindling Spirits_slots.json"
     with open(slots_path, "w", encoding="utf-8") as f:

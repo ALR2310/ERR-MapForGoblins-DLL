@@ -731,7 +731,7 @@ def main():
     # Common event 1100 "Defeat boss_obtain item" waits on a flag and awards one or two lots.
     # Nothing in it says WHERE, so the position-driven paths above can never place it - which is
     # why the six Great Runes used to need a hand-written rune->boss table. Collected here, in the
-    # one pass that already reads every EMEVD; generate_loot_massedit resolves the flag to a boss
+    # one pass that already reads every EMEVD; generate_loot resolves the flag to a boss
     # (the boss's own death event sets it alongside that boss's defeat flag, which boss_list.json
     # keys bosses by). The Divine Tower event pairs the INACTIVE rune a boss drops with the
     # RESTORED one it hands back, so a build that skips the tower step (The Convergence drops the
@@ -1524,7 +1524,7 @@ def main():
         print(f'  {cat}: {cnt}')
 
     # Sidecar: NpcParam ID → NpcName FMG ID (only rows with nameId > 0).
-    # Consumed by generate_loot_massedit.py + generate_hostile_npcs.py to
+    # Consumed by generate_loot.py + generate_hostile_npcs.py to
     # label drops/markers with named-NPC names (Millicent, Vyke, ...) via
     # the `id + 700000000` NpcName offset convention.
     npcname_path = OUTPUT_DIR / 'npc_name_ids.json'
@@ -1533,7 +1533,7 @@ def main():
     print(f'Saved {len(npc_to_name_id)} NpcParam→NpcName mappings to {npcname_path.name}')
 
     # Sidecar: the Great Runes, with the flag that awards them and the flags set beside it.
-    # generate_loot_massedit turns each into a marker on the boss that sets those flags.
+    # generate_loot turns each into a marker on the boss that sets those flags.
     def lot_run(first_lot):
         """A lot and the consecutive rows it continues into (vanilla parks the rune in +1,
         behind the boss's remembrance)."""

@@ -431,7 +431,7 @@ def main():
 
 
     # Load tutorial names for text matching
-    from generate_loot_massedit import ENEMY_NAMES, TUTORIAL_NAMES, resolve_enemy_tutorial_id
+    from generate_loot import ENEMY_NAMES, TUTORIAL_NAMES, resolve_enemy_tutorial_id
 
     # Index entities by map name for extended search
     entities_by_map = defaultdict(list)

@@ -3,7 +3,7 @@
 The HYBRID sub-area resolver: MSB MapPoint sub-volume -> MapNameOverride super-volume ->
 nearest authored anchor in 3D (WorldMapPoint place-pin UNION grace). At runtime the DLL
 OVERWRITES each marker's textId2 with this name (goblin_inject.cpp), so this is the main
-location shown. The coarse tile/grace baseline baked by massedit_common.resolve_location_id_at
+location shown. The coarse tile/grace baseline baked by marker_common.resolve_location_id_at
 is the FALLBACK - kept for rows this resolver is silent on (overworld / no volume / no anchor).
 
 Emits:
@@ -12,7 +12,7 @@ Emits:
   - LOCATION_COMPOSE[]: synthetic ids for duplicate-named sub-zones ("Hallowhorn Grounds
                         (Nokron)") - goblin_messages composes the FMG string at runtime.
 
-Reads the baked entries straight from src/generated/goblin_map_data.cpp (row_id + areaNo/grid +
+Reads the baked entries straight from the packed table (row_id + areaNo/grid +
 posX/Y/Z + current textId2; posY recovered from source data where the cpp omits it). Overworld
 (areas 60/61) is left as-is. Must run AFTER generate_data.
 
@@ -49,7 +49,7 @@ WMPP = {int(w["ID"]): w for w in json.load(open(os.path.join(PROF, "WorldMapPoin
 WP = json.load(open(os.path.join(D, "WorldMapPointParam.json"), encoding="utf-8"))
 GR = json.load(open(os.path.join(PROF, "grace_position_index.json"), encoding="utf-8"))
 SENTINELS = {5000, 5100, 5300, 8800}  # textId2/3/4 logic sentinels - never override
-from massedit_common import OVERWORLD_AREAS as OVERWORLD  # {60, 61}: no location subtitle, keep baked
+from marker_common import OVERWORLD_AREAS as OVERWORLD  # {60, 61}: no location subtitle, keep baked
 
 # ---- MSB volume cache ----
 def _prop(o,n):
@@ -240,38 +240,31 @@ for fn,key in (("rune_pieces.json","map"),("ember_pieces.json","map")):
 # COORD_SHIFTS mirror of generate_data.py - unshift baked coords for spatial lookup
 COORD_SHIFTS={(11,10):(-2195.0,-352.0)}
 
-# ---- parse baked cpp ----
-CPP=str(config.GENERATED_DIR / "goblin_map_data.cpp")
-txt=open(CPP,encoding="utf-8").read()
-# split per entry: "{<id>ull, {" ... "}, Category::<cat>, <geom>, <suffix>, "name"|nullptr, <tail...>},"
-# Everything after the object name is swallowed without being spelled out: that tail has grown
-# three times (lotId/lotType, then real_pos, then lotAggregate + display_pos) and each time an
-# exact pattern silently matched NOTHING, which wrote an empty override table and broke the
-# build with a zero-size array. Anything that is not a brace belongs to this entry's tail.
-ENTRY=re.compile(r"\{(\d+)ull,\s*\{(.*?)\},\s*Category::(\w+),\s*(-?\d+),\s*(-?\d+),\s*(?:nullptr|\"([^\"]*)\")(?:,[^{}]*?)?\}", re.DOTALL)
-def fget(body,name):
-    m=re.search(r"\."+name+r"\s*=\s*(-?[\d.]+)f?", body)
-    return m.group(1) if m else None
+# ---- read the baked (packed) table ----
+import mapblob
+CPP=str(config.GENERATED_DIR / "goblin_map_blob_data.cpp")
+CATS={v:k for k,v in mapblob.category_index(config.PROJECT_DIR / "src" / "goblin_map_data.hpp").items()}
+baked=mapblob.read_cpp(CPP)
+if not baked:
+    raise SystemExit(f"ERROR: no entries in {CPP}. Refusing to write an empty override table.")
 
 entries=[]
-if not ENTRY.search(txt):
-    raise SystemExit(
-        f"ERROR: no entries parsed out of {CPP} - the emitted row shape changed and this\n"
-        f"       regex no longer matches it. Refusing to write an empty override table.")
-for m in ENTRY.finditer(txt):
-    rid=int(m.group(1)); body=m.group(2)
-    def gi(n):
-        v=fget(body,n); return int(float(v)) if v is not None else None
-    def gf(n):
-        v=fget(body,n); return float(v) if v is not None else 0.0
-    yv=fget(body,"posY")  # MASSEDIT generators omit posY when 0 - absent != 0 for our 3D math!
+for e in baked:
+    rid=e["row_id"]; body=e["fields"]
+    def gi(n,body=body):
+        v=body.get(n); return int(v) if v is not None else None
+    def gf(n,body=body):
+        v=body.get(n); return float(v) if v is not None else 0.0
+    # A generator omits posY when it has none, and the presence mask keeps that distinction:
+    # absent is NOT 0 for the 3D math below.
+    yv=body.get("posY")
     area=gi("areaNo") or 0; gx=gi("gridXNo") or 0; gz=gi("gridZNo") or 0
     x=gf("posX"); z=gf("posZ"); y=float(yv) if yv is not None else None
     # undo display-space shift so spatial lookup/volumes work in MSB-local space
     sh=COORD_SHIFTS.get((area,gx))
     if sh: x-=sh[0]; z-=sh[1]
     # pieces etc.: exact (tile, object_name) join beats coords entirely
-    oname=m.group(6)
+    oname=e["object_name"]
     if oname:
         src=_NIDX.get((area,gx,gz,oname))
         if src: x,y,z=src
@@ -287,8 +280,8 @@ for m in ENTRY.finditer(txt):
         if v is not None and 0<v<50000000 and v not in SENT:
             loc_slot=s; loc_val=v; break
     entries.append({"row_id":rid,"area":area,"gx":gx,"gz":gz,"x":x,"y":y,"z":z,
-                    "loc_slot":loc_slot,"loc_val":loc_val,"cat":m.group(3)})
-print(f"parsed {len(entries)} baked entries from goblin_map_data.cpp "
+                    "loc_slot":loc_slot,"loc_val":loc_val,"cat":CATS[e["category"]]})
+print(f"parsed {len(entries)} baked entries from the packed table "
       f"({sum(1 for e in entries if e['y'] is None)} without posY)")
 
 # ---- Y-recovery index: (area,gx,gz) -> {(round x, round z): [(x,z,y), ...]} ----
@@ -305,7 +298,7 @@ for r in json.load(open(os.path.join(PROF,"all_gathering_nodes_final.json"),enco
     mp=r.get("map","")
     if len(mp)<9: continue
     _yidx_add(int(mp[1:3]),int(mp[4:6]),int(mp[7:9]),float(r["x"]),float(r["z"]),float(r["y"]))
-# Rune/Ember pieces + graces: categories whose MASSEDIT rows often omit posY
+# Rune/Ember pieces + graces: categories whose marker rows often omit posY
 for r in (json.load(open(os.path.join(D,"all_pieces.json"),encoding="utf-8"))["pieces"]
           if os.path.exists(os.path.join(D,"all_pieces.json")) else []):
     mp=r.get("tile","")
@@ -402,7 +395,7 @@ extern const size_t LOCATION_COMPOSE_COUNT;
 """)
 with open(os.path.join(GEN,"goblin_location_alt.cpp"),"w",encoding="utf-8") as f:
     f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
-    f.write("// Generated by tools/generate_location_overrides.py from goblin_map_data.cpp + MSB/param data\n\n")
+    f.write("// Generated by tools/generate_location_overrides.py from the packed map table + MSB/param data\n\n")
     f.write('#include "goblin_location_alt.hpp"\n\n')
     f.write("namespace goblin::generated\n{\n\n")
     f.write(f"const size_t LOCATION_ALT_COUNT = {len(trips)};\n\n")

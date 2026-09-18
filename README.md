@@ -85,14 +85,14 @@ MSB + regulation.bin + EMEVD
     ├─► scan_emevd_awards.py        → emevd_lot_mapping.json
     ├─► enrich_fallback_with_emevd.py (upgrades unmatched records in-place)
     │
-    ├─► generate_loot_massedit.py   → 50+ Loot/Equipment/Key/Quest/Magic MASSEDIT
-    ├─► generate_pieces_massedit.py → Rune/Ember MASSEDIT + slot mappings
+    ├─► generate_loot.py   → 50+ Loot/Equipment/Key/Quest/Magic .rows
+    ├─► generate_pieces.py → Rune/Ember .rows + slot mappings
     ├─► generate_material_nodes.py, generate_graces.py, generate_summoning_pools.py,
     │   generate_spirit_springs.py, generate_imp_statues.py, generate_stakes.py,
     │   generate_paintings.py, generate_maps.py, generate_gestures.py,
-    │   generate_hostile_npcs.py    → world-infrastructure MASSEDIT
+    │   generate_hostile_npcs.py    → world-infrastructure .rows
     │
-    └─► generate_data.py → goblin_map_data.cpp + goblin_legacy_conv.hpp
+    └─► generate_data.py → goblin_map_blob_data.cpp + goblin_legacy_conv.hpp
                               │
                               └─► build.bat → MapForGoblins.dll
 ```
@@ -117,7 +117,7 @@ MapForGoblins/
 │   └── goblin/             Mod-specific headers (structs, flags, tiles)
 ├── tracker/                RunePieceTracker - standalone piece tracking DLL
 ├── data/
-│   ├── massedit_generated/ MASSEDIT files (auto-generated map icon definitions)
+│   ├── rows_generated/     Generated marker rows (binary, one file per category)
 │   └── *.json, *.csv       Extracted game data (items, entity index, EMEVD map, ...)
 ├── tools/                  Python scripts (extraction, generation, analysis)
 │   ├── lib/                Andre.SoulsFormats.dll + dependencies

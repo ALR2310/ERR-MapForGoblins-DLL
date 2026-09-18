@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate Loot - Gestures.MASSEDIT - auto-discovered via gesture template.
+Generate Loot - Gestures.rows - auto-discovered via gesture template.
 
 Common event 90005570 is ER's gesture-spawn template: it sets a gesture
 flag when player interacts with a specific asset. We scan Event 0 across
@@ -17,6 +17,7 @@ conflict with clean auto-generation.
 import sys, io, os, tempfile, struct, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import config
+import rowsink
 from pathlib import Path
 from pythonnet import load
 load('coreclr')
@@ -35,7 +36,7 @@ def _safe_unlink(path):
         pass
 
 
-from massedit_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS
+from marker_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS
 
 asm = Assembly.LoadFrom(str(config.SOULSFORMATS_DLL))
 _str_type = SysType.GetType('System.String')
@@ -149,38 +150,36 @@ def main():
     gesture_items = load_gesture_items()
     print(f'GestureParam itemIds: {len(gesture_items)}')
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("Loot - Gestures")  # z-order slot; see row_id_registry
     unnamed = 0
     for r in uniq:
         disp = get_disp_mask(r['area'])
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("gestures")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {r["area"]};')
+        fields = {'iconId': __import__("icon_registry").iconid("gestures"), disp: 1,
+                  'areaNo': r['area']}
         if r['gx'] > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {r["gx"]};')
+            fields['gridXNo'] = r['gx']
         if r['gz'] > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {r["gz"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {r["x"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {r["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {r["z"]:.3f};')
+            fields['gridZNo'] = r['gz']
+        fields['posX'] = r['x']
+        fields['posY'] = r['y']
+        fields['posZ'] = r['z']
         # Gesture name: GestureParam.itemId = the gesture's goods id, whose name the DLL
         # copies from GoodsName FMG at the 500M offset. Markers with no text lines at all
         # do NOT render in-game, so the name line is required.
         item_id = gesture_items.get(r['gesture_param'], 0)
         if item_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {500000000 + item_id};')
+            fields['textId1'] = 500000000 + item_id
         else:
             unnamed += 1
-        lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {r["flag"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+        fields['textDisableFlagId1'] = r['flag']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
     if unnamed:
         print(f'WARNING: {unnamed} gesture markers without GestureParam itemId (will not render)')
 
-    out = OUT_DIR / 'Loot - Gestures.MASSEDIT'
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out = sink.write(OUT_DIR / 'Loot - Gestures.rows')
     print(f'Written {len(uniq)} gesture entries to {out.name}')
     for r in uniq:
         print(f'  flag={r["flag"]} map={r["map"]} pos=({r["x"]:.2f},{r["y"]:.2f},{r["z"]:.2f}) model={r["model"]}')

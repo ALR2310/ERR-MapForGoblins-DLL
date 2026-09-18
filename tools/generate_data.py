@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Generate C++ source files from MASSEDIT data.
+Bake the generated marker rows into the DLL's own data.
 
-Parses all .MASSEDIT files to create WorldMapPointParam entries;
-also emits dungeon→overworld conversion table from WorldMapLegacyConvParam.
+Reads every category's .rows file (tools/rowsink.py wrote them) and packs the whole map table into
+one deflated blob. It used to emit the same table as 3.34 MB of C++ brace initialisers per profile,
+which MSVC then parsed on every build of all nine and shipped as 2.14 MB of .rdata.
 
 Output:
-  - src/generated/goblin_map_data.cpp  (param entries; the Category enum and the struct are
-                                        declared in the hand-maintained src/goblin_map_data.hpp)
-  - src/generated/goblin_legacy_conv.hpp (dungeon coord conversion)
+  - src/generated/goblin_map_blob_data.cpp  (the packed table as a byte array; src/goblin_map_blob.cpp
+                                             expands it at startup into the MapEntry array declared
+                                             in the hand-maintained src/goblin_map_data.hpp)
+  - src/generated/goblin_legacy_conv.hpp    (dungeon coord conversion)
 
 Localization is handled by the DLL at runtime via FMG offset-encoding
 (textId = real_id + category_offset), so no text compilation step is needed.
@@ -21,7 +23,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Category mapping: MASSEDIT filename prefix -> Category enum
+import mapblob
+
+# Category mapping: row-file name -> Category enum
 CATEGORY_MAP = {
     "Equipment - Armaments": "EquipArmaments",
     "Equipment - Armour": "EquipArmour",
@@ -93,116 +97,11 @@ CATEGORY_MAP = {
     "World - Hero's Tomb Statues": "WorldInteractables",
 }
 
-# MASSEDIT field name -> C++ struct field name and type
-# Types: u16=unsigned short, u32=unsigned int, i32=int, f=float, u8=unsigned char, bit=bitfield
-FIELD_MAP = {
-    "iconId": ("iconId", "u16"),
-    "dispMask00": ("dispMask00", "bit"),
-    "dispMask01": ("dispMask01", "bit"),
-    "dispMinZoomStep": ("dispMinZoomStep", "u8"),
-    "areaNo": ("areaNo", "u8"),
-    "gridXNo": ("gridXNo", "u8"),
-    "gridZNo": ("gridZNo", "u8"),
-    "posX": ("posX", "f"),
-    "posY": ("posY", "f"),
-    "posZ": ("posZ", "f"),
-    "textId1": ("textId1", "i32"),
-    "textId2": ("textId2", "i32"),
-    "textId3": ("textId3", "i32"),
-    "textId4": ("textId4", "i32"),
-    "textId5": ("textId5", "i32"),
-    "textId6": ("textId6", "i32"),
-    "textId7": ("textId7", "i32"),
-    "textId8": ("textId8", "i32"),
-    "textEnableFlagId1": ("textEnableFlagId1", "u32"),
-    "textEnableFlagId2": ("textEnableFlagId2", "u32"),
-    "textEnableFlagId4": ("textEnableFlagId4", "u32"),
-    "textEnableFlagId5": ("textEnableFlagId5", "u32"),
-    "textDisableFlagId1": ("textDisableFlagId1", "u32"),
-    "textDisableFlagId2": ("textDisableFlagId2", "u32"),
-    "textDisableFlagId3": ("textDisableFlagId3", "u32"),
-    "textDisableFlagId4": ("textDisableFlagId4", "u32"),
-    "textDisableFlagId5": ("textDisableFlagId5", "u32"),
-    "textDisableFlagId6": ("textDisableFlagId6", "u32"),
-    "textDisableFlagId7": ("textDisableFlagId7", "u32"),
-    "textDisableFlagId8": ("textDisableFlagId8", "u32"),
-    "selectMinZoomStep": ("selectMinZoomStep", "u8"),
-    "eventFlagId": ("eventFlagId", "u32"),
-    "clearedEventFlagId": ("clearedEventFlagId", "u32"),
-    "textType2": ("textType2", "u8"),
-    "textType3": ("textType3", "u8"),
-    # pad2_0 is a 6-bit field at bits 2-7 of byte 0x18
-    # value 1 = bit 2 set = dispMask02 in our struct (DLC map layer)
-    "pad2_0": ("dispMask02", "bit"),
-    # unkC0-unkDC map to textEnableFlag2Id1-8
-    "unkC0": ("textEnableFlag2Id1", "i32"),
-    "unkC4": ("textEnableFlag2Id2", "i32"),
-    "unkC8": ("textEnableFlag2Id3", "i32"),
-    "unkCC": ("textEnableFlag2Id4", "i32"),
-    "unkD0": ("textEnableFlag2Id5", "i32"),
-    "unkD4": ("textEnableFlag2Id6", "i32"),
-    "unkD8": ("textEnableFlag2Id7", "i32"),
-    "unkDC": ("textEnableFlag2Id8", "i32"),
-    # Group-2 gate flags addressed by their real paramdef names (what
-    # generate_loot_massedit emits for switched chests). Group1 is the DLL's
-    # category/live-loot lane; group2 is baked straight through (see memcpy in
-    # inject_map_entries) so a marker's icon can be gated on a world-state flag.
-    # textDisableFlag2Id1 had NO mapping before, so it was silently dropped.
-    # Slots 2-8 likewise need explicit massedit-name mappings: a switched-chest
-    # marker gates EVERY populated text line (item + location + enemy), not just
-    # slot 1, so the engine hides the whole icon in the wrong world-state.
-    "textEnableFlag2Id1": ("textEnableFlag2Id1", "i32"),
-    "textEnableFlag2Id2": ("textEnableFlag2Id2", "i32"),
-    "textEnableFlag2Id3": ("textEnableFlag2Id3", "i32"),
-    "textEnableFlag2Id4": ("textEnableFlag2Id4", "i32"),
-    "textEnableFlag2Id5": ("textEnableFlag2Id5", "i32"),
-    "textEnableFlag2Id6": ("textEnableFlag2Id6", "i32"),
-    "textEnableFlag2Id7": ("textEnableFlag2Id7", "i32"),
-    "textEnableFlag2Id8": ("textEnableFlag2Id8", "i32"),
-    "textDisableFlag2Id1": ("textDisableFlag2Id1", "i32"),
-    "textDisableFlag2Id2": ("textDisableFlag2Id2", "i32"),
-    "textDisableFlag2Id3": ("textDisableFlag2Id3", "i32"),
-    "textDisableFlag2Id4": ("textDisableFlag2Id4", "i32"),
-    "textDisableFlag2Id5": ("textDisableFlag2Id5", "i32"),
-    "textDisableFlag2Id6": ("textDisableFlag2Id6", "i32"),
-    "textDisableFlag2Id7": ("textDisableFlag2Id7", "i32"),
-    "textDisableFlag2Id8": ("textDisableFlag2Id8", "i32"),
-}
-
-# C++ struct field order (must match WORLD_MAP_POINT_PARAM_ST declaration)
-CPP_FIELD_ORDER = [
-    "eventFlagId", "distViewEventFlagId", "iconId", "bgmPlaceType",
-    "isAreaIcon", "isOverrideDistViewMarkPos", "isEnableNoText",
-    "areaNo_forDistViewMark", "gridXNo_forDistViewMark", "gridZNo_forDistViewMark",
-    "clearedEventFlagId",
-    "dispMask00", "dispMask01", "dispMask02",
-    "distViewIconId", "angle",
-    "areaNo", "gridXNo", "gridZNo",
-    "posX", "posY", "posZ",
-    "textId1", "textEnableFlagId1", "textDisableFlagId1",
-    "textId2", "textEnableFlagId2", "textDisableFlagId2",
-    "textId3", "textEnableFlagId3", "textDisableFlagId3",
-    "textId4", "textEnableFlagId4", "textDisableFlagId4",
-    "textId5", "textEnableFlagId5", "textDisableFlagId5",
-    "textId6", "textEnableFlagId6", "textDisableFlagId6",
-    "textId7", "textEnableFlagId7", "textDisableFlagId7",
-    "textId8", "textEnableFlagId8", "textDisableFlagId8",
-    "textType1", "textType2", "textType3", "textType4",
-    "textType5", "textType6", "textType7", "textType8",
-    "distViewId", "posX_forDistViewMark", "posY_forDistViewMark", "posZ_forDistViewMark",
-    "distViewId1", "distViewId2", "distViewId3",
-    "dispMinZoomStep", "selectMinZoomStep", "entryFEType",
-    "textEnableFlag2Id1", "textEnableFlag2Id2", "textEnableFlag2Id3", "textEnableFlag2Id4",
-    "textEnableFlag2Id5", "textEnableFlag2Id6", "textEnableFlag2Id7", "textEnableFlag2Id8",
-    "textDisableFlag2Id1", "textDisableFlag2Id2", "textDisableFlag2Id3", "textDisableFlag2Id4",
-    "textDisableFlag2Id5", "textDisableFlag2Id6", "textDisableFlag2Id7", "textDisableFlag2Id8",
-]
-
 # Fields to skip
 SKIP_FIELDS = {"Name", "pad4"}
 
 
-# ERR-only MASSEDIT categories: never bake these in the vanilla profile, even
+# ERR-only categories: never bake these in the vanilla profile, even
 # if a stale file is present in the (gitignored) vanilla output dir.
 ERR_ONLY_FILES = {
     "Reforged - Rune Pieces", "Reforged - Ember Pieces",
@@ -211,12 +110,18 @@ ERR_ONLY_FILES = {
 }
 
 
-def parse_massedit_files(massedit_dir):
-    """Parse all .MASSEDIT files and return dict of {row_id: {field: value, ..., '_category': str}}"""
+def parse_row_files(rows_dir):
+    """Read every category's .rows file -> {row_id: {field: value_str, ..., '_category': str}}.
+
+    Values stay strings: the interior coord fix below re-formats with :.3f, and build_map_records
+    converts once at the end. Floats are rendered at 3 decimals, which is what every generator wrote
+    when this was a text format, so the baked value is unchanged by the move off it.
+    """
     import config
+    import rowsink
     entries = defaultdict(dict)
 
-    for filepath in sorted(Path(massedit_dir).glob("*.MASSEDIT")):
+    for filepath in sorted(Path(rows_dir).glob("*.rows")):
         filename = filepath.stem
         if config.PROFILE != 'err' and filename in ERR_ONLY_FILES:
             print(f"SKIP (ERR-only): {filename}")
@@ -227,31 +132,20 @@ def parse_massedit_files(massedit_dir):
             category = re.sub(r'[^A-Za-z0-9]', '', filename.replace(' - ', '_').replace(' ', '_'))
             print(f"INFO: Auto-category for '{filename}' -> {category}")
 
-        # Parse: param WorldMapPointParam: id XXXXX: fieldName: = value;
-        pattern = re.compile(
-            r"param\s+WorldMapPointParam:\s+id\s+(\d+):\s+(\w+):\s*=\s*(.+);"
-        )
-
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        for row_id, fields in rowsink.read(filepath):
+            for field, value in fields.items():
+                if field in SKIP_FIELDS:
                     continue
-                m = pattern.match(line)
-                if m:
-                    row_id = int(m.group(1))
-                    field = m.group(2)
-                    value = m.group(3).strip()
-
-                    if field in SKIP_FIELDS:
-                        continue
-
-                    if field not in FIELD_MAP:
-                        print(f"WARNING: Unknown field '{field}' in {filename}, skipping")
-                        continue
-
-                    entries[row_id][field] = value
-                    entries[row_id]["_category"] = category
+                if field not in mapblob.FIELD_ORDER:
+                    # rowsink refuses an unknown name at the call site, so reaching this means the
+                    # packer's field list has drifted from rowsink's - worth saying loudly rather
+                    # than dropping a field the generator meant to write.
+                    print(f"WARNING: '{field}' in {filename} has no slot in the packed record, "
+                          f"skipping")
+                    continue
+                entries[row_id][field] = (f"{value:.3f}" if isinstance(value, float)
+                                          else str(value))
+            entries[row_id]["_category"] = category
 
     # Fix interior areas that don't display correctly on overworld
     # e.g. m11_10 (Roundtable Hold) - MSB coords land in ocean
@@ -274,32 +168,11 @@ def parse_massedit_files(massedit_dir):
     return entries
 
 
-def format_value(cpp_field, cpp_type, raw_value):
-    if cpp_type == "f":
-        v = raw_value.rstrip(";").strip()
-        if "." not in v:
-            v += ".f"
-        else:
-            v += "f"
-        return v
-    elif cpp_type in ("u32", "u16", "u8"):
-        return str(int(float(raw_value)))
-    elif cpp_type == "i32":
-        return str(int(float(raw_value)))
-    elif cpp_type == "bit":
-        v = int(float(raw_value))
-        return "true" if v else "false"
-    elif cpp_type == "arr1":
-        v = int(float(raw_value))
-        return "{" + str(v) + "}"
-    return raw_value
-
-
-def load_piece_metadata(massedit_dir):
+def load_piece_metadata(rows_dir):
     """Load geom_slot and name_suffix from *_slots.json files.
     Returns dict: row_id (int) -> {geom_slot: int, name_suffix: int}."""
     meta = {}
-    for path in Path(massedit_dir).glob("*_slots.json"):
+    for path in Path(rows_dir).glob("*_slots.json"):
         with open(path) as f:
             data = json.load(f)
         for row_id_str, val in data.items():
@@ -312,7 +185,7 @@ def load_piece_metadata(massedit_dir):
 
 
 def _load_lot_linkage():
-    """row_id(int) -> (lotId, lotType, aggregate) from generate_loot_massedit's side file.
+    """row_id(int) -> (lotId, lotType, aggregate) from generate_loot's side file.
     Older side files carry two numbers; those markers are not aggregates."""
     import config
     p = config.DATA_DIR / 'loot_lot_linkage.json'
@@ -324,87 +197,68 @@ def _load_lot_linkage():
             for k, v in raw.items()}
 
 
-def generate_map_data_cpp(entries, output_path, geom_slots=None, orig_xz=None):
-    """Generate goblin_map_data.cpp with all param entries."""
+def build_map_records(entries, geom_slots=None):
+    """The map table as plain records, row_id order - the input to tools/mapblob.pack().
+
+    This used to write 3.34 MB of C++ brace initialisers straight out; the records exist as their
+    own step because the packer and the verification both read them.
+    """
     if geom_slots is None:
         geom_slots = {}
-    if orig_xz is None:
-        orig_xz = {}
 
     lot_linkage = _load_lot_linkage()
+    records = []
 
-    # Sort entries by row_id
-    sorted_ids = sorted(entries.keys())
+    for row_id in sorted(entries.keys()):
+        fields = entries[row_id]
+        category = fields.get("_category", "World")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
-        f.write("// Generated by tools/generate_data.py from MASSEDIT files\n\n")
-        f.write('#include "../goblin_map_data.hpp"\n\n')
-        f.write("namespace goblin::generated\n{\n\n")
+        # Values arrive as strings (the row files render positions at 3 decimals). int(float(v))
+        # rather than int(v) because that is what the old text emitter did, and an integer field
+        # that arrived as "5.0" has to land on 5, not raise.
+        param = {}
+        for row_field, raw_value in fields.items():
+            if row_field.startswith("_") or row_field in SKIP_FIELDS:
+                continue
+            param[row_field] = (float(raw_value) if row_field in mapblob.FLOAT_FIELDS
+                                else int(float(raw_value)))
 
-        f.write(f"const size_t MAP_ENTRY_COUNT = {len(sorted_ids)};\n\n")
-        f.write("const MapEntry MAP_ENTRIES[] = {\n")
+        meta = geom_slots.get(row_id, {})
+        slot = meta.get('geom_slot', -1) if isinstance(meta, dict) else meta
+        suffix = meta.get('name_suffix', -1) if isinstance(meta, dict) else -1
+        obj_name = meta.get('object_name', '') if isinstance(meta, dict) else ''
+        lot_id, lot_type, lot_aggregate = lot_linkage.get(row_id, (0, 0, 0))
+        # real_posX/real_posZ: where collected tracking has to look. Normally the marker's
+        # own position, but a piece whose DISPLAY position was moved onto its pickup target
+        # carries the MSB position of the asset itself in the slots side file - that is where
+        # the live CSWorldGeomIns sits, so that is what tracking must match. Emitted separately
+        # for exactly that case: feeding the MSB position back into the row would move the marker.
+        rx, rz = fields.get("posX", "0"), fields.get("posZ", "0")
+        if isinstance(meta, dict) and 'msb_x' in meta and 'msb_z' in meta:
+            rx, rz = meta['msb_x'], meta['msb_z']
 
-        for row_id in sorted_ids:
-            fields = entries[row_id]
-            category = fields.get("_category", "World")
+        records.append({
+            "row_id": row_id, "category": category, "fields": param,
+            "geom_slot": int(slot), "name_suffix": int(suffix), "object_name": obj_name,
+            "lotId": lot_id, "lotType": lot_type, "lotAggregate": lot_aggregate,
+            "real_posX": float(rx), "real_posZ": float(rz),
+        })
+    return records
 
-            f.write(f"    // Row ID {row_id}\n")
-            f.write(f"    {{{row_id}ull, {{\n")
 
-            field_dict = {}
-            for massedit_field, raw_value in fields.items():
-                if massedit_field.startswith("_"):
-                    continue
-                if massedit_field in SKIP_FIELDS:
-                    continue
-                cpp_field, cpp_type = FIELD_MAP[massedit_field]
-                formatted = format_value(cpp_field, cpp_type, raw_value)
-                field_dict[cpp_field] = formatted
-
-            field_assignments = []
-            for cpp_field in CPP_FIELD_ORDER:
-                if cpp_field in field_dict:
-                    field_assignments.append((cpp_field, field_dict[cpp_field]))
-
-            for cpp_field, formatted in field_assignments:
-                f.write(f"        .{cpp_field} = {formatted},\n")
-
-            meta = geom_slots.get(row_id, {})
-            slot = meta.get('geom_slot', -1) if isinstance(meta, dict) else meta
-            suffix = meta.get('name_suffix', -1) if isinstance(meta, dict) else -1
-            obj_name = meta.get('object_name', '') if isinstance(meta, dict) else ''
-            lot_id, lot_type, lot_aggregate = lot_linkage.get(row_id, (0, 0, 0))
-            name_field = f'"{obj_name}"' if obj_name else 'nullptr'
-            # real_posX/real_posZ = pre-de-overlap MSB-true coords (fall back to the
-            # possibly-shifted display pos if not snapshotted) for collected tracking.
-            rx, rz = orig_xz.get(row_id, (fields.get("posX", "0"), fields.get("posZ", "0")))
-            # That pair (which already carries the interior coord shift) is the DISPLAY
-            # anchor. Tracking starts from the same place but a piece whose display position
-            # was moved onto its pickup target carries the MSB position of the asset itself
-            # in the slots side file - that is where the live CSWorldGeomIns sits, so that
-            # is what collected-tracking must match. The two are emitted separately: feeding
-            # the MSB position back into the display anchor moved the marker itself.
-            dx, dz = rx, rz
-            if isinstance(meta, dict) and 'msb_x' in meta and 'msb_z' in meta:
-                rx, rz = meta['msb_x'], meta['msb_z']
-            rx = format_value("real_posX", "f", str(rx))
-            rz = format_value("real_posZ", "f", str(rz))
-            dx = format_value("display_posX", "f", str(dx))
-            dz = format_value("display_posZ", "f", str(dz))
-            f.write(f"    }}, Category::{category}, {slot}, {suffix}, {name_field}, "
-                    f"{lot_id}u, {lot_type}, {lot_aggregate}, {rx}, {rz}, {dx}, {dz}}},\n")
-
-        f.write("};\n\n")
-        f.write("} // namespace goblin::generated\n")
-
-    print(f"Generated {output_path} with {len(sorted_ids)} entries")
+def generate_map_blob_cpp(records, output_path, header_path):
+    """Pack the records and emit them as the deflated byte array the DLL expands at startup."""
+    categories = mapblob.category_index(header_path)
+    raw = mapblob.pack(records, categories)
+    raw_len, packed_len = mapblob.write_cpp(raw, output_path)
+    print(f"Generated {output_path}: {len(records)} entries, "
+          f"{raw_len / 1024:.0f} KB packed -> {packed_len / 1024:.0f} KB deflated")
 
 
 def generate_item_icons_cpp(output_path):
     """Generate goblin_item_icons.cpp: encoded-item-key -> (iconId, Category).
 
-    Source = item_icon_table.json from generate_loot_massedit (the same ordered
+    Source = item_icon_table.json from generate_loot (the same ordered
     LOOT_CATEGORIES classifier, applied per item). Lets the DLL re-icon and
     re-gate a lot-backed marker from the LIVE randomized item. Sorted by key
     for binary search."""
@@ -575,18 +429,18 @@ def generate_enemy_names_cpp(output_path):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--massedit-dir", type=str, default=None,
-                        help="Path to MASSEDIT directory (default: data/massedit_generated; "
-                             "the pipeline passes the active profile's massedit_generated)")
+    parser.add_argument("--rows-dir", type=str, default=None,
+                        help="Path to the generated rows directory (default: data/rows_generated; "
+                             "the pipeline passes the active profile's rows_generated)")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
     project_dir = script_dir.parent
 
-    if args.massedit_dir:
-        massedit_dir = Path(args.massedit_dir)
+    if args.rows_dir:
+        rows_dir = Path(args.rows_dir)
     else:
-        massedit_dir = project_dir / "data" / "massedit_generated"
+        rows_dir = project_dir / "data" / "rows_generated"
     import config
     output_dir = config.GENERATED_DIR  # src/generated or src/generated_vanilla
 
@@ -599,8 +453,8 @@ def main():
     # source that left git with src/generated/. Older bake dirs may still hold those copies; the
     # "../" include never reads them.
 
-    print("=== Parsing MASSEDIT files ===")
-    entries = parse_massedit_files(massedit_dir)
+    print("=== Reading generated rows ===")
+    entries = parse_row_files(rows_dir)
     print(f"Total unique entries: {len(entries)}")
 
     # Tiles the game's world-map converter refuses (custom overhaul maps with no
@@ -647,115 +501,14 @@ def main():
             print(f"Dropped {sum(_dropped.values())} rows on tiles the engine cannot project: "
                   + ", ".join(f"{t}={n}" for t, n in sorted(_dropped.items())))
 
-    # Snapshot REAL (MSB-true) X/Z BEFORE the de-overlap pass shifts them. Collected-
-    # geometry tracking (goblin_collected) matches a marker to its live CSWorldGeomMan
-    # instance by position; the spiral de-overlap below can move a tracked node up to
-    # ~15u from its real coords, which broke immediate WGM hiding (it then only hid via
-    # GEOF on tile reload). Baked as real_posX/real_posZ so tracking uses the true pos.
-    orig_xz = {rid: (f.get("posX", "0"), f.get("posZ", "0")) for rid, f in entries.items()}
-
-    # De-overlap: pull markers that sit within CLUSTER_RADIUS of each other (visually stacked on
-    # the map - even across categories, and even a few units apart) onto a square spiral
-    # SPIRAL_STEP apart around the cluster anchor. The old logic only grouped EXACT (0.1-rounded)
-    # coincident coords, so two markers a couple units apart - or the same pickup emitted at
-    # slightly different coords by two different generators - still rendered on top of each other.
-    # CLUSTER_RADIUS/SPIRAL_STEP are world units; bump if icons still overlap after a map rebuild.
-    print("\n=== De-overlapping icons ===")
-    SPIRAL_STEP = 8.0      # spacing between spiraled markers (proven to read as distinct icons)
-    CLUSTER_RADIUS = 8.0   # markers within this of a cluster anchor are treated as overlapping
-    # Bucket by tile first (markers can only collide within the same area + overworld grid cell),
-    # then greedily cluster by proximity inside each tile. Sorted iteration keeps anchors stable
-    # (deterministic output across rebuilds).
-    _tile_groups = {}  # (area, gx, gz) -> [(row_id, px, pz)]
-    for row_id in sorted(entries.keys()):
-        fields = entries[row_id]
-        area = fields.get("areaNo", "0")
-        gx = fields.get("gridXNo", "0")
-        gz = fields.get("gridZNo", "0")
-        px = float(fields.get("posX", "0"))
-        pz = float(fields.get("posZ", "0"))
-        _tile_groups.setdefault((area, gx, gz), []).append((row_id, px, pz))
-    coord_groups = []  # list of clusters; each = (anchor_px, anchor_pz, [row_ids...])
-    _r2 = CLUSTER_RADIUS * CLUSTER_RADIUS
-    for _items in _tile_groups.values():
-        _clusters = []  # each: [anchor_px, anchor_pz, [row_ids]]
-        for row_id, px, pz in _items:
-            _hit = None
-            for _cl in _clusters:
-                if (px - _cl[0]) ** 2 + (pz - _cl[1]) ** 2 <= _r2:
-                    _hit = _cl
-                    break
-            if _hit is None:
-                _clusters.append([px, pz, [row_id]])
-            else:
-                _hit[2].append(row_id)
-        coord_groups.extend((c[0], c[1], c[2]) for c in _clusters)
-
-    def spiral_offsets(n):
-        """Generate n (dx, dz) offsets in a square spiral pattern.
-        (0,0), (0,-1), (1,-1), (1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1), (0,-2), ...
-        """
-        offsets = []
-        x = z = 0
-        d = 1  # current ring distance
-        offsets.append((0, 0))
-        while len(offsets) < n:
-            # Up: (0,-d)
-            for i in range(1, d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x, -i + z))
-            z -= d
-            # Right+down diagonal to (d, 0) relative
-            for i in range(1, d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x + i, z + i))
-            x += d; z += d
-            # Down
-            for i in range(1, d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x, z + i))
-            z += d
-            # Left
-            for i in range(1, 2 * d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x - i, z))
-            x -= 2 * d
-            # Up
-            for i in range(1, 2 * d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x, z - i))
-            z -= 2 * d
-            # Right (partial, to start next ring)
-            for i in range(1, d + 1):
-                if len(offsets) >= n: break
-                offsets.append((x + i, z))
-            x += d
-            d += 1
-        return offsets[:n]
-
-    shifted = 0
-    groups = 0
-    for ax, az, row_ids in coord_groups:
-        if len(row_ids) <= 1:
-            continue
-        groups += 1
-        offsets = spiral_offsets(len(row_ids))
-        for i, row_id in enumerate(row_ids):
-            if i == 0:
-                continue  # anchor stays in place; others spiral around it
-            ox, oz = offsets[i]
-            entries[row_id]["posX"] = f"{ax + ox * SPIRAL_STEP:.3f}"
-            entries[row_id]["posZ"] = f"{az + oz * SPIRAL_STEP:.3f}"
-            shifted += 1
-
-    print(f"  Shifted {shifted} entries across {groups} overlap clusters (radius {CLUSTER_RADIUS}u)")
-
     print("\n=== Loading piece metadata ===")
-    geom_slots = load_piece_metadata(massedit_dir)
+    geom_slots = load_piece_metadata(rows_dir)
     print(f"Loaded {len(geom_slots)} piece metadata entries")
 
     print("\n=== Generating map data C++ ===")
-    generate_map_data_cpp(entries, output_dir / "goblin_map_data.cpp", geom_slots, orig_xz)
+    records = build_map_records(entries, geom_slots)
+    generate_map_blob_cpp(records, output_dir / "goblin_map_blob_data.cpp",
+                          project_dir / "src" / "goblin_map_data.hpp")
 
     print("\n=== Generating item-icon table C++ ===")
     generate_item_icons_cpp(output_dir / "goblin_item_icons.cpp")

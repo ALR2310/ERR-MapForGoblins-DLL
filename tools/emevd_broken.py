@@ -8,7 +8,7 @@ restructured), the check returns False and the icon reappears
 automatically on rebuild.
 
 Used by:
-  - extract_all_items.py (treasures/enemy drops filtered before MASSEDIT generation)
+  - extract_all_items.py (treasures/enemy drops filtered before row generation)
 
 Add new entries via `BROKEN_SPAWNS` below. Each entry needs:
   - map: tile name

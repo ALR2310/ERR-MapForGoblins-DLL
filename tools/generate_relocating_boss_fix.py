@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Relocating-boss marker fix (currently: Ancient Dragon Lansseax).
+"""Detect relocating-boss flee-spawns (currently: Ancient Dragon Lansseax).
 
-A few vanilla bosses flee their first arena and become killable at a SECOND
-location (Lansseax: flies off at ~20% HP, then fought elsewhere). The drop is
-only obtainable at the kill-spawn, but the boss's lot/rune is also referenced at
-the flee-spawn MSB entity, so we generate DUPLICATE, un-collectable loot markers
-there - and the flee-spawn shows loot instead of "the boss was here, it left".
+A few vanilla bosses flee their first arena and become killable at a SECOND location (Lansseax:
+flies off at ~20% HP, then fought elsewhere). The drop is only obtainable at the kill-spawn, but the
+flee-spawn MSB entity references the same lot, so a naive generator would place duplicate,
+un-collectable loot there and clear the boss marker on the wrong flag.
 
-This post-pass (runs after the marker generators, before generate_data) edits the
-per-profile MASSEDIT to, for each detected flee-spawn:
-  * REMOVE the duplicate loot/rune markers (the real ones stay at the kill-spawn);
-  * ENSURE the flee-spawn boss marker clears on the FLEE flag (so it shows the
-    boss, then checkmarks once it flies off).
+This script only FINDS those spawns and caches them to data/relocating_flee_spawns.json. The
+generators read that list (tools/relocating_spawns.py) and never create the wrong rows in the first
+place - until 2026-09-18 this file instead rewrote the generated output afterwards, which is what
+forced the pipeline to keep an editable text intermediate.
 
 Detection is data-derived, no hardcoded boss list:
   relocating boss = ONE npcParamID placed at 2 tiles (from boss_list.json)
@@ -31,10 +29,6 @@ def _safe_unlink(path):
         os.unlink(path)
     except PermissionError:
         pass
-
-
-MASSEDIT_DIR = config.DATA_DIR / "massedit_generated"
-RADIUS = 50.0   # loot within this of the flee-spawn boss = its duplicate drop
 
 
 def _sf():
@@ -204,124 +198,18 @@ def detect_flee_spawns(refresh=False):
     return [{**d, "tile": tuple(d["tile"])} for d in data]
 
 
-# ── MASSEDIT row parsing ──────────────────────────────────────────────────────
-ROW = re.compile(r"^param WorldMapPointParam: id (\d+): (\w+): = (-?\d+(?:\.\d+)?);")
-
-
-def parse_rows(text):
-    """-> dict id -> dict field->value(str), preserving order via 'order' list."""
-    rows = collections.OrderedDict()
-    for ln in text.splitlines():
-        m = ROW.match(ln)
-        if not m:
-            continue
-        rid, field, val = int(m.group(1)), m.group(2), m.group(3)
-        rows.setdefault(rid, {})[field] = val
-    return rows
-
-
-def _at_tile(fields, tile):
-    return (int(float(fields.get("areaNo", -1))) == tile[0]
-            and int(float(fields.get("gridXNo", -1))) == tile[1]
-            and int(float(fields.get("gridZNo", -1))) == tile[2])
-
-
-def _has_enemy(fields, enemy_id):
-    return any(int(float(fields.get(f"textId{i}", 0))) == enemy_id for i in range(1, 9))
-
-
-def _near(fields, x, z):
-    try:
-        return (float(fields.get("posX", 1e9)) - x) ** 2 + (float(fields.get("posZ", 1e9)) - z) ** 2 <= RADIUS ** 2
-    except ValueError:
-        return False
-
-
 def main():
-    report = "--report" in sys.argv
-    spawns = detect_flee_spawns()
-    print(f"[relocating-boss-fix] profile={config.PROFILE} flee-spawns detected: {len(spawns)}")
+    """Detect the flee-spawns and cache them. The generators read the cache and never create the
+    rows that used to be repaired here."""
+    spawns = detect_flee_spawns(refresh="--refresh" in sys.argv)
+    print(f"[relocating-spawns] profile={config.PROFILE} flee-spawns detected: {len(spawns)}")
     for s in spawns:
         print(f"  {s.get('name') or s['model']} flee-spawn tile "
-              f"m{s['tile'][0]}_{s['tile'][1]}_{s['tile'][2]} flag={s['flag']} enemy_id={s['enemy_id']}")
-    if not spawns:
-        return
-
-    removed = boss_fixed = boss_added = 0
-
-    # ── World - Bosses: fix the flee-spawn boss flag, or ADD a marker if none ──
-    bf = MASSEDIT_DIR / "World - Bosses.MASSEDIT"
-    if bf.exists():
-        text = bf.read_text(encoding="utf-8")
-        rows = parse_rows(text)
-        fix_ids = {}          # rid -> flag (existing marker, wrong flag)
-        covered = set()       # spawn indices already shown at the flee-spawn
-        max_id = max((rid for rid in rows), default=9000000)
-        for rid, fields in rows.items():
-            for i, s in enumerate(spawns):
-                if _at_tile(fields, s["tile"]) and _has_enemy(fields, s["enemy_id"]) and _near(fields, s["x"], s["z"]):
-                    covered.add(i)
-                    if (fields.get("clearedEventFlagId") != str(s["flag"])
-                            or fields.get("textDisableFlagId1") != str(s["flag"])):
-                        fix_ids[rid] = s["flag"]
-        add = [(i, s) for i, s in enumerate(spawns) if i not in covered]
-        if report:
-            for rid, flag in sorted(fix_ids.items()):
-                print(f"  [World - Bosses] would SET row {rid} cleared/disable flag -> {flag}")
-            for i, s in add:
-                print(f"  [World - Bosses] would ADD boss marker at flee-spawn "
-                      f"m{s['tile'][0]}_{s['tile'][1]}_{s['tile'][2]} flag={s['flag']} enemy={s['enemy_id']}")
-        else:
-            out = []
-            for ln in text.splitlines():
-                m = ROW.match(ln)
-                if m and int(m.group(1)) in fix_ids and m.group(2) in ("clearedEventFlagId", "textDisableFlagId1"):
-                    ln = f"param WorldMapPointParam: id {int(m.group(1))}: {m.group(2)}: = {fix_ids[int(m.group(1))]};"
-                out.append(ln)
-            for n, (i, s) in enumerate(add):
-                rid = max_id + 1 + n
-                a, gx, gz = s["tile"]
-                out += [
-                    f"param WorldMapPointParam: id {rid}: iconId: = {__import__('icon_registry').iconid('bosses')};",
-                    f"param WorldMapPointParam: id {rid}: dispMask00: = 1;",
-                    f"param WorldMapPointParam: id {rid}: areaNo: = {a};",
-                    f"param WorldMapPointParam: id {rid}: gridXNo: = {gx};",
-                    f"param WorldMapPointParam: id {rid}: gridZNo: = {gz};",
-                    f"param WorldMapPointParam: id {rid}: posX: = {s['x']:.3f};",
-                    f"param WorldMapPointParam: id {rid}: posY: = {s.get('y',0.0):.3f};",
-                    f"param WorldMapPointParam: id {rid}: posZ: = {s['z']:.3f};",
-                    f"param WorldMapPointParam: id {rid}: textId1: = {s['enemy_id']};",
-                    f"param WorldMapPointParam: id {rid}: clearedEventFlagId: = {s['flag']};",
-                    f"param WorldMapPointParam: id {rid}: textDisableFlagId1: = {s['flag']};",
-                    f"param WorldMapPointParam: id {rid}: selectMinZoomStep: = 1;",
-                ]
-            bf.write_text("\n".join(out) + "\n", encoding="utf-8")
-        boss_fixed += len(fix_ids); boss_added += len(add)
-
-    # ── loot / rune files: remove the duplicate flee-spawn drops ──
-    for f in sorted(MASSEDIT_DIR.glob("*.MASSEDIT")):
-        if f.name == "World - Bosses.MASSEDIT":
-            continue
-        text = f.read_text(encoding="utf-8")
-        rows = parse_rows(text)
-        drop_ids = {rid for rid, fields in rows.items()
-                    for s in spawns
-                    if _at_tile(fields, s["tile"]) and _has_enemy(fields, s["enemy_id"]) and _near(fields, s["x"], s["z"])}
-        if not drop_ids:
-            continue
-        if report:
-            print(f"  [{f.name}] would REMOVE rows: {sorted(drop_ids)}")
-        else:
-            out = [ln for ln in text.splitlines()
-                   if not (ROW.match(ln) and int(ROW.match(ln).group(1)) in drop_ids)]
-            f.write_text("\n".join(out) + "\n", encoding="utf-8")
-        removed += len(drop_ids)
-
-    print(f"[relocating-boss-fix] removed {removed} duplicate loot/rune markers, "
-          f"fixed {boss_fixed} boss flag(s), added {boss_added} flee-spawn boss marker(s)")
-    if not report:   # sentinel (OUTSIDE massedit dir so it doesn't churn that dir's signature)
-        (config.DATA_DIR / "_relocating_boss_fix.done").write_text(
-            f"removed={removed} boss_fixed={boss_fixed} boss_added={boss_added}\n", encoding="utf-8")
+              f"m{s['tile'][0]}_{s['tile'][1]}_{s['tile'][2]} flag={s['flag']} "
+              f"enemy_id={s['enemy_id']}")
+    # Sentinel kept so the pipeline stage has a stable output to check.
+    (config.DATA_DIR / "_relocating_boss_fix.done").write_text(
+        f"spawns={len(spawns)}\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

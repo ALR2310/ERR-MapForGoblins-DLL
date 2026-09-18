@@ -3,11 +3,11 @@
 
 Produces, into config.DATA_DIR (data/ for err, data/vanilla/ for vanilla):
   - WorldMapLegacyConvParam.json : dungeon->overworld coord conversion table
-        (consumed by massedit_common.convert_legacy_coords and
+        (consumed by marker_common.convert_legacy_coords and
          generate_data.generate_legacy_conv_cpp). Without it, legacy-dungeon
          markers get raw local coords instead of overworld positions.
   - valid_location_ids.json      : the set of PlaceName FMG ids that actually
-        resolve to a string (consumed by massedit_common.resolve_location_id*
+        resolve to a string (consumed by marker_common.resolve_location_id*
         as the dungeon-subtitle fallback). Picking an id absent from the FMG
         is exactly the null-PlaceName crash risk, so this must be per-game.
 

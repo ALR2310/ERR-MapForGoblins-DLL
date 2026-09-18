@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Extract WorldMapPointParam from ERR regulation.bin using SoulsFormats.
-Exports to CSV for comparison with MASSEDIT files.
+Exports to CSV for comparison with row files.
 """
 
 import csv

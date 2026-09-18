@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate Loot - Material Nodes.MASSEDIT from MSB gathering nodes.
+Generate Loot - Material Nodes.rows from MSB gathering nodes.
 
 Scans all_gathering_nodes_final.json for one-time pickup nodes
 (isEnableRepick=True AND isHiddenOnRepick=True) and generates
-WorldMapPointParam MASSEDIT entries.
+WorldMapPointParam marker rows.
 
-Output: data/massedit_generated/Loot - Material Nodes.MASSEDIT
+Output: data/rows_generated/Loot - Material Nodes.rows
 """
 
 import json
@@ -14,13 +14,14 @@ import os
 import sys
 from pathlib import Path
 import config
-from massedit_common import (UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+import rowsink
+from marker_common import (UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at, is_dlc_plane)
 from unreachable import is_unreachable_in_err
 
 def main():
     data_dir = config.DATA_DIR          # data/ or data/vanilla/ per profile
-    out_dir = data_dir / "massedit_generated"
+    out_dir = data_dir / "rows_generated"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load mappings
@@ -49,7 +50,7 @@ def main():
 
     # One-time models: isEnableRepick=True AND isHiddenOnRepick=True.
     # AEG099_821 (Rune Piece) and AEG099_822 (Ember Piece) also match but are
-    # handled by generate_pieces_massedit.py - don't double-generate markers.
+    # handled by generate_pieces.py - don't double-generate markers.
     PIECES_MODELS = {"AEG099_821", "AEG099_822"}
     onetime_models = {}
     for e in aeg099 + aeg463:
@@ -145,7 +146,7 @@ def main():
         entries.append(entry)
         emitted_nodes.append(n)
 
-    print(f"Generated {len(entries)} MASSEDIT entries "
+    print(f"Generated {len(entries)} marker rows "
           f"({excluded_unreachable} skipped as unreachable)")
 
     # Write slots.json for geom tracking. Pair each entry with the node captured in
@@ -172,36 +173,37 @@ def main():
         json.dump(slots, f, indent=2)
     print(f"Written {len(slots)} slot entries to {slots_path}")
 
-    # Write MASSEDIT file
-    massedit_path = out_dir / "Loot - Material Nodes.MASSEDIT"
-    with open(massedit_path, "w", encoding="utf-8") as f:
-        for e in entries:
-            rid = e["id"]
-            f.write(f'param WorldMapPointParam: id {rid}: iconId: = {e["iconId"]};\n')
-            if "dispMask00" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: dispMask00: = {e["dispMask00"]};\n')
-            if "dispMask01" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: dispMask01: = {e["dispMask01"]};\n')
-            if "pad2_0" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: pad2_0: = {e["pad2_0"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: areaNo: = {e["areaNo"]};\n')
-            if "gridXNo" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: gridXNo: = {e["gridXNo"]};\n')
-            if "gridZNo" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: gridZNo: = {e["gridZNo"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: posX: = {e["posX"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: posY: = {e["posY"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: posZ: = {e["posZ"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: textId1: = {e["textId1"]};\n')
-            if "textDisableFlagId1" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: textDisableFlagId1: = {e["textDisableFlagId1"]};\n')
-            if "textId2" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: textId2: = {e["textId2"]};\n')
-            if "textDisableFlagId2" in e:
-                f.write(f'param WorldMapPointParam: id {rid}: textDisableFlagId2: = {e["textDisableFlagId2"]};\n')
-            f.write(f'param WorldMapPointParam: id {rid}: selectMinZoomStep: = {e["selectMinZoomStep"]};\n')
+    # Write row file
+    out_path = out_dir / "Loot - Material Nodes.rows"
+    # The record is rebuilt here rather than handed over as-is: `entries` carries its fields in the
+    # order the builder above happened to set them, while the file's order is this loop's. The two
+    # differ (id and selectMinZoomStep go in early there, the masks and grid last), so the sink is
+    # fed in THIS order - the one every consumer has ever seen.
+    sink = rowsink.RowSink()
+    for e in entries:
+        fields = {"iconId": e["iconId"]}
+        for mask in ("dispMask00", "dispMask01", "pad2_0"):
+            if mask in e:
+                fields[mask] = e[mask]
+        fields["areaNo"] = e["areaNo"]
+        for grid in ("gridXNo", "gridZNo"):
+            if grid in e:
+                fields[grid] = e[grid]
+        fields["posX"] = e["posX"]
+        fields["posY"] = e["posY"]
+        fields["posZ"] = e["posZ"]
+        fields["textId1"] = e["textId1"]
+        if "textDisableFlagId1" in e:
+            fields["textDisableFlagId1"] = e["textDisableFlagId1"]
+        if "textId2" in e:
+            fields["textId2"] = e["textId2"]
+        if "textDisableFlagId2" in e:
+            fields["textDisableFlagId2"] = e["textDisableFlagId2"]
+        fields["selectMinZoomStep"] = e["selectMinZoomStep"]
+        sink.add(e["id"], fields)
+    sink.write(out_path)
 
-    print(f"Written to {massedit_path}")
+    print(f"Written to {out_path}")
 
     # Summary
     from collections import Counter

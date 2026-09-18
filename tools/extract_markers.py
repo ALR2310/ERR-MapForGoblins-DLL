@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Extract map marker (beacon/stamp) coordinates from an Elden Ring save file
-and find nearby MASSEDIT entries.
+and find nearby marker rows.
 
 Usage:
     py extract_markers.py <save_file.err> [--slot N] [--radius R] [--category CAT]
@@ -255,27 +255,22 @@ def _load_legacy_conv(data_dir):
     }
 
 
-def load_massedit_entries(massedit_dir, category_filter=None):
-    """Load all MASSEDIT entries with their overworld coordinates."""
-    legacy_conv = _load_legacy_conv(Path(massedit_dir).parent)
-    pattern = re.compile(
-        r"param\s+WorldMapPointParam:\s+id\s+(\d+):\s+(\w+):\s*=\s*(.+);"
-    )
+def load_row_entries(rows_dir, category_filter=None):
+    """Load all marker rows with their overworld coordinates."""
+    import rowsink
+    legacy_conv = _load_legacy_conv(Path(rows_dir).parent)
     entries = defaultdict(dict)
     entry_category = {}
-    for filepath in sorted(Path(massedit_dir).glob("*.MASSEDIT")):
+    for filepath in sorted(Path(rows_dir).glob("*.rows")):
         cat = filepath.stem
         if category_filter and category_filter.lower() not in cat.lower():
             continue
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                m = pattern.match(line.strip())
-                if m:
-                    row_id = int(m.group(1))
-                    field = m.group(2)
-                    value = m.group(3).strip()
-                    entries[row_id][field] = value
-                    entry_category[row_id] = cat
+        for row_id, fields in rowsink.read(filepath):
+            # Values stay strings: the float()/int() calls below were written against the text
+            # format and read the same either way.
+            for field, value in fields.items():
+                entries[row_id][field] = str(value)
+            entry_category[row_id] = cat
 
     result = []
     skipped_dungeon = 0
@@ -324,14 +319,14 @@ def load_massedit_entries(massedit_dir, category_filter=None):
     return result
 
 
-def find_nearby(marker, massedit_entries, radius, area_filter=None):
-    """Find MASSEDIT entries within radius of a marker's world position.
+def find_nearby(marker, row_entries, radius, area_filter=None):
+    """Find marker rows within radius of a marker's world position.
     If area_filter is set, only match entries from that area (or dungeons mapped to it).
     If None, match area 60 and 61 (overworld grids overlap)."""
     wx, wz = map_to_world(marker["map_x"], marker["map_z"])
     nearby = []
     overworld = {60, 61}
-    for entry in massedit_entries:
+    for entry in row_entries:
         if area_filter is not None:
             if entry["area"] != area_filter and entry.get("dst_area") != area_filter:
                 continue
@@ -365,15 +360,15 @@ def main():
         help="Search radius in world units (default: 300)",
     )
     parser.add_argument(
-        "--category", type=str, default=None, help="Filter MASSEDIT by category name"
+        "--category", type=str, default=None, help="Filter rows by category name"
     )
     parser.add_argument(
-        "--massedit-dir", type=str, default=None,
-        help="Path to a MASSEDIT directory (REQUIRED unless --no-massedit), "
-             "e.g. data/massedit_generated"
+        "--rows-dir", type=str, default=None,
+        help="Path to a rows directory (REQUIRED unless --no-rows), "
+             "e.g. data/rows_generated"
     )
     parser.add_argument(
-        "--no-massedit", action="store_true", help="Skip MASSEDIT lookup, just show markers"
+        "--no-rows", action="store_true", help="Skip the row lookup, just show markers"
     )
     args = parser.parse_args()
 
@@ -388,7 +383,7 @@ def main():
     print(f"Found {len(markers)} marker(s) in slot {args.slot}: {len(beacons)} beacons, {len(stamps)} stamps")
     print()
 
-    if args.no_massedit:
+    if args.no_rows:
         for marker in markers:
             wx, wz = map_to_world(marker["map_x"], marker["map_z"])
             gx, gz, _, _ = world_to_tile(wx, wz)
@@ -402,21 +397,21 @@ def main():
             )
         return
 
-    # MASSEDIT directory must be given explicitly (no default - the build's
-    # markers live in the active profile's data/<profile>/massedit_generated/,
+    # rows directory must be given explicitly (no default - the build's
+    # markers live in the active profile's data/<profile>/rows_generated/,
     # so there is no single sensible default to assume).
-    massedit_dir = args.massedit_dir
-    if not massedit_dir:
-        print("ERROR: --massedit-dir is required. Point it at a MASSEDIT directory, "
-              "e.g. data/massedit_generated (or data/<profile>/massedit_generated for a "
-              "non-ERR profile). Use --no-massedit to skip the lookup entirely.")
+    rows_dir = args.rows_dir
+    if not rows_dir:
+        print("ERROR: --rows-dir is required. Point it at a rows directory, "
+              "e.g. data/rows_generated (or data/<profile>/rows_generated for a "
+              "non-ERR profile). Use --no-rows to skip the lookup entirely.")
         sys.exit(1)
-    if not Path(massedit_dir).exists():
-        print(f"ERROR: MASSEDIT directory not found: {massedit_dir}")
+    if not Path(rows_dir).exists():
+        print(f"ERROR: rows directory not found: {rows_dir}")
         sys.exit(1)
 
-    massedit_entries = load_massedit_entries(massedit_dir, args.category)
-    print(f"Loaded {len(massedit_entries)} MASSEDIT entries (overworld + dungeon)")
+    row_entries = load_row_entries(rows_dir, args.category)
+    print(f"Loaded {len(row_entries)} marker rows (overworld + dungeon)")
     print()
 
     beacon_num = 0
@@ -437,7 +432,7 @@ def main():
         print(f"--- {seq_label} ({type_label})  map=({marker['map_x']:.1f}, {marker['map_z']:.1f})  ~m{area_guess}_{gx}_{gz}")
 
         # Match both area 60 and 61 (grids overlap), filter dungeon entries by dst_area
-        _, _, nearby = find_nearby(marker, massedit_entries, args.radius, area_filter=None)
+        _, _, nearby = find_nearby(marker, row_entries, args.radius, area_filter=None)
         if nearby:
             for dist, entry in nearby[:10]:
                 area = entry["area"]

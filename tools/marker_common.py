@@ -1,4 +1,4 @@
-"""Shared utilities for MASSEDIT generator scripts."""
+"""Shared utilities for marker generator scripts."""
 
 import json
 import re
@@ -8,7 +8,7 @@ import config
 
 # Profile-scoped (config selects data/ or data/vanilla/ via MFG_PROFILE).
 DATA_DIR = config.DATA_DIR
-OUT_DIR = DATA_DIR / 'massedit_generated'
+OUT_DIR = DATA_DIR / 'rows_generated'
 
 # Vanilla WorldMapPointParam dispMask conventions (verified against the 740
 # rows shipped in regulation.bin):

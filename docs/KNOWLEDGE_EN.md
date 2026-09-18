@@ -31,8 +31,7 @@ Current version: **v1.0.13** (pre), ~9000 WorldMapPointParam entries (+ ~740 van
 | `goblin_config.cpp` | INI parsing (mINI), 60+ category toggles + debug_logging, VK hotkey parsing |
 | `goblin_markers.cpp` | In-memory beacon/stamp-array dump via hotkey (F9, **ON by default**); shows an on-screen status-line confirmation (Markers dumped / Marker dump failed). Reads the stable pointer chain `*(exe+0x3D5DF38)->+0x68->beacons+0x118/stamps+0x1B8` (not a memory scan) |
 | `goblin_kindling.cpp` | Kindling Spirits module (`Category::WorldKindlingSpirits`); per-spirit liveness via heap scan for `CS::EcTestDistance` condition objects |
-| `goblin_massedit.cpp` | Runtime MASSEDIT file parser (alternative loading path from `dll/offline/massedit/`) |
-| `generated/goblin_map_data.cpp` | Auto-generated array from MASSEDIT files (~9000 entries) |
+| `goblin_map_blob.cpp` + `generated/goblin_map_blob_data.cpp` | The marker table: packed and deflated at generation time (~9000 entries), expanded once at startup into the `MapEntry` array declared in `goblin_map_data.hpp` |
 | `generated/goblin_legacy_conv.hpp` | Auto-generated dungeon→overworld coord conversion table (from WorldMapLegacyConvParam) |
 | `modutils.cpp` | AOB scanner (Pattern16), hooks (MinHook), memory utilities |
 | `from/params.cpp` | Working with SoloParamRepository - searching and iterating Param tables |
@@ -112,24 +111,25 @@ MSB files + regulation.bin + EMEVD
         +-- scan_emevd_awards.py    -->  emevd_lot_mapping.json
         +-- enrich_fallback_with_emevd.py (upgrades unmatched records in-place)
         |
-        +-- generate_loot_massedit.py    -->  50+ Loot/Equipment/Key/Quest/Magic MASSEDIT
-        +-- generate_pieces_massedit.py  -->  Rune/Ember MASSEDIT + _slots.json
-        +-- generate_material_nodes.py   -->  Loot - Material Nodes MASSEDIT
+        +-- generate_loot.py    -->  50+ Loot/Equipment/Key/Quest/Magic .rows
+        +-- generate_pieces.py  -->  Rune/Ember .rows + _slots.json
+        +-- generate_material_nodes.py   -->  Loot - Material Nodes .rows
         +-- generate_graces.py, generate_summoning_pools.py, generate_spirit_springs.py,
         |   generate_imp_statues.py, generate_stakes.py, generate_paintings.py,
-        |   generate_maps.py             -->  world-infrastructure MASSEDIT
+        |   generate_maps.py             -->  world-infrastructure .rows
         +-- generate_gestures.py         -->  gestures (via common event 90005570 scan)
         +-- generate_hostile_npcs.py     -->  invaders (via NpcParam.teamType=24 + MSB)
-        +-- generate_kindling_spirits_massedit.py -->  Kindling Spirits MASSEDIT
-        +-- extract_seal_puzzles.py, generate_seal_puzzles.py -->  seal puzzles MASSEDIT
-        +-- generate_hero_tomb_statues.py -->  hero tomb statues MASSEDIT
+        +-- generate_kindling_spirits.py -->  Kindling Spirits .rows
+        +-- extract_seal_puzzles.py, generate_seal_puzzles.py -->  seal puzzles .rows
+        +-- generate_hero_tomb_statues.py -->  hero tomb statues .rows
         +-- generate_boss_list.py        -->  boss list
         +-- build_grace_index.py         -->  grace index
         +-- (gathering-node scans)       -->  material/gathering node data
         |
         v
-  generate_data.py  -->  goblin_map_data.cpp + goblin_legacy_conv.hpp
-                          (MapEntry.geom_slot baked in for each piece)
+  generate_data.py  -->  goblin_map_blob_data.cpp + goblin_legacy_conv.hpp
+                          (the whole table packed to ~40 bytes a row and deflated;
+                           MapEntry.geom_slot baked in for each piece)
         |
         v
   CMake build  -->  MapForGoblins.dll
@@ -392,7 +392,7 @@ All external paths are configured via `tools/config.ini` (copy from `config.ini.
 | `rune_pieces.json` | 1164 AEG099_821 positions with InstanceID (after dedup ~1113) |
 | `ember_pieces.json` | 314 AEG099_822 positions with InstanceID |
 | `new_fmg_entries.json` | New text entries for FMG |
-| `comparison_report.json` | Comparison of MASSEDIT with items_database |
+| `comparison_report.json` | Comparison of the generated rows with items_database |
 
 ### Diagnostic JSON (Rune Pieces research)
 | File | Contents |
@@ -426,7 +426,7 @@ msb = _msbe_read_str.Invoke(None, Array[Object]([path_to_msb_dcx]))
 In SoulsFormats, the `EMEVD.Instruction` class uses `.ID` for the instruction number (not `.Index`).
 
 ### dispMask / pad2_0 confusion
-In MASSEDIT, `pad2_0: = 1` corresponds to `dispMask02` (bit 2 of byte 0x18). This is the DLC map layer (area 61). For overworld (area 60), `dispMask00` is used.
+In a generated row, `pad2_0 = 1` corresponds to `dispMask02` (bit 2 of byte 0x18). This is the DLC map layer (area 61). For overworld (area 60), `dispMask00` is used.
 
 ### Player position - wrong offsets
 Initially ChrModules+0x68 (PhysMod)+0x70 returned (0,0,0). Correct chain: ChrModules+0xC0 (SubModule)+0x40 gives real world coordinates.

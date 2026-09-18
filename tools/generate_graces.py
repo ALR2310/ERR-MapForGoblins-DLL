@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Graces.MASSEDIT from BonfireWarpParam."""
+"""Generate World - Graces.rows from BonfireWarpParam."""
 
 import json
 import sys
@@ -8,6 +8,7 @@ import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -19,7 +20,7 @@ clr.AddReference(str(config.SOULSFORMATS_DLL))
 import SoulsFormats
 
 from extract_all_items import load_paramdefs, read_param, param_to_dict
-from massedit_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS, resolve_location_id_at
+from marker_common import OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS, resolve_location_id_at
 from unreachable import is_unreachable_grace
 
 ERR_MOD_DIR = config.require_err_mod_dir()
@@ -55,7 +56,7 @@ def main():
               'dispMask02', 'bonfireEntityId'}
     data = param_to_dict(bwp, fields)
 
-    lines = []
+    sink = rowsink.RowSink()
     # Row-ID base = this category's z-order slot (lower base -> drawn on top).
     # Single source: tools/row_id_registry.py (reorder LAYER_ORDER to relayer).
     row_id = __import__("row_id_registry").base("World - Graces")
@@ -108,19 +109,17 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("graces")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("graces"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
         x = round(float(row.get('posX', 0)), 3)
         y = round(float(row.get('posY', 0)), 3)
         z = round(float(row.get('posZ', 0)), 3)
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {x:.3f};')
+        fields['posX'] = x
         if y != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {y:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {z:.3f};')
+            fields['posY'] = y
+        fields['posZ'] = z
         # Reeling Shack (custom ERR grace, rid=62354601): override the
         # default lit-flag with 1035469430. Event 923 in common.emevd sets
         # 1035469430 ON after Potent Dreambrew (SpEffect 502170) and never
@@ -143,15 +142,14 @@ def main():
             else:
                 print(f"  grace {rid}: textId1={tid1} has no PlaceName string, labelled with location {loc}")
                 tid1 = loc
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {tid1};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {disable_flag};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 2;')
+        fields['textId1'] = tid1
+        fields['textDisableFlagId1'] = disable_flag
+        fields['selectMinZoomStep'] = 2
+        sink.add(row_id, fields)
         row_id += 1
         count += 1
 
-    out_path = OUT_DIR / 'World - Graces.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Graces.rows')
     print(f"Written {count} graces to {out_path.name}")
 
 

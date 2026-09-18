@@ -395,7 +395,7 @@ struct WGMSnapshot
     // -> live instances. The engine keys collected state on (model_id, geom_idx) only
     // (FUN_1406b2b80: key = ((geom_idx | model_id<<0x11) << 0xf)); slot = runtime
     // geom_idx - 0x2328 == GEOF slot == part suffix-9000, so this matches
-    // g_tile_slot_to_row directly - immune to de-overlap display-coord shifts. px/pz kept
+    // g_tile_slot_to_row directly - immune to any display-coord shift. px/pz kept
     // only to disambiguate twins (same slot). suffix_slot = slot from the MSB name, for
     // a live cross-check of the geom_idx->slot formula.
     struct SlotInst { bool alive; float px, pz; int suffix_slot;
@@ -677,9 +677,9 @@ void goblin::collected::initialize()
             g_tile_slot_to_row[tile][geof_prefix][e.geom_slot].push_back(e.row_id);
 
         // MSB-local position for replacement detection via WGM occupancy. Use the
-        // REAL (pre-de-overlap) X/Z: data.posX/posZ may be spiral-shifted for icon
-        // declutter, which would miss the live instance's true coords and break
-        // immediate WGM hiding (regressed via the de-overlap pass).
+        // REAL geometry X/Z, which is not always where the marker is drawn: a relocated piece
+        // displays at its pickup spot while its CSWorldGeomIns stayed at the MSB position.
+        // Matching on the drawn position missed the live instance and broke immediate WGM hiding.
         g_entry_positions[e.row_id] = {e.real_posX, e.data.posY, e.real_posZ};
     }
 
@@ -848,9 +848,9 @@ int goblin::collected::refresh()
         // our geom_slot was baked from, so slot-keyed matching left collected nodes as
         // NO-ROW-MATCH and they never hid (the vanilla "gathered lily stays on the map"
         // report). Instead flatten every row and every live instance of this model in the
-        // tile, and match each row to its nearest instance by REAL (pre-de-overlap) coords.
-        // g_entry_positions holds real_posX/posZ, so the de-overlap display shift - which
-        // broke the ORIGINAL position heuristic and prompted the slot rewrite - is moot.
+        // tile, and match each row to its nearest instance by REAL geometry coords.
+        // g_entry_positions holds real_posX/posZ, so a marker displayed away from its geometry -
+        // which broke the ORIGINAL position heuristic and prompted the slot rewrite - is moot.
         for (auto &[prefix, slot_map] : tile_it->second)
         {
             auto pref_it = snap.slot_insts.find(prefix);

@@ -1,7 +1,7 @@
 """Final pass over the extracted Rune/Ember piece positions (ERR only).
 
 Produces data/rune_pieces_final.json and data/ember_pieces_final.json - the lists
-generate_pieces_massedit actually bakes. When the optional local refinement hook
+generate_pieces actually bakes. When the optional local refinement hook
 tools/local/refine_pieces.py exists (that directory is untracked and machine-specific),
 it runs instead of this file's body and writes the *_final.json outputs itself; a stock
 checkout has no hook, and the extracted positions pass through unchanged.

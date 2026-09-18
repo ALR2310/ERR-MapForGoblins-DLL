@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Imp Statues.MASSEDIT from MSB assets with seal entity IDs (suffix 570/575/565/611)."""
+"""Generate World - Imp Statues.rows from MSB assets with seal entity IDs (suffix 570/575/565/611)."""
 
 import sys
 import io
@@ -9,6 +9,7 @@ import tempfile
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -28,7 +29,7 @@ def _safe_unlink(path):
         pass
 
 
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at)
 from unreachable import is_unreachable_in_err
 
@@ -140,8 +141,8 @@ def main():
 
     print(f"  {len(deduped)} after position dedup")
 
-    # Generate MASSEDIT
-    lines = []
+    # Generate rows
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Imp Statues")  # z-order slot; see row_id_registry
     for s in deduped:
         area = s['area']
@@ -155,36 +156,33 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("imp_statues")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("imp_statues"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {s["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = s['x']
         if s['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {s["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {s["z"]:.3f};')
+            fields['posY'] = s['y']
+        fields['posZ'] = s['z']
         # Key type as first line: Stonesword Key or Imbued Sword Key
         imbued = s['suffix'] == 565 or s['model'] in IMBUED_KEY_MODELS
         if imbued:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = 500008186;')  # Imbued Sword Key
+            fields['textId1'] = 500008186  # Imbued Sword Key
         else:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = 500008000;')  # Stonesword Key
+            fields['textId1'] = 500008000  # Stonesword Key
         # Seal unlock flag = entity ID
-        lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {s["flag"]};')
+        fields['textDisableFlagId1'] = s['flag']
         # Location name for dungeons (second line) - nearest-grace lookup
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
         loc_id = resolve_location_id_at(map_code, s["x"], s.get("y", 0.0), s["z"])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {s["flag"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+            fields['textId2'] = loc_id
+            fields['textDisableFlagId2'] = s['flag']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
 
-    out_path = OUT_DIR / 'World - Imp Statues.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Imp Statues.rows')
     print(f"Written {len(deduped)} entries to {out_path.name}")
 
 

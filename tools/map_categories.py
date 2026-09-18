@@ -7,7 +7,7 @@ from this table - add a category by adding ONE row here:
   * icon_registry (iconId per icon slug, PNG per slug)    = the slug + png columns;
   * the icon PNG override used by both map tags and the overlay atlas = the png column.
 
-Columns: (MASSEDIT file basename, icon slug, custom PNG or None=composed fallback).
+Columns: (row-file basename, icon slug, custom PNG or None=composed fallback).
 Two categories sharing a slug share ONE icon/frame (e.g. Kindling Spirits reuses the incantations
 icon). Reorder rows to relayer the map; rename/extend freely - downstream renumbers automatically.
 """

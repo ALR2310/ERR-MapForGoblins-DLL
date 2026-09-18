@@ -52,12 +52,12 @@ EVENT_DIR = ERR_MOD / 'event'
 REGULATION = ERR_MOD / 'regulation.bin'
 MSGBND = ERR_MOD / 'msg' / 'engus' / 'item_dlc02.msgbnd.dcx'
 
-MASSEDIT_OUT = DATA / 'massedit_generated'
+ROWS_OUT = DATA / 'rows_generated'
 GENERATED_CPP = config.GENERATED_DIR   # src/generated or src/generated_vanilla
 
 # Stages that only make sense for the ERR mod (their source assets/items do
 # not exist in vanilla). Dropped from the vanilla pipeline.
-ERR_ONLY_STAGES = {'generate_pieces_massedit', 'generate_kindling_spirits',
+ERR_ONLY_STAGES = {'generate_pieces', 'generate_kindling_spirits',
                    'extract_rune_positions', 'extract_itemlot_csv',
                    'finalize_pieces'}
 
@@ -141,7 +141,11 @@ class Stage:
 
 
 # ── Pipeline ──
-COMMON = ['config.py', 'massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']
+COMMON = ['config.py', 'marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py',
+          # rowsink.py renders every marker row for every generator, so a change to it changes all
+          # of their output. Without it here a format change would leave every stage [CACHED] and
+          # the tree would keep the old bytes while looking up to date.
+          'rowsink.py']
 
 STAGES = [
     # Source-table extractors: regenerate the category/codex/placename tables
@@ -190,7 +194,7 @@ STAGES = [
           script='extract_rune_positions.py',
           also_scripts=['config.py']),
 
-    # ERR-only: the final pass over the extracted piece positions before the massedit
+    # ERR-only: the final pass over the extracted piece positions before the row
     # bake. Runs the optional local refinement hook (tools/local/, untracked and
     # machine-specific); a stock checkout has no hook and the positions pass through
     # unchanged. The hook's own inputs live outside the tree, so they are not listed:
@@ -204,7 +208,7 @@ STAGES = [
           script='finalize_pieces.py',
           also_scripts=['config.py']),
 
-    # ERR-only: ItemLotParam_map CSV dump (consumed by generate_pieces_massedit).
+    # ERR-only: ItemLotParam_map CSV dump (consumed by generate_pieces).
     Stage('extract_itemlot_csv',
           inputs=[REGULATION, config.PARAMDEF_DIR],
           outputs=[DATA / 'ItemLotParam_map.csv'],
@@ -268,7 +272,18 @@ STAGES = [
           script='generate_boss_list.py',
           also_scripts=['extract_all_items.py'] + COMMON),
 
-    Stage('generate_loot_massedit',
+    # Relocating-boss flee-spawns (Lansseax): DETECTION ONLY, and it has to run before the
+    # generators because they read its result and never create the wrong rows. It used to sit after
+    # every generator and rewrite their output in place, which is the single reason the pipeline
+    # needed an editable text intermediate at all.
+    Stage('relocating_boss_fix',
+          inputs=[MSB_DIR, EVENT_DIR],
+          outputs=[DATA / '_relocating_boss_fix.done',
+                   config.PROJECT_DIR / 'data' / 'relocating_flee_spawns.json'],
+          script='generate_relocating_boss_fix.py',
+          also_scripts=['config.py']),
+
+    Stage('generate_loot',
           inputs=[REPO / 'data' / 'enemy_bloodmsg_mapping.json',
                   REPO / 'data' / 'enemy_names_i18n.json',
                   REPO / 'data' / 'enemy_model_aliases.json',
@@ -285,28 +300,32 @@ STAGES = [
                   DATA / 'tutorial_title_ids.json',
                   DATA / 'tutorial_title_names.json',
                   DATA / 'grace_position_index.json'],
-          outputs=[MASSEDIT_OUT / 'Loot - Consumables.MASSEDIT',
-                   MASSEDIT_OUT / 'Equipment - Armaments.MASSEDIT',
-                   MASSEDIT_OUT / 'Quest - Progression.MASSEDIT',
-                   MASSEDIT_OUT / 'World - Bosses.MASSEDIT',
+          outputs=[ROWS_OUT / 'Loot - Consumables.rows',
+                   ROWS_OUT / 'Equipment - Armaments.rows',
+                   ROWS_OUT / 'Quest - Progression.rows',
+                   ROWS_OUT / 'World - Bosses.rows',
                    DATA / 'loot_lot_linkage.json',
                    DATA / 'item_icon_table.json',
                    DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
                    REPO / 'data' / 'npc_name_text_map.json'],
-          script='generate_loot_massedit.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'npcname_known.py']),
+          script='generate_loot.py',
+          # relocating_spawns.py decides which rows are NOT created (the flee-spawn duplicates), so
+          # a change to that rule has to invalidate this stage or the old rows survive as cached.
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py',
+                        'npcname_known.py', 'relocating_spawns.py']),
 
-    Stage('generate_pieces_massedit',
+    Stage('generate_pieces',
           inputs=[DATA / 'ItemLotParam_map.csv',
                   DATA / 'grace_position_index.json',
                   DATA / 'rune_pieces_final.json',
                   DATA / 'ember_pieces_final.json'],
-          outputs=[MASSEDIT_OUT / 'Reforged - Rune Pieces.MASSEDIT',
-                   MASSEDIT_OUT / 'Reforged - Ember Pieces.MASSEDIT',
-                   MASSEDIT_OUT / 'Reforged - Rune Pieces_slots.json',
-                   MASSEDIT_OUT / 'Reforged - Ember Pieces_slots.json'],
-          script='generate_pieces_massedit.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'icon_registry.py', 'map_categories.py']),
+          outputs=[ROWS_OUT / 'Reforged - Rune Pieces.rows',
+                   ROWS_OUT / 'Reforged - Ember Pieces.rows',
+                   ROWS_OUT / 'Reforged - Rune Pieces_slots.json',
+                   ROWS_OUT / 'Reforged - Ember Pieces_slots.json'],
+          script='generate_pieces.py',
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py',
+                        'map_categories.py', 'relocating_spawns.py']),
 
     Stage('scan_gathering_nodes',
           inputs=[MSB_DIR, DATA / 'aeg099_item_mapping.json'],
@@ -325,46 +344,46 @@ STAGES = [
                   DATA / 'aeg463_item_mapping.json',
                   DATA / 'all_gathering_nodes_final.json',
                   DATA / 'gathering_node_flags.json'],
-          outputs=[MASSEDIT_OUT / 'Loot - Material Nodes.MASSEDIT',
-                   MASSEDIT_OUT / 'Loot - Material Nodes_slots.json'],
+          outputs=[ROWS_OUT / 'Loot - Material Nodes.rows',
+                   ROWS_OUT / 'Loot - Material Nodes_slots.json'],
           script='generate_material_nodes.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'unreachable.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'unreachable.py']),
 
     Stage('generate_graces',
           inputs=[REGULATION],
-          outputs=[MASSEDIT_OUT / 'World - Graces.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Graces.rows'],
           script='generate_graces.py',
           also_scripts=['extract_all_items.py', 'unreachable.py'] + COMMON),
 
     Stage('generate_summoning_pools',
           inputs=[REGULATION, MSB_DIR],
-          outputs=[MASSEDIT_OUT / 'World - Summoning Pools.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Summoning Pools.rows'],
           script='generate_summoning_pools.py',
           also_scripts=['extract_all_items.py'] + COMMON),
 
     Stage('generate_kindling_spirits',
           inputs=[DATA / 'kindling_spirits.json'],
-          outputs=[MASSEDIT_OUT / 'World - Kindling Spirits.MASSEDIT',
-                   MASSEDIT_OUT / 'World - Kindling Spirits_slots.json'],
-          script='generate_kindling_spirits_massedit.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
+          outputs=[ROWS_OUT / 'World - Kindling Spirits.rows',
+                   ROWS_OUT / 'World - Kindling Spirits_slots.json'],
+          script='generate_kindling_spirits.py',
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
 
     Stage('generate_spirit_springs',
           inputs=[MSB_DIR],
-          outputs=[MASSEDIT_OUT / 'World - Spirit Springs.MASSEDIT',
-                   MASSEDIT_OUT / 'World - Spiritspring Hawks.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Spirit Springs.rows',
+                   ROWS_OUT / 'World - Spiritspring Hawks.rows'],
           script='generate_spirit_springs.py',
           also_scripts=['unreachable.py'] + COMMON),
 
     Stage('generate_imp_statues',
           inputs=[MSB_DIR],
-          outputs=[MASSEDIT_OUT / 'World - Imp Statues.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Imp Statues.rows'],
           script='generate_imp_statues.py',
           also_scripts=['unreachable.py'] + COMMON),
 
     Stage('generate_stakes',
           inputs=[MSB_DIR],
-          outputs=[MASSEDIT_OUT / 'World - Stakes of Marika.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Stakes of Marika.rows'],
           script='generate_stakes.py',
           also_scripts=COMMON),
 
@@ -376,33 +395,33 @@ STAGES = [
 
     Stage('generate_seal_puzzles',
           inputs=[DATA / 'seal_puzzles.json'],
-          outputs=[MASSEDIT_OUT / 'World - Seal Puzzles.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Seal Puzzles.rows'],
           script='generate_seal_puzzles.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
 
     Stage('generate_hero_tomb_statues',
           inputs=[MSB_DIR, EVENT_DIR, DATA / 'WorldMapPointParam.json'],
-          outputs=[MASSEDIT_OUT / "World - Hero's Tomb Statues.MASSEDIT"],
+          outputs=[ROWS_OUT / "World - Hero's Tomb Statues.rows"],
           script='generate_hero_tomb_statues.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
 
     Stage('generate_paintings',
           inputs=[MSB_DIR, EVENT_DIR],
-          outputs=[MASSEDIT_OUT / 'World - Paintings.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Paintings.rows'],
           script='generate_paintings.py',
           also_scripts=COMMON),
 
     Stage('generate_maps',
           inputs=[DATA / 'items_database.json'],
-          outputs=[MASSEDIT_OUT / 'World - Maps.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Maps.rows'],
           script='generate_maps.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py']),
 
     Stage('generate_gestures',
           inputs=[DATA / 'msb_entity_index.json', EVENT_DIR, REGULATION],
-          outputs=[MASSEDIT_OUT / 'Loot - Gestures.MASSEDIT'],
+          outputs=[ROWS_OUT / 'Loot - Gestures.rows'],
           script='generate_gestures.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py']),
 
     Stage('generate_hostile_npcs',
           inputs=[REGULATION, MSB_DIR, config.PARAMDEF_DIR, EVENT_DIR,
@@ -410,9 +429,9 @@ STAGES = [
                   DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
                   REPO / 'data' / 'npc_name_text_map.json',
                   REPO / 'data' / 'quest_invader_overrides.json'],
-          outputs=[MASSEDIT_OUT / 'World - Hostile NPC.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Hostile NPC.rows'],
           script='generate_hostile_npcs.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'npcname_known.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'npcname_known.py']),
 
     # Enemies wired through the common "strong enemy" templates 90005300/301: they stay dead once
     # killed, so each gets a marker that hides (or checkmarks) on its kill flag.
@@ -421,41 +440,31 @@ STAGES = [
                   REPO / 'data' / 'enemy_names_i18n.json',
                   REPO / 'data' / 'enemy_model_aliases.json',
                   REPO / 'data' / 'enemy_bloodmsg_mapping.json'],
-          outputs=[MASSEDIT_OUT / 'World - Strong Enemies.MASSEDIT'],
+          outputs=[ROWS_OUT / 'World - Strong Enemies.rows'],
           script='generate_strong_enemies.py',
-          also_scripts=['generate_hostile_npcs.py', 'generate_loot_massedit.py', 'massedit_common.py',
+          also_scripts=['generate_hostile_npcs.py', 'generate_loot.py', 'marker_common.py',
                         'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py']),
 
-    # Relocating-boss fix (Lansseax): after all marker generators, before bake.
-    # Removes the un-collectable duplicate loot at the boss's flee-spawn and
-    # ensures a flee-spawn boss marker that clears on the flee flag. Edits the
-    # MASSEDIT in place (idempotent); generate_data (below) re-bakes from it.
-    Stage('relocating_boss_fix',
-          inputs=[MASSEDIT_OUT,
-                  config.PROJECT_DIR / 'data' / 'relocating_flee_spawns.json'],
-          outputs=[DATA / '_relocating_boss_fix.done'],
-          script='generate_relocating_boss_fix.py',
-          also_scripts=['config.py']),
-
     Stage('generate_data',
-          inputs=[MASSEDIT_OUT, DATA / 'loot_lot_linkage.json',
+          inputs=[ROWS_OUT, DATA / 'loot_lot_linkage.json',
                   DATA / 'item_icon_table.json',
                   DATA / 'english_fallback.json',
                   REPO / 'data' / 'unprojectable_tiles.json',          # tiles dropped before the bake
                   config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json',
-                  DATA / '_relocating_boss_fix.done',
                   # the hand-maintained headers the generated .cpp implement (the Category
                   # enum: generate_data's CATEGORY_MAP must name its members)
                   *[config.PROJECT_DIR / 'src' / h
                     for h in ('goblin_map_data.hpp', 'goblin_item_icons.hpp',
                               'goblin_enemy_names.hpp', 'goblin_item_fallback.hpp')]],
-          outputs=[GENERATED_CPP / 'goblin_map_data.cpp',
+          outputs=[GENERATED_CPP / 'goblin_map_blob_data.cpp',
                    GENERATED_CPP / 'goblin_item_icons.cpp',
                    GENERATED_CPP / 'goblin_enemy_names.cpp',
                    GENERATED_CPP / 'goblin_item_fallback.cpp'],
           script='generate_data.py',
-          also_scripts=['icon_registry.py', 'map_categories.py'],  # ANON_ICON_ID = iconid("anon")
-          args=['--massedit-dir', str(MASSEDIT_OUT)]),
+          # mapblob.py IS the storage layout; rowsink.py is the field order it packs.
+          also_scripts=['icon_registry.py', 'map_categories.py',  # ANON_ICON_ID = iconid("anon")
+                        'mapblob.py', 'rowsink.py'],
+          args=['--rows-dir', str(ROWS_OUT)]),
 
     # Tile -> game-zone (PlaceName id) map for the Progress tab, from tile_region_map.json
     # (only err ships one today; other profiles emit an empty map and fall back to the
@@ -471,23 +480,26 @@ STAGES = [
     # in the MSB: part NAME stays vanilla, ModelName differs; GEOF save entries carry the
     # actual model's hash) - used by collected-tracking. Runs AFTER generate_data.
     Stage('generate_geof_models',
-          inputs=[GENERATED_CPP / 'goblin_map_data.cpp',
+          inputs=[GENERATED_CPP / 'goblin_map_blob_data.cpp',
                   DATA / 'all_gathering_nodes_final.json'],
           outputs=[GENERATED_CPP / 'goblin_geof_models.cpp',
                    GENERATED_CPP / 'goblin_geof_models.hpp'],
-          script='generate_geof_models.py'),
+          script='generate_geof_models.py',
+          # it decodes the packed table, so the layout is one of its inputs
+          also_scripts=['config.py', 'mapblob.py', 'rowsink.py']),
 
     # Alternative (hybrid) loot-location naming, baked as generated::LOCATION_ALT
     # (row_id -> textId2). Shown via INI [Goblin] show_location_compare = true.
-    # Must run AFTER generate_data (reads the baked goblin_map_data.cpp).
+    # Must run AFTER generate_data (reads the baked table back).
     Stage('generate_location_overrides',
-          inputs=[GENERATED_CPP / 'goblin_map_data.cpp', MSB_DIR,
+          inputs=[GENERATED_CPP / 'goblin_map_blob_data.cpp', MSB_DIR,
                   DATA / 'WorldMapPointParam.json', DATA / 'grace_position_index.json',
                   DATA / 'PlaceName_engus.json'],
           outputs=[GENERATED_CPP / 'goblin_location_alt.cpp',
                    GENERATED_CPP / 'goblin_location_alt.hpp'],
           script='generate_location_overrides.py',
-          also_scripts=['massedit_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py']),
+          also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py',
+                        'map_categories.py', 'config.py', 'mapblob.py', 'rowsink.py']),
 ]
 
 

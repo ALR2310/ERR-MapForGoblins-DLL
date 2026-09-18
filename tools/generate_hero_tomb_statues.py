@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Hero's Tomb Statues.MASSEDIT.
+"""Generate World - Hero's Tomb Statues.rows.
 
 Each statue uses the common_func template 90005683 ("英雄の墓_指示像" =
 Hero's Tomb Instruction Statue) - when the player activates it, an SFX
@@ -24,6 +24,7 @@ become markers.
 import sys, io, os, tempfile, struct
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import config
+import rowsink
 from pythonnet import load
 load('coreclr')
 import clr
@@ -33,7 +34,7 @@ from System import Array, Type as SysType, Object
 from System.IO import File as SysFile
 import SoulsFormats
 
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
                              OVERWORLD_AREAS, get_disp_mask,
                              resolve_location_id_at)
 
@@ -173,8 +174,8 @@ def main():
     grave_clear = load_grave_clear_flags()
     remapped = 0
 
-    # Pass 3: emit MASSEDIT rows
-    lines = []
+    # Pass 3: emit marker rows
+    sink = rowsink.RowSink()
     row_id = ROW_START
     written = 0
     for src_tile, entity, x0_4 in calls:
@@ -213,16 +214,14 @@ def main():
                         gz = own_gz
 
         disp = get_disp_mask(area)
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {ICON_ID};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': ICON_ID, disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {part["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = part['x']
         if part['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {part["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {part["z"]:.3f};')
+            fields['posY'] = part['y']
+        fields['posZ'] = part['z']
         # Label via ActionButtonText (+800M offset); goblin_messages.cpp copies it from
         # menu.msgbnd at runtime so the text follows the player's game language.
         # 7041 "Examine statue" exists only in ERR's ActionButtonText. Every other profile
@@ -231,23 +230,22 @@ def main():
         # drawn there ("cleared 16 dangling textId(s)" on every vanilla open). Those use the
         # game's own 1000 "Examine", present in every language.
         statue_text = 7041 if config.PROFILE == 'err' else 1000
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {800000000 + statue_text};')
+        fields['textId1'] = 800000000 + statue_text
         if flag > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {flag};')
+            fields['textDisableFlagId1'] = flag
         # Location subtitle for non-overworld tiles (most are overworld though).
         map_code = f'm{area:02d}_{gx:02d}_{gz:02d}_00'
         loc_id = resolve_location_id_at(map_code, part['x'], part['y'], part['z'])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
             if flag > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {flag};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+                fields['textDisableFlagId2'] = flag
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
         written += 1
 
-    out_path = OUT_DIR / "World - Hero's Tomb Statues.MASSEDIT"
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / "World - Hero's Tomb Statues.rows")
     print(f'Written {written} Hero\'s Tomb statue markers to {out_path.name} '
           f'({remapped} keyed to grave-cleared flag, {written - remapped} fell back to X0_4)')
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate World - Hostile NPC.MASSEDIT - fully auto-discovered.
+Generate World - Hostile NPC.rows - fully auto-discovered.
 
 Strategy:
   1. From NpcParam (regulation.bin), collect NPC IDs with teamType in
@@ -18,6 +18,7 @@ Strategy:
 import sys, io, os, tempfile, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import config
+import rowsink
 from collections import defaultdict
 from pathlib import Path
 from pythonnet import load
@@ -38,7 +39,7 @@ def _safe_unlink(path):
 
 
 from npcname_known import npcname_resolvable
-from massedit_common import (OUT_DIR, DATA_DIR, UNDERGROUND_AREAS, DLC_AREAS,
+from marker_common import (OUT_DIR, DATA_DIR, UNDERGROUND_AREAS, DLC_AREAS,
                              OVERWORLD_AREAS, get_disp_mask, resolve_location_id_at)
 
 asm = Assembly.LoadFrom(str(config.SOULSFORMATS_DLL))
@@ -281,23 +282,22 @@ def main():
     records = uniq
     records.sort(key=lambda r: (r['area'], r['gx'], r['gz'], r['x'], r['z']))
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Hostile NPC")  # z-order slot; see row_id_registry
     named = 0
     flagged = 0
     unnamed_ids = set()  # NpcParam.nameId values no NpcName FMG resolves (generic word used)
     for r in records:
         disp = get_disp_mask(r['area'])
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("hostile_npc")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {r["area"]};')
+        fields = {'iconId': __import__("icon_registry").iconid("hostile_npc"), disp: 1,
+                  'areaNo': r['area']}
         if r['area'] in OVERWORLD_AREAS or r['area'] in DLC_AREAS or r['gx'] > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {r["gx"]};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {r["gz"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {r["x"]:.3f};')
+            fields['gridXNo'] = r['gx']
+            fields['gridZNo'] = r['gz']
+        fields['posX'] = r['x']
         if r['y'] != 0.0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {r["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {r["z"]:.3f};')
+            fields['posY'] = r['y']
+        fields['posZ'] = r['z']
 
         # textId1: NPC name via NpcName FMG (resolved at runtime by
         # goblin_messages.cpp using the +700000000 offset convention).
@@ -306,37 +306,36 @@ def main():
         # is cleared by the DLL's sanitizer and never drawn. Such a row gets the generic
         # "strong foe" word instead, which every language has.
         if r['nameId'] > 0 and npcname_resolvable(r['nameId']):
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {r["nameId"] + 700000000};')
+            fields['textId1'] = r['nameId'] + 700000000
             named += 1
             # textDisableFlagId1: hide NPC name once defeated
             if r['defeatFlag'] > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {r["defeatFlag"]};')
+                fields['textDisableFlagId1'] = r['defeatFlag']
         elif r['nameId'] > 0:
             unnamed_ids.add(r['nameId'])
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {950000000 + 30003};')
+            fields['textId1'] = 950000000 + 30003
             # textDisableFlagId1: hide NPC name once defeated
             if r['defeatFlag'] > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {r["defeatFlag"]};')
+                fields['textDisableFlagId1'] = r['defeatFlag']
 
         # textId2: location subtitle (interior maps only)
         loc_id = resolve_location_id_at(r['map'], r['x'], r['y'], r['z'])
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
             if r['defeatFlag'] > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {r["defeatFlag"]};')
+                fields['textDisableFlagId2'] = r['defeatFlag']
 
         # clearedEventFlagId: shows green checkmark when defeated. C++
         # config (hideKilledBosses) chooses between checkmark and full hide.
         if r['defeatFlag'] > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: clearedEventFlagId: = {r["defeatFlag"]};')
+            fields['clearedEventFlagId'] = r['defeatFlag']
             flagged += 1
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
 
-    out = OUT_DIR / 'World - Hostile NPC.MASSEDIT'
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out = sink.write(OUT_DIR / 'World - Hostile NPC.rows')
     print(f'Written {len(records)} hostile NPC markers ({named} with name, {flagged} with defeat flag) to {out.name}')
     if unnamed_ids:
         print(f'  {len(unnamed_ids)} NpcName id(s) with no string in this profile, labelled "strong foe": {sorted(unnamed_ids)}')

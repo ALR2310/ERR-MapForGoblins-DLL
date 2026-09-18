@@ -198,11 +198,11 @@ static std::filesystem::path g_hidden_dir;   // folder holding the per-slot hide
 static std::filesystem::path g_hidden_file;  // current slot's file (persist target)
 static int g_hidden_slot = -2;               // slot the loaded set belongs to (-2 = none synced yet)
 
-// The v1 key (files without a header). Baked display position + textId1 + iconId of the
-// LIVE row: every one of those moves between builds - the offline de-overlap re-spirals a
-// position when a neighbour appears, textIds are remapped per FMG expansion, icon ids
-// change with icon patches - so a hidden marker came back after an update and re-hiding
-// it left the stale twin in the file. Kept only to migrate such files (migrate_hidden_v1).
+// The v1 key (files without a header). Baked position + textId1 + iconId of the LIVE row:
+// every one of those moves between builds - textIds are remapped per FMG expansion, icon ids
+// change with icon patches, and a marker's position changes whenever its source data does - so a
+// hidden marker came back after an update and re-hiding it left the stale twin in the file. Kept
+// only to migrate such files (migrate_hidden_v1).
 static uint64_t marker_key_v1(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
 {
     if (!p) return 0;
@@ -1086,13 +1086,6 @@ void goblin::inject_map_entries()
         uint32_t lotId;    // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;   // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
         bool lotAggregate; // the lot backs several markers; not this one's address
-        // The baked DISPLAY anchor: where the marker wants to sit, before the offline
-        // de-overlap spiralled the baked position. The live de-overlap spreads from THIS, so
-        // it never spirals an already-spiralled position. NOT the geometry position - that
-        // one (MapEntry::real_pos) is for collected tracking and can be somewhere else
-        // entirely for a relocated piece.
-        float anchor_px;
-        float anchor_pz;
         uint64_t hide_key; // stable manual-hide key (stable_hide_key of the baked entry)
         uint64_t hide_key_v2; // the same marker's pre-2.1.4 key (migration only)
     };
@@ -1173,9 +1166,7 @@ void goblin::inject_map_entries()
         // unrelated markers whose baked category happened to be Armaments.
         // (Spoiler-free and non-lot rows leave gate_cat == e.category.)
         entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType,
-                           e.lotAggregate != 0,
-                           e.display_posX, e.display_posZ, stable_hide_key(e),
-                           hide_key_v2(e)});
+                           e.lotAggregate != 0, stable_hide_key(e), hide_key_v2(e)});
     }
 
     spdlog::info("Adding {} map entries ({} live-recategorized, live-loot table ready={})",
@@ -1310,9 +1301,6 @@ void goblin::inject_map_entries()
         uint32_t lotId;            // live-loot: source ItemLotParam row (0 = none)
         uint8_t lotType;           // 0=none, 1=ItemLotParam_map, 2=ItemLotParam_enemy
         bool lotAggregate;         // see InjectedEntry
-        float anchor_px;           // display anchor (see InjectedEntry); only ours has one
-        float anchor_pz;
-        bool has_anchor;           // false for the game's own rows: read the row instead
         uint64_t hide_key;         // stable manual-hide key (0 for vanilla rows)
         uint64_t hide_key_v2;      // pre-2.1.4 key of the same marker (0 for vanilla rows)
     };
@@ -1323,15 +1311,14 @@ void goblin::inject_map_entries()
     for (uint16_t i = 0; i < orig_num_rows; i++)
     {
         auto *data = old_param_file + old_table->rows[i].param_offset;
-        all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false, {}, 0, 0, 0,
-                            false, 0.0f, 0.0f, false, 0, 0});  // vanilla rows: from the row below
+        all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false,
+                            {}, 0, 0, 0, false, 0, 0});
     }
     for (auto &entry : entries)
     {
         all_rows.push_back({entry.row_id, reinterpret_cast<const uint8_t *>(entry.data),
                             entry.is_piece, entry.is_kindling, entry.category, entry.original_row_id,
                             entry.lotId, entry.lotType, entry.lotAggregate,
-                            entry.anchor_px, entry.anchor_pz, true,
                             entry.hide_key, entry.hide_key_v2});
     }
 
@@ -1380,12 +1367,10 @@ void goblin::inject_map_entries()
                               (wp->dispMask02 ? 2 : 0xFF));
             cr.native_gx = wp->gridXNo;
             cr.native_gz = wp->gridZNo;
-            // The row carries the BAKED position, which the offline pass may already have spiralled
-            // away from the real one. Take the real coordinates as the truth and let the live
-            // de-overlap decide the display position; starting from the baked one would spiral a
-            // spiral.
-            cr.anchor_px = all_rows[i].has_anchor ? all_rows[i].anchor_px : wp->posX;
-            cr.anchor_pz = all_rows[i].has_anchor ? all_rows[i].anchor_pz : wp->posZ;
+            // The row's own position IS the display anchor: nothing shifts it any more (the
+            // generation-time de-overlap is gone), and the live de-overlap spreads from here.
+            cr.anchor_px = wp->posX;
+            cr.anchor_pz = wp->posZ;
             cr.native_px = cr.anchor_px;
             cr.native_pz = cr.anchor_pz;
             cr.hide_key = all_rows[i].hide_key;
@@ -2253,6 +2238,10 @@ bool goblin::row_reticle_dist2(const void *rowptr, float &out_dist2)
     float cU = 0.0f, cV = 0.0f, zoom = 0.0f;
     if (!reticle_view(cU, cV, zoom)) return false;
     const auto *wp = static_cast<const from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(rowptr);
+    // The RAW row is right here, and only here: the only caller passes the ENGINE's focused pin
+    // (goblin_maphover.cpp), never one of ours - ours carry a zeroed dispMask, so the engine never
+    // focuses them - and the engine's own rows are never moved by the live de-overlap. Asking
+    // display_position() instead would take the layout lock on a per-frame path to learn nothing.
     float mx = 0.0f, mz = 0.0f;
     if (!goblin::mapproject::to_map(wp->areaNo, wp->gridXNo, wp->gridZNo,
                                     wp->posX, wp->posZ, mx, mz))

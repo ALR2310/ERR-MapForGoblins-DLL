@@ -107,7 +107,9 @@ add_library( MapForGoblins SHARED
   # into the bake dir, so naming the bake copy here made a first build of a profile that has
   # no stale copy fail at configure time with "Cannot find source file".
   src/goblin_map_data.hpp
-  ${GEN_DIR}/goblin_map_data.cpp
+  src/goblin_map_blob.hpp
+  src/goblin_map_blob.cpp
+  ${GEN_DIR}/goblin_map_blob_data.cpp
   src/goblin_item_icons.hpp
   ${GEN_DIR}/goblin_item_icons.cpp
   src/goblin_enemy_names.hpp

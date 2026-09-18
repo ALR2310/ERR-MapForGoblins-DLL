@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Seal Puzzles.MASSEDIT from data/seal_puzzles.json.
+"""Generate World - Seal Puzzles.rows from data/seal_puzzles.json.
 
 Each per-seal activation flag (param[1] in CSEmkEvent template 90006051)
 is the engine-set flag that fires when the seal is interacted with.
@@ -8,7 +8,8 @@ after activation."""
 import sys, io, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import config
-from massedit_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
+import rowsink
+from marker_common import (OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
                              OVERWORLD_AREAS, resolve_location_id_at)
 
 import icon_registry
@@ -29,7 +30,7 @@ def main():
         print(f"  {puzzles_path} missing - skip"); return
     puzzles = json.load(open(puzzles_path, encoding='utf-8'))
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = ROW_START
     written = 0
     # Dedup: in ER overworld, m60_XX_YY_00 and m60_XX_YY_10 are phase
@@ -64,34 +65,31 @@ def main():
                 continue
             seen.add(dedup_key)
             disp = get_disp(area)
-            lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {ICON_ID};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-            lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+            fields = {'iconId': ICON_ID, disp: 1, 'areaNo': area}
             if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-                lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {x:.3f};')
+                fields['gridXNo'] = gx
+                fields['gridZNo'] = gz
+            fields['posX'] = x
             if y != 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {y:.3f};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {z:.3f};')
+                fields['posY'] = y
+            fields['posZ'] = z
             # Label resolved at runtime via goblin_messages.cpp from
             # ActionButtonText FMG (+800M offset) - keeps localization.
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {text_id};')
+            fields['textId1'] = text_id
             if flag > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {flag};')
+                fields['textDisableFlagId1'] = flag
             # Location subtitle for non-overworld tiles
             loc_id = resolve_location_id_at(tile, x, y, z)
             if loc_id > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+                fields['textId2'] = loc_id
                 if flag > 0:
-                    lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {flag};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+                    fields['textDisableFlagId2'] = flag
+            fields['selectMinZoomStep'] = 1
+            sink.add(row_id, fields)
             row_id += 1
             written += 1
 
-    out_path = OUT_DIR / 'World - Seal Puzzles.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Seal Puzzles.rows')
     print(f"Written {written} seal markers to {out_path.name}")
 
 

@@ -30,7 +30,7 @@ Editing the layering
 --------------------
 The knob is the row order of map_categories.CATEGORIES (top-of-map -> bottom). Move a row
 UP to make that category draw OVER more things; DOWN to sink it. LAYER_ORDER below is just
-that table's file column. Each generator asks `base("<MASSEDIT file name>")`; the registry
+that table's file column. Each generator asks `base("<row file name>")`; the registry
 hands out non-overlapping blocks in this order, so collisions are impossible by construction.
 """
 
@@ -49,7 +49,7 @@ assert len(_index) == len(LAYER_ORDER), "row_id_registry: duplicate name in LAYE
 
 
 def base(name):
-    """Row-ID base for a MASSEDIT category (its z-order slot). Raises on unknown
+    """Row-ID base for a marker category (its z-order slot). Raises on unknown
     name so a typo / renamed file fails the build loudly instead of silently
     colliding. Lower base == drawn higher on the map."""
     if name not in _index:

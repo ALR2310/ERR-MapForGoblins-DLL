@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate World - Maps.MASSEDIT from items_database.json Map: items."""
+"""Generate World - Maps.rows from items_database.json Map: items."""
 
 import json
 import sys
@@ -7,8 +7,9 @@ import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-from massedit_common import (DATA_DIR, OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
+from marker_common import (DATA_DIR, OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at)
+import rowsink
 
 
 def main():
@@ -44,7 +45,7 @@ def main():
     maps.sort(key=lambda m: m['goods_id'])
     print(f"  {len(maps)} unique maps")
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = __import__("row_id_registry").base("World - Maps")  # z-order slot; see row_id_registry
     for m in maps:
         area = m['area']
@@ -58,31 +59,28 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("world_maps")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("world_maps"), disp: 1, 'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {m["x"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = m['x']
         if m['y'] != 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {m["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {m["z"]:.3f};')
+            fields['posY'] = m['y']
+        fields['posZ'] = m['z']
         # Map name from GoodsName
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {500000000 + m["goods_id"]};')
+        fields['textId1'] = 500000000 + m['goods_id']
         # Hide when collected
-        lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {m["flag"]};')
+        fields['textDisableFlagId1'] = m['flag']
         # Location for dungeons - nearest-grace lookup
         loc_id = resolve_location_id_at(m['map'], m.get('x', 0.0), m.get('y', 0.0), m.get('z', 0.0))
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {m["flag"]};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+            fields['textId2'] = loc_id
+            fields['textDisableFlagId2'] = m['flag']
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
 
-    out_path = OUT_DIR / 'World - Maps.MASSEDIT'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    out_path = sink.write(OUT_DIR / 'World - Maps.rows')
     print(f"Written {len(maps)} entries to {out_path.name}")
 
 

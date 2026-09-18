@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Generate Loot MASSEDIT files from items_database.json.
-Fully automatic - no dependency on existing MASSEDIT files.
+Generate Loot row files from items_database.json.
+Fully automatic - no dependency on existing row files.
 Uses goodsId as textId1 for localized names via GoodsName FMG.
 
-Output: data/massedit_generated/Loot - <category>.MASSEDIT
+Output: data/rows_generated/Loot - <category>.rows
 """
 
 import json
@@ -13,7 +13,9 @@ from pathlib import Path
 from collections import defaultdict, Counter
 
 import config
-from massedit_common import (DATA_DIR, OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
+import rowsink
+import relocating_spawns
+from marker_common import (DATA_DIR, OUT_DIR, UNDERGROUND_AREAS, DLC_AREAS,
                              OVERWORLD_AREAS, VALID_LOCATION_IDS, resolve_location_id,
                              resolve_location_id_at, get_disp_mask, is_dlc_plane)
 from switched_chests import build_switch_gate_map
@@ -21,7 +23,7 @@ DB_PATH = DATA_DIR / 'items_database.json'
 
 # {(map, partName): (flag, show_when_on)} for same-position switched-chest loot pairs
 # (e.g. Patches' m31_00 Cloth chest vs Glass Shard chest on flag 3691). Populated in
-# main() and applied per-marker in write_massedit as group-2 gate flags so a switched
+# main() and applied per-marker in write_rows as group-2 gate flags so a switched
 # chest's marker only shows in the world-state where that chest is actually present.
 SWITCH_GATE = {}
 
@@ -966,8 +968,8 @@ def boss_flag_drop_records(boss_by_flag):
     return records
 
 
-def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
-    """Write MASSEDIT file + slots JSON from records.
+def write_rows(records, filepath, icon_id, start_id, lot_linkage=None):
+    """Write row file + slots JSON from records.
 
     If lot_linkage (dict) is given, records each marker's source item-lot so the
     DLL can read the LIVE getItemFlagId/item from memory at runtime (live-loot /
@@ -977,7 +979,7 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
     into one marker per category). For those the lot is not an address: slot 1 of it is
     some other category's item, so live labels and live hide-flags must leave them alone.
     """
-    lines = []
+    sink = rowsink.RowSink()
     row_id = start_id
 
     for rec in records:
@@ -1035,28 +1037,26 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {icon_id};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': icon_id, disp: 1, 'areaNo': area}
 
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
+            fields['gridXNo'] = gx
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gz > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
+            fields['gridZNo'] = gz
 
         if rec['x'] != 0.0 or rec['z'] != 0.0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {rec["x"]:.3f};')
+            fields['posX'] = rec['x']
             if rec['y'] != 0.0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {rec["y"]:.3f};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {rec["z"]:.3f};')
+                fields['posY'] = rec['y']
+            fields['posZ'] = rec['z']
 
         if text_id1 > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {text_id1};')
+            fields['textId1'] = text_id1
 
         # Event flag: hide text when collected
         flag = rec.get('eventFlag', 0)
         if flag > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {flag};')
+            fields['textDisableFlagId1'] = flag
 
         # Switched-chest ENABLE gate (group-2). Only fires for the chest that the
         # EMEVD enables when the switch flag is ON (Patches' m31_00 Glass Shard chest
@@ -1074,7 +1074,7 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
         if sw:
             s_flag = sw
             s_field = 'textEnableFlag2Id'
-            lines.append(f'param WorldMapPointParam: id {row_id}: {s_field}1: = {s_flag};')
+            fields[f'{s_field}1'] = s_flag
 
         # Text slot order:
         #   1 = item name (above)
@@ -1096,11 +1096,11 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
             npc_name_id = 0
         if npc_name_id > 0:
             npc_text_id = npc_name_id + 700000000  # NpcName FMG offset
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {npc_text_id};')
+            fields[f'textId{next_text_slot}'] = npc_text_id
             if flag > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId{next_text_slot}: = {flag};')
+                fields[f'textDisableFlagId{next_text_slot}'] = flag
             if sw:
-                lines.append(f'param WorldMapPointParam: id {row_id}: {s_field}{next_text_slot}: = {s_flag};')
+                fields[f'{s_field}{next_text_slot}'] = s_flag
             next_text_slot += 1
 
         # Location subtitle (for non-overworld). Becomes slot 2 for treasures
@@ -1113,11 +1113,11 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
                 float(rec.get('z', 0.0)),
             )
             if loc_id > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {loc_id};')
+                fields[f'textId{next_text_slot}'] = loc_id
                 if flag > 0:
-                    lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId{next_text_slot}: = {flag};')
+                    fields[f'textDisableFlagId{next_text_slot}'] = flag
                 if sw:
-                    lines.append(f'param WorldMapPointParam: id {row_id}: {s_field}{next_text_slot}: = {s_flag};')
+                    fields[f'{s_field}{next_text_slot}'] = s_flag
                 next_text_slot += 1
 
         # Generic enemy name - only when we don't have a specific named-NPC
@@ -1135,18 +1135,22 @@ def write_massedit(records, filepath, icon_id, start_id, lot_linkage=None):
                 if word_id > 0:
                     enemy_text_id = word_id + 950000000
             if enemy_text_id > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {enemy_text_id};')
+                fields[f'textId{next_text_slot}'] = enemy_text_id
                 if flag > 0:
-                    lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId{next_text_slot}: = {flag};')
+                    fields[f'textDisableFlagId{next_text_slot}'] = flag
                 if sw:
-                    lines.append(f'param WorldMapPointParam: id {row_id}: {s_field}{next_text_slot}: = {s_flag};')
+                    fields[f'{s_field}{next_text_slot}'] = s_flag
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+        fields['selectMinZoomStep'] = 1
+        # A relocating boss's flee-spawn carries the same lot as its kill-spawn, so this marker
+        # would promise loot that cannot be picked up there. The row id is still consumed, so
+        # every other marker keeps the id it has always had.
+        if not relocating_spawns.duplicate_drop(fields):
+            sink.add(row_id, fields)
 
         row_id += 1
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
+    sink.write(filepath)
 
     return row_id - start_id
 
@@ -1254,10 +1258,10 @@ def main():
         # Sort by area, grid, position
         unique.sort(key=lambda r: (r['areaNo'], r['gridX'], r['gridZ'], r['x'], r['z']))
 
-        # Write MASSEDIT
-        massedit_path = OUT_DIR / f'{cat_name}.MASSEDIT'
-        count = write_massedit(unique, massedit_path, icon_id, start_id, LOT_LINKAGE)
-        print(f'  Written {count} entries to {massedit_path.name}')
+        # Write row
+        out_path = OUT_DIR / f'{cat_name}.rows'
+        count = write_rows(unique, out_path, icon_id, start_id, LOT_LINKAGE)
+        print(f'  Written {count} entries to {out_path.name}')
 
         # Stats
         areas = defaultdict(int)
@@ -1287,9 +1291,11 @@ def main():
         if _b.get('npcNameId', 0) > 0 and _b.get('enemyModel'):
             boss_name_by_model.setdefault(_b['enemyModel'], _b['npcNameId'])
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = _row_id_registry.base("World - Bosses")  # z-order slot; see row_id_registry
     boss_count = 0
+    # Flee-spawns already shown by a boss row of their own; the rest get one appended below.
+    covered_spawns = set()
     text_matched = 0
     for rec in sorted(boss_list, key=lambda r: (r['areaNo'], r.get('gridX', 0), r.get('gridZ', 0))):
         area = rec['areaNo']
@@ -1303,20 +1309,18 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {__import__("icon_registry").iconid("bosses")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': __import__("icon_registry").iconid("bosses"), disp: 1, 'areaNo': area}
 
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
+            fields['gridXNo'] = gx
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gz > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
+            fields['gridZNo'] = gz
 
         if rec['x'] != 0.0 or rec['z'] != 0.0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {rec["x"]:.3f};')
+            fields['posX'] = rec['x']
             if rec['y'] != 0.0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {rec["y"]:.3f};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {rec["z"]:.3f};')
+                fields['posY'] = rec['y']
+            fields['posZ'] = rec['z']
 
         # textId1: enemy name via TutorialTitle (text-matched with vanilla PlaceName)
         enemy_model = rec.get('enemyModel', '')
@@ -1339,27 +1343,27 @@ def main():
         if tutorial_id <= 0 and name_id <= 0:
             name_id = boss_name_by_model.get(enemy_model, 0)
         if tutorial_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {tutorial_id + 900000000};')
+            fields['textId1'] = tutorial_id + 900000000
         elif name_id > 0:
             # Vanilla: standard boss name from NpcName (every HP-bar boss has one)
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {name_id + 700000000};')
+            fields['textId1'] = name_id + 700000000
         else:
             # Fallback: PlaceName ID from ERR WorldMapPointParam, else the
             # generic BloodMsg word "boss" (vanilla, localized)
             wmp_tid = rec.get('wmpTextId1', 0)
             if wmp_tid > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {wmp_tid};')
+                fields['textId1'] = wmp_tid
             elif config.PROFILE != 'err':
-                lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {950000000 + 30006};')
+                fields['textId1'] = 950000000 + 30006
 
         # Kill flag for green checkmark AND hide-when-killed option
         kill_flag = rec.get('killEventFlagId', 0)
         cleared_flag = kill_flag if kill_flag > 0 else rec.get('clearedEventFlagId', 0)
         if cleared_flag > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: clearedEventFlagId: = {cleared_flag};')
+            fields['clearedEventFlagId'] = cleared_flag
             # Also set textDisableFlagId1 - C++ config chooses which to use:
             # green checkmark (clearedEventFlagId) or hide killed (textDisableFlagId1)
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {cleared_flag};')
+            fields['textDisableFlagId1'] = cleared_flag
 
         # textId2: location name for dungeons - nearest-grace lookup
         loc_id = resolve_location_id_at(
@@ -1369,18 +1373,51 @@ def main():
             float(rec.get('z', 0.0)),
         )
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
             if cleared_flag > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {cleared_flag};')
+                fields['textDisableFlagId2'] = cleared_flag
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+        # A boss that flees this arena is not dead here: its marker must clear on the FLEE flag, or
+        # it keeps showing a boss that has already gone.
+        spawn = relocating_spawns.boss_marker_for(fields)
+        if spawn:
+            fields['clearedEventFlagId'] = spawn['flag']
+            fields['textDisableFlagId1'] = spawn['flag']
+            if 'textDisableFlagId2' in fields:
+                fields['textDisableFlagId2'] = spawn['flag']
+            covered_spawns.add(id(spawn))
+
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
         boss_count += 1
 
-    massedit_path = OUT_DIR / 'World - Bosses.MASSEDIT'
-    with open(massedit_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    print(f'  Written {boss_count} entries ({text_matched} text-matched) to {massedit_path.name}')
+    # A flee-spawn with no boss row of its own gets one, so the arena reads "the boss was here"
+    # rather than standing empty.
+    for spawn in relocating_spawns.load():
+        if id(spawn) in covered_spawns:
+            continue
+        a, gx, gz = spawn['tile']
+        sink.row(row_id,
+                 iconId=__import__('icon_registry').iconid('bosses'),
+                 dispMask00=1,
+                 areaNo=a,
+                 gridXNo=gx,
+                 gridZNo=gz,
+                 posX=spawn['x'],
+                 posY=spawn.get('y', 0.0),
+                 posZ=spawn['z'],
+                 textId1=spawn['enemy_id'],
+                 clearedEventFlagId=spawn['flag'],
+                 textDisableFlagId1=spawn['flag'],
+                 selectMinZoomStep=1)
+        print(f"  flee-spawn boss marker added at m{a}_{gx}_{gz} flag={spawn['flag']}")
+        row_id += 1
+        boss_count += 1
+
+    out_path = OUT_DIR / 'World - Bosses.rows'
+    sink.write(out_path)
+    print(f'  Written {boss_count} entries ({text_matched} text-matched) to {out_path.name}')
 
 
     # ── Great Runes: dropped by story bosses ──
@@ -1407,7 +1444,7 @@ def main():
             if item.get('greatRune'):
                 rune_drops.append((item.get('labelItem', item['id']), item.get('name', ''), drop))
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = _row_id_registry.base("Key - Great Runes")  # z-order slot; see row_id_registry
     gr_count = 0
     seen_runes = set()
@@ -1433,20 +1470,19 @@ def main():
         else:
             disp = 'dispMask00'
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: iconId: = {_icon_registry.iconid_for_name("Key - Great Runes")};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: {disp}: = 1;')
-        lines.append(f'param WorldMapPointParam: id {row_id}: areaNo: = {area};')
+        fields = {'iconId': _icon_registry.iconid_for_name("Key - Great Runes"), disp: 1,
+                  'areaNo': area}
         if area in OVERWORLD_AREAS or area in DLC_AREAS or gx > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridXNo: = {gx};')
-            lines.append(f'param WorldMapPointParam: id {row_id}: gridZNo: = {gz};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posX: = {boss["x"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posY: = {boss["y"]:.3f};')
-        lines.append(f'param WorldMapPointParam: id {row_id}: posZ: = {boss["z"]:.3f};')
+            fields['gridXNo'] = gx
+            fields['gridZNo'] = gz
+        fields['posX'] = boss['x']
+        fields['posY'] = boss['y']
+        fields['posZ'] = boss['z']
 
         # Text: Great Rune name - hide when boss killed (rune obtained)
-        lines.append(f'param WorldMapPointParam: id {row_id}: textId1: = {500000000 + rune_id};')
+        fields['textId1'] = 500000000 + rune_id
         if kill_flag > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {kill_flag};')
+            fields['textDisableFlagId1'] = kill_flag
 
         # Dungeon location text - nearest-grace lookup
         loc_id = resolve_location_id_at(
@@ -1456,18 +1492,18 @@ def main():
             float(boss.get('z', 0.0)),
         )
         if loc_id > 0:
-            lines.append(f'param WorldMapPointParam: id {row_id}: textId2: = {loc_id};')
+            fields['textId2'] = loc_id
             if kill_flag > 0:
-                lines.append(f'param WorldMapPointParam: id {row_id}: textDisableFlagId2: = {kill_flag};')
+                fields['textDisableFlagId2'] = kill_flag
 
-        lines.append(f'param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;')
+        fields['selectMinZoomStep'] = 1
+        sink.add(row_id, fields)
         row_id += 1
         gr_count += 1
 
-    massedit_path = OUT_DIR / 'Key - Great Runes.MASSEDIT'
-    with open(massedit_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    print(f'  Written {gr_count} entries to {massedit_path.name}')
+    out_path = OUT_DIR / 'Key - Great Runes.rows'
+    sink.write(out_path)
+    print(f'  Written {gr_count} entries to {out_path.name}')
 
     # Live-loot lot linkage (row_id -> [lotId, lotType]); generate_data.py joins
     # this onto MapEntry so the DLL can read the live ItemLotParam at runtime.

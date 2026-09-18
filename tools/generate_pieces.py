@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate MASSEDIT entries for Rune Pieces and Ember Pieces
+Generate marker rows for Rune Pieces and Ember Pieces
 from extracted JSON coordinate data.
 Matches placements with ItemLotParam_map event flags for auto-hide on pickup.
 """
@@ -10,7 +10,9 @@ import json
 import math
 from pathlib import Path
 
-from massedit_common import (DATA_DIR, OUT_DIR as OUTPUT_DIR, OVERWORLD_AREAS,
+import rowsink
+import relocating_spawns
+from marker_common import (DATA_DIR, OUT_DIR as OUTPUT_DIR, OVERWORLD_AREAS,
                              resolve_location_id, resolve_location_id_at,
                              DLC_AREAS, UNDERGROUND_AREAS, get_disp_mask)
 
@@ -49,7 +51,7 @@ def load_event_flags(csv_path, goods_id):
     return flags
 
 
-def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_file, event_flags=None):
+def emit_rows(items, item_name, text_id, icon_id, start_row_id, output_file, event_flags=None):
     # Deduplicate: skip _10 variants (post-event duplicates)
     seen_coords = set()
     unique_items = []
@@ -64,7 +66,7 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
     flags = list(event_flags) if event_flags else []
     flag_idx = 0
 
-    lines = []
+    sink = rowsink.RowSink()
     row_id = start_row_id
 
     for item in unique_items:
@@ -82,29 +84,28 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
         else:
             disp = "dispMask00"
 
-        lines.append(f"param WorldMapPointParam: id {row_id}: iconId: = {icon_id};")
-        lines.append(f"param WorldMapPointParam: id {row_id}: {disp}: = 1;")
+        fields = {'iconId': icon_id, disp: 1}
 
-        lines.append(f"param WorldMapPointParam: id {row_id}: areaNo: = {area};")
+        fields['areaNo'] = area
         if area in (60, 61) or area in DLC_AREAS:
-            lines.append(f"param WorldMapPointParam: id {row_id}: gridXNo: = {gridX};")
-            lines.append(f"param WorldMapPointParam: id {row_id}: gridZNo: = {gridZ};")
+            fields['gridXNo'] = gridX
+            fields['gridZNo'] = gridZ
         elif gridX > 0:
-            lines.append(f"param WorldMapPointParam: id {row_id}: gridXNo: = {gridX};")
+            fields['gridXNo'] = gridX
 
-        lines.append(f"param WorldMapPointParam: id {row_id}: posX: = {x:.3f};")
+        fields['posX'] = x
         y = item.get('y', 0.0)
         if y != 0.0:  # carry source MSB Y (posY is unused by the game; the hover overlay reads it for height)
-            lines.append(f"param WorldMapPointParam: id {row_id}: posY: = {y:.3f};")
-        lines.append(f"param WorldMapPointParam: id {row_id}: posZ: = {z:.3f};")
+            fields['posY'] = y
+        fields['posZ'] = z
         # Offset-encode goods ID (500M) to avoid collision with PlaceName IDs
-        lines.append(f"param WorldMapPointParam: id {row_id}: textId1: = {text_id + 500000000};")
+        fields['textId1'] = text_id + 500000000
 
         # Per-item auto-hide flag (from items_database boss-flag records); kept
         # backwards-compatible with AEG099_821/822 markers which don't have one.
         item_flag = item.get('event_flag', 0)
         if item_flag > 0:
-            lines.append(f"param WorldMapPointParam: id {row_id}: textDisableFlagId1: = {item_flag};")
+            fields['textDisableFlagId1'] = item_flag
             flag_idx += 1
 
         next_text_slot = 2
@@ -112,9 +113,9 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
         # (e.g. Nokron vs Siofra River in m12_02/m12_07).
         loc_id = resolve_location_id_at(item['map'], item['x'], item.get('y', 0.0), item['z'])
         if loc_id > 0:
-            lines.append(f"param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {loc_id};")
+            fields[f'textId{next_text_slot}'] = loc_id
             if item_flag > 0:
-                lines.append(f"param WorldMapPointParam: id {row_id}: textDisableFlagId{next_text_slot}: = {item_flag};")
+                fields[f'textDisableFlagId{next_text_slot}'] = item_flag
             next_text_slot += 1
 
         # Enemy name for boss-flag pieces. Two paths:
@@ -130,17 +131,20 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
         elif npc_name_id > 0:
             enemy_text_id = npc_name_id + 700000000
         if enemy_text_id > 0:
-            lines.append(f"param WorldMapPointParam: id {row_id}: textId{next_text_slot}: = {enemy_text_id};")
+            fields[f'textId{next_text_slot}'] = enemy_text_id
             if item_flag > 0:
-                lines.append(f"param WorldMapPointParam: id {row_id}: textDisableFlagId{next_text_slot}: = {item_flag};")
+                fields[f'textDisableFlagId{next_text_slot}'] = item_flag
             next_text_slot += 1
 
-        lines.append(f"param WorldMapPointParam: id {row_id}: selectMinZoomStep: = 1;")
+        fields['selectMinZoomStep'] = 1
+        # Same rule as the loot generator: a piece that names a relocating boss and stands on its
+        # flee-spawn is that boss's drop, and it cannot be picked up there.
+        if not relocating_spawns.duplicate_drop(fields):
+            sink.add(row_id, fields)
 
         row_id += 1
 
-    with open(output_file, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
+    sink.write(output_file)
 
     slot_map = {}
     row_id2 = start_row_id
@@ -176,7 +180,7 @@ def generate_massedit(items, item_name, text_id, icon_id, start_row_id, output_f
     return row_id
 
 
-# --- Enemy-name resolution (shared with generate_loot_massedit) ---
+# --- Enemy-name resolution (shared with generate_loot) ---
 def _load_enemy_tutorial_mapping():
     p = DATA_DIR / 'enemy_tutorial_mapping.json'
     return json.load(open(p)) if p.exists() else {}
@@ -190,7 +194,7 @@ TUTORIAL_IDS = _load_tutorial_ids()
 
 def resolve_enemy_tutorial_id(enemy_model, npc_param_id):
     """Resolve TutorialTitle FMG id for an enemy. Mirrors
-    generate_loot_massedit.resolve_enemy_tutorial_id (variant by NpcParam digit)."""
+    generate_loot.resolve_enemy_tutorial_id (variant by NpcParam digit)."""
     base_id = ENEMY_NAMES.get(enemy_model, 0)
     if base_id <= 0:
         return 0
@@ -417,21 +421,21 @@ def main():
     ember_flags = load_event_flags(CSV_PATH, 850010)
     print(f"CSV-derived event flags: {len(rune_flags)} for Rune, {len(ember_flags)} for Ember")
 
-    print("\nGenerating MASSEDIT...")
+    print("\nGenerating rows...")
 
-    generate_massedit(
+    emit_rows(
         rune_items, "Rune Pieces",
         text_id=800010, icon_id=__import__("icon_registry").iconid("rune_pieces"),   # "Rune Piece" - localized via GoodsName FMG
         start_row_id=__import__("row_id_registry").base("Reforged - Rune Pieces"),
-        output_file=OUTPUT_DIR / "Reforged - Rune Pieces.MASSEDIT",
+        output_file=OUTPUT_DIR / "Reforged - Rune Pieces.rows",
         event_flags=rune_flags
     )
 
-    generate_massedit(
+    emit_rows(
         ember_items, "Ember Pieces",
         text_id=850010, icon_id=__import__("icon_registry").iconid("ember_pieces"),   # "Ember Piece" - same star as Rune Pieces
         start_row_id=__import__("row_id_registry").base("Reforged - Ember Pieces"),
-        output_file=OUTPUT_DIR / "Reforged - Ember Pieces.MASSEDIT",
+        output_file=OUTPUT_DIR / "Reforged - Ember Pieces.rows",
         event_flags=ember_flags
     )
 

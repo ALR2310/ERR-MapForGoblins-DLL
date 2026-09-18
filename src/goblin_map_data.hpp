@@ -1,8 +1,9 @@
 #pragma once
 
 // Hand-maintained, NOT generated: the Category enum and the MapEntry layout that every profile's
-// baked src/generated*/goblin_map_data.cpp fills. tools/generate_data.py writes the .cpp against
-// this header (CATEGORY_MAP there names these members). It used to live in src/generated/ and left
+// packed src/generated*/goblin_map_blob_data.cpp expands into. tools/generate_data.py packs
+// against this header (its CATEGORY_MAP names these members, and tools/mapblob.py reads the
+// Category enum straight out of this file so the two cannot drift). It used to live in src/generated/ and left
 // git with that directory in 560bc65; it belongs with the sources.
 
 #include "from/paramdef/WORLD_MAP_POINT_PARAM_ST.hpp"
@@ -102,24 +103,22 @@ struct MapEntry
     // category came first. Live labels and live hide-flags skip it and the baked label and
     // the boss's own kill flag stand; the spoiler-free icon and label still apply.
     uint8_t  lotAggregate;
-    // REAL (pre-de-overlap) MSB-local X/Z. data.posX/posZ may be spiral-shifted by
-    // the de-overlap pass so stacked icons read separately; collected-geometry
-    // tracking must match the LIVE CSWorldGeomMan instance at its true coordinates,
-    // so it uses these instead of the shifted display position. Equal to
-    // data.posX/posZ for any row the de-overlap didn't move.
+    // Where collected-geometry tracking has to LOOK, which is not always where the marker is
+    // drawn: a relocated piece displays at its pickup spot while its geometry - the live
+    // CSWorldGeomMan instance tracking has to find - stayed at the MSB position. Equal to
+    // data.posX/posZ for every row that was not moved that way.
+    // The DISPLAY position is data.posX/posZ itself. There used to be a third pair here,
+    // because a generation-time pass spiralled stacked icons apart and made data.pos untrue;
+    // that pass is gone (the live de-overlap in goblin_inject.cpp re-spreads from the row's own
+    // position on every refresh and overwrote the baked spread anyway).
     float real_posX;
     float real_posZ;
-    // Pre-de-overlap DISPLAY position: where this marker wants to sit on the map before the
-    // offline pass spiralled stacked icons apart. Separate from real_pos because the two
-    // diverge: a relocated piece displays at its pickup spot but its geometry - what
-    // collected tracking has to find - stayed at the MSB position, and Roundtable Hold rows
-    // carry an interior shift that display needs and tracking must not have. The live
-    // de-overlap and the native marker path start from THIS pair.
-    float display_posX;
-    float display_posZ;
 };
 
-extern const MapEntry MAP_ENTRIES[];
-extern const size_t MAP_ENTRY_COUNT;
+// Filled by goblin::generated::load_map_data() (src/goblin_map_blob.cpp) at startup, from
+// the packed table in src/generated*/goblin_map_blob_data.cpp. A POINTER, not an array:
+// every use is MAP_ENTRIES[i], which reads the same, and nothing takes sizeof it.
+extern const MapEntry *MAP_ENTRIES;
+extern size_t MAP_ENTRY_COUNT;
 
 } // namespace goblin::generated

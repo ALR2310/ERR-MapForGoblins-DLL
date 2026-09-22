@@ -116,7 +116,9 @@ MapForGoblins/
 │   ├── from/               Game engine structures (params, paramdefs)
 │   └── goblin/             Mod-specific headers (structs, flags, tiles)
 ├── tracker/                RunePieceTracker - standalone piece tracking DLL
-├── data/
+├── inputs/                 Committed pipeline inputs nothing regenerates (unprojectable tiles,
+│   └── <profile>/          invader overrides, model aliases, enemy names i18n; per-profile extras)
+├── data/                   Pipeline workspace, gitignored: everything here is regenerated
 │   ├── rows_generated/     Generated marker rows (binary, one file per category)
 │   └── *.json, *.csv       Extracted game data (items, entity index, EMEVD map, ...)
 ├── tools/                  Python scripts (extraction, generation, analysis)

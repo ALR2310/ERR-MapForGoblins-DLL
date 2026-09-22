@@ -3744,7 +3744,7 @@ namespace
                 // is why one open gets 7877 sprite-171 executions and the next gets 10.
                 // Where the projection failures are, once per distinct set: the tiles the
                 // engine's converter refuses are a property of the profile's data, and this
-                // line is what data/unprojectable_tiles.json is maintained from.
+                // line is what inputs/unprojectable_tiles.json is maintained from.
                 if (!g_v3_native.failed_project_tiles.empty())
                 {
                     std::string tiles;

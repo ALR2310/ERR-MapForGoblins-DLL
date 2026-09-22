@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate GENERATED_DIR/goblin_region_map.{hpp,cpp}: a tile -> game-zone map for
-the overlay Progress tab, baked from data/[<profile>/]tile_region_map.json (derived
+the overlay Progress tab, baked from inputs/<profile>/tile_region_map.json (derived
 from BonfireWarpParam graces).
 
 Why: the map-fragment table (goblin_map_tiles.hpp) groups tiles by which fragment
@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import config
 
 OUT_DIR = config.GENERATED_DIR
-SRC = config.DATA_DIR / "tile_region_map.json"
+SRC = config.PROFILE_INPUTS_DIR / "tile_region_map.json"
 PLACENAME = config.DATA_DIR / "PlaceName_engus.json"
 
 KEY_RE = re.compile(r"^m(\d+)_(\d+)_(\d+)")

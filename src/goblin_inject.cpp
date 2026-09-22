@@ -2879,7 +2879,7 @@ const std::vector<uint8_t *> &goblin::injected_row_ptrs()
 // stop being attackable, so both markers should show the checkmark.
 // Such rows are baked with the PRIMARY flag; once the ALT flag turns on
 // this rewrites the matching fields so the checkmark/hide reacts within
-// the running session. Pairs mirror data/quest_invader_overrides.json.
+// the running session. Pairs mirror inputs/quest_invader_overrides.json.
 //
 // Event-flag query - same AOBs as goblin_markers.cpp / goblin_kindling.cpp
 // (each keeps its own local copy by established convention there).

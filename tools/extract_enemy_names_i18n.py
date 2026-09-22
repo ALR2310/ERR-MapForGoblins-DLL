@@ -9,7 +9,7 @@ Omen"). Tutorial tips and any category-header entries are NOT extracted. The
 output is a plain enemy-name table; consumers never reference where the source
 msgbnd came from.
 
-Output (committed, profile-independent): data/enemy_names_i18n.json
+Output (committed, profile-independent): inputs/enemy_names_i18n.json
   { "<id>": { "engus": "Margit, the Fell Omen", "jpnjp": "...", ... }, ... }
 """
 import sys, io, os, re, json, tempfile
@@ -85,7 +85,7 @@ def main():
                 count += 1
         print(f'  {lang}: {count} enemy names')
 
-    out = config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json'
+    out = config.INPUTS_DIR / 'enemy_names_i18n.json'
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(table, f, ensure_ascii=False, indent=0)
     # coverage stats

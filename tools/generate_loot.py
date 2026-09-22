@@ -192,8 +192,10 @@ LOOT_CATEGORIES = {
         'startId': 3300000,
     },
     'Key - Larval Tears': {
+        # 8185 Larval Tear, 2008033 (DLC), 8180 Golden Larval Tear (ERR 2.3.5.0: the
+        # Fundamental Rebirth tear at Rennala; goodsType puts it with crafting materials).
         'filter': lambda items: any(
-            i['category'] == 1 and i['id'] in (8185, 2008033)
+            i['category'] == 1 and i['id'] in (8185, 2008033, 8180)
             for i in items
         ),
         'iconId': 418,
@@ -752,7 +754,7 @@ def deduplicate(records):
 # their enemy labels match the ERR-build quality; the strings themselves are
 # FromSoft / community-wiki enemy names (see the comparison notes).
 def _load_enemy_names_i18n():
-    p = config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json'
+    p = config.INPUTS_DIR / 'enemy_names_i18n.json'
     if p.exists():
         with open(p, encoding='utf-8') as f:
             return json.load(f)  # {"<id>": {"engus": name, ...}}
@@ -785,7 +787,7 @@ def load_enemy_names():
         with open(path) as f:
             names = json.load(f) or None
     names = names or _model_map_from_i18n()
-    alias_path = config.PROJECT_DIR / 'data' / 'enemy_model_aliases.json'
+    alias_path = config.INPUTS_DIR / 'enemy_model_aliases.json'
     if alias_path.exists():
         with open(alias_path, encoding='utf-8') as f:
             for model, target in json.load(f).items():
@@ -815,7 +817,7 @@ def load_bloodmsg_words():
     vanilla FMGs (regular mobs): the closest word from the blood-message
     vocabulary (BloodMsg FMG, localized in all languages). Lives in the
     committed data/ root (profile-independent source table)."""
-    path = config.PROJECT_DIR / 'data' / 'enemy_bloodmsg_mapping.json'
+    path = config.INPUTS_DIR / 'enemy_bloodmsg_mapping.json'
     if path.exists():
         with open(path, encoding='utf-8') as f:
             return {m: int(v['word_id']) for m, v in json.load(f).items()}

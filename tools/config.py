@@ -53,13 +53,20 @@ PROFILE = os.environ.get("MFG_PROFILE", "err").strip().lower()
 if PROFILE not in ("err", "vanilla", "convergence2", "convergence3", "erte", "goldenage", "goldenage361", "vins", "reborn", "graceborne", "throne"):
     PROFILE = "err"
 
-# Profile-scoped intermediate/generated data dir.
+# Profile-scoped intermediate/generated data dir. Everything under data/ is WRITTEN by the pipeline
+# and gitignored; a clone regenerates it from the mod's own files.
 if PROFILE == "err":
     DATA_DIR = PROJECT_DIR / "data"
     GENERATED_DIR = PROJECT_DIR / "src" / "generated"
 else:
     DATA_DIR = PROJECT_DIR / "data" / PROFILE
     GENERATED_DIR = PROJECT_DIR / "src" / ("generated_" + PROFILE)
+
+# The committed inputs nothing regenerates: hand-maintained tables (unprojectable tiles, invader
+# overrides, model aliases, blood-message mapping) and the one-off enemy-name extraction. Shared ones
+# at inputs/, profile-specific ones at inputs/<profile>/ (only err has any today).
+INPUTS_DIR = PROJECT_DIR / "inputs"
+PROFILE_INPUTS_DIR = INPUTS_DIR / PROFILE
 
 # Sprite-171 icon frame offset for the active profile. Our custom icon frames
 # occupy 349-440 on the ERR/vanilla worldmap gfx. The Convergence's own

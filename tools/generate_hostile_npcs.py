@@ -142,7 +142,7 @@ def main():
     # Curated quest-invader overrides (committed repo data, profile-independent;
     # decompile-verified flags/positions for invaders outside the 90005792
     # template - e.g. the Knight of the Great Jar trio).
-    overrides_path = config.PROJECT_DIR / 'data' / 'quest_invader_overrides.json'
+    overrides_path = config.INPUTS_DIR / 'quest_invader_overrides.json'
     quest_overrides = {}
     if overrides_path.exists():
         with open(overrides_path, encoding='utf-8') as f:

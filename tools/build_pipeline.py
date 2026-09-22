@@ -36,7 +36,9 @@ import config
 
 REPO = Path(__file__).resolve().parent.parent
 TOOLS = REPO / 'tools'
-DATA = config.DATA_DIR                 # data/ (err) or data/<profile>/ otherwise
+DATA = config.DATA_DIR                 # data/ (err) or data/<profile>/ otherwise
+INPUTS = config.INPUTS_DIR                  # committed, never generated (see config.py)
+PROFILE_INPUTS = config.PROFILE_INPUTS_DIR
 DATA.mkdir(parents=True, exist_ok=True)
 CACHE_FILE = DATA / '.build_cache.json'
 
@@ -284,9 +286,9 @@ STAGES = [
           also_scripts=['config.py']),
 
     Stage('generate_loot',
-          inputs=[REPO / 'data' / 'enemy_bloodmsg_mapping.json',
-                  REPO / 'data' / 'enemy_names_i18n.json',
-                  REPO / 'data' / 'enemy_model_aliases.json',
+          inputs=[INPUTS / 'enemy_bloodmsg_mapping.json',
+                  INPUTS / 'enemy_names_i18n.json',
+                  INPUTS / 'enemy_model_aliases.json',
                   DATA / 'items_database.json',
                   DATA / 'goods_sort_groups.json',
                   DATA / 'goods_crafting_ids.json',
@@ -362,7 +364,7 @@ STAGES = [
           also_scripts=['extract_all_items.py'] + COMMON),
 
     Stage('generate_kindling_spirits',
-          inputs=[DATA / 'kindling_spirits.json'],
+          inputs=[PROFILE_INPUTS / 'kindling_spirits.json'],
           outputs=[ROWS_OUT / 'World - Kindling Spirits.rows',
                    ROWS_OUT / 'World - Kindling Spirits_slots.json'],
           script='generate_kindling_spirits.py',
@@ -428,7 +430,7 @@ STAGES = [
                   DATA / 'items_database.json',
                   DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
                   REPO / 'data' / 'npc_name_text_map.json',
-                  REPO / 'data' / 'quest_invader_overrides.json'],
+                  INPUTS / 'quest_invader_overrides.json'],
           outputs=[ROWS_OUT / 'World - Hostile NPC.rows'],
           script='generate_hostile_npcs.py',
           also_scripts=['marker_common.py', 'row_id_registry.py', 'icon_registry.py', 'map_categories.py', 'config.py', 'npcname_known.py']),
@@ -437,9 +439,9 @@ STAGES = [
     # killed, so each gets a marker that hides (or checkmarks) on its kill flag.
     Stage('generate_strong_enemies',
           inputs=[REGULATION, MSB_DIR, config.PARAMDEF_DIR, EVENT_DIR,
-                  REPO / 'data' / 'enemy_names_i18n.json',
-                  REPO / 'data' / 'enemy_model_aliases.json',
-                  REPO / 'data' / 'enemy_bloodmsg_mapping.json'],
+                  INPUTS / 'enemy_names_i18n.json',
+                  INPUTS / 'enemy_model_aliases.json',
+                  INPUTS / 'enemy_bloodmsg_mapping.json'],
           outputs=[ROWS_OUT / 'World - Strong Enemies.rows'],
           script='generate_strong_enemies.py',
           also_scripts=['generate_hostile_npcs.py', 'generate_loot.py', 'marker_common.py',
@@ -449,8 +451,8 @@ STAGES = [
           inputs=[ROWS_OUT, DATA / 'loot_lot_linkage.json',
                   DATA / 'item_icon_table.json',
                   DATA / 'english_fallback.json',
-                  REPO / 'data' / 'unprojectable_tiles.json',          # tiles dropped before the bake
-                  config.PROJECT_DIR / 'data' / 'enemy_names_i18n.json',
+                  INPUTS / 'unprojectable_tiles.json',          # tiles dropped before the bake
+                  INPUTS / 'enemy_names_i18n.json',
                   # the hand-maintained headers the generated .cpp implement (the Category
                   # enum: generate_data's CATEGORY_MAP must name its members)
                   *[config.PROJECT_DIR / 'src' / h
@@ -468,9 +470,9 @@ STAGES = [
 
     # Tile -> game-zone (PlaceName id) map for the Progress tab, from tile_region_map.json
     # (only err ships one today; other profiles emit an empty map and fall back to the
-    # fragment grouping). Cheap; reads config.DATA_DIR/tile_region_map.json if present.
+    # fragment grouping). Cheap; reads inputs/<profile>/tile_region_map.json if present.
     Stage('generate_region_map',
-          inputs=[DATA / 'tile_region_map.json'],
+          inputs=[PROFILE_INPUTS / 'tile_region_map.json'],
           outputs=[GENERATED_CPP / 'goblin_region_map.cpp',
                    GENERATED_CPP / 'goblin_region_map.hpp'],
           script='generate_region_map.py',

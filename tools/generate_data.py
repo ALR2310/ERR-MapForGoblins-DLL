@@ -398,7 +398,7 @@ def generate_enemy_names_cpp(output_path):
     is_err = (config.PROFILE == "err")
     table = {}
     if not is_err:
-        p = config.PROJECT_DIR / "data" / "enemy_names_i18n.json"
+        p = config.INPUTS_DIR / "enemy_names_i18n.json"
         if p.exists():
             with open(p, encoding="utf-8") as f:
                 table = json.load(f)
@@ -462,11 +462,11 @@ def main():
     # itself declines). A marker there is never drawn - the engine answers "cannot convert"
     # and the DLL skips it, 111 rows on Golden Age 3.6.8 - so it is dropped here instead of
     # being baked, counted as "failed" on every map open and hiding real failures.
-    # Patterns per profile live in data/unprojectable_tiles.json: "m32_68" is one tile
+    # Patterns per profile live in inputs/unprojectable_tiles.json: "m32_68" is one tile
     # (gz 00 implied), "m32_68_01" a specific one, "m32_*" a whole area. Rows dropped here
     # are listed once per bake.
     def _load_unprojectable():
-        p = project_dir / "data" / "unprojectable_tiles.json"
+        p = config.INPUTS_DIR / "unprojectable_tiles.json"
         if not p.exists():
             return []
         with open(p, encoding="utf-8") as f:

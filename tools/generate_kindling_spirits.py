@@ -22,6 +22,7 @@ Output: data/rows_generated/World - Kindling Spirits.rows
 import json
 from pathlib import Path
 
+import config
 import rowsink
 from marker_common import OUT_DIR
 
@@ -50,7 +51,7 @@ ICON_ID = icon_registry.iconid_for_name("World - Kindling Spirits")
 
 def main():
     project_dir = Path(__file__).parent.parent
-    data_path = project_dir / "data" / "kindling_spirits.json"
+    data_path = config.PROFILE_INPUTS_DIR / "kindling_spirits.json"
     out_dir = OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 

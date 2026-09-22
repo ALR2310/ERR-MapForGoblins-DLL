@@ -93,6 +93,10 @@ SMITHBOX_DIR = None
 DARKSCRIPT_RESOURCES = None  # path to <DarkScript3>/Resources/ (optional)
 EXE_DIR = None              # folder of alternate eldenring.exe builds (anchor rebase proof)
 
+# pngquant, which generate_map_icons.py runs to quantise every map icon to a 64-colour palette
+# (bundled like SoulsFormats; GPLv3, licence beside it). [paths] pngquant in config.ini overrides.
+PNGQUANT = LIB_DIR / "pngquant" / "pngquant.exe"
+
 _config_path = TOOLS_DIR / "config.ini"
 
 if _config_path.exists():
@@ -150,6 +154,10 @@ if _config_path.exists():
     _ds = _cfg.get("paths", "darkscript_resources", fallback="").strip()
     if _ds:
         DARKSCRIPT_RESOURCES = Path(_ds)
+
+    _pq = _cfg.get("paths", "pngquant", fallback="").strip()
+    if _pq:
+        PNGQUANT = Path(_pq)
 
     _exes = _cfg.get("paths", "exe_dir", fallback="").strip()
     if _exes:

@@ -10,11 +10,14 @@ assigns each a fresh charId (maxCharId+1+i, computed live - no hardcode), append
 remaps every marker whose baked iconId is one of these to the resulting injected iconId. So no
 custom gfx needs to ship; the base gfx's vanilla icons (1-348) stay as-is.
 
-DefineBitsLossless2 body layout (format 5 = 32-bit, premultiplied ARGB, zlib):
-  [charId u16][fmt=5 u8][width u16][height u16][zlib( rows of [A,R*,G*,B*] )]
+DefineBitsLossless2 body layout, kind 3 (the default: a 64-colour palette from pngquant):
+  [charId u16][kind=3 u8][width u16][height u16][colours-1 u8][zlib( table of [R*,G*,B*,A] x colours,
+  then one index byte per pixel, rows padded to 4 bytes )]
+and kind 5 (MFG_ICON_PALETTE=0: 32-bit premultiplied ARGB):
+  [charId u16][kind=5 u8][width u16][height u16][zlib( rows of [A,R*,G*,B*] )]
 charId is emitted as 0 (placeholder); the DLL patches it to the live charId at inject time.
 """
-import os, sys, re, zlib, struct
+import os, sys, re, zlib, struct, subprocess, tempfile
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 import generate_overlay_icons as g
@@ -89,9 +92,78 @@ def icon_matrix(w, h):
     return generate_logo.swf_matrix(sc, sc, -round(w * sc * 10), -round(h * sc * 10))
 
 
+# Every icon ships as a 64-colour palette tag (DefineBitsLossless2 kind 3), quantised by pngquant -
+# a real RGBA quantiser, alpha is part of the palette. The 32-bit ARGB tags (kind 5) were 1.27 MB of
+# a 5 MB DLL and zlib barely dented them; the palette costs 216 KB and was judged on the map on
+# 2026-09-22: fine, a little soft up close. MFG_ICON_PALETTE=N picks another size, 0 = 32-bit.
+PALETTE_COLOURS = int(os.environ.get("MFG_ICON_PALETTE", "64") or 0)
+
+
+def palette_body(img, colours):
+    """DefineBitsLossless2 body, kind 3: a colour table of premultiplied R,G,B,A entries plus one
+    index byte per pixel, rows padded to 4 bytes, zlib. `img` is the premultiplied crop normalize()
+    returns; pngquant wants straight alpha, so the premultiply is undone for it and redone on the
+    palette entries it picks."""
+    import config
+    pq = getattr(config, "PNGQUANT", None)
+    if not pq or not Path(pq).is_file():
+        raise SystemExit(f"pngquant.exe not found at {pq} (tools/lib/pngquant, or [paths] pngquant "
+                         "in tools/config.ini)")
+    w, h = img.size
+    px = img.load()
+    straight = Image.new("RGBA", (w, h))
+    sp = straight.load()
+    for y in range(h):
+        for x in range(w):
+            r, gg, b, a = px[x, y]
+            sp[x, y] = ((min(255, (r * 255 + a // 2) // a), min(255, (gg * 255 + a // 2) // a),
+                         min(255, (b * 255 + a // 2) // a), a) if a else (0, 0, 0, 0))
+    with tempfile.TemporaryDirectory() as td:
+        src, dst = Path(td) / "in.png", Path(td) / "out.png"
+        straight.save(src, "PNG")
+        r = subprocess.run([str(pq), "--force", "--speed", "1", "--quality", "0-100",
+                            "--output", str(dst), str(colours), "--", str(src)],
+                           capture_output=True, text=True)
+        if r.returncode not in (0, 98, 99) or not dst.is_file():
+            raise SystemExit(f"pngquant failed ({r.returncode}): {r.stderr.strip()}")
+        q = Image.open(dst)
+        q.load()
+    if q.mode != "P":
+        raise SystemExit(f"pngquant returned a {q.mode} image, expected a palette")
+    # The alpha of a PNG8 palette lives in the tRNS chunk, which Pillow keeps in info["transparency"]
+    # (one byte per entry, shorter than the palette = the rest opaque) and does NOT fold into
+    # getpalette("RGBA") - that call answers 255 for every entry, which shipped a build whose icon
+    # edges were solid on the map while the same PNGs looked right in a browser.
+    pal = q.getpalette("RGB") or []
+    n = len(pal) // 3
+    if not 1 <= n <= 256:
+        raise SystemExit(f"palette of {n} entries")
+    trns = q.info.get("transparency", b"")
+    if isinstance(trns, int):
+        trns = bytes(255 if i != trns else 0 for i in range(n))
+    alphas = [trns[i] if i < len(trns) else 255 for i in range(n)]
+    if all(a == 255 for a in alphas) and any(px[x, y][3] < 255 for y in range(h) for x in range(w)):
+        raise SystemExit("palette came back fully opaque for an icon that has transparent pixels")
+    table = bytearray()
+    for i in range(n):
+        r, gg, b = pal[i * 3:i * 3 + 3]
+        a = alphas[i]
+        table += bytes(((r * a + 127) // 255, (gg * a + 127) // 255, (b * a + 127) // 255, a))
+    stride = (w + 3) & ~3
+    idx = q.tobytes()
+    rows = bytearray()
+    pad = bytes(stride - w)
+    for y in range(h):
+        rows += idx[y * w:(y + 1) * w] + pad
+    z = zlib.compress(bytes(table + rows), 9)
+    return struct.pack("<HBHHB", 0, 3, w, h, n - 1) + z
+
+
 def lossless_body(img):
     """DefineBitsLossless2 body (charId placeholder 0) from an ALREADY-normalized (premultiplied, cropped)
     RGBA image - do NOT normalize or premultiply again here."""
+    if PALETTE_COLOURS:
+        return palette_body(img, PALETTE_COLOURS)
     w, h = img.size
     px = img.load()
     raw = bytearray(w * h * 4)
@@ -116,6 +188,8 @@ def main():
     base = FALLBACK_CHARID_BASE
     print(f"[map-icons] MAP_ICON_CHARID_BASE fallback = {base} (real base computed at runtime)")
 
+    print("[map-icons] " + (f"{PALETTE_COLOURS}-colour palette tags (kind 3) via pngquant"
+                            if PALETTE_COLOURS else "32-bit ARGB tags (kind 5)"))
     icons = icon_set()
     g.render_icons(icons)  # no-op stub (warns on any iconId lacking committed PNG art); NO gfx render
 

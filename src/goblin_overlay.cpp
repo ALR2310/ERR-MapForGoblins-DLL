@@ -1789,12 +1789,38 @@ static std::vector<unsigned char> build_atlas_rgba()
             if (gen::MAP_ICON_TAGS[k].srcIconId == srcIcon) { tag = &gen::MAP_ICON_TAGS[k]; break; }
         if (!tag || tag->tagLen < 8) continue;
         const unsigned char *b = tag->tag;
+        const int kind = b[2];
         int w = b[3] | (b[4] << 8), h = b[5] | (b[6] << 8);
         if (w <= 0 || h <= 0 || w > 1024 || h > 1024) continue;
-        std::vector<unsigned char> px((size_t)w * h * 4);
-        mz_ulong destlen = (mz_ulong)px.size();
-        if (mz_uncompress(px.data(), &destlen, b + 7, (mz_ulong)(tag->tagLen - 7)) != MZ_OK ||
-            destlen != px.size())
+        std::vector<unsigned char> px((size_t)w * h * 4);   // A,R',G',B' per pixel, premultiplied
+        if (kind == 5)
+        {
+            mz_ulong destlen = (mz_ulong)px.size();
+            if (mz_uncompress(px.data(), &destlen, b + 7, (mz_ulong)(tag->tagLen - 7)) != MZ_OK ||
+                destlen != px.size())
+                continue;
+        }
+        else if (kind == 3 && tag->tagLen > 8)
+        {
+            // Palette tag (MFG_ICON_PALETTE builds): a colour table of n premultiplied R,G,B,A entries,
+            // then one index byte per pixel with rows padded to 4 bytes. Expanded into the same A,R,G,B
+            // buffer the 32-bit branch fills, so the downscale below does not care which one shipped.
+            const size_t n = (size_t)b[7] + 1, stride = ((size_t)w + 3) & ~(size_t)3;
+            std::vector<unsigned char> raw(n * 4 + stride * (size_t)h);
+            mz_ulong destlen = (mz_ulong)raw.size();
+            if (mz_uncompress(raw.data(), &destlen, b + 8, (mz_ulong)(tag->tagLen - 8)) != MZ_OK ||
+                destlen != raw.size())
+                continue;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    const size_t i = raw[n * 4 + (size_t)y * stride + x];
+                    const unsigned char *e = &raw[(i < n ? i : 0) * 4];
+                    unsigned char *d = &px[((size_t)y * w + x) * 4];
+                    d[0] = e[3]; d[1] = e[0]; d[2] = e[1]; d[3] = e[2];
+                }
+        }
+        else
             continue;
         const int cx = (ci % COLS) * C, cy = (ci / COLS) * C;
         // Tags are now cropped TIGHT (variable, often non-square). LETTERBOX into the square cell so the

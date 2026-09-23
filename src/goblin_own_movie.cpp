@@ -6,6 +6,7 @@
 
 #include "goblin_config.hpp"
 #include "goblin_gfx_probe.hpp"  // movie_name(): which movie a parse belongs to
+#include "goblin_swf_ids.hpp"    // which tags register a character id, as the engine reads them
 #include "modutils.hpp"
 
 #include "generated_shared/goblin_menu_icon_tags.hpp"
@@ -150,38 +151,21 @@ namespace
         out.insert(out.end(), src + t.offset, src + t.offset + t.length);
     }
 
-    // The highest character id the movie defines: ours start one past it, so they collide with none
-    // whatever movie loaded (the stock one, a patched one, an overhaul's). Define tags all start with
-    // a character id; that is the only field we need.
+    // The highest character id the movie registers: ours start one past it, so they collide with none
+    // whatever movie loaded (the stock one, a patched one, an overhaul's). Which tags register an id,
+    // and how each one's id is read, is the engine's own answer (goblin_swf_ids.hpp) - shared with the
+    // world map's ids, and it covers what the hand-kept list here missed: imports (57/71) and the u32
+    // font-texture ids (1002), with external images (1009) keyed the way the loader keys them.
     uint16_t highest_defined_cid(const uint8_t *src, const std::vector<Tag> &tags)
     {
-        // SWF defines plus the GFX EXTENSIONS - 1009 (external image) is by far the most common define
-        // tag in these movies and was missing, so the guard used to declare a range "free" while ids in
-        // it were defined by image tags. 8 (JPEGTables) and 13 (DefineFontInfo) define no character and
-        // are dropped. Audited 2026-07-28; the 1009 body leads with a u32 id, and reading its low u16 is
-        // fine for the ids these movies use (all well under 0x10000).
-        static const uint16_t kDefineTags[] = {
-            2,  6,  7,  10, 11, 14, 20, 21, 22, 32, 33, 34, 35, 36, 37, 39, 46, 48, 60, 75, 83,
-            84, 87, 90, 91,
-            1001, 1003, 1004, 1005, 1006, 1007, 1008, 1009};
-        uint16_t highest = 0;
+        uint32_t highest = 0;
         for (const Tag &t : tags)
         {
-            bool defines = false;
-            for (uint16_t d : kDefineTags)
-                if (t.code == d)
-                {
-                    defines = true;
-                    break;
-                }
-            if (!defines || t.length < 2)
-                continue;
-            uint16_t cid = 0;
-            std::memcpy(&cid, src + t.offset, 2);
-            if (cid > highest)
-                highest = cid;
+            uint32_t id = 0;
+            if (goblin::swf::tag_max_id(t.code, src + t.offset, t.length, id) && id > highest)
+                highest = id;
         }
-        return highest;
+        return static_cast<uint16_t>(highest); // tag_max_id only reports ids below 0x10000
     }
 
     // Does the sprite `t` place anything at a depth in [lo, hi]? Our row children go there, so a row
@@ -1940,7 +1924,7 @@ namespace
         return false;
     }
 
-    void tag_loop_detour(void *movieData, void *ctx, void *arg3)
+    void tag_loop_body(void *movieData, void *ctx, void *arg3)
     {
         uint64_t reader = 0;
         void *source = nullptr;
@@ -2042,6 +2026,16 @@ namespace
         spdlog::info("[ownmovie] caption block dropped from the panel: {}",
                      g_caption_block_dropped ? "yes" : "no");
         o_tag_loop(movieData, ctx, arg3);
+    }
+
+    // Every path through the body ends in the engine's own loop, so when it returns the movie is fully
+    // parsed (the loop has set the load state to finished) and not yet instanced. The world map's
+    // parse gets its one-shot check of our character ids there (gfx_probe::after_parse); for every
+    // other movie that call is two compares.
+    void tag_loop_detour(void *movieData, void *ctx, void *arg3)
+    {
+        tag_loop_body(movieData, ctx, arg3);
+        goblin::gfx_probe::after_parse(movieData, ctx);
     }
 
 }

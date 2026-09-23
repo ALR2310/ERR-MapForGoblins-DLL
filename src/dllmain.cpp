@@ -27,6 +27,7 @@
 #include "sc2/overlay_present.hpp" // capture_creation_entrypoints(), called first thing below
 #include "goblin_map_timing.hpp"
 #include "goblin_gfx_probe.hpp"
+#include "goblin_safemem.hpp" // this thread's own VirtualQuery counters, for [tickcost]
 #include "goblin_maphover.hpp"
 #include "goblin_stall_probe.hpp"
 #include "goblin_worldmap_probe.hpp"
@@ -41,6 +42,18 @@ static int safe_refresh_seh()
     __try
     {
         return goblin::collected::refresh();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+static uint64_t safe_change_signature_seh()
+{
+    __try
+    {
+        return goblin::collected::change_signature();
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -95,7 +108,7 @@ static void safe_gfx_tick_seh()
 {
     __try
     {
-        goblin::gfx_probe::tick(); // charId collision self-heal + (debug_logging) diagnostics
+        goblin::gfx_probe::tick(); // audit, stall sampler + (debug_logging) diagnostics
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -134,6 +147,7 @@ static void init_maphover()         { goblin::maphover::setup(); }
 static void init_stall_probe()      { goblin::stall_probe::setup(); }
 static void init_worldmap_probe()   { goblin::worldmap_probe::setup(); }
 static void init_anchors()          { goblin::anchors::warm(); }
+static void init_class_names()      { goblin::anchors::prewarm_vtables(); }
 
 static void safe_init_step(InitFn fn, const char *name)
 {
@@ -817,8 +831,11 @@ static void setup_logger(std::filesystem::path log_file)
 {
     auto logger = std::make_shared<spdlog::logger>("mapforgoblins");
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] %^[%l]%$ %v");
+    // The _mt sink: this logger is written from the watcher, the map/render thread, the hotkey and
+    // worker threads at once. The _st sink has no lock at all, so two writers shared the pattern
+    // formatter's cached time and, at the daily rotation, the file close/open.
     logger->sinks().push_back(
-        std::make_shared<spdlog::sinks::daily_file_sink_st>(log_file.string(), 0, 0, false, 5));
+        std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file.string(), 0, 0, false, 5));
     logger->flush_on(spdlog::level::info);
 
 #if _DEBUG
@@ -913,6 +930,16 @@ static void setup_mod()
     try { modutils::enable_hooks(); }  // apply just the gfx_probe hooks queued so far (MH_ApplyQueued)
     catch (const std::exception &e) { spdlog::error("handler setup (gfx) FAILED: {}", e.what()); }
 
+    // Find every class the mod checks by RTTI name (goblin::anchors::kRttiClasses) now, on this
+    // thread. Everything that asks for one - the stall_probe menu paths on the UI thread, the
+    // parked-movie scan, the kindling worker - is set up further down this same function, so
+    // each answer is published before its first caller can exist, and none of them waits or
+    // walks the exe. Here and not ahead of gfx_probe: those handlers must be live as early as
+    // possible (above), and this walk (~8 ms) only moves the start of the params wait below.
+    // Until 2026-09-23 each class was found on first use: 65-90 ms apiece, and the first
+    // settings-screen open over the map paid for two of them in a single 186 ms frame.
+    safe_init_step(&init_class_names, "anchors::class_names");
+
     // Blocks (polls internally) until the game's param tables are fully loaded. THIS is the real
     // "wait for game init" - no fixed startup sleep is used (a sleep would also push the hook-arming
     // above past the worldmap movie load on fast Proton boots, which breaks icons).
@@ -993,13 +1020,173 @@ static void setup_mod()
     bool modules_rechecked = false;
     int prev_collected = -1, prev_kindling = -1;
     auto start = std::chrono::steady_clock::now();
+
+    // Tick cadence. The regular tick (everything below) runs every 2 s on a deadline, so the period
+    // stays 2.0 s instead of creeping by up to a poll each time. Between regular ticks a cheap poll
+    // every 100 ms reads collected::change_signature() (the flag-save table gaining or losing a
+    // block, the geometry manager's block tree changing) and the save slot; when it moves, an EARLY
+    // tick runs - not sooner than 250 ms after the previous collected refresh - with only what a load
+    // or a character switch needs at once: the collected refresh, the visibility gate it feeds, and
+    // the per-character slot sync (hide file, saved focus). Kindling, the icon/stall tick, the flag
+    // pairs, the fault report and the focus prune stay on the 2 s clock exactly as before. So any
+    // load, not only one in the first half-minute, is picked up within a few hundred ms, and a quiet
+    // world costs what it did.
+    //
+    // This replaced a fixed 100 ms "fast phase" for the first 30 s after init, whose stated purpose
+    // (catching GeomNonActiveBlockManager data before it moved to the geometry manager) went away
+    // when that manager stopped being read (v1.0.17 - it never held collected state). It only ever
+    // showed up as 40-120 full walks at ~104 ms when a character loaded inside that window, and a
+    // load after it waited up to 2 s. The 30 s mark is still what times the module re-check.
+    constexpr auto kPollInterval = std::chrono::milliseconds(100);
+    constexpr auto kTickInterval = std::chrono::seconds(2);
+    constexpr auto kEarlyTickGap = std::chrono::milliseconds(250);
+    auto next_regular = start;              // the first poll runs a regular tick
+    auto last_refresh = start - kTickInterval;
+    uint64_t last_signature = 0;
+
+    // [tickcost] (debug_logging only): what a tick costs on this thread, how many ran early on a
+    // change, and the real poll period - one line per 2 minutes.
+    struct TickCost
+    {
+        int ticks = 0, early = 0, polls = 0;
+        int64_t work_us = 0, worst_us = 0, early_us = 0, poll_period_us = 0;
+    } tick_cost;
+    auto tick_cost_since = start;
+    auto prev_poll = start;
+    bool tick_tid_logged = false;
+
+    // ...and WHERE it goes. The totals above could say that one tick took 1.49 s (2026-09-23,
+    // ERR 2.3.5.1) but not which tick or which part of it. Each tick is timed part by part with QPC
+    // laps, beside this thread's own safemem numbers (VirtualQuery calls and time - the thread_local
+    // counters, not the process-wide ones every thread adds to) and its CPU time. A tick of 50 ms or
+    // more is named on the spot, so its log timestamp says WHEN; the 2-minute line is followed by
+    // the window's per-part totals and the worst tick's own split. CPU far below the wall time means
+    // the tick WAITED (a lock, a page brought in, the scheduler); kernel CPU close to it means a
+    // system call - VirtualQuery above all - did the work.
+    enum TickPart : int
+    {
+        TP_SIG, TP_MODULES, TP_FAULTS, TP_REFRESH, TP_KINDLING, TP_GFX_MSGCHECK, TP_GFX_STALL,
+        TP_GFX_LAYER, TP_GFX_CHARIDS, TP_GFX_REST, TP_FLAGS, TP_VIS, TP_SLOT, TP_PRUNE, TP_REST,
+        TP_COUNT
+    };
+    static constexpr const char *kTickPartName[TP_COUNT] = {
+        "sig", "modules", "faults", "refresh", "kindling", "gfx.msgcheck", "gfx.stall", "gfx.layer",
+        "gfx.charids", "gfx.rest", "flags", "vis", "slot", "prune", "rest"};
+    struct TickSplit
+    {
+        int64_t qpc[TP_COUNT] = {};
+        uint64_t vq_calls = 0, vq_qpc = 0, copies = 0, refused = 0, page_hits = 0;
+        int64_t cpu_user_us = 0, cpu_kernel_us = 0;
+    };
+    TickSplit split_sum{}, split_worst{};
+    bool worst_early = false;
+    const int64_t qpc_hz = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<int64_t>(f.QuadPart ? f.QuadPart : 1);
+    }();
+    auto qpc_now = [] {
+        LARGE_INTEGER v;
+        QueryPerformanceCounter(&v);
+        return static_cast<int64_t>(v.QuadPart);
+    };
+    // GetThreadTimes advances in scheduler quanta (~15.6 ms), so the CPU split is coarse on a short
+    // tick; it is there for the long ones, where waited-versus-worked is the question.
+    auto thread_cpu_us = [](int64_t &user, int64_t &kernel) {
+        FILETIME created{}, exited{}, k{}, u{};
+        user = kernel = 0;
+        if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &k, &u))
+            return;
+        const auto us = [](const FILETIME &f) {
+            return static_cast<int64_t>(((static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 10);
+        };
+        user = us(u);
+        kernel = us(k);
+    };
+    // "refresh 3412, gfx.layer 288950; VQ 67 call(s) 288731 us, ...". Parts under 100 us are left out.
+    auto split_text = [&](const TickSplit &s) {
+        char b[768];
+        int n = 0;
+        for (int p = 0; p < TP_COUNT; ++p)
+        {
+            const long long us = static_cast<long long>(s.qpc[p] * 1000000 / qpc_hz);
+            if (us < 100 || n >= 600)
+                continue;
+            const int w = _snprintf_s(b + n, sizeof(b) - n, _TRUNCATE, "%s%s %lld", n ? ", " : "",
+                                      kTickPartName[p], us);
+            if (w > 0)
+                n += w;
+        }
+        _snprintf_s(b + n, sizeof(b) - n, _TRUNCATE,
+                    "%sVQ %llu call(s) %lld us, %llu copies, %llu refused, %llu page-probe answers; cpu user %lld + "
+                    "kernel %lld us",
+                    n ? "; " : "every part under 100 us; ", static_cast<unsigned long long>(s.vq_calls),
+                    static_cast<long long>(static_cast<int64_t>(s.vq_qpc) * 1000000 / qpc_hz),
+                    static_cast<unsigned long long>(s.copies), static_cast<unsigned long long>(s.refused),
+                    static_cast<unsigned long long>(s.page_hits), static_cast<long long>(s.cpu_user_us),
+                    static_cast<long long>(s.cpu_kernel_us));
+        return std::string(b);
+    };
+
     while (true)
     {
-        // Fast polling (100ms) for first 30 seconds to catch NonActive GEOF data
-        // before it transitions to WGM. Then slow down to 2 seconds.
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        bool fast_phase = elapsed < std::chrono::seconds(30);
-        std::this_thread::sleep_for(fast_phase ? std::chrono::milliseconds(100) : std::chrono::seconds(2));
+        std::this_thread::sleep_for(kPollInterval);
+        const auto poll_time = std::chrono::steady_clock::now();
+        // One read of the switch per poll, so a tick is split, and reported, whole or not at all.
+        const bool tc_on = goblin::config::debugLogging;
+        if (tc_on)
+        {
+            ++tick_cost.polls;
+            tick_cost.poll_period_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(poll_time - prev_poll).count();
+        }
+        prev_poll = poll_time;
+        TickSplit split{};
+        int64_t lap_mark = tc_on ? qpc_now() : 0;
+        auto lap = [&](TickPart part) {
+            if (!tc_on)
+                return;
+            const int64_t now = qpc_now();
+            split.qpc[part] += now - lap_mark;
+            lap_mark = now;
+        };
+
+        uint64_t signature = 0;
+        try
+        {
+            signature = safe_change_signature_seh() * 31u + static_cast<uint64_t>(goblin::active_save_slot() + 2);
+        }
+        catch (...)
+        {
+        }
+        // Regular: the poll nearest the deadline (within half a poll either side). Early: the
+        // signature moved and the last collected refresh is at least kEarlyTickGap old.
+        const bool regular = poll_time + kPollInterval / 2 >= next_regular;
+        const bool early_tick =
+            !regular && signature != last_signature && poll_time - last_refresh >= kEarlyTickGap;
+        if (!regular && !early_tick)
+            continue;
+        lap(TP_SIG);
+        int64_t cpu_user0 = 0, cpu_kernel0 = 0;
+        uint64_t vq0 = 0, vq_qpc0 = 0, copies0 = 0, refused0 = 0, page_hits0 = 0;
+        if (tc_on)
+        {
+            thread_cpu_us(cpu_user0, cpu_kernel0);
+            vq0 = goblin::safemem::t_queries;
+            vq_qpc0 = goblin::safemem::t_query_qpc;
+            copies0 = goblin::safemem::t_copies;
+            refused0 = goblin::safemem::t_refused;
+            page_hits0 = goblin::safemem::t_page_hits;
+        }
+        if (regular)
+        {
+            next_regular += kTickInterval;
+            if (next_regular <= poll_time) // fell a whole interval behind (a long tick): restart the clock
+                next_regular = poll_time + kTickInterval;
+        }
+        last_signature = signature;
+        last_refresh = poll_time;
+        const bool startup_window = poll_time - start < std::chrono::seconds(30);
 
         // NOTHING IN A TICK MAY UNWIND OUT OF setup_mod. This function does not return after
         // "Initialization complete" - it lives in this loop for the whole session - so a throw
@@ -1014,7 +1201,7 @@ static void setup_mod()
             // Second and last inventory pass, once the frame-generation overlays and the other loader
             // DLLs have finished arriving - at init they are simply not there yet. Writes nothing if
             // the count is unchanged.
-            if (!fast_phase && !modules_rechecked)
+            if (regular && !startup_window && !modules_rechecked)
             {
                 modules_rechecked = true;
                 // Guarded because this walks paths that came from OTHER people's DLLs. Report 43: a
@@ -1032,11 +1219,16 @@ static void setup_mod()
                     spdlog::warn("[modules] t+30s inventory skipped: {}", e.what());
                 }
             }
+            lap(TP_MODULES);
 
             // Faults our own reads raised since the last poll. Printed whether or not the map is
             // open - the map being CLOSED is exactly the window that had no instrument at all.
-            if (std::string faults = goblin::crashdiag::fault_report(); !faults.empty())
-                spdlog::warn("[faults] {}", faults);
+            if (regular)
+            {
+                if (std::string faults = goblin::crashdiag::fault_report(); !faults.empty())
+                    spdlog::warn("[faults] {}", faults);
+            }
+            lap(TP_FAULTS);
 
             try
             {
@@ -1051,29 +1243,50 @@ static void setup_mod()
             catch (...)
             {
             }
+            lap(TP_REFRESH);
 
-            try
+            // The 2 s clock only (see the cadence note above the loop).
+            if (regular)
             {
-                safe_kindling_refresh_seh();
-            }
-            catch (...)
-            {
-            }
+                try
+                {
+                    safe_kindling_refresh_seh();
+                }
+                catch (...)
+                {
+                }
+                lap(TP_KINDLING);
 
-            try
-            {
-                safe_gfx_tick_seh(); // icon collision self-heal + diagnostics (overlay-independent)
-            }
-            catch (...)
-            {
-            }
+                try
+                {
+                    safe_gfx_tick_seh(); // audit, stall sampler + diagnostics (overlay-independent)
+                }
+                catch (...)
+                {
+                }
+                if (tc_on)
+                {
+                    // tick() times its own blocks; whatever it spent outside them (and a split cut
+                    // short by a fault it swallowed) lands in gfx.rest.
+                    const auto &g = goblin::gfx_probe::last_tick_split();
+                    const int64_t now = qpc_now();
+                    const int64_t inner = g.msgcheck + g.stall + g.layer + g.charids;
+                    split.qpc[TP_GFX_MSGCHECK] += g.msgcheck;
+                    split.qpc[TP_GFX_STALL] += g.stall;
+                    split.qpc[TP_GFX_LAYER] += g.layer;
+                    split.qpc[TP_GFX_CHARIDS] += g.charids;
+                    split.qpc[TP_GFX_REST] += (now - lap_mark) - inner;
+                    lap_mark = now;
+                }
 
-            try
-            {
-                safe_flag_or_pairs_seh();
-            }
-            catch (...)
-            {
+                try
+                {
+                    safe_flag_or_pairs_seh();
+                }
+                catch (...)
+                {
+                }
+                lap(TP_FLAGS);
             }
 
             // When the collected set changes, refresh the live visibility gate so
@@ -1088,6 +1301,7 @@ static void setup_mod()
                 prev_kindling = kc;
                 safe_apply_category_visibility_seh();
             }
+            lap(TP_VIS);
 
             // Per-character state: on a save-slot (character) switch, load that character's
             // focus (and, when the feature is on, their hidden set) and reapply visibility.
@@ -1103,11 +1317,14 @@ static void setup_mod()
             catch (...)
             {
             }
+            lap(TP_SLOT);
 
             // Auto-clear a category focus once its last shown marker is gone (in-world pickup,
             // flag, GEOF, etc.) so a stale "showing only ..." highlight doesn't stick around.
-            if (goblin::prune_focus_if_empty())
+            // On the 2 s clock, after the slot sync of the same tick as before.
+            if (regular && goblin::prune_focus_if_empty())
                 safe_apply_category_visibility_seh();
+            lap(TP_PRUNE);
         }
         catch (const std::exception &e)
         {
@@ -1125,6 +1342,77 @@ static void setup_mod()
             {
                 ++s_tick_unknown;
                 spdlog::warn("[tick] a poll tick failed and was skipped (unknown exception)");
+            }
+        }
+
+        lap(TP_REST); // whatever ran after the last lap (a tick cut short by an exception included)
+
+        if (tc_on)
+        {
+            using namespace std::chrono;
+            const auto done = steady_clock::now();
+            const int64_t work = duration_cast<microseconds>(done - poll_time).count();
+            split.vq_calls = goblin::safemem::t_queries - vq0;
+            split.vq_qpc = goblin::safemem::t_query_qpc - vq_qpc0;
+            split.copies = goblin::safemem::t_copies - copies0;
+            split.refused = goblin::safemem::t_refused - refused0;
+            split.page_hits = goblin::safemem::t_page_hits - page_hits0;
+            {
+                int64_t cpu_user1 = 0, cpu_kernel1 = 0;
+                thread_cpu_us(cpu_user1, cpu_kernel1);
+                split.cpu_user_us = cpu_user1 - cpu_user0;
+                split.cpu_kernel_us = cpu_kernel1 - cpu_kernel0;
+            }
+            if (!tick_tid_logged)
+            {
+                tick_tid_logged = true;
+                spdlog::info("[tickcost] watcher ticks run on tid {}", GetCurrentThreadId());
+            }
+            if (early_tick)
+            {
+                ++tick_cost.early;
+                tick_cost.early_us += work;
+            }
+            else
+            {
+                ++tick_cost.ticks;
+                tick_cost.work_us += work;
+            }
+            for (int p = 0; p < TP_COUNT; ++p)
+                split_sum.qpc[p] += split.qpc[p];
+            split_sum.vq_calls += split.vq_calls;
+            split_sum.vq_qpc += split.vq_qpc;
+            split_sum.copies += split.copies;
+            split_sum.refused += split.refused;
+            split_sum.page_hits += split.page_hits;
+            split_sum.cpu_user_us += split.cpu_user_us;
+            split_sum.cpu_kernel_us += split.cpu_kernel_us;
+            // Named on the spot: this line's own timestamp is the answer to "which tick".
+            if (work >= 50000)
+                spdlog::info("[tickcost] slow {} tick {} us: {}; map {}", early_tick ? "early" : "regular", work,
+                             split_text(split), goblin::maphover::map_dialog() ? "open" : "closed");
+            if (work > tick_cost.worst_us)
+            {
+                tick_cost.worst_us = work;
+                split_worst = split;
+                worst_early = early_tick;
+            }
+            if (done - tick_cost_since >= minutes(2))
+            {
+                spdlog::info("[tickcost] {} s: {} regular tick(s) avg {} us, {} early on a change avg {} us, worst "
+                             "{} us; {} poll(s), period avg {} us",
+                             duration_cast<seconds>(done - tick_cost_since).count(), tick_cost.ticks,
+                             tick_cost.ticks ? tick_cost.work_us / tick_cost.ticks : 0, tick_cost.early,
+                             tick_cost.early ? tick_cost.early_us / tick_cost.early : 0, tick_cost.worst_us,
+                             tick_cost.polls, tick_cost.polls ? tick_cost.poll_period_us / tick_cost.polls : 0);
+                spdlog::info("[tickcost] parts over the window: {}", split_text(split_sum));
+                spdlog::info("[tickcost] the worst tick ({}, {} us): {}", worst_early ? "early" : "regular",
+                             tick_cost.worst_us, split_text(split_worst));
+                tick_cost = {};
+                split_sum = {};
+                split_worst = {};
+                worst_early = false;
+                tick_cost_since = done;
             }
         }
     }

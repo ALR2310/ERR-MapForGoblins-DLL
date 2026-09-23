@@ -72,9 +72,10 @@ PROFILE_INPUTS_DIR = INPUTS_DIR / PROFILE
 # occupy 349-440 on the ERR/vanilla worldmap gfx. The Convergence's own
 # 02_120_worldmap.gfx ALREADY extends sprite 171 to 756 frames (408 icons of
 # its own), so there our frames are appended after theirs and every baked
-# (Removed OUR_ICON_RANGE / ICON_FRAME_OFFSET.) Pure-DLL injects icon frames at
-# runtime (compute_safe_base) and rewrites each marker's iconId to the injected
-# frame, so baked iconIds are value-agnostic lookup keys - no vanilla-frame offset
+# (Removed OUR_ICON_RANGE / ICON_FRAME_OFFSET.) Pure-DLL appends icon frames at
+# runtime (character ids chosen per world-map parse, choose_charid_window) and
+# rewrites each marker's iconId to the appended frame, so baked iconIds are
+# value-agnostic lookup keys - no vanilla-frame offset
 # is needed on any profile. Numbering is owned by tools/icon_registry.py.
 
 # Local project resources (no user config needed)

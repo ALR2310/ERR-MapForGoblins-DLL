@@ -1249,6 +1249,8 @@ def main():
     no_lot = 0
     no_items = 0
 
+    no_row_items = set()  # (category, id) a lot hands out but its Equip param has no row for
+
     def extract_lot_items(lot):
         """Extract items from an ItemLotParam entry."""
         items = []
@@ -1268,8 +1270,27 @@ def main():
                 base = custom_weapon_db.get(item_id, {}).get('baseWepId', 0)
                 if base > 0:
                     custom_id, item_id, cat = item_id, base, 2
-            name = name_dbs.get(cat, {}).get(item_id, '')
-            broad_cat, sub_cat = categorize_item(cat, item_id, goods_db, weapon_db)
+            # A weapon can be handed out at an upgrade level: id = base + affinity*100 + level
+            # (ERTE lot 16000690 gives 17030004, Serpent-Hunter +4). EquipParamWeapon and
+            # WeaponName key the level-0 id, as the game itself names it. Exact id first: an
+            # overhaul's real row with non-zero last digits (VINS 2020001, Reborn 17050001) wins.
+            # The DLL names the raw key the same way (setup_messages, "level-0 base"), so the
+            # marker's textId stays the raw id.
+            name_id = item_id
+            if cat == 2 and item_id not in weapon_db and item_id % 100 \
+                    and item_id - item_id % 100 in weapon_db:
+                name_id = item_id - item_id % 100
+            # The item must exist in the param table of its category, or the pickup gives
+            # nothing: ERR 2.3.5.0 deleted Moonrithyll's Knight Sword (4540000) and left lot 30865
+            # pointing at it; ERTE lot 30100100 asks for "gem" 32360000, a weapon id. Skipped
+            # only when that table was actually read, so a missing param never drops a category.
+            cat_db = {1: goods_db, 2: weapon_db, 3: protector_db,
+                      4: accessory_db, 5: gem_db}.get(cat)
+            if cat_db and name_id not in cat_db:
+                no_row_items.add((cat, item_id))
+                continue
+            name = name_dbs.get(cat, {}).get(name_id, '')
+            broad_cat, sub_cat = categorize_item(cat, name_id, goods_db, weapon_db)
             item = {
                 'id': item_id, 'category': cat, 'num': num,
                 'name': name, 'broad_category': broad_cat, 'sub_category': sub_cat,
@@ -1444,6 +1465,7 @@ def main():
         database.append(record)
 
     print(f'  {len(database)} records (no lot: {no_lot}, no items: {no_items})')
+    print(f'  {len(no_row_items)} lot item id(s) skipped: no Equip row in their category')
 
     # Items present in ItemLotParam_map but not matched to any MSB treasure
     print('\n=== Fallback: unmatched ItemLotParam_map entries ===')

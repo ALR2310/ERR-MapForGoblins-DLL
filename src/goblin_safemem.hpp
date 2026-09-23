@@ -15,8 +15,8 @@
 // because their setup symbolized more cheaply. Our own log said nothing either time - both storms
 // were witnessed only by somebody else's log, which is why refusals are counted and reported here.
 //
-// So: ask the OS whether the range is mapped, and only then read. A refusal costs one VirtualQuery
-// on a miss and a few compares on a hit; an exception costs whatever every handler in the process
+// So: ask the OS whether the range is mapped, and only then read. A refusal costs one page probe
+// plus one VirtualQuery on a miss and a few compares on a hit; an exception costs whatever every handler in the process
 // decides to spend. The `__try` stays underneath as a net for the check-then-read race (another
 // thread can unmap between the query and the copy).
 //
@@ -65,7 +65,22 @@ namespace goblin::safemem
     // mod, and on one tester's 4.4-4.7 ms - roughly 40x normal, consistent with a memory-API
     // filter (an anti-virus). Three calls a second is therefore not "nothing next to a
     // syscall per read"; it is a visible hitch. Report this alongside the count.
+    // (The cost turned out to be the RegionSize walk, not a filter - see page_probe below.)
     inline std::atomic<uint64_t> g_query_qpc{0};
+    // Answers that came from the one-page probe instead of VirtualQuery, and what the probe costs:
+    // its QPC ticks (answered or not) and the calls it could not answer (they went on to
+    // VirtualQuery). Its 1.3-9 us is an idle-process figure; in the game it shares the memory
+    // manager with the streaming threads, so it is timed, not assumed.
+    inline std::atomic<uint64_t> g_page_hits{0};
+    inline std::atomic<uint64_t> g_probe_qpc{0};
+    inline std::atomic<uint64_t> g_probe_misses{0};
+    // The same tallies for the CALLING thread only: the process-wide ones above mix the map thread
+    // with the watcher and loader threads (ERR 2026-09-23: a 41 ms lookup in a window whose map
+    // frames never passed 9 ms could not be placed). t_queries / t_query_qpc = VirtualQuery calls
+    // and their QPC ticks, t_copies = copy() calls, t_refused = copy() refusals, t_page_hits =
+    // answered by page_probe.
+    inline thread_local uint64_t t_queries = 0, t_query_qpc = 0, t_copies = 0, t_refused = 0,
+                                 t_page_hits = 0, t_probe_qpc = 0;
 
     inline bool prot_readable(DWORD p)
     {
@@ -127,22 +142,134 @@ namespace goblin::safemem
         return nullptr;
     }
 
+    // The slot this address already owns, if any (it may just be stale).
+    inline Region *owning_slot(uintptr_t a)
+    {
+        for (size_t i = 0; i < kSlots; ++i)
+            if (t_cache[i].end && a >= t_cache[i].base && a < t_cache[i].end)
+                return &t_cache[i];
+        return nullptr;
+    }
+
+    // ── the one-page probe ───────────────────────────────────────────────────────────────────
+    // VirtualQuery's price is not the syscall. Its RegionSize is the run of identical pages from
+    // the queried page to the end of the run, and the kernel walks every page of it to report
+    // that. Measured on the author's machine 2026-09-23 (scratch/tick_gate): 1.3 us at the last
+    // page of a run, 0.64 ms for 256 MB, 8.5-10 ms for 1 GB and 11-19 ms for 2 GB of resident
+    // pages, 17-19 ms for 1 GB of trimmed ones. On ERR the map anchor sits early in a multi-GB
+    // committed game heap: 29-34 ms per cache miss, on 7 of 13 opens plus once per kTtlMs while
+    // the map stayed up, each inside the open's longest frame.
+    //
+    // QueryWorkingSetEx answers for ONE page in 1.3-9 us whatever the run: bit 0 (Valid) says the
+    // page is in the working set, bits 4-14 carry its protection. Resident and readable is proof
+    // enough for a positive. Anything else - not resident, guard, no-access, not committed, or
+    // the call unavailable - goes to VirtualQuery exactly as before, so every refusal is still the
+    // OS's full answer and negatives are still never cached.
+    //
+    // The positive covers that page and nothing more. range_ok walks region by region, so the
+    // next page of a range gets its own probe: one page can never vouch for the next, and a stale
+    // positive no longer speaks for the gigabytes a VirtualQuery run did.
+    //
+    // SHORT ranges only (kProbePages). Every per-frame caller reads a few hundred bytes at most;
+    // a bulk copy (tag and frame arrays at icon load) keeps the single VirtualQuery whose one
+    // answer covers the whole run, instead of paying a probe per page.
+    constexpr uintptr_t kPage = 0x1000;
+    constexpr uintptr_t kProbePages = 2;
+
+    // PSAPI_WORKING_SET_EX_INFORMATION, declared here so psapi.h is not pulled in.
+    struct WsExInfo
+    {
+        void *VirtualAddress;
+        uint64_t VirtualAttributes; // bit 0 Valid, bits 1-3 ShareCount, bits 4-14 Win32Protection
+    };
+    using QueryWsExFn = BOOL(WINAPI *)(HANDLE, void *, DWORD);
+
+    // Resolved at runtime from kernel32, like crashdiag's K32GetProcessMemoryInfo: no psapi.lib and
+    // no new import-table entry. Null where it does not exist, which just means VirtualQuery.
+    inline QueryWsExFn ws_query_fn()
+    {
+        static const QueryWsExFn fn = [] {
+            const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+            return k32 ? reinterpret_cast<QueryWsExFn>(
+                             reinterpret_cast<void *>(GetProcAddress(k32, "K32QueryWorkingSetEx")))
+                       : nullptr;
+        }();
+        return fn;
+    }
+
+    inline bool page_probe(uintptr_t a, uint64_t now, Region &out)
+    {
+        const QueryWsExFn fn = ws_query_fn();
+        if (!fn)
+            return false;
+        const uintptr_t page = a & ~(kPage - 1);
+        WsExInfo w{};
+        w.VirtualAddress = reinterpret_cast<void *>(page);
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        const BOOL ok = fn(GetCurrentProcess(), &w, sizeof(w));
+        QueryPerformanceCounter(&t1);
+        const uint64_t dt = static_cast<uint64_t>(t1.QuadPart - t0.QuadPart);
+        g_probe_qpc.fetch_add(dt, std::memory_order_relaxed);
+        t_probe_qpc += dt;
+        if (!ok || !(w.VirtualAttributes & 1))
+        {
+            g_probe_misses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const DWORD prot = static_cast<DWORD>((w.VirtualAttributes >> 4) & 0x7FF);
+        Region r{};
+        r.base = page;
+        r.end = page + kPage;
+        r.stamp = now;
+        r.read_ok = prot_readable(prot);
+        r.write_ok = prot_writable(prot);
+        if (!r.read_ok && !r.write_ok)
+        {
+            g_probe_misses.fetch_add(1, std::memory_order_relaxed);
+            return false; // resident but not accessible: let VirtualQuery give the full answer
+        }
+        out = r;
+        return true;
+    }
+
     // Ask the OS. A positive verdict (readable or writable) is cached; a negative one is returned
     // but NOT stored - the engine may commit into that very range on the next allocation, and a
     // cached "no" would blind us to it (the marker-creation lesson in the header comment). A
     // negative answer also EVICTS any cached positive it contradicts, so a freed region does not
     // keep passing on a stale slot until the TTL runs out.
-    inline Region query_region(uintptr_t a, uint64_t now)
+    //
+    // want_end is the end of the range the caller is validating: it decides whether the one-page
+    // probe may answer (see above).
+    inline Region query_region(uintptr_t a, uint64_t now, uintptr_t want_end)
     {
+        if (want_end > a && (want_end - 1) / kPage - a / kPage < kProbePages)
+        {
+            Region p{};
+            if (page_probe(a, now, p))
+            {
+                g_page_hits.fetch_add(1, std::memory_order_relaxed);
+                ++t_page_hits;
+                // Reuse the slot this address already owns, so a refresh does not evict a
+                // different hot region.
+                Region *slot = owning_slot(a);
+                if (!slot)
+                    slot = &t_cache[t_victim++ % kSlots];
+                *slot = p;
+                return p;
+            }
+        }
         MEMORY_BASIC_INFORMATION mbi{};
         g_queries.fetch_add(1, std::memory_order_relaxed);
+        ++t_queries;
         Region r{};
         LARGE_INTEGER t0, t1;
         QueryPerformanceCounter(&t0);
         const SIZE_T got = VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi));
         QueryPerformanceCounter(&t1);
-        g_query_qpc.fetch_add(static_cast<uint64_t>(t1.QuadPart - t0.QuadPart),
-                              std::memory_order_relaxed);
+        const uint64_t dt = static_cast<uint64_t>(t1.QuadPart - t0.QuadPart);
+        g_query_qpc.fetch_add(dt, std::memory_order_relaxed);
+        t_query_qpc += dt;
         if (got != sizeof(mbi))
             return r; // r.end == 0: not a queryable address at all
         r.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
@@ -153,21 +280,22 @@ namespace goblin::safemem
         r.write_ok = committed && prot_writable(mbi.Protect);
         // Reuse the slot this address already owns if it has one (it may just be stale), so a
         // refresh does not evict a different hot region.
-        Region *slot = nullptr;
-        for (size_t i = 0; i < kSlots; ++i)
-            if (t_cache[i].end && a >= t_cache[i].base && a < t_cache[i].end)
-            {
-                slot = &t_cache[i];
-                break;
-            }
+        Region *slot = owning_slot(a);
         if (r.read_ok || r.write_ok)
         {
             if (!slot)
                 slot = &t_cache[t_victim++ % kSlots];
             *slot = r;
         }
-        else if (slot)
-            *slot = Region{};
+        else
+        {
+            // Every slot containing the address, not just the first: one-page probe entries and
+            // multi-GB VirtualQuery entries now overlap, and a surviving overlapping positive would
+            // answer the very next call against this refusal.
+            for (auto &c : t_cache)
+                if (c.end && a >= c.base && a < c.end)
+                    c = Region{};
+        }
         return r;
     }
 
@@ -194,10 +322,12 @@ namespace goblin::safemem
             return false;
         const uint64_t now = GetTickCount64(); // once per range, not per hop
         uintptr_t at = a;
-        for (int hop = 0; hop < 4 && at < b; ++hop)
+        // 4 region hops, plus kProbePages: a range whose first pages are cached as one-page probe
+        // entries spends a hop per page before it reaches a multi-page region.
+        for (int hop = 0; hop < 4 + static_cast<int>(kProbePages) && at < b; ++hop)
         {
             const Region *cached = cache_find(at, now);
-            const Region r = cached ? *cached : query_region(at, now);
+            const Region r = cached ? *cached : query_region(at, now, b);
             if (!r.end)
                 return false;
             if (!(want_write ? r.write_ok : r.read_ok))
@@ -225,10 +355,10 @@ namespace goblin::safemem
             return 0;
         const uint64_t now = GetTickCount64();
         uintptr_t at = a;
-        for (int hop = 0; hop < 4 && at < b; ++hop)
+        for (int hop = 0; hop < 4 + static_cast<int>(kProbePages) && at < b; ++hop)
         {
             const Region *cached = cache_find(at, now);
-            const Region r = cached ? *cached : query_region(at, now);
+            const Region r = cached ? *cached : query_region(at, now, b);
             if (!r.end || !r.read_ok)
                 break;
             at = r.end;
@@ -254,9 +384,17 @@ namespace goblin::safemem
             return;
         if (due == 0) // first call arms the window; nothing to report yet
             return;
-        spdlog::info("[safemem] {} copies, {} region lookups, {} refused, {} late faults",
+        LARGE_INTEGER qf;
+        QueryPerformanceFrequency(&qf);
+        spdlog::info("[safemem] {} copies, {} region lookups, {} page probes ({} unanswered, {} us), "
+                     "{} refused, {} late faults",
                      g_copies.load(std::memory_order_relaxed),
                      g_queries.load(std::memory_order_relaxed),
+                     g_page_hits.load(std::memory_order_relaxed),
+                     g_probe_misses.load(std::memory_order_relaxed),
+                     qf.QuadPart ? g_probe_qpc.load(std::memory_order_relaxed) * 1000000 /
+                                       static_cast<uint64_t>(qf.QuadPart)
+                                 : 0,
                      g_refused.load(std::memory_order_relaxed),
                      g_late_faults.load(std::memory_order_relaxed));
     }
@@ -283,10 +421,12 @@ namespace goblin::safemem
         if (n == 0)
             return true;
         g_copies.fetch_add(1, std::memory_order_relaxed);
+        ++t_copies;
         report_periodically();
         if (!readable(src, n) || !writable(dst, n))
         {
             g_refused.fetch_add(1, std::memory_order_relaxed);
+            ++t_refused;
             return false;
         }
         if (seh_memcpy(dst, src, n))

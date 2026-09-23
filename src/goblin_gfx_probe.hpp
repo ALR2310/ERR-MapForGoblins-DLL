@@ -8,8 +8,8 @@
 // 2026-07-30; this header still claimed the old one): it is LOGGING ONLY. It does not arm the
 // RM2::Execute hook - that hook is armed by the kNativeMarkers build variant and carries the
 // marker-factory pulse, so it is live in every shipping build and is not a trace. The live
-// SpriteDef / resource-dict dumps additionally require the compile key MFG_DUMP_FRAMES, which
-// is not defined anywhere in the tree.
+// SpriteDef / frame dumps additionally require the compile key MFG_DUMP_FRAMES, which is not
+// defined anywhere in the tree.
 // See docs/research_no_gfx_icons.md.
 #include <cstdint>
 
@@ -64,7 +64,21 @@ namespace goblin::gfx_probe
     // 1-based frame id returned by injected_iconid(), this is the resource id
     // encoded in the frame's PlaceObject tag. Used by the deferred V3 factory
     // to identify the real DisplayObject when Scaleform materialises it.
+    // The ids are chosen at runtime, per world-map parse, above every id that movie registers (no
+    // build-time number exists). 0 = no ids yet (the map's icons are not in), or this icon was left
+    // out because its id did not resolve to our bitmap right after registration, or stopped doing so
+    // by the end of the parse (see after_parse) - callers skip on 0.
     uint32_t native_character_id(int sourceIconId);
+
+    // Called by goblin_own_movie's parse hook as the engine's tag loop RETURNS for any movie (loader
+    // thread; the movie is parsed and not yet instanced). For the world map's parse - the load context
+    // AND the load data our ids went into - it checks once that every id still resolves to the bitmap
+    // we registered. An icon id some later registration took over is logged and that icon left out of
+    // the marker layer; the logo is only logged. If (nearly) all ids read as changed - counting the
+    // ones already missing at registration - the check itself is taken as failed and no icon is left
+    // out (those turned off at registration are put back). The ids are never moved. For any other
+    // movie this is two compares.
+    void after_parse(void *loadData, void *ctx);
     // Injected iconId for the anon "?" (its source = generated::ANON_ICON_ID). 0 before load.
     uint32_t anon_dynamic_iconid();
     // Lowest / highest 1-based frame id we appended this worldmap load (0,0 before load). Used by
@@ -72,10 +86,24 @@ namespace goblin::gfx_probe
     // remap = two DLL instances injected; resolves to the wrong frame when the ranges overlap).
     void injected_iid_range(uint32_t &lo, uint32_t &hi);
     // Called periodically from the DLL's background watcher thread (NOT the overlay Present hook, so it
-    // runs regardless of menu_enabled): locates the worldmap icon sprite (charId 171), runs the charId
-    // collision self-heal, and (when debug_logging) the read-only diagnostic dumps. Injection itself is
-    // done by the load-time hooks, independent of this.
+    // runs regardless of menu_enabled): the patched-slot audit, the map-stall sampler and (when
+    // debug_logging) read-only diagnostics. It touches no character ids: those are chosen and checked
+    // on the loader thread during the world map's parse (injection and after_parse), not here.
     void tick();
+
+    // [tickcost] (debug_logging only): what the last tick() on the CALLING thread spent per block, in
+    // QueryPerformanceCounter ticks. Zero when debug_logging is off.
+    struct TickSplit
+    {
+        int64_t msgcheck = 0; // check_patched_slots
+        int64_t stall = 0;    // the map-stall sampler
+        int64_t layer = 0;    // the debug dialog scan
+        // Reported as gfx.charids. It timed the tick-driven charId check, which is gone (the ids are
+        // chosen per parse now); what is left under it is the debug-only sprite line, so it reads ~0.
+        // Kept so the [tickcost] columns stay the same.
+        int64_t charids = 0;
+    };
+    const TickSplit &last_tick_split();
 
     // Debug V3 spike lifecycle: the map owns and destroys the transplanted child.
     // Re-arm creation after that owner starts teardown so the next map can create
@@ -118,6 +146,14 @@ namespace goblin::gfx_probe
     // has been transplanted out, so the engine's own materialization pass can
     // never re-process the record and spawn a duplicate inside the host sprite.
     bool remove_native_icon_record(uint16_t depth, void *ctx, uint32_t frame);
+
+    // [v3pump] frame pump generator: queue ONE sprite placement of `spriteCharId` at `depth`
+    // on the live ctx - the create_native_icon_instance path with the HasImage flag cleared, so the
+    // engine instantiates a Sprite (MovieClip) instead of a bitmap leaf. Returns the timeline record
+    // found at `depth`, or 0; the caller runs the materialize driver and the place detour stages the
+    // child exactly like a marker. Revives the solid-fill spike's placement (commit 60a8f09).
+    uintptr_t create_native_sprite_child(uint16_t spriteCharId, uint16_t depth, void *ctx,
+                                         uint32_t frame);
     // NOTE: the Lever A single-mesh DrawingContext probe was removed 2026-07-18 after it
     // hit a GPU-texture wall (our injected icons cannot supply a created texture to
     // beginBitmapFill). Findings + revival options: docs/research_native_singlemesh_wall.md.

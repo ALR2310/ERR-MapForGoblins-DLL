@@ -849,6 +849,40 @@ void goblin::setup_messages()
         }
         copy_fmg_layered(weapon_slots, ammo_ids, 0, "WeaponName(ammo)");
         copy_fmg_layered(weapon_slots, weapon_offset_ids, 100000000, "WeaponName(weapon)");
+
+        // A lot can hand a weapon out at an upgrade level: id = base + affinity*100 + level
+        // (ERTE lot 16000690 gives 17030004, Serpent-Hunter +4). WeaponName keys only the
+        // level-0 id, exactly as the game names it, so an id left unnamed above takes its base
+        // id's string under its OWN key. The key stays the raw id, which is what encode_live_item
+        // and the icon table use. Only leftovers: an overhaul's real row with non-zero last digits
+        // (VINS 2020001, Reborn 17050001) has its own string and was satisfied above.
+        std::map<int32_t, std::vector<int32_t>> leveled_by_base;
+        for (int32_t key : weapon_offset_ids)
+            if (const int32_t level = (key - 100000000) % 100)
+                leveled_by_base[key - level].push_back(key);
+        if (!leveled_by_base.empty())
+        {
+            std::set<int32_t> base_keys;
+            for (const auto &kv : leveled_by_base) base_keys.insert(kv.first);
+            const size_t mark = new_entries.size();
+            copy_fmg_layered(weapon_slots, base_keys, 100000000, "WeaponName(level-0 base)");
+            const size_t end = new_entries.size();
+            int named = 0;
+            for (size_t i = mark; i < end; ++i)
+            {
+                auto it = leveled_by_base.find(new_entries[i].id);
+                if (it == leveled_by_base.end()) continue;
+                const wchar_t *text = new_entries[i].text;  // push_back below may reallocate
+                for (int32_t key : it->second)
+                {
+                    new_entries.push_back({key, text});
+                    weapon_offset_ids.erase(key);
+                    ++named;
+                }
+            }
+            if (named)
+                spdlog::info("WeaponName: {} upgrade-level id(s) named by their level-0 base", named);
+        }
     }
 
     // ProtectorName. Offset 200M.

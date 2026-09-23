@@ -228,7 +228,7 @@ static uintptr_t kindling_resolve(const char *aob)
 // 2.2.x) - see scratch/vtable_by_rtti.py.
 static uintptr_t distance_vft()
 {
-    static uintptr_t s = goblin::anchors::vtable_of(".?AVEcTestDistance@CS@@");
+    static uintptr_t s = goblin::anchors::vtable_of(goblin::anchors::RttiClass::EcTestDistance);
     return s;
 }
 // WorldSfxMan singleton slot (was RVA 0x3D6F5F8) - "game world loaded"

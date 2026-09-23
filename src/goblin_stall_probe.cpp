@@ -59,10 +59,11 @@ namespace
 {
     // The engine classes whose vtable identity these probes check. Looked up by RTTI name at
     // runtime (goblin::anchors::vtable_of) because a vtable lives in .rdata, where a byte
-    // anchor has nothing to match - a baked address only ever matched one game build.
-    constexpr const char *kVtAutoHideCtrl = ".?AVCSFeAutoHideCtrl@CS@@";
-    constexpr const char *kVtKeyConfigDialog = ".?AVKeyConfigDialog@CS@@";
-    constexpr const char *kVtWorldMapDialog = ".?AVWorldMapDialog@CS@@";
+    // anchor has nothing to match - a baked address only ever matched one game build. The
+    // names live in goblin::anchors::kRttiClasses, which init resolves before these run.
+    constexpr auto kVtAutoHideCtrl = goblin::anchors::RttiClass::CSFeAutoHideCtrl;
+    constexpr auto kVtKeyConfigDialog = goblin::anchors::RttiClass::KeyConfigDialog;
+    constexpr auto kVtWorldMapDialog = goblin::anchors::RttiClass::WorldMapDialog;
 
     std::atomic<bool> g_running{false};
 
@@ -419,6 +420,67 @@ namespace
     using V3MatDriverFn = void(void *, void *); // (execCtx, sprite)
     V3MatDriverFn *g_v3_mat_driver = nullptr;
 
+    // [v3pump] The frame pump (variants::kFramePump). Markers can only be created inside a
+    // timeline snapshot that Sprite::GotoFrame is filling: the RM2 tags of every frame it covers
+    // call our RM2 hook, and each such "pulse" lets the factory build a batch. The engine does that
+    // only in its open burst, so until 2.1.5 all ~10k markers landed in ONE frame (80-100 ms).
+    // The pump makes one hidden sprite-171 instance of our own per generation (the "generator":
+    // created in the first pulse through the marker pipeline, re-parented to the marker parent,
+    // never in `objects`, dies with the movie) and drives GotoFrame on it through its vtable:
+    //   1. first pulse: create it, then one GotoFrame NESTED inside the engine's own, with pulses
+    //      only counted (the proof). Pulses arrived -> the burst builds only the rows visible at
+    //      seed (they sort first, so draw order is unchanged) and the pump owns the rest. No pulse
+    //      or no generator -> this open builds everything in the burst, exactly as before.
+    //   2. every map tick until the queue is spent: a budget of markers (adapted toward
+    //      V3_PUMP_TARGET_US) built from the generator's own pulses, a stroke or a few per frame.
+    // Measured with the probe (ERR 2026-09-24, 36 calls, 0 faults): a stroke over M of our frames
+    // gives exactly 2M pulses (our frames are RM2 d1 + RM2 d2 + PO), a stroke back to our first
+    // frame refills from 0 and gives the stock count (143 on ERR); the calls themselves cost
+    // 12-300 us, the markers ~5 us each.
+    // RE (live exe): GotoFrame exe+0x11C3360 = Sprite vtable +0x378, frame count +0x380; entry
+    // guard word +0x6A bit 0x800 set and 0x1000 clear, dword +0x2C >= -1; current frame +0x11C
+    // (0-based). A forward jump covers cur+1..target-1, a backward one 0..target-1; the target
+    // frame itself runs through the tags' Execute (no pulse). GotoFrame stores +0x118 = 1
+    // (stopped) itself on every path past its entry test (exe+0x11C35F6), so no SetPlayState call.
+    // Flags (whole-.text scan): 0x400 = is a Sprite (ctor, never cleared; the engine's
+    // gotoAndStop tests it too), 0x800 = AS3 MovieClip timeline (instance init; sprite 171 is a
+    // MovieClip class), 0x1000 = unloading. Nested use is safe only on a sprite that is neither the
+    // one whose GotoFrame is running nor its descendant: the generator is re-parented to the marker
+    // parent before any call. No globals, no recursion guard, the snapshot's pool is per call on
+    // the movie heap (RE report, scratch/create_cost/gotoframe/nested/).
+    using V3GotoFrameFn = void(void *, uint32_t);      // (sprite, 0-based frame)
+    using V3FrameCountFn = uint32_t(void *);
+    V3GotoFrameFn *g_v3_goto_frame = nullptr;
+    constexpr uint32_t V3_SLOT_GOTO_FRAME = 0x378;
+    constexpr uint32_t V3_SLOT_FRAME_COUNT = 0x380;
+    constexpr uint16_t V3_PUMP_SPRITE_CHAR = 171;      // the world-map icon sprite
+    // Per-frame row budget, adapted on the measured cost of one row (full frames only, so the
+    // short last frame of an open cannot ratchet it up). The target is the pump's own time; the
+    // viewport reconcile detaches the same hidden rows in the same frame at about the same cost
+    // per row (~5 us each on ERR), so a frame carries roughly twice this.
+    constexpr size_t V3_PUMP_BUDGET_START = 512;
+    constexpr size_t V3_PUMP_BUDGET_MIN = 128;
+    constexpr size_t V3_PUMP_BUDGET_MAX = 2048;
+    constexpr int64_t V3_PUMP_TARGET_US = 2500;
+    constexpr uint32_t V3_PUMP_MAX_STROKES = 4;        // GotoFrame calls per frame, at most
+    struct V3PumpSession
+    {
+        bool off = false;        // a call raised or a proof came back empty: bursts only, for good
+        uint32_t no_gen_logs = 0;
+        size_t budget = V3_PUMP_BUDGET_START; // adapted per pump frame, kept across opens
+    };
+    V3PumpSession g_v3_pump; // map thread only
+    // Per thread, so a pulse on any other thread is never counted (or swallowed) as ours.
+    struct V3PumpPulses
+    {
+        bool active = false;   // the proof's GotoFrame is on the stack: pulses counted, not built
+        uintptr_t expect = 0;  // the generator; a pulse whose ctx+0x58 names it is ours
+        uint32_t pulses = 0, own = 0, other = 0;
+        bool pumping = false;  // a pump stroke is on the stack: pulses BUILD, and are counted
+        uint32_t pumped = 0;
+    };
+    thread_local V3PumpPulses t_v3_pump;
+
     // Lever C self-detach primitives (the engine's own remove-from-container path,
     // as used by the high-level reparent FUN_1410c8440):
     //   find-index  FUN_14113f8d0(childVecHeader=owner+0xd8, child) -> index or -1
@@ -631,6 +693,18 @@ namespace
         // this movie yet). Split 2026-08-05, when opens started reporting failed=5035 and 6091
         // against failed=1 on a healthy one.
         uint32_t failed_project = 0;  // mapproject::to_map said no
+        // ...split by worldmap_probe::ProjFail: `stale` / `no_view` = the game's converter was
+        // never asked (its last own call is older than the 300 ms gate), `declined` = it was
+        // asked and refused the tile. A slow first open that lost every underground and DLC tile
+        // (2026-09-22 22:57, project=2027) could not say which of the two it was.
+        uint32_t failed_project_stale = 0;
+        uint32_t failed_project_declined = 0;
+        uint32_t failed_project_noview = 0;
+        uint32_t failed_project_faulted = 0;  // the call raised and was caught (report-19 class)
+        // Placed from a tile origin learned earlier (v3_prelearn_tiles or a previous open) while
+        // the converter could not be asked. Without it a slow open that the prelearn rescued
+        // reads exactly like a fast one - this is the number that shows it engaged.
+        uint32_t placed_from_origin = 0;
         // ...and WHERE: per tile (area<<16 | gx<<8 | gz), so a profile whose count is not the
         // known one can be read off the log instead of guessed at from three capped warnings.
         // Reported once per open at CATEGORIES READY, only when the set differs from the
@@ -650,6 +724,19 @@ namespace
         uint32_t settle_frames = 0;
         bool completion_reported = false;
         bool in_factory = false;
+        // [v3pump] this generation's hidden sprite-171 instance (a child of `parent`, never in
+        // `objects`, dies with the movie) and one creation attempt. `pump_capped` = the burst
+        // stopped at the rows visible at seed and the pump owns the rest of the queue.
+        uintptr_t pump_gen = 0;
+        bool pump_tried = false;
+        bool pump_capped = false;
+        // Pending index where the burst's share ends: the rows visible at seed (they sort first)
+        // plus hidden rows on tiles whose origin the prelearn could not learn (moved right behind
+        // them: only the burst has the engine converter fresh).
+        size_t burst_end = 0;
+        uint32_t pump_dry = 0;         // pump frames in a row that got no pulse
+        uint32_t pump_stuck = 0;       // pump frames in a row with pulses but no queue progress
+        bool pump_merged = false;      // this tick already ran a merge: the pump sits it out
         uint64_t last_progress_ms = 0; // last creation (or seed); queue watchdog
         uint16_t next_depth = 24;      // timeline depth allocator (never reused)
         // Focus rings live ABOVE every marker. Depth is what decides who draws over whom, and
@@ -990,12 +1077,20 @@ namespace
         return false;
     }
 
-    uintptr_t v3_movie_of(uintptr_t object)
+    // gated=true asks the OS before every hop (v3_node_unusable) instead of letting the SEH read
+    // find out. ONLY for the previous anchor in v3_note_movie_attach, which after the
+    // big_enough/screen_gone skip is reached a handful of times per session. NOT for the tick:
+    // gating its two walks (the parent_movie capture and the unseeded dead-anchor test) cost
+    // 24-59 ms single-frame spikes on map open (2026-09-23, VirtualQuery ~4 ms a call on this
+    // box, and each hop's region pushed the anchor's own out of safemem's 8-slot cache, so the
+    // tick's entry gate missed too). The per-child attach callers keep the memo-only form above
+    // (the 45898-lookup freeze).
+    uintptr_t v3_movie_of(uintptr_t object, bool gated = false)
     {
         uintptr_t current = object;
         for (uint32_t level = 0;; ++level)
         {
-            if (level >= 16 || v3_memo_dead(current))
+            if (level >= 16 || (gated ? v3_node_unusable(current) : v3_memo_dead(current)))
                 return 0;
             // The u16 flags live at +0x6A; through the aligned u32 at +0x68
             // their 0x80 bit reads as 0x00800000.
@@ -1023,7 +1118,8 @@ namespace
         // because that is what ModEngine3's host spends symbolizing each one - the 2 s freeze.
         uint64_t as_root = 0, movie = 0;
         if (!v3_read64(current + 0x20, as_root) ||
-            v3_memo_dead(static_cast<uintptr_t>(as_root)))
+            (gated ? v3_node_unusable(static_cast<uintptr_t>(as_root), 0x18)
+                   : v3_memo_dead(static_cast<uintptr_t>(as_root))))
             return 0;
         if (!v3_read64(static_cast<uintptr_t>(as_root) + 0x10, movie))
         {
@@ -1122,6 +1218,20 @@ namespace
         int64_t create_qpc = 0;  // create_native_icon_instance (tag Execute + node search)
         int64_t mat_qpc = 0;     // the engine's record-materialization driver
         int64_t attach_qpc = 0;  // attach into the parent + the transform write
+        // [v3pump] The pulse fields above are the BURST only; the pump's own work is here, so
+        // "factory" stays the number that decides the open frame.
+        int64_t gen_qpc = 0;     // generator creation + the nested proof, inside the burst
+        uint32_t proof_pulses = 0;
+        bool capped = false;     // the proof passed: the burst was capped and the pump ran
+        size_t burst_cap = 0;    // rows the burst was allowed (visible at seed)
+        size_t burst_built = 0;  // objects when the pump took over
+        int64_t pump_qpc = 0, pump_max_qpc = 0;
+        uint32_t pump_frames = 0, pump_calls = 0, pump_pulses = 0;
+        size_t pump_built = 0;
+        // The generator's own child count, worst seen after a pump frame. 1 is its frame's icon;
+        // more would be markers left inside it instead of moved to the marker parent.
+        uint32_t gen_kids_max = 0;
+        size_t pump_dropped = 0; // rows a pump stop left unbuilt this open (dropped from the queue)
     };
     V3OpenCost g_v3_open;
 
@@ -1171,6 +1281,10 @@ namespace
         int64_t mergesec_qpc = 0;// the refresh gate itself (includes merge_qpc)
         int64_t tail_qpc = 0;   // everything after it (includes zoom_qpc)
         uint64_t copies0 = 0, queries0 = 0, refused0 = 0, vq_qpc0 = 0;
+        // One-page probe answers (process-wide), and THIS thread's VirtualQuery count and ticks.
+        // The snapshot and the line both run on the map thread, so the second pair is the map
+        // frame's own share - the process-wide lookups above mix in the watcher and loader threads.
+        uint64_t pages0 = 0, tq0 = 0, tvq0 = 0, tpq0 = 0;
     };
     V3Perf g_v3_perf;
 
@@ -1273,9 +1387,20 @@ namespace
                 const uintptr_t cand_movie = v3_movie_of(parent);
                 const bool cand_live = cand_movie != 0 && !v3_node_detached(parent);
                 const uintptr_t anchor_movie = g_v3_target_movie.load(std::memory_order_relaxed);
+                const bool big_enough = count >= kSeedMinItemsValue;
+                const bool screen_gone = g_map_screen_gone.load(std::memory_order_acquire);
+                // The previous anchor is chased ONLY when that can decide arm B: B needs
+                // big_enough, and with the screen gone arm C makes the same move without touching
+                // the old movie - whose memory is exactly what a close releases. Chasing it there
+                // cost one first-chance AV on about 1 in 13 reopens (14 of 169, ERR 09-16..09-22:
+                // v3_read32/64 <- v3_movie_of(prev_parent) <- here). The skip is the fix; the gate
+                // on what is left is a best effort only - safemem caches "readable" for 5 s and
+                // the tick keeps the anchor's region warm, so a death with the screen still up
+                // can still cost one fault before the memo answers (no worse than before).
                 const bool anchor_dead =
-                    prev_parent != 0 &&
-                    (v3_node_detached(prev_parent) || v3_movie_of(prev_parent) == 0);
+                    prev_parent != 0 && big_enough && !screen_gone &&
+                    (v3_node_unusable(prev_parent) || v3_node_detached(prev_parent) ||
+                     v3_movie_of(prev_parent, /*gated=*/true) == 0);
 
                 // The SIZE FLOOR on every arm that moves to a DIFFERENT container. Measured
                 // 2026-08-03 the hard way: with no floor at all, arm B fired on the first attach of
@@ -1292,8 +1417,8 @@ namespace
                 //
                 // Arm A keeps no floor (there is nothing to lose by anchoring early when we have no
                 // anchor at all, and arm E can still upgrade), and arm E is an upgrade within one
-                // movie, which is already ordered by count.
-                const bool big_enough = count >= kSeedMinItemsValue;
+                // movie, which is already ordered by count. (big_enough is computed above, with
+                // anchor_dead, which depends on it.)
 
                 const char *arm = nullptr;
                 // Arm A takes the floor too. Without it the first anchor of a session landed on a
@@ -1302,8 +1427,7 @@ namespace
                 // that session's first open the frozen counter-zoom.
                 if (prev_parent == 0 && big_enough)                  arm = "A-first";
                 else if (anchor_dead && big_enough)                  arm = "B-anchor-dead";
-                else if (g_map_screen_gone.load(std::memory_order_acquire) && big_enough)
-                                                                     arm = "C-new-screen";
+                else if (screen_gone && big_enough)                  arm = "C-new-screen";
                 else if (cand_movie != anchor_movie && big_enough)   arm = "D-new-movie";
                 else if (g_v3_native.objects.empty() && count > prev_count) arm = "E-upgrade";
 
@@ -1340,7 +1464,7 @@ namespace
                     spdlog::info("[v3movie] RETARGET arm={} parent 0x{:X} -> 0x{:X} count={} "
                                  "layer={} movie 0x{:X} -> 0x{:X} screenGone={}",
                                  arm, prev_parent, parent, count, live_layer, anchor_movie,
-                                 cand_movie, g_map_screen_gone.load(std::memory_order_relaxed));
+                                 cand_movie, screen_gone);
                     g_v3_target_movie.store(cand_movie, std::memory_order_relaxed);
                     // One-shot per REAL screen. Only the phase byte reading 0 can re-arm it, so a
                     // retarget can never hand itself permission to retarget again - the exact
@@ -1609,9 +1733,24 @@ namespace
     {
         std::array<ParkRegion, 32> r{};
         unsigned victim = 0;
+        // What the misses cost, owned like the slots by the one thread that owns the cache:
+        // misses the one-page probe answered, misses that went to VirtualQuery, and the QPC
+        // ticks of each. Only ever added to; a reader takes a difference.
+        uint64_t page_answers = 0;
+        uint64_t vq_calls = 0;
+        int64_t probe_qpc = 0;
+        int64_t vq_qpc = 0;
     };
     ParkRegionCache g_park_cache; // the map tick's own; touched by no other thread
 
+    // A miss asks safemem's one-page residency probe first (1-9 us) and VirtualQuery only when it
+    // cannot answer. ERR 2026-09-23: this walk cost 46-60 ms on 15 of 16 closes (28-69 ms over the
+    // day's 68), in ONE frame of the game's menu update, and 0 ms on the two closes under 1 s after
+    // the previous walk (cache still warm). VirtualQuery walks the whole run of identical pages after
+    // the address: 12-30 ms per call at ~20 GB committed. A resident readable page is proof enough
+    // for a positive and covers that page only (park_read64's addr + 7 check probes the next page on
+    // a straddle). Everything else takes the VirtualQuery path as before; negatives stay cached.
+    // Safe on the scan worker: the probe keeps only atomics and its own thread-local tally.
     bool park_point_ok(ParkRegionCache &c, uintptr_t a, uint64_t now)
     {
         ParkRegion *slot = nullptr;
@@ -1623,19 +1762,37 @@ namespace
                 slot = &r; // stale entry for this region: refresh in place
                 break;
             }
-        MEMORY_BASIC_INFORMATION mbi{};
         ParkRegion r{};
         r.stamp = now;
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof mbi) == sizeof mbi)
+        goblin::safemem::Region page{};
+        const int64_t p0 = v3_perf_now();
+        const bool resident = goblin::safemem::page_probe(a, now, page) && page.read_ok;
+        const int64_t p1 = v3_perf_now();
+        c.probe_qpc += p1 - p0;
+        if (resident)
         {
-            r.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            r.end = r.base + mbi.RegionSize;
-            r.ok = mbi.State == MEM_COMMIT && goblin::safemem::prot_readable(mbi.Protect);
+            ++c.page_answers;
+            r.base = page.base;
+            r.end = page.end;
+            r.ok = true;
         }
         else
         {
-            r.base = a & ~0xFFFull; // not a queryable address at all: remember the page as a "no"
-            r.end = r.base + 0x1000;
+            MEMORY_BASIC_INFORMATION mbi{};
+            const SIZE_T got = VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof mbi);
+            ++c.vq_calls;
+            c.vq_qpc += v3_perf_now() - p1;
+            if (got == sizeof mbi)
+            {
+                r.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                r.end = r.base + mbi.RegionSize;
+                r.ok = mbi.State == MEM_COMMIT && goblin::safemem::prot_readable(mbi.Protect);
+            }
+            else
+            {
+                r.base = a & ~0xFFFull; // not a queryable address at all: remember the page as a "no"
+                r.end = r.base + 0x1000;
+            }
         }
         if (!slot)
             slot = &c.r[c.victim++ % c.r.size()];
@@ -1678,8 +1835,10 @@ namespace
         // parked movie with no burst: the map comes up with no icons. The vtable filter admitted
         // exactly ONE candidate on that dump: the real slot. When RTTI resolution fails we keep
         // the structural shortlist as the degraded path, cap and all.
-        const uintptr_t vt_sys = exe ? goblin::anchors::vtable_of(".?AVCSScaleformSystem@CS@@") : 0;
-        const uintptr_t vt_imp = exe ? goblin::anchors::vtable_of(".?AVCSScaleformImp@CS@@") : 0;
+        const uintptr_t vt_sys =
+            exe ? goblin::anchors::vtable_of(goblin::anchors::RttiClass::CSScaleformSystem) : 0;
+        const uintptr_t vt_imp =
+            exe ? goblin::anchors::vtable_of(goblin::anchors::RttiClass::CSScaleformImp) : 0;
         if (exe)
         {
         const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe);
@@ -1761,35 +1920,22 @@ namespace
         std::thread(v3_park_scan_worker).detach();
     }
 
-    void v3_park_expire_tick()
+    // Cost account of the parked-entry walk: per target (from its first frame) and a running total
+    // that [closeframes] takes a one-frame difference of. UI thread only, like the walk.
+    struct ParkWalkCost
     {
-        const uintptr_t want = g_park_target.load(std::memory_order_relaxed);
-        if (!want) return;
-        v3_park_build_slots();
-        // No frame is charged while the scan thread is still running: on a machine where the
-        // scan outlives 600 frames the walk would otherwise disarm before its list ever existed.
-        if (!g_park_slots_built.load(std::memory_order_acquire))
-        {
-            // Say so ONCE per armed movie: this is the exact state behind "the map came up empty
-            // on a quick reopen" - the parked entry survives because the shortlist is not there.
-            static uintptr_t s_not_ready_for = 0;
-            if (s_not_ready_for != want)
-            {
-                s_not_ready_for = want;
-                spdlog::info("[v3park] shortlist not ready at close for movie 0x{:X}; "
-                             "a reopen before it lands may come up empty",
-                             want);
-            }
-            return;
-        }
-        if (++g_park_frames > 600)   // ~10 s of frames: the entry is not there, stop looking
-        {
-            g_park_target.store(0, std::memory_order_relaxed);
-            spdlog::info("[v3park] no parked entry for movie 0x{:X} after {} frames - disarmed",
-                         want, g_park_frames);
-            g_park_frames = 0;
-            return;
-        }
+        int64_t qpc = 0;
+        uint64_t answers0 = 0, vq0 = 0;
+        int64_t vq_qpc0 = 0;
+    };
+    ParkWalkCost g_park_walk;
+    int64_t g_park_walk_total_qpc = 0;
+    int64_t park_us(int64_t qpc) { return qpc * 1000000 / v3_perf_freq(); }
+
+    // One walk over the manager's parked-player list for `want`: the node whose countdown was set to
+    // -1 (expired), or 0 (no exact match this frame, or the store did not land - retried next frame).
+    uintptr_t v3_park_walk_once(uintptr_t want)
+    {
         // Try the slot that matched before; failing that, every candidate. The loop below ends on
         // an exact movie-pointer match, so a wrong candidate costs one short walk and nothing else.
         for (size_t cand = 0; cand < (g_park_slot ? 1u : g_park_slots.size()); ++cand)
@@ -1824,23 +1970,9 @@ namespace
                 g_park_slot = slot_addr;
                 g_vt_sfmgr = mvt;
                 const float expired = -1.0f;
-                if (v3_write_bytes(static_cast<uintptr_t>(node) + 0x18, &expired, sizeof expired))
-                {
-                    // The FIRST expiry of a session always prints (the one-line proof the
-                    // mechanism is alive on this build); the per-close repeats only under
-                    // debug_logging - they said the same thing a hundred times per session.
-                    static bool s_reported_once = false;
-                    if (!s_reported_once || goblin::config::debugLogging)
-                    {
-                        s_reported_once = true;
-                        spdlog::info("[v3park] expired the parked entry for movie 0x{:X} "
-                                     "(node 0x{:X}, {} frames) - the next open rebuilds and bursts",
-                                     want, node, g_park_frames);
-                    }
-                    g_park_target.store(0, std::memory_order_relaxed);
-                    g_park_frames = 0;
-                }
-                return;
+                return v3_write_bytes(static_cast<uintptr_t>(node) + 0x18, &expired, sizeof expired)
+                           ? static_cast<uintptr_t>(node)
+                           : 0;
             }
             uint64_t next = 0;
             if (!park_read64(g_park_cache, static_cast<uintptr_t>(node), next) ||
@@ -1849,6 +1981,118 @@ namespace
             if (node == head) break;   // circular list, one lap done
         }
         }   // candidate slots
+        return 0;
+    }
+
+    void v3_park_expire_tick()
+    {
+        const uintptr_t want = g_park_target.load(std::memory_order_relaxed);
+        if (!want) return;
+        v3_park_build_slots();
+        // No frame is charged while the scan thread is still running: on a machine where the
+        // scan outlives 600 frames the walk would otherwise disarm before its list ever existed.
+        if (!g_park_slots_built.load(std::memory_order_acquire))
+        {
+            // Say so ONCE per armed movie: this is the exact state behind "the map came up empty
+            // on a quick reopen" - the parked entry survives because the shortlist is not there.
+            static uintptr_t s_not_ready_for = 0;
+            if (s_not_ready_for != want)
+            {
+                s_not_ready_for = want;
+                spdlog::info("[v3park] shortlist not ready at close for movie 0x{:X}; "
+                             "a reopen before it lands may come up empty",
+                             want);
+            }
+            return;
+        }
+        if (++g_park_frames > 600)   // ~10 s of frames: the entry is not there, stop looking
+        {
+            g_park_target.store(0, std::memory_order_relaxed);
+            spdlog::info("[v3park] no parked entry for movie 0x{:X} after {} frames - disarmed; "
+                         "walk {} us: {} page probes, {} VirtualQuery ({} us)",
+                         want, g_park_frames, park_us(g_park_walk.qpc),
+                         g_park_cache.page_answers - g_park_walk.answers0,
+                         g_park_cache.vq_calls - g_park_walk.vq0,
+                         park_us(g_park_cache.vq_qpc - g_park_walk.vq_qpc0));
+            g_park_frames = 0;
+            return;
+        }
+        if (g_park_frames == 1) // first walk for this target: start its cost account
+        {
+            g_park_walk = ParkWalkCost{};
+            g_park_walk.answers0 = g_park_cache.page_answers;
+            g_park_walk.vq0 = g_park_cache.vq_calls;
+            g_park_walk.vq_qpc0 = g_park_cache.vq_qpc;
+        }
+        const int64_t w0 = v3_perf_now();
+        const uintptr_t node = v3_park_walk_once(want);
+        const int64_t dw = v3_perf_now() - w0;
+        g_park_walk.qpc += dw;
+        g_park_walk_total_qpc += dw;
+        if (!node)
+            return; // no match or the store did not land: try again next frame, as before
+        // The FIRST expiry of a session always prints (the one-line proof the mechanism is alive on
+        // this build); the per-close repeats only under debug_logging - they said the same thing a
+        // hundred times per session.
+        static bool s_reported_once = false;
+        if (!s_reported_once || goblin::config::debugLogging)
+        {
+            s_reported_once = true;
+            spdlog::info("[v3park] expired the parked entry for movie 0x{:X} (node 0x{:X}, {} frames); "
+                         "walk {} us: {} page probes, {} VirtualQuery ({} us) - the next open "
+                         "rebuilds and bursts",
+                         want, node, g_park_frames, park_us(g_park_walk.qpc),
+                         g_park_cache.page_answers - g_park_walk.answers0,
+                         g_park_cache.vq_calls - g_park_walk.vq0,
+                         park_us(g_park_cache.vq_qpc - g_park_walk.vq_qpc0));
+        }
+        g_park_target.store(0, std::memory_order_relaxed);
+        g_park_frames = 0;
+    }
+
+    // [closeframes] (debug_logging): frame intervals around a map close from menu_update_detour's
+    // own entry stamps (updateTask runs once a frame). t[0] the frame before the close frame, t[1]
+    // the close frame (the dialog destructor ran inside it), t[2] the frame that first reads the
+    // byte at 0 and runs the parked-entry walk, then four more. Printed once when complete. UI
+    // thread only.
+    struct CloseFrames
+    {
+        int64_t last = 0, before_last = 0, t[8] = {}, walk0 = 0, walk_next = 0;
+        int n = 0;
+    };
+    CloseFrames g_close_frames;
+    void close_frames_note(int64_t now, bool close_edge)
+    {
+        CloseFrames &c = g_close_frames;
+        if (c.n == 0)
+        {
+            if (close_edge && goblin::config::debugLogging && c.before_last && c.last)
+            {
+                c.t[0] = c.before_last;
+                c.t[1] = c.last;
+                c.t[2] = now;
+                c.n = 3;
+                c.walk0 = g_park_walk_total_qpc;
+            }
+        }
+        else
+        {
+            if (c.n == 3)
+                c.walk_next = g_park_walk_total_qpc - c.walk0;
+            c.t[c.n++] = now;
+            if (c.n == 8)
+            {
+                const double f = static_cast<double>(v3_perf_freq()) / 1000.0;
+                spdlog::info("[closeframes] frame times around a map close, ms: before {:.1f} | "
+                             "close {:.1f} | next {:.1f} (walk {} us) | then {:.1f} {:.1f} {:.1f} {:.1f}",
+                             (c.t[1] - c.t[0]) / f, (c.t[2] - c.t[1]) / f, (c.t[3] - c.t[2]) / f,
+                             park_us(c.walk_next), (c.t[4] - c.t[3]) / f, (c.t[5] - c.t[4]) / f,
+                             (c.t[6] - c.t[5]) / f, (c.t[7] - c.t[6]) / f);
+                c.n = 0;
+            }
+        }
+        c.before_last = c.last;
+        c.last = now;
     }
 
     // ── the world map's CURRENT movie, read every frame without an attachMovie burst ────────────
@@ -2027,6 +2271,430 @@ namespace
         {
             return static_cast<uint32_t>(GetExceptionCode());
         }
+    }
+
+    // ── [v3pump] frame pump (see V3PumpSession) ──────────────────────────────────────────────────────
+    // SEH leaves first: no C++ temporaries in these frames.
+
+    // GotoFrame through the vtable slot the caller has checked. 0 or the exception code.
+    uint32_t v3_pump_guarded_goto(uintptr_t sprite, uint32_t frame0)
+    {
+        __try
+        {
+            const uintptr_t vt = *reinterpret_cast<const uintptr_t *>(sprite);
+            (*reinterpret_cast<V3GotoFrameFn *const *>(vt + V3_SLOT_GOTO_FRAME))(
+                reinterpret_cast<void *>(sprite), frame0);
+            return 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return static_cast<uint32_t>(GetExceptionCode());
+        }
+    }
+
+    uint32_t v3_pump_guarded_frame_count(uintptr_t sprite)
+    {
+        __try
+        {
+            const uintptr_t vt = *reinterpret_cast<const uintptr_t *>(sprite);
+            return (*reinterpret_cast<V3FrameCountFn *const *>(vt + V3_SLOT_FRAME_COUNT))(
+                reinterpret_cast<void *>(sprite));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    // Is `child` in `parent`'s child vector (+0xD8 data, stride 0x10, u32 count +0xE0)? The
+    // generator sits right after the native pins, so a forward walk finds it early.
+    bool v3_pump_parent_holds(uintptr_t parent, uintptr_t child)
+    {
+        bool found = false;
+        __try
+        {
+            const uintptr_t base = *reinterpret_cast<const uintptr_t *>(parent + 0xd8);
+            const uint32_t count = *reinterpret_cast<const uint32_t *>(parent + 0xe0);
+            if (base && count <= 0x10000)
+                for (uint32_t i = 0; i < count && !found; ++i)
+                    found = *reinterpret_cast<const uintptr_t *>(
+                                base + static_cast<uint64_t>(i) * 0x10) == child;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            found = false;
+        }
+        return found;
+    }
+
+    struct V3PumpGenState
+    {
+        uint64_t vt = 0, slot = 0, parent = 0;
+        uint32_t flags = 0;  // u16 at +0x6A
+        int32_t depth = 0;   // +0x2C
+        uint32_t cur = 0;    // +0x11C, 0-based
+        uint32_t play = 0;   // +0x118
+        uint32_t kids = 0;   // own child count, +0xE0
+    };
+
+    bool v3_pump_read_state(uintptr_t gen, V3PumpGenState &st)
+    {
+        uint32_t packed = 0, depth = 0;
+        if (!v3_read64(gen, st.vt) || !v3_heap_ptr(st.vt) ||
+            !v3_read64(st.vt + V3_SLOT_GOTO_FRAME, st.slot) || !v3_read64(gen + 0x38, st.parent) ||
+            !v3_read32(gen + 0x68, packed) || !v3_read32(gen + 0x2c, depth) ||
+            !v3_read32(gen + 0x11c, st.cur) || !v3_read32(gen + 0x118, st.play) ||
+            !v3_read32(gen + 0xe0, st.kids))
+            return false;
+        st.flags = packed >> 16;
+        st.depth = static_cast<int32_t>(depth);
+        return true;
+    }
+
+    // GotoFrame's own entry test, plus: the slot we call through IS the resolved GotoFrame.
+    const char *v3_pump_refusal(const V3PumpGenState &st)
+    {
+        if (st.slot != reinterpret_cast<uint64_t>(g_v3_goto_frame))
+            return "vtable slot +0x378 is not the resolved GotoFrame";
+        if (!(st.flags & 0x0400))
+            return "flag 0x400 (Sprite) clear";
+        if (!(st.flags & 0x0800) || (st.flags & 0x1000))
+            return "flags fail the GotoFrame entry test";
+        if (st.depth < -1)
+            return "depth field below -1";
+        return nullptr;
+    }
+
+    // The proof: one GotoFrame with pulses COUNTED, not built (v3_native_factory_pulse returns at
+    // its top while t_v3_pump.active).
+    struct V3PumpCall
+    {
+        uint32_t from = 0, after = 0;
+        uint32_t pulses = 0, own = 0, other = 0;
+        int64_t qpc = 0;
+        uint32_t exc = 0;
+    };
+
+    void v3_pump_count_call(uintptr_t gen, uint32_t to, V3PumpCall &c)
+    {
+        v3_read32(gen + 0x11c, c.from);
+        t_v3_pump.expect = gen;
+        t_v3_pump.pulses = t_v3_pump.own = t_v3_pump.other = 0;
+        t_v3_pump.active = true;
+        const int64_t t0 = v3_perf_now();
+        c.exc = v3_pump_guarded_goto(gen, to);
+        c.qpc = v3_perf_now() - t0;
+        t_v3_pump.active = false;
+        c.pulses = t_v3_pump.pulses;
+        c.own = t_v3_pump.own;
+        c.other = t_v3_pump.other;
+        v3_read32(gen + 0x11c, c.after);
+    }
+
+    // Our appended frames as 0-based frame indices. The pump needs three of them at least: a
+    // forward stroke from the first must be able to cover one frame.
+    bool v3_pump_own_frames(uint32_t &first0, uint32_t &last0)
+    {
+        uint32_t lo = 0, hi = 0;
+        goblin::gfx_probe::injected_iid_range(lo, hi);
+        if (lo == 0 || hi < lo + 2)
+            return false;
+        first0 = lo - 1;
+        last0 = hi - 1;
+        return true;
+    }
+
+    // Every later open builds in the burst, as before the pump. Rows this open still owed the pump
+    // have no pulse source left: the queue watchdog drops them, the close sees an unfinished
+    // generation and the next open (a fresh burst) builds everything.
+    void v3_pump_off(const char *why, uint32_t code)
+    {
+        g_v3_pump.off = true;
+        const size_t left = g_v3_native.pump_capped
+                                ? g_v3_native.pending.size() - g_v3_native.pending_index
+                                : 0;
+        spdlog::warn("[v3pump] off for this session: {} (code 0x{:08X}); {} markers of this open "
+                     "left unbuilt, later opens build all markers at once",
+                     why, code, left);
+        // Only a queue the pump owned is dropped (see v3_pump_stop_open); from the generator's
+        // creation the burst still owns its whole budget and keeps building.
+        if (g_v3_native.pump_capped)
+        {
+            g_v3_open.pump_dropped += left;
+            g_v3_native.pending_index = g_v3_native.pending.size();
+        }
+        g_v3_native.pump_gen = 0;
+        g_v3_native.pump_capped = false;
+    }
+
+    // This open only: what is left of its queue is dropped at once (no pulse source remains, and a
+    // queue that is not spent holds back the periodic merge), as the queue watchdog would. The
+    // queue then counts as spent, so READY still follows, and the "[v3pump] this open" line says
+    // how many rows were dropped. A new open gets a new parent and builds from scratch; later opens
+    // pump again.
+    void v3_pump_stop_open(const char *why, uint32_t code)
+    {
+        const size_t left = g_v3_native.pending.size() - g_v3_native.pending_index;
+        spdlog::warn("[v3pump] stopped for this open: {} (code 0x{:08X}); {} markers left unbuilt "
+                     "until the next open",
+                     why, code, left);
+        g_v3_open.pump_dropped += left;
+        g_v3_native.pump_gen = 0;
+        g_v3_native.pump_capped = false;
+        g_v3_native.pending_index = g_v3_native.pending.size();
+    }
+
+    // In the FIRST pulse of a generation, before any marker (called from the factory with slot 0
+    // free, before in_factory). Same slot / materialize / stage / attach sequence as a marker, with
+    // charId 171 and a Sprite placement; our staging reference is dropped, so the marker parent
+    // owns it. Then the proof, nested in the engine's own GotoFrame, and the burst cap.
+    void v3_pump_make_generator(void *live_ctx, uint32_t frame, uintptr_t sprite,
+                                uintptr_t target_movie)
+    {
+        g_v3_native.pump_tried = true;
+        uint32_t first0 = 0, last0 = 0;
+        if (!v3_pump_own_frames(first0, last0))
+            return;
+        const int64_t t0 = v3_perf_now();
+        const uint16_t depth = g_v3_native.next_depth++;
+        // The place detour counts a staging rejection into `failed`, which is the MARKER count
+        // READY and the close's unfinished test read: keep the generator out of it.
+        const uint32_t failed0 = g_v3_native.failed;
+        auto &s = g_v3_factory_slots[0];
+        s = V3FactorySlot{};
+        s.depth = depth;
+        s.char_id = V3_PUMP_SPRITE_CHAR;
+        g_v3_factory_active = 1;
+        const uintptr_t node = goblin::gfx_probe::create_native_sprite_child(
+            V3_PUMP_SPRITE_CHAR, depth, live_ctx, frame);
+        uint32_t mat_exc = 0, att_exc = 0;
+        if (v3_heap_ptr(node) && (!s.held || !v3_heap_ptr(s.child)))
+            mat_exc = v3_guarded_materialize(live_ctx, sprite);
+        uintptr_t gen = 0;
+        const char *why = nullptr;
+        const bool rejected = g_v3_native.failed != failed0;
+        g_v3_native.failed = failed0;
+        if (!v3_heap_ptr(node))
+            why = "the placement left no timeline record";
+        else if (rejected)
+            why = "the staging rejected the child (see the line above)";
+        else if (!s.held || !v3_heap_ptr(s.child))
+            why = "the record was not materialized";
+        else if (s.root != target_movie)
+            why = "the child belongs to another movie";
+        else
+        {
+            att_exc = v3_guarded_attach(g_v3_native.wrapper, s.child);
+            uint64_t par = 0;
+            v3_read64(s.child + 0x38, par);
+            if (att_exc == 0 && par == g_v3_native.parent)
+                gen = s.child;
+            else
+                why = "attach to the marker parent failed";
+        }
+        const uintptr_t child = s.child;
+        if (s.held && v3_heap_ptr(s.child))
+        {
+            uint32_t rb = 0, ra = 0;
+            v3_drop_held_ref(s.child, rb, ra);
+        }
+        if (v3_heap_ptr(node))
+            goblin::gfx_probe::remove_native_icon_record(depth, live_ctx, frame);
+        s = V3FactorySlot{};
+        g_v3_factory_active = 0;
+
+        V3PumpGenState st{};
+        uint32_t frames = 0;
+        if (gen)
+        {
+            why = v3_pump_read_state(gen, st) ? v3_pump_refusal(st) : "state unreadable";
+            // A virtual call only once the vtable is proven to be the Sprite one (slot +0x378).
+            frames = why ? 0 : v3_pump_guarded_frame_count(gen);
+            if (!why && frames <= last0)
+                why = "the instance's timeline ends before our frames";
+        }
+        if (!gen || why)
+        {
+            // This open builds everything in the burst; a later open tries again - unless the
+            // vtable slot holds some other function, which is this exe, not this open. (An attached
+            // generator that failed the checks just stays hidden on the parent until teardown.)
+            g_v3_open.gen_qpc += v3_perf_now() - t0;
+            if (gen && st.slot != 0 && st.slot != reinterpret_cast<uint64_t>(g_v3_goto_frame))
+                g_v3_pump.off = true;
+            if (g_v3_pump.no_gen_logs++ < 4)
+                spdlog::warn("[v3pump] no generator this open, all markers built at once: {} "
+                             "(record 0x{:X} child 0x{:X} driver 0x{:08X} attach 0x{:08X} flags "
+                             "0x{:04X} frames {})",
+                             why, node, child, mat_exc, att_exc, st.flags, frames);
+            return;
+        }
+        g_v3_native.pump_gen = gen;
+        V3PumpCall c{};
+        v3_pump_count_call(gen, first0, c);
+        g_v3_open.gen_qpc += v3_perf_now() - t0;
+        g_v3_open.proof_pulses = c.own;
+        if (c.exc)
+        {
+            v3_pump_off("the nested GotoFrame raised", c.exc);
+            return;
+        }
+        if (c.own == 0)
+        {
+            v3_pump_off("the nested GotoFrame produced no pulse", 0);
+            return;
+        }
+        // The rows visible at seed sort first (merge_snapshot), so capping the burst at their end
+        // builds exactly them now and leaves draw order unchanged.
+        const size_t head = g_v3_native.burst_end > g_v3_native.pending_index
+                                ? g_v3_native.burst_end - g_v3_native.pending_index
+                                : 0;
+        g_v3_native.frame_budget = (std::min)(g_v3_native.frame_budget, head);
+        g_v3_native.pump_capped = true;
+        g_v3_open.capped = true;
+        g_v3_open.burst_cap = head;
+        if (goblin::config::debugLogging)
+            spdlog::info("[v3pump] generator 0x{:X} depth {} ({} frames, ours {}..{}, flags "
+                         "0x{:04X}); proof {} -> {}: {} pulses ({} other) in {} us; the burst "
+                         "builds {} visible rows, the pump the other {}",
+                         gen, depth, frames, first0, last0, st.flags, c.from, c.after, c.own,
+                         c.other, park_us(c.qpc), head,
+                         g_v3_native.pending.size() - g_v3_native.pending_index - head);
+    }
+
+    void v3_factory_clear_request(bool drop_held_ref); // defined with the factory, below
+
+    // Map tick tail, while the pump owns part of the queue: a budget of markers from the
+    // generator's own pulses. Strokes run forward through our frames (2 pulses per frame covered)
+    // and, at the end of them, back to the first (the fill restarts at 0: the stock count).
+    void v3_pump_tick()
+    {
+        // A merge costs about what a pump frame does (~3 ms); one of them per frame is enough.
+        const bool merged = g_v3_native.pump_merged;
+        g_v3_native.pump_merged = false;
+        if (!g_v3_native.pump_capped)
+            return;
+        if (g_v3_native.pending_index >= g_v3_native.pending.size())
+        {
+            g_v3_native.pump_capped = false; // done; READY follows once the parent settles
+            return;
+        }
+        if (merged || g_v3_native.in_factory || g_v3_map_closed.load(std::memory_order_acquire) ||
+            !v3_map_drivable())
+            return;
+        // No pulse is on the stack here, so a slot still armed was left by one that threw; the
+        // next pulse would clear it, but the pump IS the next pulse source.
+        if (g_v3_factory_active != 0)
+            v3_factory_clear_request(true);
+        const uintptr_t gen = g_v3_native.pump_gen;
+        uint32_t first0 = 0, last0 = 0;
+        V3PumpGenState st{};
+        const char *refusal =
+            !v3_pump_own_frames(first0, last0)              ? "our frames are gone"
+            : !v3_pump_parent_holds(g_v3_native.parent, gen) ? "the generator left the marker parent"
+            : !v3_pump_read_state(gen, st)                   ? "generator state unreadable"
+                                                             : v3_pump_refusal(st);
+        if (refusal)
+        {
+            // A different function in the GotoFrame slot says something about this exe, not
+            // this open; everything else (a generator that left, an unloading one) is local.
+            if (st.slot != 0 && st.slot != reinterpret_cast<uint64_t>(g_v3_goto_frame))
+                v3_pump_off(refusal, st.flags);
+            else
+                v3_pump_stop_open(refusal, st.flags);
+            return;
+        }
+        if (g_v3_open.pump_frames == 0)
+            g_v3_open.burst_built = g_v3_native.objects.size();
+        const int64_t t0 = v3_perf_now();
+        const size_t built0 = g_v3_native.objects.size();
+        const size_t index0 = g_v3_native.pending_index;
+        const size_t budget = (std::min)(g_v3_pump.budget,
+                                         g_v3_native.pending.size() - g_v3_native.pending_index);
+        g_v3_native.frame_budget = budget;
+        uint32_t pulses = 0, calls = 0, exc = 0;
+        while (calls < V3_PUMP_MAX_STROKES && g_v3_native.frame_budget != 0 &&
+               g_v3_native.pending_index < g_v3_native.pending.size())
+        {
+            uint32_t cur = 0;
+            v3_read32(gen + 0x11c, cur);
+            // One pulse per batch of what is left of the budget, plus one.
+            const uint32_t want = static_cast<uint32_t>(
+                (g_v3_native.frame_budget + V3_FACTORY_BATCH - 1) / V3_FACTORY_BATCH + 1);
+            uint32_t target = first0;
+            if (cur >= first0 && cur + 2 <= last0)
+                target = cur + 1 + std::min<uint32_t>((want + 1) / 2, last0 - cur - 1);
+            ++calls;
+            if (target < cur)
+            {
+                // The return stroke refills the snapshot from frame 0 (MarkAll / UnmarkAll on the
+                // generator's list around it). The engine's own burst never builds in that mode -
+                // its pins only go forward from 0 - so nothing is built here: pulses are counted,
+                // as in the proof, and the forward strokes do the building.
+                V3PumpCall c{};
+                v3_pump_count_call(gen, target, c);
+                g_v3_open.pump_pulses += c.own;
+                exc = c.exc;
+                if (exc || c.own == 0)
+                    break;
+                continue;
+            }
+            t_v3_pump.pumped = 0;
+            t_v3_pump.pumping = true;
+            exc = v3_pump_guarded_goto(gen, target);
+            t_v3_pump.pumping = false;
+            pulses += t_v3_pump.pumped;
+            if (exc || t_v3_pump.pumped == 0)
+                break;
+        }
+        g_v3_native.frame_budget = 0; // the tail hands the usual 96 right after
+        const int64_t dt = v3_perf_now() - t0;
+        uint32_t kids = 0;
+        if (v3_read32(gen + 0xe0, kids))
+            g_v3_open.gen_kids_max = (std::max)(g_v3_open.gen_kids_max, kids);
+        g_v3_open.pump_qpc += dt;
+        g_v3_open.pump_max_qpc = (std::max)(g_v3_open.pump_max_qpc, dt);
+        ++g_v3_open.pump_frames;
+        g_v3_open.pump_calls += calls;
+        g_v3_open.pump_pulses += pulses;
+        if (g_v3_native.objects.size() >= built0)
+            g_v3_open.pump_built += g_v3_native.objects.size() - built0;
+        if (exc)
+        {
+            v3_pump_off("a pump GotoFrame raised", exc);
+            return;
+        }
+        // A reset inside a stroke (dead anchor, unfinished-generation drop) leaves nothing to pump.
+        if (!g_v3_native.pump_capped)
+            return;
+        if (pulses == 0)
+        {
+            if (++g_v3_native.pump_dry >= 3)
+                v3_pump_stop_open("three pump frames in a row got no pulse", 0);
+            return;
+        }
+        g_v3_native.pump_dry = 0;
+        // Rows done this frame, built or failed: pulses that move nothing mean a gate in the
+        // factory refuses them, and with the queue watchdog off while the pump owns the queue
+        // nothing else would ever end the open's build.
+        const size_t rows = g_v3_native.pending_index >= index0 ? g_v3_native.pending_index - index0 : 0;
+        if (rows == 0)
+        {
+            if (++g_v3_native.pump_stuck >= 3)
+                v3_pump_stop_open("three pump frames in a row moved no row", 0);
+            return;
+        }
+        g_v3_native.pump_stuck = 0;
+        // Adapt on the cost of one row, from full frames only (not the short last one, whose
+        // budget the queue's remainder cut), halfway toward the new figure.
+        const int64_t us = park_us(dt);
+        if (budget == g_v3_pump.budget && rows >= budget && us > 0)
+        {
+            const size_t fit = static_cast<size_t>(V3_PUMP_TARGET_US * static_cast<int64_t>(rows) / us);
+            g_v3_pump.budget = (std::min)(V3_PUMP_BUDGET_MAX,
+                                          (std::max)(V3_PUMP_BUDGET_MIN, (g_v3_pump.budget + fit) / 2));
+        }
+        if (g_v3_native.pending_index >= g_v3_native.pending.size())
+            g_v3_native.pump_capped = false;
     }
 
     // v3_record_candidate() stood here: it retained a growing display list's wrapper the first
@@ -2513,6 +3181,10 @@ namespace
 
     bool v3_native_node_is_ours(uint64_t node)
     {
+        // The [v3pump] generator is a sprite-171 child of the parent that no engine scale ever
+        // reaches: the widget sampler must never take it for a native pin.
+        if (node != 0 && node == g_v3_native.pump_gen)
+            return true;
         for (const auto &obj : g_v3_native.objects)
             if (obj.child == node)
                 return true;
@@ -2778,9 +3450,19 @@ namespace
     // v3_native_reset itself.
     void v3_drop_dead_anchor(const char *where, uintptr_t parent)
     {
-        spdlog::warn("[v3native] anchor 0x{:X} left the live tree ({}); dropping it "
-                     "for rediscovery",
-                     parent, where);
+        // An anchor from a screen that has since been destroyed is EXPECTED to be dead: that is
+        // every quick reopen (close released the generation, the parked entry was expired, the
+        // reopen's first tick finds the old list torn down - 47 of 47 in the test-install logs
+        // 08-04..09-18, every one after a close with no anchor taken since). Only a death while
+        // the screen we anchored on is still up - the 2.1.1 layer-2 kind - is worth a warning.
+        if (g_map_screen_gone.load(std::memory_order_acquire))
+            spdlog::info("[v3native] anchor 0x{:X} belonged to a closed screen ({}); dropping it "
+                         "for rediscovery",
+                         parent, where);
+        else
+            spdlog::warn("[v3native] anchor 0x{:X} left the live tree ({}); dropping it "
+                         "for rediscovery",
+                         parent, where);
         // If the manager's children sit on a DIFFERENT parent that is still live (the
         // target moved on and then died before we ever seeded on it), take them off
         // first, exactly like the reseed path does - resetting past a live parent is
@@ -3084,6 +3766,60 @@ namespace
         return true;
     }
 
+    // Ask the converter about every non-overworld tile ONCE, at the seed, before the burst walks
+    // the queue. A tile the converter has answered for is remembered by mapproject::to_map (its
+    // origin), and every later point on it is placed from that even when the converter may no
+    // longer be called. Without this, a tile was first met wherever the queue happened to reach
+    // it - visible layer-0 rows first, then underground and DLC - and on a slow first open that
+    // was past the 300 ms window: 2026-09-22 22:57 lost every m12 / m20-m45 tile and the dungeon
+    // the player stood in (project=2027, 8 such first opens since 09-07), all back on a reopen.
+    // One representative point per tile: 94-99 tiles per profile, each a memo hit when the same
+    // point was converted before (most opens after the first) or one converter call. A tile the
+    // converter declines is simply not learned - the per-marker path then declines it exactly as
+    // before. Whether the learned origins were then USED shows as fromOrigin= at READY.
+    uint64_t v3_tile_key(uint8_t area, uint16_t gx, uint16_t gz)
+    {
+        return (static_cast<uint64_t>(area) << 32) | (static_cast<uint64_t>(gx) << 16) | gz;
+    }
+
+    // `unknown` (optional) receives every non-overworld tile the converter could not be ASKED
+    // about in this pass: rows there need it, and it answers only while fresh. Declined tiles are
+    // left out - the converter refuses them in any frame, so nothing is gained by hurrying them.
+    void v3_prelearn_tiles(std::unordered_set<uint64_t> *unknown = nullptr)
+    {
+        using goblin::worldmap_probe::ProjFail;
+        const int64_t t0 = v3_perf_now();
+        std::unordered_set<uint64_t> seen;
+        uint32_t asked = 0, known = 0, declined = 0, not_asked = 0;
+        for (size_t i = g_v3_native.pending_index; i < g_v3_native.pending.size(); ++i)
+        {
+            const auto &p = g_v3_native.pending[i];
+            if (p.area == 60 || p.area == 61)
+                continue;  // plain arithmetic in to_map, no converter involved
+            const uint64_t tile = v3_tile_key(p.area, p.gx, p.gz);
+            if (!seen.insert(tile).second)
+                continue;
+            ++asked;
+            float mx = 0.0f, mz = 0.0f;
+            ProjFail why = ProjFail::none;
+            if (goblin::mapproject::to_map(p.area, p.gx, p.gz, p.px, p.pz, mx, mz, &why))
+                ++known;
+            else if (why == ProjFail::declined)
+                ++declined;
+            else
+            {
+                ++not_asked;
+                if (unknown)
+                    unknown->insert(tile);
+            }
+        }
+        const int64_t f = v3_perf_freq();
+        spdlog::info("[v3native] tile origins known before the build: {} of {} ({} declined, {} "
+                     "not asked) in {} us",
+                     known, asked, declined, not_asked,
+                     f > 0 ? (v3_perf_now() - t0) * 1000000 / f : 0);
+    }
+
     void v3_native_merge_snapshot(const std::vector<goblin::NativeMarkerPoint> &snapshot,
                                   bool initial)
     {
@@ -3232,6 +3968,33 @@ namespace
                 g_v3_native.queued.insert(point.original_row_id).second)
                 g_v3_native.pending.push_back(point);
         }
+        // [v3pump] While the pump owns the queue, rows not built yet still carry the point they had
+        // at seed. Hand them the current one, so a tab switch, a category toggle or a moved ring
+        // made during the pump is what gets built. One hash of the snapshot, only in that window.
+        if (!initial && g_v3_native.pump_capped &&
+            g_v3_native.pending_index < g_v3_native.pending.size())
+        {
+            std::unordered_map<uint64_t, const goblin::NativeMarkerPoint *> now;
+            now.reserve(snapshot.size());
+            for (const auto &point : snapshot)
+                now.emplace(point.original_row_id, &point);
+            for (size_t i = g_v3_native.pending_index; i < g_v3_native.pending.size(); ++i)
+            {
+                // Rings keep their seed point: a built ring follows its host through later merges,
+                // while a ring re-pointed now at a host on an unlearned tile could fail for good.
+                if (g_v3_native.pending[i].original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT)
+                    continue;
+                const auto hit = now.find(g_v3_native.pending[i].original_row_id);
+                if (hit != now.end())
+                    g_v3_native.pending[i] = *hit->second;
+            }
+            // Rows that became visible go first, in the order the seed sort gave them, so a tab
+            // switched to mid-pump fills in before the rest.
+            std::stable_partition(
+                g_v3_native.pending.begin() + static_cast<ptrdiff_t>(g_v3_native.pending_index),
+                g_v3_native.pending.end(),
+                [](const goblin::NativeMarkerPoint &p) { return p.visible; });
+        }
         // (A "sweep the rows this snapshot did not mention" pass stood here for one build. It could
         //  never fire: native_marker_snapshot returns EVERY row whatever the layer - measured
         //  migrated=9552 requested=9552 on both layer 0 and layer 2 - and encodes the layer in
@@ -3281,11 +4044,40 @@ namespace
                            (b.original_row_id & goblin::NATIVE_CLEARED_KEY_BIT);
                 });
         if (initial)
+        {
             spdlog::info("[v3native] item categories layer={} seedParentCount={}; "
                          "migrated={} visible={} requested={}",
                          g_v3_native.layer, g_v3_native.observed_count,
                          snapshot.size(), visible_count,
                          g_v3_native.pending.size() - g_v3_native.pending_index);
+            std::unordered_set<uint64_t> unknown_tiles;
+            v3_prelearn_tiles(&unknown_tiles);
+            // [v3pump] The burst's share: the visible head of the sorted queue, then the hidden
+            // rows on tiles the prelearn could not learn. Those need the engine converter, which
+            // answers only while its own last call is under 300 ms old - true in this burst, not
+            // necessarily frames later (a slow frame rate, the Deck). Moving them up changes draw
+            // order among hidden rows only, and only for rows the converter has to place.
+            size_t v = g_v3_native.pending_index;
+            while (v < g_v3_native.pending.size() && g_v3_native.pending[v].visible)
+                ++v;
+            if (goblin::variants::kFramePump && g_v3_goto_frame && !g_v3_pump.off &&
+                !unknown_tiles.empty())
+            {
+                const auto mid = std::stable_partition(
+                    g_v3_native.pending.begin() + static_cast<ptrdiff_t>(v),
+                    g_v3_native.pending.end(), [&](const goblin::NativeMarkerPoint &p) {
+                        return p.area != 60 && p.area != 61 &&
+                               unknown_tiles.count(v3_tile_key(p.area, p.gx, p.gz)) != 0;
+                    });
+                const size_t moved = static_cast<size_t>(mid - g_v3_native.pending.begin()) - v;
+                if (moved && goblin::config::debugLogging)
+                    spdlog::info("[v3pump] {} hidden rows on {} tile(s) without a known origin go "
+                                 "into the burst",
+                                 moved, unknown_tiles.size());
+                v += moved;
+            }
+            g_v3_native.burst_end = v;
+        }
         // MARKER visibility belongs on this line too. It read rings only, and rings are all
         // invisible unless a focus category is set - so "visible=0" said nothing about the icons
         // and the log could not answer the one question asked of it: after the master switch goes
@@ -3351,7 +4143,16 @@ namespace
         if (v3_node_unusable(wrapper, 0x20) || v3_node_unusable(parent, 0xE8) ||
             !v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != parent ||
             !v3_read64(parent + 0xe0, live_count))
+        {
+            // A refused gate is still a frame we paid for (a failed probe plus a VirtualQuery
+            // each time the dead-anchor memo lapses), so it goes into gate / head / worst frame.
+            mark(g_v3_perf.head_gate_qpc);
+            const int64_t d = t_mark - t_head0;
+            g_v3_perf.head_qpc += d;
+            if (d > g_v3_perf.head_max_qpc)
+                g_v3_perf.head_max_qpc = d;
             return;
+        }
         mark(g_v3_perf.head_gate_qpc);
         if (g_v3_target_layer.load(std::memory_order_relaxed) < 0)
             g_v3_target_layer.store(layer, std::memory_order_relaxed);
@@ -3384,6 +4185,17 @@ namespace
             g_v3_native.parent_vtable = 0;
             g_v3_native.parent_movie = 0;  // adopted together with the vtable, on the same frame
             g_v3_native.observed_count = live_count;
+            // Close the head split on this return too. It comes after the gate's mark, so without
+            // this the frame that first validates a NEW anchor counted in `gate` but not in `head`
+            // or `worst frame` - read on ERR 2026-09-23 as "head 69 (gate 33934 + rest 43, worst
+            // frame 38)", where the 34 ms frame was this one.
+            mark(g_v3_perf.head_rest_qpc);
+            {
+                const int64_t d = t_mark - t_head0;
+                g_v3_perf.head_qpc += d;
+                if (d > g_v3_perf.head_max_qpc)
+                    g_v3_perf.head_max_qpc = d;
+            }
             return;
         }
         // The QUICK-REOPEN heartbeat arm stood here and is GONE, 2026-08-03. It cleared
@@ -3568,7 +4380,12 @@ namespace
         // If queued rows never build (this session's 180-parent incident), the
         // outstanding queue would gate the 500ms refresh forever and kill live
         // hide/show - drop it (rows stay in `queued`, skip-for-session).
+        // [v3pump] Not while the pump owns the queue: it is the pulse source, and it stops only
+        // with the map tick (our own screen over the map is enough), so the first tick after
+        // such a pause would otherwise find "no progress for 5 s" and drop what it was building.
+        // A pump that fails turns itself off, which re-arms this.
         if (g_v3_native.pending_index < g_v3_native.pending.size() &&
+            !g_v3_native.pump_capped &&
             g_v3_native.last_progress_ms != 0 &&
             now_ms - g_v3_native.last_progress_ms > 5000)
         {
@@ -3633,8 +4450,10 @@ namespace
             v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
             g_v3_perf.merge_qpc += v3_perf_now() - t_m0;
             ++g_v3_perf.merges;
+            g_v3_native.pump_merged = true;
         }
-        else if (g_v3_native.pending_index >= g_v3_native.pending.size() &&
+        else if ((g_v3_native.pending_index >= g_v3_native.pending.size() ||
+                  g_v3_native.pump_capped) &&
                  now_ms >= g_v3_native.next_refresh_ms)
         {
             g_v3_native.next_refresh_ms = now_ms + V3_IDLE_REFRESH_MS;
@@ -3642,6 +4461,7 @@ namespace
             v3_native_merge_snapshot(goblin::native_marker_snapshot(layer, true), false);
             g_v3_perf.merge_qpc += v3_perf_now() - t_m0;
             ++g_v3_perf.merges;
+            g_v3_native.pump_merged = true;
         }
         mark(g_v3_perf.mergesec_qpc);
 
@@ -3763,13 +4583,17 @@ namespace
                     }
                 }
                 spdlog::info("[v3native] CATEGORIES READY: layer={} "
-                             "created={} failed={} (project={} charId={} noNode={} "
+                             "created={} failed={} (project={} [declined={} stale={} "
+                             "noView={} raised={}] fromOrigin={} charId={} noNode={} "
                              "notMaterialized={} attach={}) wrongCtx={} "
                              "parentCount={} inferredHeavy={}; "
                              "RM2 this open: {} tags, {} sprite-171, refused {} no-screen / "
                              "{} no-icons",
                              g_v3_native.layer, lightweight, g_v3_native.failed,
-                             g_v3_native.failed_project, g_v3_native.failed_charid,
+                             g_v3_native.failed_project, g_v3_native.failed_project_declined,
+                             g_v3_native.failed_project_stale, g_v3_native.failed_project_noview,
+                             g_v3_native.failed_project_faulted, g_v3_native.placed_from_origin,
+                             g_v3_native.failed_charid,
                              g_v3_native.failed_nonode, g_v3_native.failed_material,
                              g_v3_native.failed_attach,
                              g_v3_native.wrong_contexts, live_count, heavy, rt, rs, rd, ri);
@@ -3790,6 +4614,19 @@ namespace
                                  g_v3_open.mat_qpc * 1000 / f, g_v3_open.attach_qpc * 1000 / f,
                                  sc, si, sw, sl);
                 }
+                // [v3pump] The other half of the open: "factory" above is the burst alone.
+                if (g_v3_open.capped)
+                    spdlog::info("[v3pump] this open: burst built {} of a cap of {}, the pump {} in "
+                                 "{} frames / {} calls / {} pulses, {} us in all, worst frame {} "
+                                 "us, budget now {}; generator + nested proof {} us ({} pulses), "
+                                 "its children at most {}; {} rows dropped by a stop",
+                                 g_v3_open.pump_frames ? g_v3_open.burst_built : lightweight,
+                                 g_v3_open.burst_cap, g_v3_open.pump_built, g_v3_open.pump_frames,
+                                 g_v3_open.pump_calls, g_v3_open.pump_pulses,
+                                 park_us(g_v3_open.pump_qpc), park_us(g_v3_open.pump_max_qpc),
+                                 g_v3_pump.budget, park_us(g_v3_open.gen_qpc),
+                                 g_v3_open.proof_pulses, g_v3_open.gen_kids_max,
+                                 g_v3_open.pump_dropped);
                 v3_seed_trace("at READY");
                 if (goblin::config::debugLogging) // per-open diagnostics, not shipping chatter
                 {
@@ -3815,6 +4652,8 @@ namespace
                 goblin::crashdiag::probe_survivors();
             }
         }
+
+        v3_pump_tick();
 
         // A live RM2::Execute callback later in this frame consumes this budget.
         // The timeline ctx is never retained here. 96, i.e. two batches: raising it in step with
@@ -6227,11 +7066,11 @@ namespace
             const uintptr_t item_at = *reinterpret_cast<uintptr_t *>(vvt + 0x28);
             if (!exe_image_ptr(item_at))
                 return false;
-            // AND the index must be inside the list AS IT IS RIGHT NOW. itemAt CLAMPS rather than
-            // refusing, so an index left over from before a rebuild comes back as a mapped but
-            // stale slot; nothing faults at the call, and the crash surfaces one frame deeper when
-            // that dead item's scene proxy is copied (measured: exe+0x74A7F5, six times in a
-            // second while the player toggled a row). Decompiled 2026-08-02: the list at dlg+0x1268
+            // AND the index must be inside the list AS IT IS RIGHT NOW. itemAt does not check the
+            // index at all (begin + index*0x50, disassembled 2026-09-23), so an index left over from
+            // before a rebuild comes back as a mapped but stale slot; nothing faults at the call, and
+            // the crash surfaces one frame deeper when that dead item's scene proxy is copied
+            // (measured: exe+0x74A7F5, six times in a second while the player toggled a row). Decompiled 2026-08-02: the list at dlg+0x1268
             // holds a {begin,end,cap} vector at +0x10/+0x18/+0x20 with a 0x50 element stride, and
             // the rebuild destructs every element in place and may relocate the buffer entirely.
             // There is no generation counter and no rebuild-in-progress flag anywhere to ask
@@ -6691,10 +7530,26 @@ namespace
     {
         __try
         {
+            // The same checks selected_model_index makes. itemAt (vt+0x28, exe+0x8695A0 on 1.17.1)
+            // is `begin + index*0x50` with NO bounds check, and the per-frame icon repaint walks all
+            // kGridSlots slots: on a page with fewer rows, the slots below the last row asked for
+            // items past the end of the vector and read whatever lay there - ERR 2026-09-23, page 0
+            // (11 rows): 4 refused reads every frame while the settings screen was up. The vtable
+            // and its slot must point into the game's image before either becomes a call target.
+            const uintptr_t list_begin = *reinterpret_cast<uintptr_t *>(dlg + 0x1278);
+            const uintptr_t list_end = *reinterpret_cast<uintptr_t *>(dlg + 0x1280);
+            if (!v3_heap_ptr(list_begin) || !v3_heap_ptr(list_end) || list_end < list_begin ||
+                (list_end - list_begin) % 0x50 != 0 || index >= (list_end - list_begin) / 0x50)
+                return nullptr;
             using ItemAtFn = void *(void *viewList, uint32_t index);
             void *viewList = reinterpret_cast<void *>(dlg + 0x1268);
             const uintptr_t vvt = *reinterpret_cast<uintptr_t *>(viewList);
-            return (*reinterpret_cast<ItemAtFn **>(vvt + 0x28))(viewList, index);
+            if (!exe_image_ptr(vvt))
+                return nullptr;
+            const uintptr_t item_at = *reinterpret_cast<uintptr_t *>(vvt + 0x28);
+            if (!exe_image_ptr(item_at))
+                return nullptr;
+            return reinterpret_cast<ItemAtFn *>(item_at)(viewList, index);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -8421,7 +9276,9 @@ namespace
         // NOT from here: our tick runs before the timeline advance, so the engine's re-placement
         // of the authored matrix always landed after it. The repaint moved to the tail of
         // form_update_detour, the one point in the frame that is later than the advance.
-        if (goblin::config::debugLogging)
+        // Only while the dialog is provably alive: for ~600 ms after its last update this read freed
+        // memory (ERR 2026-09-23: top 0 / 1440 and count 3196666339 alternating after the close).
+        if (goblin::config::debugLogging && safe_to_call_engine(top, GetTickCount64()))
         {
             // Scroll telemetry: a top that stops at (totalRows - visible) is a clamp, a top that
             // keeps climbing is the data mapping running out.
@@ -8450,6 +9307,7 @@ namespace
     }
     void menu_update_detour(void *menuman, void *dt)
     {
+        const int64_t entry_qpc = v3_perf_now(); // [closeframes]: this frame's stamp (a POD, no unwinding)
         // Arm the action log from HERE too, not only from the form upkeep: the control measurement is
         // ESC pressed in PLAIN GAMEPLAY, where no screen of ours exists and the upkeep does not run.
         // Whatever id answers YES there is the action ESC really produces - and the first run proved
@@ -8512,6 +9370,8 @@ namespace
                 // above): a no-op once the list exists, a retry if the early scan found nothing.
                 v3_park_build_slots();
             }
+            // Before the walk, so the walk's time falls into the "next" interval of [closeframes].
+            close_frames_note(entry_qpc, prev != 0 && prev != 0xFF && raw == 0);
             // While the map is closed is exactly when the parked entry exists and the engine is
             // counting it down. One bounded walk per frame, read-only until the exact match.
             if (raw == 0)
@@ -8767,6 +9627,11 @@ namespace
             return;   // spent queue: the normal end of a build, not a blocked gate
         if (g_v3_native.frame_budget == 0)
         {
+            // [v3pump] A capped burst stops here: the rest is the pump's, and the self-grant below
+            // would quietly build it all in this frame again. Inside a pump stroke the budget is
+            // simply spent.
+            if (g_v3_native.pump_capped || t_v3_pump.pumping)
+                return;
             // The budget is a PER-FRAME cap and only the map-frame tick refills it (to 96). When
             // that tick does not run - our own screen sitting on top of the map is enough to stop
             // it - the budget stays 0 forever and every pulse bounces off it while the queue still
@@ -8829,6 +9694,9 @@ namespace
             v3_drop_dead_anchor("factory pulse", g_v3_native.parent);
             return;
         }
+        if (!g_v3_native.pump_tried && goblin::variants::kFramePump && g_v3_goto_frame &&
+            !g_v3_pump.off && g_v3_native.burst_end < g_v3_native.pending.size())
+            v3_pump_make_generator(live_ctx, frame, static_cast<uintptr_t>(sprite), target_movie);
         g_v3_native.in_factory = true;
 
         // Per-item synchronous pipeline: queue ONE record, run the engine's
@@ -8848,16 +9716,37 @@ namespace
             --g_v3_native.frame_budget;
             float mx = 0.0f, mz = 0.0f;
             const int64_t t_proj0 = v3_perf_now();
+            goblin::worldmap_probe::ProjFail proj_why = goblin::worldmap_probe::ProjFail::none;
+            bool from_origin = false;
             const bool proj_ok = goblin::mapproject::to_map(point.area, point.gx, point.gz,
-                                                            point.px, point.pz, mx, mz);
-            g_v3_open.proj_qpc += v3_perf_now() - t_proj0;
+                                                            point.px, point.pz, mx, mz, &proj_why,
+                                                            &from_origin);
+            if (!t_v3_pump.pumping) // stages of the BURST, like "factory"
+                g_v3_open.proj_qpc += v3_perf_now() - t_proj0;
+            if (proj_ok && from_origin)
+                ++g_v3_native.placed_from_origin;
             if (!proj_ok)
             {
                 ++g_v3_native.failed;
                 ++g_v3_native.failed_project;
-                ++g_v3_native.failed_project_tiles[(static_cast<uint32_t>(point.area) << 16) |
-                                                   (static_cast<uint32_t>(point.gx & 0xFF) << 8) |
-                                                   static_cast<uint32_t>(point.gz & 0xFF)];
+                using goblin::worldmap_probe::ProjFail;
+                if (proj_why == ProjFail::declined)
+                {
+                    ++g_v3_native.failed_project_declined;
+                    // Only the converter's own refusals go into the by-tile line: that line is
+                    // what inputs/unprojectable_tiles.json is maintained from, and a tile we
+                    // never asked about says nothing about the profile's data.
+                    ++g_v3_native.failed_project_tiles[
+                        (static_cast<uint32_t>(point.area) << 16) |
+                        (static_cast<uint32_t>(point.gx & 0xFF) << 8) |
+                        static_cast<uint32_t>(point.gz & 0xFF)];
+                }
+                else if (proj_why == ProjFail::stale)
+                    ++g_v3_native.failed_project_stale;
+                else if (proj_why == ProjFail::no_view)
+                    ++g_v3_native.failed_project_noview;
+                else
+                    ++g_v3_native.failed_project_faulted;
                 // NOT OUR ARITHMETIC - the ENGINE's own converter declined this tile. Identified
                 // 2026-08-05 after `failed=1 (project=1)` showed up on 47 of 47 opens: it is
                 // always vanilla row 6000197, a Stake of Marika at area 42 grid (1,0), the only
@@ -8870,8 +9759,15 @@ namespace
                 // profile where this count is not 1 is still noticed.
                 static uint32_t s_proj_logged = 0;
                 if (s_proj_logged++ < 3)
-                    spdlog::warn("[v3native] engine converter declined this tile, marker skipped:"
+                    spdlog::warn("[v3native] {}, marker skipped:"
                                  " row={} area={} grid=({},{}) pos=({:.1f},{:.1f}) ring={}",
+                                 proj_why == ProjFail::declined
+                                     ? "engine converter declined this tile"
+                                 : proj_why == ProjFail::stale
+                                     ? "converter not asked (its last own call is over 300 ms old)"
+                                 : proj_why == ProjFail::no_view
+                                     ? "converter not asked (no map view yet)"
+                                     : "converter call raised and was caught",
                                  point.original_row_id & ~goblin::NATIVE_CLEARED_KEY_BIT,
                                  point.area, point.gx, point.gz, point.px, point.pz,
                                  (point.original_row_id & goblin::NATIVE_HIGHLIGHT_KEY_BIT) != 0);
@@ -8903,7 +9799,8 @@ namespace
             const int64_t t_create0 = v3_perf_now();
             const uintptr_t node = goblin::gfx_probe::create_native_icon_instance(
                 point.source_icon_id, depth, live_ctx, frame);
-            g_v3_open.create_qpc += v3_perf_now() - t_create0;
+            if (!t_v3_pump.pumping) // stages of the BURST, like "factory"
+                g_v3_open.create_qpc += v3_perf_now() - t_create0;
             bool ok = false;
             // Which of the three post-request failures happened, for the counters at the end of
             // the iteration: the logs are capped, the counters are not.
@@ -8926,7 +9823,8 @@ namespace
                     const int64_t t_mat0 = v3_perf_now();
                     const uint32_t mat_exc = v3_guarded_materialize(
                         live_ctx, static_cast<uintptr_t>(sprite));
-                    g_v3_open.mat_qpc += v3_perf_now() - t_mat0;
+                    if (!t_v3_pump.pumping) // stages of the BURST, like "factory"
+                        g_v3_open.mat_qpc += v3_perf_now() - t_mat0;
                     if (mat_exc)
                     {
                         static bool s_mat_exc_logged = false;
@@ -8998,7 +9896,8 @@ namespace
                                           s.base_tx, s.base_ty, s.basis,
                                           g_v3_native.cur_fx * emph,
                                           g_v3_native.cur_fy * emph);
-                    g_v3_open.attach_qpc += v3_perf_now() - t_att0;
+                    if (!t_v3_pump.pumping) // stages of the BURST, like "factory"
+                        g_v3_open.attach_qpc += v3_perf_now() - t_att0;
                     if (!positioned)
                     {
                         why = FailWhy::Attach;
@@ -9607,13 +10506,15 @@ namespace
         V3FactorySlot *slot = nullptr;
         if (g_v3_factory_active != 0 &&
             v3_read32(placement + 0x4c, depth) &&
-            v3_read32(placement + 0x50, char_id))
+            v3_read32(placement + 0x50, char_id) && char_id != 0)
         {
             // Match by depth+charId only: materialization is normally
             // SYNCHRONOUS (fires inside create_native_icon_instance's Execute,
             // before the issuer stores the returned node), so s.node may still
             // be 0 at capture time. Default slots (depth=UINT32_MAX, charId=0)
-            // can never match a real placement.
+            // can never match a real placement, and charId 0 is never ours: our
+            // ids are chosen per world-map parse and 0 means "none yet" (the
+            // factory skips a marker whose native_character_id() is 0).
             for (auto &s : g_v3_factory_slots)
                 if (!s.child && s.depth == depth && s.char_id == char_id)
                 {
@@ -10640,6 +11541,10 @@ namespace
         p.queries0 = goblin::safemem::g_queries.load(std::memory_order_relaxed);
         p.refused0 = goblin::safemem::g_refused.load(std::memory_order_relaxed);
         p.vq_qpc0 = goblin::safemem::g_query_qpc.load(std::memory_order_relaxed);
+        p.pages0 = goblin::safemem::g_page_hits.load(std::memory_order_relaxed);
+        p.tpq0 = goblin::safemem::t_probe_qpc;
+        p.tq0 = goblin::safemem::t_queries;   // thread_local: called from v3_perf_note_frame,
+        p.tvq0 = goblin::safemem::t_query_qpc; // i.e. on the map thread
     }
 
     // ── Map-stall sampler ────────────────────────────────────────────────────────────
@@ -10773,7 +11678,8 @@ namespace
                      "reconcile {} us (of the tick, {} merges cost {} us, emphasis {} us / {} "
                      "writes, zoom reapply {} us / {} passes); tick split: head {} (gate {} + "
                      "rest {}, worst frame {}) + emph {} + refresh {} + tail {} us; {} pulses {} us; "
-                     "safemem copies +{} lookups +{} ({} us in VirtualQuery) refused +{}",
+                     "safemem copies +{} page-probes +{} (map thread {} us) lookups +{} ({} us in "
+                     "VirtualQuery; map thread +{} / {} us) refused +{}",
                      p.frames, span, us(p.total_qpc),
                      us(p.total_qpc / (p.frames ? p.frames : 1)), us(p.max_qpc),
                      us(p.tick_qpc), us(p.recon_qpc), p.merges, us(p.merge_qpc), us(p.emph_qpc),
@@ -10782,10 +11688,14 @@ namespace
                      us(p.head_max_qpc), us(p.emphsec_qpc), us(p.mergesec_qpc), us(p.tail_qpc),
                      p.pulses, us(p.pulse_qpc),
                      goblin::safemem::g_copies.load(std::memory_order_relaxed) - p.copies0,
+                     goblin::safemem::g_page_hits.load(std::memory_order_relaxed) - p.pages0,
+                     us(static_cast<int64_t>(goblin::safemem::t_probe_qpc - p.tpq0)),
                      goblin::safemem::g_queries.load(std::memory_order_relaxed) - p.queries0,
                      us(static_cast<int64_t>(
                          goblin::safemem::g_query_qpc.load(std::memory_order_relaxed) -
                          p.vq_qpc0)),
+                     goblin::safemem::t_queries - p.tq0,
+                     us(static_cast<int64_t>(goblin::safemem::t_query_qpc - p.tvq0)),
                      goblin::safemem::g_refused.load(std::memory_order_relaxed) - p.refused0);
         p = V3Perf{};
         p.window_ms = now;
@@ -10902,6 +11812,22 @@ void goblin::stall_probe::sample_map_stall()
 
 void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
 {
+    // [v3pump] The nested proof's GotoFrame is on the stack (we are inside the engine's burst, in
+    // the factory's first pulse). Count the pulse and build nothing - no seed, no factory, no owner
+    // check: the proof asks only whether pulses arrive, and from which sprite's snapshot (ctx+0x58).
+    // Pump strokes (t_v3_pump.pumping) are the opposite case: counted, then built as usual.
+    if (t_v3_pump.active)
+    {
+        ++t_v3_pump.pulses;
+        uint64_t from = 0;
+        if (v3_read64(reinterpret_cast<uintptr_t>(ctx) + 0x58, from) && from == t_v3_pump.expect)
+            ++t_v3_pump.own;
+        else
+            ++t_v3_pump.other;
+        return;
+    }
+    if (t_v3_pump.pumping)
+        ++t_v3_pump.pumped;
     try
     {
         v3_note_thread("v3_native_factory_pulse (RM2 burst)");
@@ -10915,10 +11841,13 @@ void goblin::stall_probe::v3_native_factory_pulse(void *ctx, unsigned frame)
         const int64_t perf_t0 = v3_perf_now();
         v3_native_factory_consume(ctx, static_cast<uint32_t>(frame));
         const int64_t perf_dt = v3_perf_now() - perf_t0;
-        ++g_v3_perf.pulses;
-        g_v3_perf.pulse_qpc += perf_dt;
-        ++g_v3_open.pulses;
-        g_v3_open.pulse_qpc += perf_dt;
+        if (!t_v3_pump.pumping) // the burst's cost; the pump's is timed as a whole in the tick
+        {
+            ++g_v3_perf.pulses;
+            g_v3_perf.pulse_qpc += perf_dt;
+            ++g_v3_open.pulses;
+            g_v3_open.pulse_qpc += perf_dt;
+        }
     }
     catch (const std::exception &e)
     {
@@ -10946,6 +11875,15 @@ void goblin::stall_probe::on_map_close()
 
 uint32_t goblin::stall_probe::v3_detach_all_children()
 {
+    // [v3pump] The generator belongs to this generation. Forgotten here, ahead of the early
+    // returns below (no markers yet, no remove-at), and never touched again: a parent address can
+    // come back as a new movie's parent. The next generation makes its own.
+    const bool pump_was_building = g_v3_native.pump_capped;
+    g_v3_native.pump_gen = 0;
+    g_v3_native.pump_tried = false;
+    g_v3_native.pump_capped = false;
+    g_v3_native.pump_dry = 0;
+    g_v3_native.pump_stuck = 0;
     if (!goblin::variants::kSelfDetach || !g_v3_remove_at)
         return 0;
     const uintptr_t wrapper = g_v3_native.wrapper;
@@ -11049,6 +11987,7 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
         // the field check on that: 7189 independent children agreeing on one vtable pointer, and
         // that pointer being the resolved one, is what says the walk holds on this build. A low
         // agreement rate would say it does not, whatever the offline verification concluded.
+        const int64_t r0 = v3_perf_now(); // the release's own cost, survey included (UI thread frame)
         {
             uint64_t top = 0;
             uint32_t top_n = 0, walked = 0, distinct = 0;
@@ -11075,6 +12014,7 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
                          (top && v3_slot_vtable() && top == v3_slot_vtable()) ? "MATCHES"
                                                                              : "does NOT match");
         }
+        const int64_t r1 = v3_perf_now();
         for (auto &o : g_v3_native.objects)
         {
             if (!o.ref_held || !v3_heap_ptr(o.child) || vt == 0)
@@ -11100,9 +12040,12 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
                 ++refused;
             }
         }
+        const int64_t r2 = v3_perf_now();
         spdlog::info("[v3native] generation released at close: {} released, {} destroyed, "
-                     "{} refused, {} unsafe(pre-test), of {} tracked, movie=0x{:X}",
-                     released, destroyed, refused, unsafe, g_v3_native.objects.size(), movie);
+                     "{} refused, {} unsafe(pre-test), of {} tracked, movie=0x{:X} in {} us "
+                     "(survey {} us)",
+                     released, destroyed, refused, unsafe, g_v3_native.objects.size(), movie,
+                     park_us(r2 - r0), park_us(r1 - r0));
         // Ask for this movie's parked entry to be expired, so the next open cannot reuse it and
         // therefore cannot skip the burst we build from. Harmless if the entry is never found.
         if (v3_heap_ptr(movie))
@@ -11112,6 +12055,18 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     // the same movie and parent; measured across every session on 2026-08-03, 30 of 30 opens
     // retargeted to a NEW parent, so it never once fired - and holding a generation for it is what
     // pins the movie.
+    // Decided BEFORE the clear below: the branch further down tested objects.empty() after clearing
+    // it, so it could never fire. "Unfinished" = rows queued but neither built nor failed (a close
+    // mid-burst), not "READY not printed yet": 6 of 16 closes on ERR 2026-09-23 came before READY
+    // with every row built. ONLY at the dialog close (g_v3_map_closed, set by on_map_close right
+    // before wmd_dtor_detour calls this): the seed's re-anchor and v3_drop_dead_anchor also call
+    // this function with the map open, and clearing the target there would pull the anchor out from
+    // under the build the seed is about to start on it.
+    const size_t built_at_close = g_v3_native.objects.size();
+    const size_t queued_at_close = g_v3_native.pending.size();
+    const bool unfinished_at_close = g_v3_map_closed.load(std::memory_order_acquire) &&
+                                     g_v3_native.seeded && !g_v3_native.completion_reported &&
+                                     built_at_close + g_v3_native.failed < queued_at_close;
     g_v3_native.objects.clear();
     g_v3_native.by_row.clear();
     g_v3_native.queued.clear();
@@ -11132,11 +12087,18 @@ uint32_t goblin::stall_probe::v3_detach_all_children()
     // markers LAST, so a short build is missing exactly the ones the player is standing among.
     // Clearing the target here forces the next attach burst through arm A, the same path a first
     // open takes, which is the one path guaranteed to have a whole pulse pool ahead of it.
-    if (!g_v3_native.completion_reported && !g_v3_native.objects.empty())
+    if (unfinished_at_close)
     {
-        spdlog::warn("[v3native] generation ended UNFINISHED ({} of {} built); clearing the "
-                     "anchor so the next open rebuilds from scratch instead of adopting it",
-                     g_v3_native.objects.size(), g_v3_native.pending.size());
+        // [v3pump] A close in the first frames after an open, while the pump still builds the
+        // hidden rows, is ordinary now: same handling, no warning.
+        if (pump_was_building)
+            spdlog::info("[v3native] closed while the pump was building ({} of {} built); "
+                         "clearing the anchor so the next open rebuilds from scratch",
+                         built_at_close, queued_at_close);
+        else
+            spdlog::warn("[v3native] generation ended UNFINISHED ({} of {} built); clearing the "
+                         "anchor so the next open rebuilds from scratch instead of adopting it",
+                         built_at_close, queued_at_close);
         g_v3_target_parent.store(0, std::memory_order_relaxed);
         g_v3_target_wrapper.store(0, std::memory_order_release);
         g_v3_target_layer.store(-1, std::memory_order_relaxed);
@@ -11230,8 +12192,9 @@ void goblin::stall_probe::setup()
     }
 #endif // MFG_STALL_PROFILER
 
-    // PlaceObject insertion path (v1.16 FUN_14113e7e0). The detour filters to
-    // MAP_ICON_CHARID_BASE, so ordinary display-tree construction is untouched
+    // PlaceObject insertion path (v1.16 FUN_14113e7e0, DisplayList::Add). The detour
+    // only matches the marker factory's outstanding (depth, charId) slots - our ids,
+    // chosen per world-map parse - so ordinary display-tree construction is untouched
     // apart from the pass-through hook itself.
     try
     {
@@ -11265,6 +12228,46 @@ void goblin::stall_probe::setup()
         spdlog::warn("[stallprobe] v3 record driver AOB miss (native marker "
                      "creation limited): {}",
                      e.what());
+    }
+
+    // [v3pump] Sprite::GotoFrame. Accepted only if the match also calls the record driver twice
+    // within its first 0x300 bytes (it is that driver's only caller, E8 sites at +0x115 and +0x241
+    // on the live exe), so a byte-twin elsewhere is refused. A miss: every open builds all markers
+    // at once, as before the pump.
+    if (goblin::variants::kFramePump && g_v3_mat_driver)
+    {
+        try
+        {
+            auto *gf = static_cast<const uint8_t *>(modutils::scan<void>(
+                {.aob = "4C 8B DC 55 53 56 49 8D 6B A1 48 81 EC 90 00 00 00 48 8B D9 8B F2 "
+                        "0F B7 49 6A 0F B7 C1 66 C1 E8 0B A8 01 0F 84"}));
+            uint32_t calls = 0;
+            const uintptr_t driver = reinterpret_cast<uintptr_t>(g_v3_mat_driver);
+            for (uint32_t i = 0; gf && i + 5 <= 0x300; ++i)
+            {
+                if (gf[i] != 0xE8)
+                    continue;
+                int32_t rel = 0;
+                memcpy(&rel, gf + i + 1, 4);
+                if (reinterpret_cast<uintptr_t>(gf) + i + 5 + static_cast<intptr_t>(rel) == driver)
+                    ++calls;
+            }
+            const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            if (gf && calls == 2)
+            {
+                g_v3_goto_frame = reinterpret_cast<V3GotoFrameFn *>(const_cast<uint8_t *>(gf));
+                spdlog::info("[v3pump] GotoFrame resolved @ exe+0x{:X}",
+                             reinterpret_cast<uintptr_t>(gf) - exe);
+            }
+            else
+                spdlog::warn("[v3pump] GotoFrame candidate @ exe+0x{:X} calls the record driver {} "
+                             "time(s), expected 2 - pump off",
+                             gf ? reinterpret_cast<uintptr_t>(gf) - exe : 0, calls);
+        }
+        catch (const std::exception &e)
+        {
+            spdlog::warn("[v3pump] GotoFrame AOB miss - pump off: {}", e.what());
+        }
     }
 
     // Render-node GetWritableData(entry, changeFlags): the copy-on-write + change-record
@@ -11304,6 +12307,12 @@ void goblin::stall_probe::setup()
         spdlog::warn("[stallprobe] v3 self-detach primitive AOB miss (lever C off): {}",
                      e.what());
     }
+
+    // Resolve the snapshot-slot class now, on this init thread: otherwise the first map close pays
+    // the one-time .rdata scan (9-10 ms on every session's first close, ERR 2026-09-23) inside the
+    // game's menu update. anchors::warm() placed the two slot functions it keys on before this step.
+    if (goblin::variants::kViewportWindow)
+        (void)v3_slot_vtable();
 
     // Six DrawingContext primitives (begin / beginFill / moveTo / lineTo / endFill / shapeReset)
     // were AOB-scanned here on every startup for the solid-fill spike. The spike itself no longer

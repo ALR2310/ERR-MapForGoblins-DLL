@@ -47,19 +47,22 @@ namespace
         return o_convert(vm, out, packed, world_local);
     }
 
-    bool seh_fold(void *vm, uint32_t packed, float px, float pz, float &u, float &v)
+    // 1 = converted, 0 = the converter refused the tile, -1 = the call raised (the report-19
+    // class: a view model that died under us). The last two must not be confused - only a
+    // refusal says anything about the profile's data.
+    int seh_fold(void *vm, uint32_t packed, float px, float pz, float &u, float &v)
     {
         __try
         {
             Vec2 out{0, 0};
             Vec3 wl{px, 0.0f, pz};
             uint32_t p = packed;
-            if (!o_convert(vm, &out, &p, &wl)) return false;
+            if (!o_convert(vm, &out, &p, &wl)) return 0;
             u = out.x;
             v = out.y;
-            return true;
+            return 1;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
 }
 
@@ -80,16 +83,24 @@ void goblin::worldmap_probe::setup()
 }
 
 bool goblin::worldmap_probe::project(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
-                                     float &map_u, float &map_v)
+                                     float &map_u, float &map_v, ProjFail *why)
 {
+    if (why) *why = ProjFail::none;
     void *vm = g_vm.load(std::memory_order_relaxed);
-    if (!vm || !o_convert) return false;
+    if (!vm || !o_convert)
+    {
+        if (why) *why = ProjFail::no_view;
+        return false;
+    }
     // Validate before calling, never catch after. seh_fold's __except is a net for the case
     // this test cannot see, not the mechanism - reaching it is now a defect, not an answer.
     const uint64_t stamped = g_vm_ms.load(std::memory_order_acquire);
     const uint64_t now = GetTickCount64();
     if (stamped == 0 || now < stamped || now - stamped > VM_FRESH_MS)
+    {
+        if (why) *why = ProjFail::stale;
         return false;
+    }
     const uint32_t packed = (static_cast<uint32_t>(area) << 24) |
                             ((static_cast<uint32_t>(gx) & 0xFF) << 16) |
                             ((static_cast<uint32_t>(gz) & 0xFF) << 8);
@@ -98,7 +109,8 @@ bool goblin::worldmap_probe::project(uint8_t area, uint16_t gx, uint16_t gz, flo
     // points inside the guard, so an in-place decrement would be skipped on two of them and the
     // thread_local depth would ratchet up until crash logging was dead for the session.
     ++goblin::guarded::depth;
-    const bool ok = seh_fold(vm, packed, px, pz, map_u, map_v);
+    const int r = seh_fold(vm, packed, px, pz, map_u, map_v);
     --goblin::guarded::depth;
-    return ok;
+    if (r != 1 && why) *why = r == 0 ? ProjFail::declined : ProjFail::faulted;
+    return r == 1;
 }

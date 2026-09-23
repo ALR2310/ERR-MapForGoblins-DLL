@@ -180,6 +180,18 @@ SIGNATURES = [
                 "marker creation to the finite build-burst trickle.",
     },
     {
+        "name": "sprite_goto_frame",
+        "pattern": "4C 8B DC 55 53 56 49 8D 6B A1 48 81 EC 90 00 00 00 48 8B D9 8B F2 "
+                   "0F B7 49 6A 0F B7 C1 66 C1 E8 0B A8 01 0F 84",
+        "slot": None,
+        "critical": False,
+        "refs": ["goblin_stall_probe.cpp"],
+        "note": "Sprite::GotoFrame (Sprite vtable +0x378, live exe+0x11C3360), the only "
+                "caller of record_materialize_driver (two E8 sites, cross-checked at "
+                "runtime). Drives the [v3pump] frame pump; a miss turns the pump off and "
+                "every map open builds all markers in the engine's burst, as before 2.1.5.",
+    },
+    {
         "name": "detach_remove_at",
         "pattern": "40 57 48 83 EC 20 48 8B 41 18 48 8B F9 3B 90 E0 00 00 00 72 08 "
                    "33 C0 48 83 C4 20 5F C3",
@@ -222,6 +234,10 @@ SIGNATURES = [
     },
     {
         "name": "gfx_lookup",
+        "retired":
+            "2026-09-23: the detour on this function was removed. It is DisplayList::FindByDepth "
+            "(2.6.2 0x14113FD90), not a character-id lookup, so the movie latch and the tick() id "
+            "check built on it never saw an id; character ids are chosen per world-map parse now",
         "pattern": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 49 8B F8 8B DA "
                    "48 8B F1 E8 F4 F8 FF FF",
         "slot": None,
@@ -232,6 +248,10 @@ SIGNATURES = [
     },
     {
         "name": "gfx_registrar",
+        "retired":
+            "2026-09-23: the detour on this function was removed. It is the bind-index registrar "
+            "(images, fonts, external images - never sprites, shapes or imports), and its per-movie "
+            "count read 0 on every load; the ids come from the movie's own stream and registry now",
         "pattern": "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 "
                    "41 8B 00 48 8B F9 48 8B 49 38",
         "slot": None,
@@ -605,9 +625,9 @@ SIGNATURES = [
         "slot": None,
         "critical": False,
         "refs": ["goblin_stall_probe.cpp"],
-        "note": "Scaleform PlaceObject add path (v1.16 entry 0x14113e7e0). The spy "
-                "filters to the spike's MAP_ICON_CHARID_BASE/depth-24 pair and captures "
-                "the ready custom DisplayObject.",
+        "note": "Scaleform PlaceObject add path (DisplayList::Add, v1.16 entry 0x14113e7e0). "
+                "The detour matches the marker factory's outstanding (depth, charId) slots - "
+                "charIds chosen per world-map parse - and captures the ready DisplayObject.",
     },
     {
         "name": "stallprobe_v3_attach_movie_bridge",

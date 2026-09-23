@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // The anchor each call site wants, by name. The RVA never leaves the table.
@@ -46,14 +47,63 @@ namespace goblin::anchors
     // matches a File and the transform stays off - a safe degradation.
     uintptr_t memfile_vtable();
 
+    // Every class the mod finds by its RTTI name. ONE list, so that a new user of vtable_of
+    // cannot be left out of prewarm_vtables(): vtable_of only takes a value of this enum, and
+    // a value without its row in kRttiClasses fails the static_assert below. To add a class:
+    // a value here (before Count), its decorated name in kRttiClasses at the same position.
+    enum class RttiClass : uint8_t
+    {
+        CSFeAutoHideCtrl,  // stall_probe: the HUD-mode restore and its log (UI thread)
+        KeyConfigDialog,   // stall_probe: the settings screen's row builder (UI thread)
+        WorldMapDialog,    // stall_probe: the map as the settings screen's host (UI thread)
+        CSScaleformSystem, // stall_probe: the parked-movie slot scan (its own thread)
+        CSScaleformImp,    // stall_probe: the parked-movie slot scan (its own thread)
+        EcTestDistance,    // kindling: spirit liveness (the kindling worker)
+        Count
+    };
+
+    struct RttiClassName
+    {
+        RttiClass id;
+        const char *decorated; // exactly as the exe spells it
+    };
+
+    inline constexpr RttiClassName kRttiClasses[] = {
+        {RttiClass::CSFeAutoHideCtrl, ".?AVCSFeAutoHideCtrl@CS@@"},
+        {RttiClass::KeyConfigDialog, ".?AVKeyConfigDialog@CS@@"},
+        {RttiClass::WorldMapDialog, ".?AVWorldMapDialog@CS@@"},
+        {RttiClass::CSScaleformSystem, ".?AVCSScaleformSystem@CS@@"},
+        {RttiClass::CSScaleformImp, ".?AVCSScaleformImp@CS@@"},
+        {RttiClass::EcTestDistance, ".?AVEcTestDistance@CS@@"},
+    };
+
+    constexpr bool rtti_classes_complete()
+    {
+        if (sizeof(kRttiClasses) / sizeof(kRttiClasses[0]) != static_cast<size_t>(RttiClass::Count))
+            return false;
+        for (size_t i = 0; i < sizeof(kRttiClasses) / sizeof(kRttiClasses[0]); ++i)
+            if (static_cast<size_t>(kRttiClasses[i].id) != i)
+                return false;
+        return true;
+    }
+    static_assert(rtti_classes_complete(),
+                  "kRttiClasses needs exactly one row per RttiClass value, in enum order");
+
     // The VA of a class's vtable, found by its RTTI name, 0 when it is not there or the name
-    // is ambiguous. Pass the decorated name exactly as the exe spells it, e.g.
-    // ".?AVWorldMapDialog@CS@@". Cached per name pointer, so pass a string literal.
+    // is ambiguous. After prewarm_vtables() this is a single atomic load and never waits.
+    // Before it (or for a class it could not publish) the class is resolved on the calling
+    // thread, with no lock held during the walk, and published for every later call.
     //
     // A vtable address cannot be anchored by bytes - it lives in .rdata and holds addresses.
     // Baking one instead pins the check that uses it to a single game build, which is how the
     // map menu lost its host on 1.17. The RTTI name does not move.
-    uintptr_t vtable_of(const char *decorated_name);
+    uintptr_t vtable_of(RttiClass cls);
+
+    // Resolve every kRttiClasses entry in one walk (~8 ms on the file; the old walk took
+    // 65-90 ms per class) and publish the answers. Called once by init, off the game thread
+    // and before anything that calls vtable_of is set up, so no frame ever pays for a lookup:
+    // on 2026-09-23 the first open of the settings screen over the map paid for two, 186 ms.
+    void prewarm_vtables();
 
     // A vtable found by the CODE it points at: the one place in .rdata where both anchored
     // functions sit at their own slot index. For classes RTTI cannot name - the Scaleform ones -

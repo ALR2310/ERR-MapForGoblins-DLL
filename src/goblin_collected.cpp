@@ -5,6 +5,7 @@
 #include "modutils.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -90,6 +91,14 @@ static std::map<uint32_t, std::map<std::string, std::map<int, std::vector<uint64
 static std::map<uint64_t, std::tuple<float, float, float>> g_entry_positions;
 static bool g_initialized = false;
 
+// World-rebuild hold (refresh(), see where it is decided). Whether this character's flag-save table
+// has been seen non-empty, whether an abrupt loss of it armed the hold, and since when the table has
+// read empty while tiles are loaded. Touched only by the refresh thread; forget_session_state()
+// (same thread) resets them.
+static bool g_geof_seen_for_character = false;
+static bool g_rebuild_armed = false;
+static uint64_t g_rebuild_hold_since_ms = 0;
+
 
 struct GEOFEntry
 {
@@ -97,6 +106,7 @@ struct GEOFEntry
     uint8_t flags;
     uint16_t geom_idx;
     uint32_t model_hash;  // bytes 4-7 of GEOF entry, identifies model type
+    uint32_t raw_key;     // the table key as stored, 4th map component (DD) included - tile_id masks it off
 };
 
 // Each geom_idx holds two slots: flags=0x00 → even, flags=0x80 → odd
@@ -237,34 +247,202 @@ static bool safe_write_byte(uint8_t *addr, uint8_t val)
     }
 }
 
+// ─── walk cost measurement (debug_logging only) ─────────────────────
+//
+// What one refresh() costs and how much it reads, split into the flag-save table walk, the live
+// geometry snapshot and the rest (classification, carry-forward, the debug diff, the param writes).
+// Nothing is logged per walk at info level: a summary every 60 walks, plus debug-level detail for the
+// first 20 walks that see flag-save data (the load) and for any walk over 10 ms. The counters are
+// filled only while t_wc_on is set, which refresh() does for its own thread - the marker dump's
+// diagnose_rows() calls the same readers from the hotkey thread and must not add to them.
+namespace
+{
+struct WalkCounts
+{
+    uint64_t live_count = 0;                                 // flag-save count at +0x189D0 this walk
+    uint64_t slots = 0, tiles = 0, records = 0, kept = 0;    // table slots / blocks / 8-byte records / tracked kept
+    uint64_t blocks = 0, insts = 0, family = 0, tracked = 0; // geometry blocks / instances / AEG099+463 / tracked
+};
+thread_local bool t_wc_on = false;
+WalkCounts g_wn; // this walk (refresh thread only)
+struct WalkTotals
+{
+    uint64_t walks = 0;
+    int64_t geof = 0, wgm = 0, rest = 0, total = 0, worst = 0;
+    WalkCounts sum;
+};
+WalkTotals g_wt; // since the last summary line (refresh thread only)
+int s_wc_detailed = 0;
+
+int64_t wc_now()
+{
+    LARGE_INTEGER v;
+    QueryPerformanceCounter(&v);
+    return v.QuadPart;
+}
+
+double wc_us(int64_t d)
+{
+    static const double k = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / static_cast<double>(f.QuadPart);
+    }();
+    return static_cast<double>(d) * k;
+}
+
+struct WalkCostScope
+{
+    bool on;
+    int64_t t0 = 0, t_geof = 0, t_wgm = 0;
+    explicit WalkCostScope(bool enabled) : on(enabled)
+    {
+        t_wc_on = enabled;
+        if (!enabled)
+            return;
+        g_wn = {};
+        t0 = wc_now();
+    }
+    void mark_geof()
+    {
+        if (on) t_geof = wc_now();
+    }
+    void mark_wgm()
+    {
+        if (on) t_wgm = wc_now();
+    }
+    ~WalkCostScope()
+    {
+        t_wc_on = false;
+        if (!on || !t_geof)
+            return;
+        const int64_t t_end = wc_now();
+        const int64_t geof = t_geof - t0;
+        const int64_t wgm = t_wgm ? t_wgm - t_geof : 0;
+        const int64_t rest = t_end - (t_wgm ? t_wgm : t_geof);
+        const int64_t total = t_end - t0;
+        ++g_wt.walks;
+        g_wt.geof += geof;
+        g_wt.wgm += wgm;
+        g_wt.rest += rest;
+        g_wt.total += total;
+        if (total > g_wt.worst)
+            g_wt.worst = total;
+        g_wt.sum.tiles += g_wn.tiles;
+        g_wt.sum.records += g_wn.records;
+        g_wt.sum.kept += g_wn.kept;
+        g_wt.sum.blocks += g_wn.blocks;
+        g_wt.sum.insts += g_wn.insts;
+        g_wt.sum.family += g_wn.family;
+        g_wt.sum.tracked += g_wn.tracked;
+        const bool load_window = g_wn.kept > 0 && s_wc_detailed < 20;
+        if (load_window || wc_us(total) > 10000.0)
+        {
+            if (load_window)
+                ++s_wc_detailed;
+            spdlog::debug("[walkcost] walk {:.0f} us = table {:.0f} + geometry {:.0f} + rest {:.0f}; table count {} "
+                          "slots {} blocks {} records {} kept {}; geometry blocks {} instances {} aeg {} tracked {}",
+                          wc_us(total), wc_us(geof), wc_us(wgm), wc_us(rest), g_wn.live_count, g_wn.slots,
+                          g_wn.tiles, g_wn.records, g_wn.kept, g_wn.blocks, g_wn.insts, g_wn.family,
+                          g_wn.tracked);
+        }
+        if (g_wt.walks >= 60)
+        {
+            const double n = static_cast<double>(g_wt.walks);
+            spdlog::info("[walkcost] {} walks: avg {:.0f} us (table {:.0f} / geometry {:.0f} / rest {:.0f}), worst "
+                         "{:.0f} us; avg table blocks {:.0f} records {:.0f} kept {:.0f}; avg geometry blocks {:.1f} "
+                         "instances {:.0f} aeg {:.0f} tracked {:.0f}; tid {}",
+                         g_wt.walks, wc_us(g_wt.total) / n, wc_us(g_wt.geof) / n, wc_us(g_wt.wgm) / n,
+                         wc_us(g_wt.rest) / n, wc_us(g_wt.worst), g_wt.sum.tiles / n, g_wt.sum.records / n,
+                         g_wt.sum.kept / n, g_wt.sum.blocks / n, g_wt.sum.insts / n, g_wt.sum.family / n,
+                         g_wt.sum.tracked / n, GetCurrentThreadId());
+            g_wt = {};
+        }
+    }
+};
+} // namespace
+
+// What the flag-save table walk saw beyond the records themselves. refresh() needs the raw keys to
+// tell a loaded tile whose saved state the engine has not applied yet (see the transit test there).
+struct GeofTableInfo
+{
+    void *manager = nullptr;       // the manager this walk read; null = unreachable, nothing is known
+    uint64_t count = 0;            // its element count as read (0 when unreadable or past the capacity)
+    uint64_t tiles = 0;            // blocks that passed the area/pointer sanity tests
+    std::set<uint32_t> raw_blocks; // their keys as stored (mAA_BB_CC_DD, DD kept)
+};
+
+// The DLFixedVector behind the table: capacity 0x189C (6300) pairs of 16 bytes from +0x08, so the
+// array ends at +0x189C8, and the element count is the qword at +0x189D0. The same four engine
+// idioms that address it (load/apply `mov rcx,[rsi+0x189C8]`, erase `dec qword [rdi+0x189C8]`, two
+// `cmp rax,0x189C`) are present once each on all eight exe builds we hold (2.2.0 .. 2.7.1), checked
+// 2026-09-23 (scratch/geof_cost/geof_layout_check.py).
+static constexpr uint64_t GEOF_CAPACITY = 0x189C;
+static constexpr int GEOF_ARRAY_END = 0x189C8;
+static constexpr int GEOF_COUNT_OFF = 0x189D0;
+
 static void read_singleton_entries(uintptr_t slot,
-                                    std::vector<GEOFEntry> &out)
+                                    std::vector<GEOFEntry> &out,
+                                    GeofTableInfo *info = nullptr)
 {
     void *gf_ptr = nullptr;
     if (!slot || !safe_read((void *)slot, &gf_ptr, 8) || !gf_ptr)
         return;
+    if (info)
+        info->manager = gf_ptr;
 
     // The manager keeps a SORTED DENSE vector of (tile_id, blob) pairs: base = gf_ptr + 8, stride 0x10,
     // and the live element count is a qword at gf_ptr + 0x189D0. The engine walks exactly that many.
     // Scanning to a fixed 0x20000 instead read stale slots past the end (the vector removes elements in
     // place, so those slots keep previously-removed records -> phantom "collected" geometry) and also
     // read past the object entirely, which only looked harmless because safe_read swallows the faults.
-    // Audited 2026-07-28; if the count looks insane we fall back to the old bounded scan.
+    // Audited 2026-07-28.
+    //
+    // A count of 0 means EMPTY, exactly as it does to the engine. It used to mean "fall back to the
+    // bounded scan", and that scan is the one case where the stale slots are all there is: the erase
+    // shifts the pairs down and decrements the count without clearing the vacated slot, and the blob
+    // behind it is already freed. A vanilla session (2026-09-11 19:07, count 0 from the main menu on)
+    // followed 20 such slots on every tick - 20 first-chance faults per walk, each one symbolized by
+    // another module's handler, ~1.6 s per tick - and the one-fault-per-tick VINS run (2026-09-15)
+    // faulted at the same read. Only an unreadable count or one beyond the capacity still scans, and
+    // then only inside the array (it used to run to +0x20000, 0x7630 bytes past the object).
     uint64_t live_count = 0;
-    if (!safe_read((char *)gf_ptr + 0x189D0, &live_count, 8) || live_count == 0 || live_count > 0x2000)
-        live_count = 0;
-    const int scan_limit = live_count ? (int)(0x08 + live_count * 16) : 0x20000;
+    const bool have_count =
+        safe_read((char *)gf_ptr + GEOF_COUNT_OFF, &live_count, 8) && live_count <= GEOF_CAPACITY;
+    const int scan_limit = have_count ? (int)(0x08 + live_count * 16) : GEOF_ARRAY_END;
+    if (info)
+        info->count = have_count ? live_count : 0;
+    if (t_wc_on)
+        g_wn.live_count = live_count;
     if (goblin::config::debugLogging)
     {
+        // The first read, and the first NON-ZERO count: the pre-load 0 alone never showed whether the
+        // count is right once a character is in (it is what every walk after the load relies on).
         static std::atomic<int> once{0};
-        if (once.fetch_add(1, std::memory_order_relaxed) < 2)
-            spdlog::info("[verify] GEOF table: live count from +0x189D0 = {} -> scanning to 0x{:X} "
-                         "(the old code always scanned to 0x20000)", live_count, scan_limit);
+        static std::atomic<bool> nonzero_seen{false};
+        const bool first = once.fetch_add(1, std::memory_order_relaxed) == 0;
+        const bool first_nonzero = have_count && live_count > 0 && !nonzero_seen.exchange(true);
+        if (first || first_nonzero)
+            spdlog::info("[verify] GEOF table: live count from +0x189D0 = {}{} -> reading to 0x{:X}", live_count,
+                         have_count ? "" : " (unreadable or past the capacity: bounded scan)", scan_limit);
+        if (have_count && live_count == 0)
+        {
+            // Did the old fallback have something stale to follow here? One look at the first pair
+            // (inside the object, no blob read), once per session.
+            static std::atomic<bool> stale_noted{false};
+            uint64_t first_pair[2] = {0, 0};
+            if (!stale_noted.load(std::memory_order_relaxed) && safe_read((char *)gf_ptr + 0x08, first_pair, 16) &&
+                (first_pair[0] || first_pair[1]) && !stale_noted.exchange(true))
+                spdlog::info("[verify] GEOF table: count 0 over a non-empty first pair (key 0x{:08X}) - read as "
+                             "empty; the old fallback scan followed these", (uint32_t)first_pair[0]);
+        }
     }
 
     int tiles_found = 0, tiles_skipped = 0, consecutive_empty = 0;
     for (int off = 0x08; off < scan_limit; off += 16)
     {
+        if (t_wc_on)
+            ++g_wn.slots;
         uint64_t id_val = 0, ptr_val = 0;
         if (!safe_read((char *)gf_ptr + off, &id_val, 8))
             break;
@@ -296,6 +474,13 @@ static void read_singleton_entries(uintptr_t slot,
             continue;
         }
         tiles_found++;
+        if (info)
+        {
+            ++info->tiles;
+            info->raw_blocks.insert((uint32_t)id_val);
+        }
+        if (t_wc_on)
+            ++g_wn.tiles;
 
         // Layout A: count @+8, entries @+16 | Layout B: count @+0, entries @+8
         uint8_t header[16] = {};
@@ -328,6 +513,8 @@ static void read_singleton_entries(uintptr_t slot,
             uint8_t entry[8] = {};
             if (!safe_read((void *)(entries_start + ei * 8), entry, 8))
                 break;
+            if (t_wc_on)
+                ++g_wn.records;
 
             // The record is `key | value`, where the key is ((model_id << 0x11) | geom_idx) << 0xf and
             // BIT 0 IS THE STORED BOOLEAN. The engine's setter does not drop a record when the value
@@ -356,7 +543,11 @@ static void read_singleton_entries(uintptr_t slot,
             uint32_t model_hash = entry[4] | (entry[5] << 8) | (entry[6] << 16) | (entry[7] << 24);
 
             if (g_tracked_model_ids.count(model_hash) && (entry_flags == 0x00 || entry_flags == 0x80))
-                out.push_back({tile_id, entry_flags, geom_idx, model_hash});
+            {
+                out.push_back({tile_id, entry_flags, geom_idx, model_hash, (uint32_t)id_val});
+                if (t_wc_on)
+                    ++g_wn.kept;
+            }
         }
     }
 
@@ -364,8 +555,8 @@ static void read_singleton_entries(uintptr_t slot,
     // are the answer to "did the walk actually see the table, or did it reject everything", which
     // is the first question when collected-tracking goes quiet.
     //
-    // Edge-triggered ON PURPOSE. This runs on every refresh - 10 Hz while a map is open - and the
-    // interesting information is entirely in the TRANSITIONS: the walk starting to see the table,
+    // Edge-triggered ON PURPOSE. This runs on every refresh - every 2 s, and more often around
+    // loads - and the interesting information is entirely in the TRANSITIONS: the walk starting to see the table,
     // or going quiet. Printing the same pair on every pass buries the rest of the log (a 53 s
     // Graceborne session on 2026-07-31 was 650 identical lines out of 716) without adding a fact.
     static std::atomic<uint64_t> last_reported{UINT64_MAX};
@@ -399,16 +590,21 @@ struct WGMSnapshot
     // only to disambiguate twins (same slot). suffix_slot = slot from the MSB name, for
     // a live cross-check of the geom_idx->slot formula.
     struct SlotInst { bool alive; float px, pz; int suffix_slot;
-                      uint8_t f263, f26B; uint32_t model_id, gidx; };  // raw flags + engine id (diag)
+                      uint8_t f263, f26B; uint32_t model_id, gidx;    // raw flags + engine id (diag)
+                      uint32_t block; };  // the block key as stored (DD kept): which block it came from
     std::map<std::string, std::map<int, std::vector<SlotInst>>> slot_insts;
 };
 
-static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
+// raw_blocks (optional): every block the geometry manager lists with data, by its key as stored
+// (DD kept) - including blocks that hold no tracked instance, which never get a `result` entry.
+static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot(std::set<uint32_t> *raw_blocks = nullptr)
 {
     std::map<uint32_t, WGMSnapshot> result;
 
+    // An unresolved slot is 0, and reading address 0 is a first-chance fault on every call.
+    const uintptr_t slot = world_geom_man_slot();
     void *wgm = nullptr;
-    if (!safe_read((void *)world_geom_man_slot(), &wgm, 8) || !wgm)
+    if (!slot || !safe_read((void *)slot, &wgm, 8) || !wgm)
         return result;
 
     // Tree at WGM+0x18: +0x08 head_ptr, +0x10 size
@@ -473,6 +669,10 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
 
         if (block_data)
         {
+            if (raw_blocks)
+                raw_blocks->insert(block_id);
+            if (t_wc_on)
+                ++g_wn.blocks;
             // geom_ins vector at BlockData+0x288
             void *vec_begin = nullptr, *vec_end = nullptr;
             safe_read((char *)block_data + 0x288 + 0x08, &vec_begin, 8);
@@ -482,6 +682,8 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
             {
                 size_t count = ((uintptr_t)vec_end - (uintptr_t)vec_begin) / 8;
                 if (count > 10000) count = 10000;
+                if (t_wc_on)
+                    g_wn.insts += count;
 
                 for (size_t i = 0; i < count; i++)
                 {
@@ -514,6 +716,8 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
                         narrow_str.compare(0, 7, "AEG463_") == 0;
                     if (!is_tracked_family)
                         continue;
+                    if (t_wc_on)
+                        ++g_wn.family;
 
                     // Runtime position lives in MsbPart +0x20 (3 floats). Only X and Z are taken:
                     // they disambiguate twins at the same slot. Y was read into a `py` that nothing
@@ -561,7 +765,9 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
                             const char *us = strrchr(narrow, '_');
                             if (us && us[1]) suffix_slot = atoi(us + 1) - 9000;
                             snap.slot_insts[mprefix][slot].push_back(
-                                {alive, px, pz, suffix_slot, f263, f26B, model_id, gidx});
+                                {alive, px, pz, suffix_slot, f263, f26B, model_id, gidx, block_id});
+                            if (t_wc_on)
+                                ++g_wn.tracked;
                         }
                     }
                 }
@@ -593,11 +799,11 @@ static std::map<uint32_t, WGMSnapshot> read_wgm_snapshot()
     return result;
 }
 
-static std::vector<GEOFEntry> read_geof_from_memory()
+static std::vector<GEOFEntry> read_geof_from_memory(GeofTableInfo *info = nullptr)
 {
     std::vector<GEOFEntry> result;
 
-    read_singleton_entries(geom_flag_slot(), result);
+    read_singleton_entries(geom_flag_slot(), result, info);
 
     // NOTE: GeomNonActiveBlockManager (RVA_GEOM_NONACTIVE) is intentionally NOT
     // scanned. Despite the name, its layout is nothing like GeomFlagSaveData-
@@ -611,10 +817,47 @@ static std::vector<GEOFEntry> read_geof_from_memory()
     // tiles) + the immediate per-AEG +0x26B flag. Full RE:
     // docs/geom_nonactive_block_manager.md.
 
-    if (!result.empty())
+    // On change only. This printed on every walk that found anything - 15062 of the 69190 lines
+    // of the 2026-09-21 ERR log were this one line with the same number - while the facts are in
+    // the transitions (the table filling at a load, a block written or applied).
+    static std::atomic<size_t> last_reported{SIZE_MAX};
+    if (last_reported.exchange(result.size(), std::memory_order_relaxed) != result.size())
         spdlog::debug("[GEOF] Memory: {} flag-save entries", result.size());
 
     return result;
+}
+
+// Cheap change test for the watcher (see dllmain's loop): the pieces of state that move when the
+// inputs of refresh() move in bulk - the flag-save table gaining a block (a tile unloaded) or losing
+// one (a tile loaded and its saved state applied), and the geometry manager's block tree growing or
+// shrinking. Five aligned reads, no pointer chasing into blocks. A pickup changes none of these; it
+// is seen by the regular walk.
+uint64_t goblin::collected::change_signature()
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 0x100000001B3ull;
+    };
+    const uintptr_t gf_slot = geom_flag_slot();
+    void *gf = nullptr;
+    uint64_t count = 0;
+    if (gf_slot && safe_read((void *)gf_slot, &gf, 8) && gf)
+        safe_read((char *)gf + GEOF_COUNT_OFF, &count, 8);
+    mix((uint64_t)gf);
+    mix(count);
+    const uintptr_t wgm_slot = world_geom_man_slot();
+    void *wgm = nullptr;
+    uint64_t tree_head = 0, tree_size = 0;
+    if (wgm_slot && safe_read((void *)wgm_slot, &wgm, 8) && wgm)
+    {
+        safe_read((char *)wgm + 0x18 + 0x08, &tree_head, 8);
+        safe_read((char *)wgm + 0x18 + 0x10, &tree_size, 8);
+    }
+    mix((uint64_t)wgm);
+    mix(tree_head);
+    mix(tree_size);
+    return h;
 }
 
 // ─── tile ID helper ──────────────────────────────────────────────────
@@ -785,17 +1028,25 @@ bool goblin::collected::original_area_no(uint64_t row_id, uint8_t &area_out)
 
 int goblin::collected::refresh()
 {
+    // An unresolved slot is 0; reading address 0 would be a first-chance fault on every tick.
+    const uintptr_t wgm_slot = world_geom_man_slot();
+    const uintptr_t geof_slot = geom_flag_slot();
     void *wgm_check = nullptr;
-    safe_read((void *)world_geom_man_slot(), &wgm_check, 8);
+    if (wgm_slot)
+        safe_read((void *)wgm_slot, &wgm_check, 8);
     void *geof_check = nullptr;
-    safe_read((void *)geom_flag_slot(), &geof_check, 8);
+    if (geof_slot)
+        safe_read((void *)geof_slot, &geof_check, 8);
     if (!wgm_check && !geof_check)
         return 0;
 
     if (!g_initialized || g_tile_to_rows.empty())
         return 0;
 
-    auto geof = read_geof_from_memory();
+    WalkCostScope walk_cost(goblin::config::debugLogging);
+    GeofTableInfo table;
+    auto geof = read_geof_from_memory(&table);
+    walk_cost.mark_geof();
 
     std::set<uint64_t> new_collected;
 
@@ -822,13 +1073,171 @@ int goblin::collected::refresh()
     // reasoning still worth carrying: absence of a name never means collected on its own,
     // because the game spawns alive gathering-node CSWorldGeomIns lazily, so a name we do
     // not see may simply not have spawned near the player yet.
-    auto wgm = read_wgm_snapshot();
+    std::set<uint32_t> wgm_blocks;
+    auto wgm = read_wgm_snapshot(&wgm_blocks);
+    walk_cost.mark_wgm();
     std::set<uint32_t> wgm_tiles;
 
     // Rows we positively observed alive in WGM this refresh. Used to override
     // sticky carry-forward below: a row is "uncollected" only when we see its
     // live instance, not just because the tile is unloaded.
     std::set<uint64_t> demonstrably_alive_rows;
+
+    // ── Tiles in transit: an "alive" reading that is not one yet ──
+    //
+    // The engine applies a tile's saved state when the tile loads, in ONE call (FUN_1406e9140: find
+    // the tile's flag-save block, apply it to the live instances through FUN_1406a9af0 ->
+    // FUN_1406b2b80, then free the blob and erase the pair). Until that call the new instances read
+    // alive, collected or not, and on the way out a tile's block is written while the geometry
+    // manager still lists its instances. So "the geometry manager lists block B AND the flag-save
+    // table holds a block under the same key B" means B's live flags are not the truth yet - its
+    // saved block is. Reading them as the truth is what released 55-64 collected rows for one poll
+    // at area loads (the 2.1.5 TODO's collected flicker: 55 of 59 logged flickers carry exactly that
+    // surplus block, one more is an unload with the block already written).
+    //
+    // The block is identified by its key as stored, 4th map component included, and its records
+    // are matched only against instances FROM THAT SAME BLOCK, by the engine's own key: model id +
+    // runtime geom index (FUN_1406b2b80 marks every live instance whose (model_id, geom_idx) equals a
+    // record's). So a _00 and a _10 block of one tile never stand in for each other, and neither the
+    // slot numbering nor the single-row fallback of the GEOF pass is involved.
+    //
+    // An instance of a block in transit that its block records as collected is taken as dead (the
+    // state the engine is about to apply): its row is hidden and not released. An instance the block
+    // does NOT record is read live as before, so a respawned node (grace rest) is released on the
+    // same walk, and a dead reading still hides at once. No block that is not in transit is affected.
+    //
+    // Observed transits last one or two walks on a load and up to ~12 s on an unload (m11_00_00
+    // next to m35, 2026-09-21 22:10:43-22:10:55). A block still in transit after 60 s is read live
+    // again, so a state that never resolves cannot pin rows.
+    constexpr uint64_t kTransitCapMs = 60000;
+    const uint64_t now_ms = GetTickCount64();
+    struct TransitSeen
+    {
+        uint64_t since_ms;
+        bool noted;
+    };
+    static std::map<uint32_t, TransitSeen> s_transit_seen; // raw key -> first walk that saw it (refresh thread)
+    std::set<uint32_t> transit_raw;
+    {
+        std::map<uint32_t, TransitSeen> still;
+        for (uint32_t b : wgm_blocks)
+        {
+            if (!table.raw_blocks.count(b))
+                continue;
+            auto it = s_transit_seen.find(b);
+            TransitSeen seen = it != s_transit_seen.end() ? it->second : TransitSeen{now_ms, false};
+            if (now_ms - seen.since_ms < kTransitCapMs)
+                transit_raw.insert(b);
+            else if (!seen.noted)
+            {
+                seen.noted = true;
+                spdlog::info("[COLLECTED] m{:02d}_{:02d}_{:02d}_{:02d} loaded with its saved state unapplied for "
+                             "{} s - read live again", (b >> 24) & 0xFF, (b >> 16) & 0xFF, (b >> 8) & 0xFF,
+                             b & 0xFF, kTransitCapMs / 1000);
+            }
+            still[b] = seen;
+        }
+        s_transit_seen.swap(still);
+    }
+    // The engine key of every collected record in a block in transit, per block: model id in the
+    // high half, runtime geom index in the low half. The record stores the runtime index as its
+    // bits 15..31 (entry[2..3] = index >> 1, entry[1] bit 7 = its low bit); the live instance
+    // carries the same index at [[inst+0x48]+8] (a full dword in the engine's getter, compared
+    // unmasked: a masked index of 0x10000 or more would alias a record the engine never matches).
+    auto engine_key = [](uint32_t model_id, uint32_t runtime_idx) {
+        return (static_cast<uint64_t>(model_id) << 32) | runtime_idx;
+    };
+    std::map<uint32_t, std::set<uint64_t>> transit_keys;
+    if (!transit_raw.empty())
+        for (auto &e : geof)
+            if (transit_raw.count(e.raw_key))
+                transit_keys[e.raw_key].insert(
+                    engine_key(e.model_hash, (static_cast<uint32_t>(e.geom_idx) << 1) | ((e.flags & 0x80) ? 1u : 0u)));
+    auto transit_recorded = [&](const WGMSnapshot::SlotInst &in) {
+        auto t = transit_keys.find(in.block);
+        return t != transit_keys.end() && t->second.count(engine_key(in.model_id, in.gidx)) > 0;
+    };
+
+    // ── World rebuild: no saved state at all to check a reading against ──
+    //
+    // A warp or a reload can clear the flag-save table and refill it a moment later, and tiles can
+    // come up in between (2026-09-09 07:36:36: 7 tiles loaded over an empty table released 68 rows,
+    // re-hidden 2 s later when the table came back with 232 blocks). The hold is ARMED only by an
+    // abrupt loss of the table - the previous walk saw at least 8 blocks and this one sees none, or
+    // the flag-save or geometry manager itself was replaced - for a character whose table was seen
+    // full. A normal load applies and erases blocks one at a time, so an early-game table whose only
+    // blocks belong to loaded tiles runs down to 0 without arming it. While armed, the table reads
+    // empty and tiles are loaded, alive readings do not release; dead ones still hide. Disarmed when
+    // the table has blocks again, on a character switch, or 15 s after tiles came up (a table that is
+    // genuinely empty now - a new cycle - holds nothing longer than that). An unreadable manager
+    // neither arms nor holds: nothing is known then.
+    constexpr uint64_t kRebuildHoldMs = 15000;
+    constexpr uint64_t kAbruptDropBlocks = 8;
+    static uint64_t s_prev_tiles = 0;
+    static void *s_prev_geof_mgr = nullptr, *s_prev_wgm_mgr = nullptr;
+    if (table.manager && table.tiles > 0)
+    {
+        g_geof_seen_for_character = true;
+        g_rebuild_armed = false;
+    }
+    else if (table.manager && table.tiles == 0 && g_geof_seen_for_character &&
+             (s_prev_tiles >= kAbruptDropBlocks ||
+              (s_prev_geof_mgr && s_prev_geof_mgr != table.manager) ||
+              (s_prev_wgm_mgr && wgm_check && s_prev_wgm_mgr != wgm_check)))
+        g_rebuild_armed = true;
+    // An unreadable walk leaves the previous block count alone: zeroing it here would let a
+    // 232 -> unreadable -> 0 sequence miss the abrupt drop and never arm.
+    if (table.manager)
+    {
+        s_prev_tiles = table.tiles;
+        s_prev_geof_mgr = table.manager;
+    }
+    if (wgm_check)
+        s_prev_wgm_mgr = wgm_check;
+    bool rebuild_hold = false;
+    if (g_rebuild_armed && table.manager && table.tiles == 0 && !wgm.empty())
+    {
+        if (!g_rebuild_hold_since_ms)
+            g_rebuild_hold_since_ms = now_ms;
+        rebuild_hold = now_ms - g_rebuild_hold_since_ms < kRebuildHoldMs;
+        if (!rebuild_hold)
+        {
+            g_rebuild_armed = false;
+            spdlog::info("[COLLECTED] flag-save table still empty {} s after tiles loaded - live readings "
+                         "trusted again", kRebuildHoldMs / 1000);
+        }
+    }
+    else
+        g_rebuild_hold_since_ms = 0;
+
+    // A count field that never reads non-zero while tracked tiles stay loaded is either a character
+    // with nothing collected on an unloaded tile yet, or a table this exe no longer keeps where we
+    // read it - which would leave every unloaded tile's collected state dark without a word. Said
+    // once per session after 3 minutes of it, so the second case is visible in a player's log.
+    {
+        static bool s_count_seen = false, s_dark_noted = false;
+        static uint64_t s_dark_since_ms = 0;
+        if (table.count > 0 || table.tiles > 0)
+            s_count_seen = true;
+        if (!s_count_seen && !s_dark_noted && table.manager && !wgm.empty())
+        {
+            if (!s_dark_since_ms)
+                s_dark_since_ms = now_ms;
+            else if (now_ms - s_dark_since_ms >= 180000)
+            {
+                s_dark_noted = true;
+                spdlog::info("[COLLECTED] flag-save table count has read 0 for 3 min with {} tracked tile(s) "
+                             "loaded - expected for a character with nothing collected on an unloaded tile; "
+                             "otherwise the count at +0x189D0 is not where this exe keeps it",
+                             wgm.size());
+            }
+        }
+        else if (wgm.empty())
+            s_dark_since_ms = 0; // the 3 minutes are counted with tiles loaded, not across the menu
+    }
+
+    int kept_by_transit = 0, kept_by_rebuild = 0; // hidden rows whose alive reading was not taken
+    std::set<uint32_t> kept_blocks;               // the transit blocks that actually kept one
 
     // WGM classification. The slot survives only as the shape of the map we walk - the match
     // itself is by position, for the reason spelled out at the inner loop below. (An earlier
@@ -911,20 +1320,35 @@ int goblin::collected::refresh()
                         best_d2 = named_d2;
                         if (!best) continue;
                     }
-                    if (best->alive) demonstrably_alive_rows.insert(row_id);
-                    else             new_collected.insert(row_id);
+                    if (!best->alive)
+                        new_collected.insert(row_id);
+                    else if (transit_recorded(*best))
+                    {
+                        new_collected.insert(row_id); // the saved state about to be applied to it
+                        if (g_collected_rows.count(row_id))
+                        {
+                            ++kept_by_transit;
+                            kept_blocks.insert(best->block);
+                        }
+                    }
+                    else if (rebuild_hold)
+                    {
+                        if (g_collected_rows.count(row_id))
+                            ++kept_by_rebuild; // not released; carry-forward keeps it
+                    }
+                    else
+                        demonstrably_alive_rows.insert(row_id);
                 }
         }
     }
 
     // ── GEOF: for unloaded tiles ──
-    for (auto &[tid, prefix_slots] : geof_tile_prefix_slots)
+    // (A loaded tile skips this pass; its live instances decide, a block in transit through its own
+    // records matched to its own instances above.)
+    auto geof_pass = [&](uint32_t tid, const std::map<std::string, std::vector<int>> &prefix_slots)
     {
-        if (wgm_tiles.count(tid))
-            continue;
-
         auto tile_it = g_tile_slot_to_row.find(tid);
-        if (tile_it == g_tile_slot_to_row.end()) continue;
+        if (tile_it == g_tile_slot_to_row.end()) return;
 
         for (auto &[prefix, slots] : prefix_slots)
         {
@@ -961,6 +1385,26 @@ int goblin::collected::refresh()
                 for (uint64_t r : row_it->second)
                     new_collected.insert(r);
             }
+        }
+    };
+    for (auto &[tid, prefix_slots] : geof_tile_prefix_slots)
+        if (!wgm_tiles.count(tid))
+            geof_pass(tid, prefix_slots);
+
+    // Say so when the transit or rebuild rule actually kept a hidden row hidden - edge-triggered, a
+    // handful of lines per session (the loads), nothing when it had nothing to do.
+    {
+        static int s_last_kept = 0;
+        const int kept = kept_by_transit + kept_by_rebuild;
+        if (kept != s_last_kept)
+        {
+            s_last_kept = kept;
+            if (kept_by_transit > 0)
+                spdlog::info("[COLLECTED] {} hidden row(s) read alive on {} loaded block(s) whose saved state is "
+                             "not applied yet - kept hidden", kept_by_transit, kept_blocks.size());
+            if (kept_by_rebuild > 0)
+                spdlog::info("[COLLECTED] {} hidden row(s) read alive while the flag-save table is empty "
+                             "(world rebuild) - kept hidden", kept_by_rebuild);
         }
     }
 
@@ -1137,6 +1581,10 @@ void goblin::collected::forget_session_state()
         g_collected_count = 0;
     }
     g_unmatched_count = 0;
+    // The world-rebuild hold is about THIS character's flag-save table having been seen full.
+    g_geof_seen_for_character = false;
+    g_rebuild_armed = false;
+    g_rebuild_hold_since_ms = 0;
     if (dropped > 0)
         spdlog::info("[COLLECTED] character switch: {} row(s) of the previous character released", dropped);
 }
@@ -1235,7 +1683,7 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
             {
                 snprintf(buf, sizeof(buf),
                          "        WGM: tile loaded, %zu tracked instance(s) on it, NONE of model %s -> "
-                         "no WGM outcome, and GEOF is skipped for a loaded tile\n",
+                         "no WGM outcome, and GEOF is skipped for a loaded tile (sticky state stands)\n",
                          total, geof_prefix.c_str());
                 o << buf;
             }
@@ -1281,9 +1729,10 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
                                                     : "  <- name-slot match: dead -> collected";
                     snprintf(buf, sizeof(buf),
                              "          slot=%d name-slot=%d pos=(%.2f,%.2f) dist=%.1f alive=%d f263=0x%02X "
-                             "f26B=0x%02X model=%u gidx=%u%s\n",
+                             "f26B=0x%02X model=%u gidx=%u block _%02u%s\n",
                              r.slot, r.in->suffix_slot, r.in->px, r.in->pz, r.d, r.in->alive ? 1 : 0,
-                             (unsigned)r.in->f263, (unsigned)r.in->f26B, r.in->model_id, r.in->gidx, outcome);
+                             (unsigned)r.in->f263, (unsigned)r.in->f26B, r.in->model_id, r.in->gidx,
+                             (unsigned)(r.in->block & 0xFF), outcome);
                     o << buf;
                 }
             }
@@ -1296,8 +1745,8 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
             if (g.tile_id != tile) continue;
             if (prefix_from_model_id(g.model_hash) != geof_prefix) continue;
             const int slot = aeg099_index_from_geof(g.geom_idx, g.flags);
-            snprintf(buf, sizeof(buf), "        GEOF: slot=%d geom_idx=0x%04X flags=0x%02X%s\n", slot,
-                     (unsigned)g.geom_idx, (unsigned)g.flags,
+            snprintf(buf, sizeof(buf), "        GEOF: block _%02u slot=%d geom_idx=0x%04X flags=0x%02X%s\n",
+                     (unsigned)(g.raw_key & 0xFF), slot, (unsigned)g.geom_idx, (unsigned)g.flags,
                      slot == e->geom_slot ? "  <- this row's slot" : "");
             o << buf;
             ++n;
@@ -1310,7 +1759,10 @@ std::string goblin::collected::diagnose_rows(const std::vector<uint64_t> &live_r
         if (loaded)
             o << "        rule: tile LOADED -> WGM decides: nearest instance within 4u, else the instance "
                  "whose MSB name carries this row's slot; a dead match hides. GEOF is not consulted "
-                 "while loaded\n";
+                 "while loaded, with two exceptions: a GEOF record listed here while its block is also "
+                 "loaded (saved state not applied yet) makes the instance of that same block with the "
+                 "same model and geom index count as dead; and for up to 15 s after the table was lost "
+                 "abruptly (world rebuild) an alive match does not release a hidden row\n";
     }
     return o.str();
 }

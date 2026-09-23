@@ -17,6 +17,8 @@
 // consumer of the screen half of the chain.
 #include <cstdint>
 
+#include "goblin_worldmap_probe.hpp"
+
 namespace goblin::mapproject
 {
     struct MapView
@@ -47,7 +49,11 @@ namespace goblin::mapproject
     // Convert a raw WorldMapPointParam position to the map canvas coordinate
     // used by native Scaleform display objects. It does NOT depend on the current
     // pan/zoom or on the client size - that is what makes it safe to bake against.
+    // On false, `why` (when given) says whether the game's converter was asked at all. On true,
+    // `from_origin` (when given) says the point was placed from a tile origin learned earlier
+    // because the converter could not be asked right now.
     bool to_map(uint8_t area, uint16_t gx, uint16_t gz, float px, float pz,
-                float &map_x, float &map_z);
+                float &map_x, float &map_z, worldmap_probe::ProjFail *why = nullptr,
+                bool *from_origin = nullptr);
 
 }

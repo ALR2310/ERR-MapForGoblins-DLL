@@ -6,6 +6,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
@@ -99,8 +101,9 @@ namespace
         // caller survives, which is exactly why the one time it was WRONGLY 0 nothing in the
         // log pointed at it - the menu screen just quietly kept the stock movie.
         if (!g_memfile_vt)
-            spdlog::warn("[anchors] the memory-file vtable could not be derived from its ctor - "
-                         "the menu-movie transform stays off this session");
+            spdlog::warn("[anchors] the memory-file class could not be derived from its ctor - "
+                         "the menu-movie transform stays off this session, and the map's icon ids are "
+                         "chosen without reading its movie");
         if (st.at_baked == kCount)
         {
             // Note what carried the verdict, not just the verdict. "All present" used to be
@@ -170,26 +173,75 @@ namespace goblin::anchors
 // on ONE game build (CSFeAutoHideCtrl, KeyConfigDialog, WorldMapDialog). A byte anchor cannot
 // follow those: .rdata holds addresses, not code. So they were simply wrong on every other
 // build, and the check they guard bowed out - which on 1.17 left the map menu with no host to
-// hang its screen on.
+// hang its screen on. (The full list of classes found this way is RttiClass, in the header.)
 //
 // MSVC leaves a handle that no patch moves: one qword BEFORE a vtable sits a pointer to a
 // _RTTICompleteObjectLocator, and the locator names the class as a string. Walking that
 // backwards - name -> TypeDescriptor -> locator -> vtable - finds the class wherever the
 // linker put it this time. Verified on 2.6.2 and 2.7.0: all three classes resolve, and the
 // answers match what the same vtables were found to be by their slot functions
-// (scratch/vtable_by_rtti.py, scratch/find_vtables.py).
+// (scratch/vtable_by_rtti.py, scratch/find_vtables.py). The walk itself is
+// goblin::rtti_resolve::find_vtables (goblin_anchor_resolve.hpp), where the offline test
+// scratch/rtti_prewarm/ runs it against every exe build we hold.
+//
+// Publication. Each class has a done flag and a value. A reader that finds the flag set
+// returns the value with one acquire load - no lock. A reader that does not resolves the
+// class itself, with NO lock held during the walk, then publishes under a mutex that guards
+// only the two stores; losing that race just means another thread's identical answer is
+// used. The old cache held one mutex across the whole 65-90 ms walk, so a frame that needed
+// a class already known could still queue behind a walk for another one.
 namespace
 {
-    struct VtCache
+    constexpr size_t kRttiCount = static_cast<size_t>(goblin::anchors::RttiClass::Count);
+    std::atomic<bool> g_rtti_done[kRttiCount] = {};
+    std::atomic<uintptr_t> g_rtti_va[kRttiCount] = {};
+    std::mutex g_rtti_publish_mutex;
+
+    // True when this call stored the answer (the one that logs it), false when it was there.
+    bool rtti_publish(size_t i, uintptr_t va)
     {
-        const char *name;
-        uintptr_t va;
-    };
-    VtCache g_vt_cache[8] = {};
+        std::lock_guard<std::mutex> lock(g_rtti_publish_mutex);
+        if (g_rtti_done[i].load(std::memory_order_relaxed))
+            return false;
+        g_rtti_va[i].store(va, std::memory_order_relaxed);
+        g_rtti_done[i].store(true, std::memory_order_release);
+        return true;
+    }
+
+    void rtti_log(size_t i, uintptr_t base, uintptr_t va)
+    {
+        const char *decorated_name = goblin::anchors::kRttiClasses[i].decorated;
+        if (va)
+            spdlog::info("[anchors] {} -> exe+0x{:X}", decorated_name, va - base);
+        else
+            spdlog::info("[anchors] {} -> not found", decorated_name);
+    }
+
+    // Resolve the listed classes in one walk and publish them. Returns how many were found.
+    size_t rtti_resolve_and_publish(uintptr_t base, const size_t *idx, size_t n)
+    {
+        const char *names[kRttiCount] = {};
+        uint32_t rva[kRttiCount] = {};
+        for (size_t k = 0; k < n; ++k)
+            names[k] = goblin::anchors::kRttiClasses[idx[k]].decorated;
+        const auto secs = goblin::rtti_resolve::sections_of(base);
+        goblin::rtti_resolve::find_vtables(base, secs.data(), secs.size(), names, n, rva);
+        size_t found = 0;
+        for (size_t k = 0; k < n; ++k)
+        {
+            const uintptr_t va = rva[k] ? base + rva[k] : 0;
+            if (va)
+                ++found;
+            if (rtti_publish(idx[k], va))
+                rtti_log(idx[k], base, va);
+        }
+        return found;
+    }
+
+    // vtable_with's cache below; vtable_of no longer takes this lock.
     std::mutex g_vt_mutex;
 
-    // Every section, so the name string can be found wherever the linker put it (.data on the
-    // builds seen here) while the locator and the vtable itself live in .rdata.
+    // Every section - vtable_with's walk over .rdata.
     template <typename F>
     void each_section(uintptr_t base, F &&fn)
     {
@@ -214,85 +266,45 @@ namespace
             if (hay[i] == *n0 && std::memcmp(hay + i, n0, nlen) == 0)
                 fn(i);
     }
-
-    uintptr_t find_vtable_uncached(uintptr_t base, const char *decorated)
-    {
-        const size_t nlen = std::strlen(decorated) + 1; // the NUL keeps a prefix from matching
-
-        // 1. the name string -> the TypeDescriptor that owns it (name sits at +0x10)
-        uint32_t td_rva = 0;
-        unsigned td_hits = 0;
-        each_section(base, [&](const uint8_t *p, size_t len, uint32_t va, bool) {
-            scan_for(p, len, decorated, nlen, [&](size_t off) {
-                if (va + off >= 0x10)
-                {
-                    td_rva = static_cast<uint32_t>(va + off - 0x10);
-                    ++td_hits;
-                }
-            });
-        });
-        if (td_hits != 1)
-            return 0;
-
-        // 2. every .rdata reference to it, keeping only the ones that really are a locator.
-        //    The TypeDescriptor RVA appears TWICE per class: once in the
-        //    _RTTICompleteObjectLocator (pTypeDescriptor at +12) and once in the
-        //    _RTTIBaseClassDescriptor (pTypeDescriptor at +0). Demanding a single reference
-        //    here is what made the first version answer "not found" for all three classes on a
-        //    live 2.7.0 while the same walk succeeded offline. The x64 locator identifies
-        //    itself: signature 1 at +0, and pSelf at +20 holding its OWN rva.
-        // 3. the vtable is one qword after whatever points at that locator.
-        uintptr_t vt = 0;
-        unsigned vt_hits = 0;
-        each_section(base, [&](const uint8_t *p, size_t len, uint32_t va, bool rdata) {
-            if (!rdata)
-                return;
-            scan_for(p, len, &td_rva, sizeof(td_rva), [&](size_t off) {
-                if (off < 12 || off - 12 + 24 > len)
-                    return; // a locator is 24 bytes; do not read past the section
-                const uint32_t col_rva = static_cast<uint32_t>(va + off - 12);
-                const auto *col = reinterpret_cast<const uint32_t *>(base + col_rva);
-                if (col[0] != 1 || col[5] != col_rva)
-                    return; // a base-class descriptor, not the locator
-                const uint64_t col_va = static_cast<uint64_t>(base) + col_rva;
-                each_section(base, [&](const uint8_t *q, size_t qlen, uint32_t qva, bool qrd) {
-                    if (!qrd)
-                        return;
-                    scan_for(q, qlen, &col_va, sizeof(col_va), [&](size_t qoff) {
-                        vt = base + qva + qoff + 8;
-                        ++vt_hits;
-                    });
-                });
-            });
-        });
-        return vt_hits == 1 ? vt : 0;
-    }
 }
 
 namespace goblin::anchors
 {
-    uintptr_t vtable_of(const char *decorated_name)
+    uintptr_t vtable_of(RttiClass cls)
+    {
+        const size_t i = static_cast<size_t>(cls);
+        if (i >= kRttiCount)
+            return 0;
+        if (g_rtti_done[i].load(std::memory_order_acquire))
+            return g_rtti_va[i].load(std::memory_order_relaxed);
+        // Not published yet: prewarm_vtables() has not run (or could not finish). Resolve this
+        // one class here - one name alone costs ~3 ms on the file, it used to be 65-90 ms.
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!base)
+            return 0;
+        rtti_resolve_and_publish(base, &i, 1);
+        // Published now, by this call or by a thread that got there first with the same answer;
+        // the publish mutex both went through orders that store before this load.
+        return g_rtti_va[i].load(std::memory_order_acquire);
+    }
+
+    void prewarm_vtables()
     {
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        if (!base || !decorated_name)
-            return 0;
-        std::lock_guard<std::mutex> lock(g_vt_mutex);
-        size_t free_slot = SIZE_MAX;
-        for (size_t i = 0; i < sizeof(g_vt_cache) / sizeof(g_vt_cache[0]); ++i)
-        {
-            if (g_vt_cache[i].name == decorated_name)
-                return g_vt_cache[i].va;
-            if (!g_vt_cache[i].name && free_slot == SIZE_MAX)
-                free_slot = i;
-        }
-        const uintptr_t va = find_vtable_uncached(base, decorated_name);
-        if (free_slot != SIZE_MAX)
-            g_vt_cache[free_slot] = {decorated_name, va};
-        if (va)
-            spdlog::info("[anchors] {} -> exe+0x{:X}", decorated_name, va - base);
-        else
-            spdlog::info("[anchors] {} -> not found", decorated_name);
-        return va;
+        if (!base)
+            return;
+        size_t idx[kRttiCount] = {};
+        size_t n = 0;
+        for (size_t i = 0; i < kRttiCount; ++i)
+            if (!g_rtti_done[i].load(std::memory_order_acquire))
+                idx[n++] = i;
+        if (!n)
+            return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t found = rtti_resolve_and_publish(base, idx, n);
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        spdlog::info("[anchors] {} of {} classes found by name at init in {:.1f} ms", found, n, ms);
     }
 }
 

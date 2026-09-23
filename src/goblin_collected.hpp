@@ -19,6 +19,12 @@ namespace goblin::collected
     /// Re-read GEOF/WGM from memory. Returns delta (newly hidden count).
     int refresh();
 
+    /// A few reads that change when refresh()'s inputs change in bulk: the flag-save table's
+    /// block count and the geometry manager's block tree. The watcher polls it between its regular
+    /// ticks and ticks early when it moves (a tile loaded or unloaded, the table filled at a load).
+    /// A pickup does not move it; the regular tick sees those.
+    uint64_t change_signature();
+
     /// Drop everything refresh() has accumulated for the character that was loaded until now.
     /// Called on a save-slot switch: the sticky carry-forward in refresh() keeps a row collected
     /// until its live object is seen alive, and that memory belongs to ONE character. Left in

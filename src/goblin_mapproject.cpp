@@ -75,8 +75,11 @@ bool goblin::mapproject::read_view(MapView &out)
 }
 
 bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
-                                float px, float pz, float &map_x, float &map_z)
+                                float px, float pz, float &map_x, float &map_z,
+                                worldmap_probe::ProjFail *why, bool *from_origin)
 {
+    if (why) *why = worldmap_probe::ProjFail::none;
+    if (from_origin) *from_origin = false;
     if (area == 60 || area == 61)
     {
         map_x = (static_cast<float>(gx) * 256.0f + px) - CONST_X;
@@ -176,7 +179,7 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
             return true;
         }
     }
-    if (goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z))
+    if (goblin::worldmap_probe::project(area, gx, gz, px, pz, map_x, map_z, why))
     {
         std::lock_guard<std::mutex> lock(memo_mutex);
         memo.emplace(key, std::make_pair(map_x, map_z));
@@ -211,11 +214,13 @@ bool goblin::mapproject::to_map(uint8_t area, uint16_t gx, uint16_t gz,
         std::lock_guard<std::mutex> lock(memo_mutex);
         const auto hit = tiles.find(tkey);
         if (hit == tiles.end() || !hit->second.usable)
-            return false;
+            return false;  // `why` still holds project()'s reason
         map_x = hit->second.ou + px;
         map_z = hit->second.ov - pz;
         memo.emplace(key, std::make_pair(map_x, map_z));
     }
+    if (why) *why = worldmap_probe::ProjFail::none;
+    if (from_origin) *from_origin = true;
     return true;
 }
 

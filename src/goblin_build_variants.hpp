@@ -53,6 +53,10 @@ namespace goblin::variants
 //   MFG_ATTACH_ALL_MARKERS=1   attach every marker at once instead of only the near-view window
 //                              (the old native_viewport_window=false). Costs map stutter with ~9500
 //                              markers, but removes all attach/detach churn while panning.
+//   MFG_NO_FRAME_PUMP=1        build every marker inside the engine's open burst, as before 2.1.5,
+//                              instead of only the visible ones there and the rest over the next
+//                              frames through a hidden sprite of our own (goblin_stall_probe.cpp,
+//                              [v3pump]). Costs one long frame at every map open.
 #ifndef MFG_SLOW_MAP_OPEN
 #define MFG_SLOW_MAP_OPEN 0
 #endif
@@ -62,12 +66,16 @@ namespace goblin::variants
 #ifndef MFG_ATTACH_ALL_MARKERS
 #define MFG_ATTACH_ALL_MARKERS 0
 #endif
+#ifndef MFG_NO_FRAME_PUMP
+#define MFG_NO_FRAME_PUMP 0
+#endif
 
 namespace goblin::variants
 {
     inline constexpr bool kFastMapOpen = MFG_SLOW_MAP_OPEN == 0;
     inline constexpr bool kSelfDetach = MFG_NO_SELF_DETACH == 0;
     inline constexpr bool kViewportWindow = MFG_ATTACH_ALL_MARKERS == 0;
+    inline constexpr bool kFramePump = MFG_NO_FRAME_PUMP == 0;
 }
 
 // ── Overlay backend: ONE is built, and it is the in-swapchain one ────────────────────────────────

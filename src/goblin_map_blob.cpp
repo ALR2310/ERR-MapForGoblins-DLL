@@ -15,7 +15,7 @@
 //     category      u8
 //     lot_type      u8
 //     lot_aggregate u8
-//     (pad)         u8
+//     state_show    u8      StateShow (v3; the pad byte in v2)
 //     geom_slot     i16
 //     name_suffix   i16
 //     name_index    u16     index into strtab; 0 = none
@@ -23,6 +23,7 @@
 //     lot_id        u32
 //     real_posX     f32
 //     real_posZ     f32
+//     state_flag    u32     the world-state rule's event flag, 0 = none (v3)
 //     then, for each set mask bit in order, 4 bytes: f32 for a position field, u32 otherwise.
 
 #include "goblin_map_blob.hpp"
@@ -49,7 +50,9 @@ size_t MAP_ENTRY_COUNT = 0;
 namespace
 {
 
-constexpr uint16_t kBlobVersion = 2;
+// 3: the world-state rule (state_show, state_flag) joined the record head.
+constexpr uint16_t kBlobVersion = 3;
+constexpr size_t kRecordHead = 36;  // tools/mapblob.py RECORD_HEAD_SIZE
 
 // The param fields any generator writes, in the packer's bit order. Adding one goes on the END in
 // both this list and tools/rowsink.py, or every record after it decodes one field out of step.
@@ -181,7 +184,7 @@ bool load_map_data()
     g_entries.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
     {
-        if (p + 32 > end)
+        if (p + kRecordHead > end)
         {
             spdlog::error("[mapdata] the packed table ends mid-record at {} of {}; no markers",
                           i, count);
@@ -194,7 +197,7 @@ bool load_map_data()
         e.category = static_cast<Category>(take<uint8_t>(p));
         e.lotType = take<uint8_t>(p);
         e.lotAggregate = take<uint8_t>(p);
-        (void)take<uint8_t>(p); // pad
+        const uint8_t state_show = take<uint8_t>(p);
         e.geom_slot = take<int16_t>(p);
         e.name_suffix = take<int16_t>(p);
         const uint16_t name_index = take<uint16_t>(p);
@@ -202,6 +205,11 @@ bool load_map_data()
         e.lotId = take<uint32_t>(p);
         e.real_posX = take<float>(p);
         e.real_posZ = take<float>(p);
+        e.state_flag = take<uint32_t>(p);
+        // An unknown polarity is read as no rule: showing a marker is the recoverable mistake.
+        e.state_show = (e.state_flag != 0 && state_show <= static_cast<uint8_t>(StateShow::WhileOff))
+                           ? static_cast<StateShow>(state_show)
+                           : StateShow::Always;
         // Index 0 is the empty name: a row with no MSB object, which is most of them.
         e.object_name = (name_index != 0 && name_index < g_names.size())
                             ? &g_names[name_index]
@@ -228,8 +236,12 @@ bool load_map_data()
 
     MAP_ENTRIES = g_entries.data();
     MAP_ENTRY_COUNT = g_entries.size();
-    spdlog::info("[mapdata] {} markers expanded from {} KB packed ({} KB raw)",
-                 MAP_ENTRY_COUNT, MAP_BLOB_SIZE / 1024, MAP_BLOB_RAW_SIZE / 1024);
+    size_t ruled = 0;
+    for (const MapEntry &e : g_entries)
+        if (e.state_show != StateShow::Always) ++ruled;
+    spdlog::info("[mapdata] {} markers expanded from {} KB packed ({} KB raw), {} of them shown by "
+                 "world state",
+                 MAP_ENTRY_COUNT, MAP_BLOB_SIZE / 1024, MAP_BLOB_RAW_SIZE / 1024, ruled);
     return MAP_ENTRY_COUNT != 0;
 }
 

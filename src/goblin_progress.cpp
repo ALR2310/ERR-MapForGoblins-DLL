@@ -129,6 +129,17 @@ const AreaFallback AREA_FALLBACK[] = {
     {45, 11000, "Leyndell, Royal Capital"},  // Subterranean Shunning-Grounds
 };
 
+// One sub-tile that is its own zone although the rest of its area folds into AREA_FALLBACK's one.
+// Leyndell stands in two states, two maps: m11_00 the Royal Capital and m11_05 the Ashen Capital,
+// and which one exists is world state (flag 300; see MapEntry::state_flag). Their markers are
+// never on the map together, so they are two regions, not one. The grace tile map already says so
+// where a profile ships one (err: m11_05 -> 11050); this is the same answer for every profile that
+// does not, which would otherwise fold the Ashen Capital into the Royal one.
+struct TileFallback { int area; int gx; int gz; int32_t place_name_id; const char *en; };
+const TileFallback TILE_FALLBACK[] = {
+    {11, 5, 0, 11050, "Leyndell, Ashen Capital"},
+};
+
 // Look up a baked interior/underground tile in the game-zone map (subCategoryId).
 // Returns the PlaceName id (>0) + English fallback, or 0 if the tile isn't mapped.
 int32_t zone_for_tile(const from::paramdef::WORLD_MAP_POINT_PARAM_ST &d, const char **en_out)
@@ -217,6 +228,12 @@ int32_t resolve_region(const from::paramdef::WORLD_MAP_POINT_PARAM_ST &d, const 
     //    a sub-zone per Site of Grace. Runs BEFORE the baked name so it wins over the grace.
     if (!overworld && !is_fold_area(d.areaNo))
     {
+        for (const auto &tf : TILE_FALLBACK)
+            if (tf.area == d.areaNo && tf.gx == d.gridXNo && tf.gz == d.gridZNo)
+            {
+                if (en_out) *en_out = tf.en;
+                return tf.place_name_id;
+            }
         for (const auto &af : AREA_FALLBACK)
             if (af.area == d.areaNo)
             {
@@ -284,6 +301,10 @@ bool row_is_trackable(const goblin::generated::MapEntry &e)
 // collectible right now). Only the switched-chest gate is BAKED into group-2; post-event
 // story gates are applied at runtime (not in MAP_ENTRIES), so this matches exactly that
 // case and never touches story-gated markers.
+// Nor the world-state rule (Leyndell's capitals, MapEntry::state_flag), which is not in any param
+// field at all: none of these predicates read it, so a marker whose state is away stays in the
+// total and counts as not collected - which it is (and where the state can be switched back, as
+// ERR's Roundtable braziers do, it can still be collected).
 bool row_switch_gate_off(const goblin::generated::MapEntry &e)
 {
     const int g2[8] = {e.data.textEnableFlag2Id1, e.data.textEnableFlag2Id2, e.data.textEnableFlag2Id3,

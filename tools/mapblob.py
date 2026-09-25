@@ -14,10 +14,13 @@ version word is the guard.
   strtab     NUL-separated names         strtab_len   (index 0 is the empty name = nullptr)
   count x record:
     row_id u32, mask u32,
-    category u8, lot_type u8, lot_aggregate u8, pad u8,
+    category u8, lot_type u8, lot_aggregate u8, state_show u8,
     geom_slot i16, name_suffix i16, name_index u16, pad u16,
-    lot_id u32, real_posX f32, real_posZ f32,
+    lot_id u32, real_posX f32, real_posZ f32, state_flag u32,
     then one 4-byte value per set mask bit, in FIELD_ORDER: f32 for a position, u32 otherwise.
+
+Version 3 added the world-state rule (state_show in the old pad byte, state_flag after real_posZ):
+the marker is shown only while event flag state_flag is ON (1) or OFF (2); 0 = no rule.
 """
 import re
 import struct
@@ -27,7 +30,12 @@ from pathlib import Path
 import rowsink
 
 MAGIC = b"MFGD"
-VERSION = 2
+VERSION = 3
+# The record head before the per-field values. src/goblin_map_blob.cpp reads the same bytes.
+RECORD_HEAD = "<IIBBBBhhHHIffI"
+RECORD_HEAD_SIZE = struct.calcsize(RECORD_HEAD)
+# goblin::generated::StateShow (src/goblin_map_data.hpp): the values the DLL compares against.
+STATE_SHOW = {"always": 0, "while_on": 1, "while_off": 2}
 # The packer and the DLL walk the mask in this order; it is rowsink's, so a field added there is
 # added here by construction rather than by remembering to.
 FIELD_ORDER = rowsink.FIELDS
@@ -41,12 +49,32 @@ def category_index(header_path):
     splitting the raw text on commas turned one of those into an enumerator - which then shifted
     every category after it by one and silently mislabelled several thousand markers.
     """
+    return enum_index(header_path, "Category")
+
+
+# STATE_SHOW key -> the StateShow enumerator the DLL compares against.
+_STATE_SHOW_ENUM = {"always": "Always", "while_on": "WhileOn", "while_off": "WhileOff"}
+
+
+def check_state_show(header_path):
+    """Raise unless STATE_SHOW matches src/goblin_map_data.hpp's StateShow enum, value for value.
+
+    The polarity byte is part of the packed record: a StateShow renumbered on one side only would
+    turn "show while ON" into "show while OFF" for every ruled marker, with nothing failing."""
+    enum = enum_index(header_path, "StateShow")
+    want = {_STATE_SHOW_ENUM[k]: v for k, v in STATE_SHOW.items()}
+    if enum != want:
+        raise ValueError(f"{header_path}: StateShow is {enum}, tools/mapblob.py STATE_SHOW packs {want}")
+
+
+def enum_index(header_path, enum_name):
+    """Enumerator name -> value for one `enum class <enum_name>` in a header (see category_index)."""
     text = Path(header_path).read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     text = re.sub(r"//[^\n]*", "", text)
-    m = re.search(r"enum\s+class\s+Category\s*:\s*\w+\s*\{(.*?)\}", text, re.S)
+    m = re.search(r"enum\s+class\s+" + re.escape(enum_name) + r"\s*:\s*\w+\s*\{(.*?)\}", text, re.S)
     if not m:
-        raise ValueError(f"{header_path}: Category enum not found")
+        raise ValueError(f"{header_path}: {enum_name} enum not found")
 
     out = {}
     value = 0
@@ -84,7 +112,8 @@ class StringTable:
 
 def pack(records, categories):
     """records: dicts with row_id, category (name), fields {param field: number}, geom_slot,
-    name_suffix, object_name, lotId, lotType, lotAggregate, real_posX/Z."""
+    name_suffix, object_name, lotId, lotType, lotAggregate, real_posX/Z, and optionally
+    state_flag / state_show (the world-state rule; absent = none)."""
     names = StringTable()
     body = bytearray()
     for r in records:
@@ -100,13 +129,18 @@ def pack(records, categories):
         name_index = names.add(r.get("object_name") or "")
         if name_index > 0xFFFF:
             raise ValueError("the name table outgrew a u16 index; widen the record")
+        state_flag = int(r.get("state_flag", 0))
+        state_show = int(r.get("state_show", STATE_SHOW["always"])) if state_flag else 0
+        if state_show not in STATE_SHOW.values():
+            raise ValueError(f"row {r['row_id']}: state_show {state_show} is not a StateShow value")
         body += struct.pack(
-            "<IIBBBBhhHHIff",
+            RECORD_HEAD,
             r["row_id"], mask,
-            cat, r["lotType"], r["lotAggregate"], 0,
+            cat, r["lotType"], r["lotAggregate"], state_show,
             r["geom_slot"], r["name_suffix"], name_index, 0,
             r["lotId"],
-            float(r["real_posX"]), float(r["real_posZ"]))
+            float(r["real_posX"]), float(r["real_posZ"]),
+            state_flag)
         for name in FIELD_ORDER:
             if name in r["fields"]:
                 v = r["fields"][name]
@@ -126,7 +160,7 @@ def unpack(raw):
     """The inverse of pack(), for verification: it decodes what the DLL will decode.
 
     Returns [{row_id, category (index), fields {name: float|int}, geom_slot, name_suffix,
-    object_name, lotId, lotType, lotAggregate, real_posX/Z}]. Integers come back
+    object_name, lotId, lotType, lotAggregate, real_posX/Z, state_flag, state_show}]. Integers come back
     SIGNED where the paramdef's member is signed, so a decoded row compares directly against the
     old generated C++.
     """
@@ -148,9 +182,9 @@ def unpack(raw):
 
     out = []
     for _ in range(count):
-        (row_id, mask, cat, lot_type, lot_agg, _pad, geom, suffix, name_index, _pad2,
-         lot_id, rpx, rpz) = struct.unpack_from("<IIBBBBhhHHIff", raw, off)
-        off += 32
+        (row_id, mask, cat, lot_type, lot_agg, state_show, geom, suffix, name_index, _pad2,
+         lot_id, rpx, rpz, state_flag) = struct.unpack_from(RECORD_HEAD, raw, off)
+        off += RECORD_HEAD_SIZE
         fields = {}
         for i, fname in enumerate(FIELD_ORDER):
             if not (mask & (1 << i)):
@@ -165,7 +199,8 @@ def unpack(raw):
         out.append({"row_id": row_id, "category": cat, "fields": fields,
                     "geom_slot": geom, "name_suffix": suffix, "object_name": name_at(name_index),
                     "lotId": lot_id, "lotType": lot_type, "lotAggregate": lot_agg,
-                    "real_posX": rpx, "real_posZ": rpz})
+                    "real_posX": rpx, "real_posZ": rpz,
+                    "state_flag": state_flag, "state_show": state_show})
     return out
 
 

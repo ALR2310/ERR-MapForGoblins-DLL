@@ -452,7 +452,9 @@ STAGES = [
                   DATA / 'item_icon_table.json',
                   DATA / 'english_fallback.json',
                   INPUTS / 'unprojectable_tiles.json',          # tiles dropped before the bake
+                  INPUTS / 'world_state_rules.json',            # per-marker world-state rule
                   INPUTS / 'enemy_names_i18n.json',
+                  DATA / 'WorldMapLegacyConvParam.json',        # -> goblin_legacy_conv.hpp
                   # the hand-maintained headers the generated .cpp implement (the Category
                   # enum: generate_data's CATEGORY_MAP must name its members)
                   *[config.PROJECT_DIR / 'src' / h
@@ -463,9 +465,10 @@ STAGES = [
                    GENERATED_CPP / 'goblin_enemy_names.cpp',
                    GENERATED_CPP / 'goblin_item_fallback.cpp'],
           script='generate_data.py',
-          # mapblob.py IS the storage layout; rowsink.py is the field order it packs.
-          also_scripts=['icon_registry.py', 'map_categories.py',  # ANON_ICON_ID = iconid("anon")
-                        'mapblob.py', 'rowsink.py'],
+          # mapblob.py IS the storage layout; rowsink.py is the field order it packs. textblob.py
+          # packs the enemy names and the item fallback; legacy_conv.py resolves the conv chains.
+          also_scripts=['config.py', 'icon_registry.py', 'map_categories.py',  # ANON_ICON_ID = iconid("anon")
+                        'mapblob.py', 'rowsink.py', 'textblob.py', 'legacy_conv.py'],
           args=['--rows-dir', str(ROWS_OUT)]),
 
     # Tile -> game-zone (PlaceName id) map for the Progress tab, from tile_region_map.json

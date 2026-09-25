@@ -6,11 +6,17 @@ Reads every category's .rows file (tools/rowsink.py wrote them) and packs the wh
 one deflated blob. It used to emit the same table as 3.34 MB of C++ brace initialisers per profile,
 which MSVC then parsed on every build of all nine and shipped as 2.14 MB of .rdata.
 
+Each marker also gets its world-state rule from inputs/world_state_rules.json (see
+load_world_state_rules): the event flag, and the polarity, that must hold for it to be shown.
+
 Output:
   - src/generated/goblin_map_blob_data.cpp  (the packed table as a byte array; src/goblin_map_blob.cpp
                                              expands it at startup into the MapEntry array declared
                                              in the hand-maintained src/goblin_map_data.hpp)
   - src/generated/goblin_legacy_conv.hpp    (dungeon coord conversion)
+  - src/generated/goblin_enemy_names.cpp,   (the enemy names and the English item-name fallback,
+    src/generated/goblin_item_fallback.cpp   each packed and deflated by tools/textblob.py;
+                                             src/goblin_names_blob.cpp expands them at startup)
 
 Localization is handled by the DLL at runtime via FMG offset-encoding
 (textId = real_id + category_offset), so no text compilation step is needed.
@@ -24,6 +30,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import mapblob
+import textblob
 
 # Category mapping: row-file name -> Category enum
 CATEGORY_MAP = {
@@ -197,7 +204,42 @@ def _load_lot_linkage():
             for k, v in raw.items()}
 
 
-def build_map_records(entries, geom_slots=None):
+# mapblob.STATE_SHOW: the rule's polarity as the DLL's goblin::generated::StateShow reads it.
+_SHOW_WHILE = {"on": mapblob.STATE_SHOW["while_on"], "off": mapblob.STATE_SHOW["while_off"]}
+
+
+def load_world_state_rules():
+    """inputs/world_state_rules.json -> [(area, gx, gz, flag, show, tile)] for the active profile.
+
+    A marker that exists in only one state of the world (Leyndell's two capitals, flag 300) is
+    shown only while that state holds. The rule is baked per marker here and applied by the DLL's
+    visibility test alone - it never enters a param field, because every field a marker carries
+    is also read by something that decides "collected" or "trackable" (see goblin_progress.cpp).
+    A profile key replaces the '*' list for that profile.
+    """
+    import config
+    p = config.INPUTS_DIR / "world_state_rules.json"
+    if not p.exists():
+        return []
+    with open(p, encoding="utf-8") as f:
+        table = json.load(f)
+    raw = table[config.PROFILE] if config.PROFILE in table else table.get("*", [])
+    rules = []
+    for r in raw:
+        m = re.fullmatch(r"m(\d+)_(\d+)_(\d+)", str(r.get("tile", "")))
+        if not m:
+            raise ValueError(f"world_state_rules.json: tile {r.get('tile')!r} is not mAA_BB_CC")
+        show = _SHOW_WHILE.get(str(r.get("show_while", "")).lower())
+        if show is None:
+            raise ValueError(f"world_state_rules.json: {r.get('tile')}: show_while must be 'on' or 'off'")
+        flag = int(r.get("flag", 0))
+        if flag <= 0:
+            raise ValueError(f"world_state_rules.json: {r.get('tile')}: flag must be a positive event flag")
+        rules.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), flag, show, r["tile"]))
+    return rules
+
+
+def build_map_records(entries, geom_slots=None, state_rules=None):
     """The map table as plain records, row_id order - the input to tools/mapblob.pack().
 
     This used to write 3.34 MB of C++ brace initialisers straight out; the records exist as their
@@ -205,6 +247,12 @@ def build_map_records(entries, geom_slots=None):
     """
     if geom_slots is None:
         geom_slots = {}
+    by_tile = {}
+    for area, gx, gz, flag, show, tile in (state_rules or []):
+        if (area, gx, gz) in by_tile:
+            raise ValueError(f"world_state_rules.json: two rules for {tile}")
+        by_tile[(area, gx, gz)] = (flag, show)
+    state_hits = defaultdict(int)
 
     lot_linkage = _load_lot_linkage()
     records = []
@@ -237,18 +285,34 @@ def build_map_records(entries, geom_slots=None):
         if isinstance(meta, dict) and 'msb_x' in meta and 'msb_z' in meta:
             rx, rz = meta['msb_x'], meta['msb_z']
 
+        # World-state rule, by the marker's own baked tile (an absent grid field is 0 in the row).
+        tile = (param.get("areaNo", 0), param.get("gridXNo", 0), param.get("gridZNo", 0))
+        state_flag, state_show = by_tile.get(tile, (0, mapblob.STATE_SHOW["always"]))
+        if state_flag:
+            state_hits[tile] += 1
+
         records.append({
             "row_id": row_id, "category": category, "fields": param,
             "geom_slot": int(slot), "name_suffix": int(suffix), "object_name": obj_name,
             "lotId": lot_id, "lotType": lot_type, "lotAggregate": lot_aggregate,
             "real_posX": float(rx), "real_posZ": float(rz),
+            "state_flag": state_flag, "state_show": state_show,
         })
+
+    # One line per rule, so a bake says how many markers each state rule governs - and a rule that
+    # matched nothing (a profile without that tile) is visible instead of silently inert.
+    for area, gx, gz, flag, show, tile in (state_rules or []):
+        n = state_hits.get((area, gx, gz), 0)
+        when = "ON" if show == mapblob.STATE_SHOW["while_on"] else "OFF"
+        print(f"  world state: {tile} shown while flag {flag} is {when}: {n} markers"
+              + ("  (WARNING: no marker on this tile)" if n == 0 else ""))
     return records
 
 
 def generate_map_blob_cpp(records, output_path, header_path):
     """Pack the records and emit them as the deflated byte array the DLL expands at startup."""
     categories = mapblob.category_index(header_path)
+    mapblob.check_state_show(header_path)  # the polarity byte means what the DLL's StateShow says
     raw = mapblob.pack(records, categories)
     raw_len, packed_len = mapblob.write_cpp(raw, output_path)
     print(f"Generated {output_path}: {len(records)} entries, "
@@ -354,20 +418,14 @@ def generate_item_fallback_cpp(output_path, entries=None):
             if nm:
                 table.setdefault(tid, nm.strip())
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
-        f.write("// Generated by tools/generate_data.py from item_icon_table.json\n\n")
-        f.write('#include "../goblin_item_fallback.hpp"\n\n')
-        f.write("namespace goblin::generated\n{\n\n")
-        f.write(f"const size_t ITEM_NAME_FALLBACK_COUNT = {len(table)};\n\n")
-        f.write("const ItemNameFallback ITEM_NAME_FALLBACK[] = {\n")
-        for key in sorted(table.keys()):
-            f.write(f"    {{{key}, {_wlit(table[key])}}},\n")
-        if not table:
-            f.write("    {0, nullptr},\n")
-        f.write("};\n\n")
-        f.write("} // namespace goblin::generated\n")
-    print(f"Generated {output_path} with {len(table)} item-name fallback entries")
+    # Packed and deflated (tools/textblob.py); src/goblin_names_blob.cpp expands it at startup.
+    rows = [(key, [table[key]]) for key in sorted(table.keys())]
+    raw_len, packed_len = textblob.write_cpp(
+        textblob.pack_names(rows, 1), output_path, "ITEM_FALLBACK_BLOB",
+        namespace="goblin::generated", generator="tools/generate_data.py from item_icon_table.json",
+        what="The English item-name fallback, packed and deflated; src/goblin_names_blob.cpp expands it.")
+    print(f"Generated {output_path} with {len(table)} item-name fallback entries, "
+          f"{raw_len / 1024:.0f} KB packed -> {packed_len / 1024:.0f} KB deflated")
 
 
 # Fixed language order for the embedded enemy-name table (msgbnd codes). engus
@@ -376,24 +434,14 @@ ENEMY_NAME_LANGS = ["engus", "jpnjp", "deude", "frafr", "itait", "korkr", "polpl
                     "porbr", "rusru", "spaes", "spaar", "thath", "zhocn", "zhotw", "araae"]
 
 
-def _wlit(s):
-    """C++ wide-string literal with every non-ASCII unit as \\uXXXX (encoding-safe)."""
-    units = s.encode("utf-16-le")
-    out = []
-    for i in range(0, len(units), 2):
-        cu = units[i] | (units[i + 1] << 8)
-        if 0x20 <= cu < 0x7f and chr(cu) not in '"\\':
-            out.append(chr(cu))
-        else:
-            out.append("\\u%04x" % cu)
-    return 'L"' + "".join(out) + '"'
-
-
 def generate_enemy_names_cpp(output_path):
     """Generate goblin_enemy_names.cpp: localized enemy names for the non-ERR
     builds (marker textId = id + 900000000). Empty for the ERR build (it uses
     its own runtime name table). Strings are FromSoft / community-wiki enemy
-    names; no reference to where the source data was read from."""
+    names; no reference to where the source data was read from.
+
+    The names are packed and deflated (tools/textblob.py) and src/goblin_names_blob.cpp expands
+    them at startup; only the fifteen language codes stay literals."""
     import config
     is_err = (config.PROFILE == "err")
     table = {}
@@ -403,27 +451,21 @@ def generate_enemy_names_cpp(output_path):
             with open(p, encoding="utf-8") as f:
                 table = json.load(f)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("// AUTO-GENERATED FILE - DO NOT EDIT\n")
-        f.write("// Generated by tools/generate_data.py from enemy_names_i18n.json\n\n")
-        f.write('#include "../goblin_enemy_names.hpp"\n\n')
-        f.write("namespace goblin::generated\n{\n\n")
-        f.write("const char *const ENEMY_NAME_LANGS[ENEMY_NAME_LANG_COUNT] = {\n    ")
-        f.write(", ".join(f'"{c}"' for c in ENEMY_NAME_LANGS))
-        f.write("\n};\n\n")
-        f.write(f"const size_t ENEMY_NAME_COUNT = {len(table)};\n\n")
-        f.write("const EnemyName ENEMY_NAMES[] = {\n")
-        for k in sorted(table, key=lambda x: int(x)):
-            langs = table[k]
-            en = langs.get("engus", "")
-            cells = [_wlit(langs.get(code, en)) for code in ENEMY_NAME_LANGS]
-            f.write(f"    {{{int(k)}, {{{', '.join(cells)}}}}},\n")
-        if not table:
-            f.write("    {0, {" + ", ".join(["nullptr"] * len(ENEMY_NAME_LANGS)) + "}},\n")
-        f.write("};\n\n")
-        f.write("} // namespace goblin::generated\n")
+    rows = []
+    for k in sorted(table, key=lambda x: int(x)):
+        langs = table[k]
+        en = langs.get("engus", "")
+        rows.append((int(k), [langs.get(code, en) for code in ENEMY_NAME_LANGS]))
+    langs_line = ("const char *const ENEMY_NAME_LANGS[ENEMY_NAME_LANG_COUNT] = {\n    "
+                  + ", ".join(f'"{c}"' for c in ENEMY_NAME_LANGS) + "\n};")
+    raw_len, packed_len = textblob.write_cpp(
+        textblob.pack_names(rows, len(ENEMY_NAME_LANGS)), output_path, "ENEMY_NAMES_BLOB",
+        namespace="goblin::generated", generator="tools/generate_data.py from enemy_names_i18n.json",
+        what="The localized enemy names, packed and deflated; src/goblin_names_blob.cpp expands them.",
+        includes=["../goblin_enemy_names.hpp"], extra=[langs_line, ""])
     print(f"Generated {output_path} with {len(table)} enemy-name entries"
-          + (" (ERR: empty, uses runtime table)" if is_err else ""))
+          + (" (ERR: empty, uses runtime table)" if is_err else "")
+          + f", {raw_len / 1024:.0f} KB packed -> {packed_len / 1024:.0f} KB deflated")
 
 
 def main():
@@ -506,7 +548,7 @@ def main():
     print(f"Loaded {len(geom_slots)} piece metadata entries")
 
     print("\n=== Generating map data C++ ===")
-    records = build_map_records(entries, geom_slots)
+    records = build_map_records(entries, geom_slots, load_world_state_rules())
     generate_map_blob_cpp(records, output_dir / "goblin_map_blob_data.cpp",
                           project_dir / "src" / "goblin_map_data.hpp")
 

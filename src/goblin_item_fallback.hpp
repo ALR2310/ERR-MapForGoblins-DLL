@@ -1,6 +1,7 @@
 #pragma once
 
-// Hand-maintained declarations; each profile's baked src/generated*/goblin_item_fallback.cpp defines them.
+// Hand-maintained declarations. Each profile's baked src/generated*/goblin_item_fallback.cpp holds
+// the packed table; src/goblin_names_blob.cpp expands it into ITEM_NAME_FALLBACK.
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,8 @@ namespace goblin::generated
         const wchar_t *name;
     };
 
-    extern const size_t ITEM_NAME_FALLBACK_COUNT;
-    extern const ItemNameFallback ITEM_NAME_FALLBACK[];  // sorted ascending by id
+    // Filled by goblin::generated::load_name_tables() (src/goblin_names_blob.cpp) at startup; a
+    // pointer, like ENEMY_NAMES.
+    extern size_t ITEM_NAME_FALLBACK_COUNT;
+    extern const ItemNameFallback *ITEM_NAME_FALLBACK;  // sorted ascending by id
 }

@@ -29,6 +29,7 @@
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 
 #include <algorithm>
@@ -53,6 +54,7 @@ using ParamRowInfo = from::params::ParamRowInfo;
 using ParamTable = from::params::ParamTable;
 using ParamResCap = from::params::ParamResCap;
 using Category = goblin::generated::Category;
+using StateShow = goblin::generated::StateShow;
 
 static void *allocation = nullptr;
 
@@ -92,6 +94,10 @@ struct CategoryRow
     unsigned baked_cleared;  // clearedEventFlagId as baked (for live hide_killed_bosses)
     unsigned baked_dis1;     // textDisableFlagId1 as baked
     unsigned baked_dis2;     // textDisableFlagId2 as baked
+    int baked_g2[8];         // textEnableFlag2Id1..8 as baked (MapEntry::data). The post-event gate
+                             // (goblin_logic.cpp) and a focus restore THESE, never the live row's.
+    uint32_t state_flag;     // MapEntry::state_flag: world-state rule, 0 = none
+    StateShow state_show;    // MapEntry::state_show
     int32_t region_id;       // progress region PlaceName id (goblin::progress::region_place_id) for focus
     int32_t baked_text1;     // textId1 as baked (restored when focus removes a fabricated label)
     bool baked_notext;       // isEnableNoText as baked (restored after focus force-show)
@@ -367,10 +373,11 @@ static bool row_hidden_by_flag(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p
 
 // True if a group-2 ENABLE gate is currently blocking this marker's icon: any live
 // textEnableFlag2IdN is a real flag that is NOT set. Group-2 gates a slot IN ADDITION to
-// group-1 (both must hold), applied uniformly across a row's populated slots. We set it
-// for the switched-chest pair (baked, e.g. Patches' Glass Shard vs Cloth on flag 3691:
-// the absent variant's gate is off) and post-story-event areas (runtime, apply_map_logic).
-// Either way an off gate means the game isn't drawing this icon.
+// group-1 (both must hold). We set it for the switched-chest pair (baked, e.g. Patches'
+// Glass Shard vs Cloth on flag 3691: the absent variant's gate is off) and, with
+// require_map_fragments, for post-story-event areas (runtime, apply_map_logic, which puts its
+// flag only in the slots the bake left free). ANY slot counts here, populated text line or not:
+// for our markers this test is the renderer, so a row carrying both gates needs both flags.
 static bool row_group2_gate_off(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p)
 {
     if (!p) return false;
@@ -380,6 +387,18 @@ static bool row_group2_gate_off(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *
     for (int f : g2)
         if (f > 0 && !goblin::flag_is_set(static_cast<uint32_t>(f))) return true;
     return false;
+}
+
+// Does the world currently stand in the state this marker belongs to? (MapEntry::state_flag:
+// Leyndell's capitals, flag 300 ON = Ashen / OFF = Royal.) Read live, so the right capital's
+// markers are there on the next map open after the switch, whatever else has been applied.
+// DELIBERATELY not part of row_is_hidden: that one means "done" to the Progress page, the search
+// and the focus prune, and a marker whose state is away is not done - it is waiting.
+static bool row_state_open(const CategoryRow &cr)
+{
+    if (cr.state_show == StateShow::Always || cr.state_flag == 0) return true;
+    const bool on = goblin::flag_is_set(cr.state_flag);
+    return cr.state_show == StateShow::WhileOn ? on : !on;
 }
 
 // Single "is this marker's icon currently hidden?" test, shared by the focus-highlight
@@ -899,22 +918,22 @@ void goblin::apply_focus_highlight()
             // Focus IGNORES require_map_fragments: force this marker visible so its
             // highlight appears (and focus doesn't self-cancel) even in an undiscovered or
             // post-event area, where apply_map_logic gated it - group-1 via eventFlagId, and
-            // group-2 via a STORY flag (SetSecondaryFlags, e.g. Leyndell Ashen Capital). We
-            // clear ONLY those discovery gates: a switched-chest group-2 gate is a different
-            // flag and stays (so a genuinely-absent variant isn't spuriously highlighted).
-            // apply_map_logic re-derives every gate on each reapply, so leaving focus
-            // restores them automatically - no explicit undo needed.
+            // group-2 via a STORY flag (the post-event gate: Stone Platform, Shadow Keep,
+            // Enir-Ilim, ...). We lift ONLY those discovery gates: group-2 goes back to the BAKED
+            // values, so a switched-chest gate stays (a genuinely-absent variant isn't spuriously
+            // highlighted). The world-state rule (Leyndell's two capitals) is lifted the same way,
+            // but in native_row_visible - it is not in the row at all.
+            // No explicit undo here: apply_map_logic re-derives every gate on each reapply, and
+            // every path that ENDS a focus runs one (the menus, the search, the hide hotkey's
+            // prune, and on the watcher the prune and a slot switch that drops a focus - see
+            // safe_reapply_live_settings_seh in dllmain.cpp). A new path that ends a focus with only
+            // apply_category_visibility would leave these rows forced visible.
             cr.p->eventFlagId = static_cast<decltype(cr.p->eventFlagId)>(goblin::flag::AlwaysOn);
-            auto unstory = [](auto &slot) {
-                if (slot == goblin::flag::StoryErdtreeOnFire ||
-                    slot == goblin::flag::StoryCharmBroken ||
-                    slot == goblin::flag::StorySealingTreeBurnt)
-                    slot = goblin::flag::AlwaysOn;
-            };
-            unstory(cr.p->textEnableFlag2Id1); unstory(cr.p->textEnableFlag2Id2);
-            unstory(cr.p->textEnableFlag2Id3); unstory(cr.p->textEnableFlag2Id4);
-            unstory(cr.p->textEnableFlag2Id5); unstory(cr.p->textEnableFlag2Id6);
-            unstory(cr.p->textEnableFlag2Id7); unstory(cr.p->textEnableFlag2Id8);
+            int *g2[8] = {&cr.p->textEnableFlag2Id1, &cr.p->textEnableFlag2Id2,
+                          &cr.p->textEnableFlag2Id3, &cr.p->textEnableFlag2Id4,
+                          &cr.p->textEnableFlag2Id5, &cr.p->textEnableFlag2Id6,
+                          &cr.p->textEnableFlag2Id7, &cr.p->textEnableFlag2Id8};
+            for (int k = 0; k < 8; ++k) *g2[k] = cr.baked_g2[k];
             // Textless rows: fabricate a "?" label + force the line on (textEnableFlagId
             // 0 = treated as On; NOT flag::AlwaysOn=6001, which is a real flag that must
             // be set, so it would HIDE the line). Text-having rows keep their baked gating.
@@ -959,6 +978,7 @@ static bool row_marker_info(const from::paramdef::WORLD_MAP_POINT_PARAM_ST *p,
 }
 
 static void refresh_deoverlap(int layer);  // defined with the de-overlap, further down
+static void build_state_flags();           // defined with the world-state poll, further down
 static std::vector<uint8_t> g_vis;   // per row index; 1 = on screen right now
 static int g_vis_layer = -1;         // which layer that answer was for (-1 = none yet)
 // ONE lock over the layout state: g_vis, g_vis_layer, the de-overlap's occupancy grid and the
@@ -1088,6 +1108,8 @@ void goblin::inject_map_entries()
         bool lotAggregate; // the lot backs several markers; not this one's address
         uint64_t hide_key; // stable manual-hide key (stable_hide_key of the baked entry)
         uint64_t hide_key_v2; // the same marker's pre-2.1.4 key (migration only)
+        uint32_t state_flag;  // world-state rule (MapEntry::state_flag / state_show)
+        StateShow state_show;
     };
 
     // Live-loot icons (config::liveLootIcons): a randomized lot may now hold an
@@ -1166,7 +1188,8 @@ void goblin::inject_map_entries()
         // unrelated markers whose baked category happened to be Armaments.
         // (Spoiler-free and non-lot rows leave gate_cat == e.category.)
         entries.push_back({0, e.row_id, &e.data, is_piece, is_kindling, gate_cat, lotId, lotType,
-                           e.lotAggregate != 0, stable_hide_key(e), hide_key_v2(e)});
+                           e.lotAggregate != 0, stable_hide_key(e), hide_key_v2(e),
+                           e.state_flag, e.state_show});
     }
 
     spdlog::info("Adding {} map entries ({} live-recategorized, live-loot table ready={})",
@@ -1303,6 +1326,8 @@ void goblin::inject_map_entries()
         bool lotAggregate;         // see InjectedEntry
         uint64_t hide_key;         // stable manual-hide key (0 for vanilla rows)
         uint64_t hide_key_v2;      // pre-2.1.4 key of the same marker (0 for vanilla rows)
+        uint32_t state_flag;       // world-state rule (0 / Always for vanilla rows)
+        StateShow state_show;
     };
 
     std::vector<RowSource> all_rows;
@@ -1312,14 +1337,14 @@ void goblin::inject_map_entries()
     {
         auto *data = old_param_file + old_table->rows[i].param_offset;
         all_rows.push_back({static_cast<int32_t>(old_table->rows[i].row_id), data, false, false,
-                            {}, 0, 0, 0, false, 0, 0});
+                            {}, 0, 0, 0, false, 0, 0, 0, StateShow::Always});
     }
     for (auto &entry : entries)
     {
         all_rows.push_back({entry.row_id, reinterpret_cast<const uint8_t *>(entry.data),
                             entry.is_piece, entry.is_kindling, entry.category, entry.original_row_id,
                             entry.lotId, entry.lotType, entry.lotAggregate,
-                            entry.hide_key, entry.hide_key_v2});
+                            entry.hide_key, entry.hide_key_v2, entry.state_flag, entry.state_show});
     }
 
     std::sort(all_rows.begin(), all_rows.end(),
@@ -1375,6 +1400,20 @@ void goblin::inject_map_entries()
             cr.native_pz = cr.anchor_pz;
             cr.hide_key = all_rows[i].hide_key;
             cr.hide_key_v2 = all_rows[i].hide_key_v2;
+            cr.state_flag = all_rows[i].state_flag;
+            cr.state_show = all_rows[i].state_show;
+            // Group-2 straight from the MapEntry (data_ptr points INTO MAP_ENTRIES for our rows):
+            // the baked values - the switched-chest gate where there is one - whatever the live row
+            // is later made to carry.
+            {
+                const auto *baked =
+                    reinterpret_cast<const from::paramdef::WORLD_MAP_POINT_PARAM_ST *>(all_rows[i].data_ptr);
+                const int g2[8] = {baked->textEnableFlag2Id1, baked->textEnableFlag2Id2,
+                                   baked->textEnableFlag2Id3, baked->textEnableFlag2Id4,
+                                   baked->textEnableFlag2Id5, baked->textEnableFlag2Id6,
+                                   baked->textEnableFlag2Id7, baked->textEnableFlag2Id8};
+                for (int k = 0; k < 8; ++k) cr.baked_g2[k] = g2[k];
+            }
             unsigned *en[8];
             enable_flag_ptrs(wp, en);
             for (int k = 0; k < 8; ++k) cr.baked_enable[k] = *en[k];
@@ -1526,6 +1565,7 @@ void goblin::inject_map_entries()
 
     spdlog::info("Registered {} piece + {} kindling entries ({} + {} hidden at load)",
                  registered_pieces, registered_kindling, hidden_pieces, hidden_kindling);
+    build_state_flags();  // the world-state rules' flags, now that every row is known
     if (goblin::config::debugLogging)
         spdlog::info("[v3native] item-category migration suppressed stock rows: "
                      "OW={} UG={} DLC={} total={}",
@@ -1599,6 +1639,64 @@ static bool gamepad_combo_held()
     return false;
 }
 
+// ---- World state: which flags the rules read, and what the watcher last saw them at ---------
+// The distinct event flags the injected markers' world-state rules read (MapEntry::state_flag),
+// with how many markers follow each and the value each had at the watcher's last poll
+// (world_state_poll). Built once at injection (build_state_flags) and never resized after that;
+// only the values change. The poll records a value the moment it REPORTS it, not once the re-apply
+// it triggers has finished: a re-apply that faulted partway would otherwise leave the value behind
+// and the poll reporting the same change - a re-apply, a merge and a log line - every tick for good.
+static std::vector<uint32_t> g_state_flags;
+static std::vector<size_t> g_state_counts;
+static std::unique_ptr<std::atomic<uint8_t>[]> g_state_seen;  // 0 = never read, 1 = OFF, 2 = ON
+
+static uint8_t state_now(uint32_t flag) { return goblin::flag_is_set(flag) ? 2 : 1; }
+
+static void build_state_flags()
+{
+    std::map<uint32_t, size_t> seen;
+    for (const auto &cr : g_category_rows)
+        if (cr.state_show != StateShow::Always && cr.state_flag != 0) ++seen[cr.state_flag];
+    g_state_flags.clear();
+    g_state_counts.clear();
+    for (const auto &[flag, n] : seen)
+    {
+        g_state_flags.push_back(flag);
+        g_state_counts.push_back(n);
+    }
+    g_state_seen.reset(new std::atomic<uint8_t>[g_state_flags.size() ? g_state_flags.size() : 1]);
+    for (size_t i = 0; i < g_state_flags.size(); ++i) g_state_seen[i].store(0);
+}
+
+size_t goblin::world_state_poll(WorldStateChange *out, size_t max_out)
+{
+    // No logging and nothing to destroy in here: the caller runs this under __try (it reads the
+    // game's event flags, from the watcher, at the main menu and through loading screens too) and
+    // says what changed outside it.
+    size_t changed = 0;
+    for (size_t i = 0; i < g_state_flags.size(); ++i)
+    {
+        const uint8_t now = state_now(g_state_flags[i]);
+        const uint8_t was = g_state_seen[i].exchange(now, std::memory_order_relaxed);
+        if (now == was) continue;
+        if (out && changed < max_out)
+            out[changed] = WorldStateChange{g_state_flags[i], now == 2, was != 0, g_state_counts[i]};
+        ++changed;
+    }
+    return changed;
+}
+
+bool goblin::injected_row_baked_group2(int32_t row_id, int out[8])
+{
+    // g_category_rows is in row-id order: it is filled from all_rows after the sort by id.
+    const auto it = std::lower_bound(
+        g_category_rows.begin(), g_category_rows.end(), static_cast<uint64_t>(row_id),
+        [](const CategoryRow &cr, uint64_t id) { return cr.row_id < id; });
+    if (it == g_category_rows.end() || it->row_id != static_cast<uint64_t>(row_id)) return false;
+    for (int k = 0; k < 8; ++k) out[k] = it->baked_g2[k];
+    return true;
+}
+
 // Single source of truth for live marker visibility. A row's primary line (and
 // thus its icon) is shown only when its category is enabled AND it is not
 // collected (pieces/nodes via collected::, kindling spirits via kindling::).
@@ -1620,6 +1718,11 @@ void goblin::apply_category_visibility()
                     !collected::is_row_collected(cr.row_id) &&
                     !kindling::is_row_collected(cr.row_id) &&
                     !is_manually_hidden(cr);  // user-hidden markers stay hidden
+        // The engine-pin build draws from these flags, so the world state has to be written into
+        // them there (native_row_visible decides it for the shipping build). Re-written when a rule's
+        // flag flips: see world_state_poll. A focused marker is shown past it, as in native.
+        if constexpr (goblin::variants::kLegacyPinMarkers)
+            if (show && !focus_active() && !row_state_open(cr)) show = false;
         unsigned *en[8];
         enable_flag_ptrs(cr.p, en);
         for (int k = 0; k < 8; ++k)
@@ -1791,9 +1894,15 @@ static bool native_row_visible(const CategoryRow &cr, int layer, int focus)
 {
     if (!cr.p || cr.original_row_id == 0 || !native_category_migrated(cr.cat)) return false;
     if (cr.native_layer != layer) return false;
-    const bool eligible = focus_active() ? row_in_focus(cr, focus) : is_category_enabled(cr.cat);
+    const bool focused = focus_active() && row_in_focus(cr, focus);
+    const bool eligible = focus_active() ? focused : is_category_enabled(cr.cat);
     if (!eligible) return false;
     if (cr.p->eventFlagId != 0 && !goblin::flag_is_set(cr.p->eventFlagId)) return false;
+    // World state (Leyndell: the Royal Capital's markers while it stands, the Ashen Capital's
+    // after it burns - and back again where ERR's Roundtable braziers switch it). A focused marker
+    // is shown past it, as apply_focus_highlight lifts the post-event gates: the player asked
+    // where it is.
+    if (!focused && !row_state_open(cr)) return false;
     return !native_row_hidden(cr) && !row_group2_gate_off(cr.p);
 }
 

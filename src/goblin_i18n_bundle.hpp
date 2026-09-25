@@ -1,7 +1,8 @@
 #pragma once
 // Internal bundle layout shared between the i18n LOGIC (goblin_i18n.cpp) and the
 // GENERATED string data (src/generated_shared/goblin_i18n_strings.cpp, produced
-// from i18n/*.json by tools/generate_i18n.py). Not part of the public API.
+// from i18n/*.json by tools/generate_i18n.py as a packed, deflated blob that
+// goblin_i18n_blob.cpp expands on first use). Not part of the public API.
 #include "goblin_i18n.hpp"
 
 #include <cstddef>
@@ -25,6 +26,6 @@ namespace goblin::i18n::detail
         const NameKV *entry_comments; size_t n_entry_comments;
     };
 
-    // Defined in the generated translation unit.
+    // Defined in goblin_i18n_blob.cpp, which expands the generated blob on the first call.
     const LocaleBundle &bundle(Language language);
 }

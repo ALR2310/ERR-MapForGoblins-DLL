@@ -116,6 +116,8 @@ add_library( MapForGoblins SHARED
   ${GEN_DIR}/goblin_enemy_names.cpp
   src/goblin_item_fallback.hpp
   ${GEN_DIR}/goblin_item_fallback.cpp
+  src/goblin_names_blob.hpp
+  src/goblin_names_blob.cpp
   ${GEN_DIR}/goblin_location_alt.hpp
   ${GEN_DIR}/goblin_location_alt.cpp
   ${GEN_DIR}/goblin_geof_models.hpp
@@ -127,6 +129,7 @@ add_library( MapForGoblins SHARED
   src/goblin_i18n.hpp
   src/goblin_i18n.cpp
   src/goblin_i18n_bundle.hpp
+  src/goblin_i18n_blob.cpp
   src/goblin_config.hpp
   src/goblin_config.cpp
   src/goblin_anchors.hpp
@@ -303,8 +306,15 @@ endif()
 # Tiny build-time tool that emits the default ini from the in-code schema
 # (src/goblin_config_schema.cpp). build.bat runs it to generate the shipped
 # ini per profile instead of copying a hand-maintained file.
-add_executable(mfg_inigen src/inigen_main.cpp src/goblin_config_schema.cpp src/goblin_i18n.cpp src/generated_shared/goblin_i18n_strings.cpp)
-target_include_directories(mfg_inigen PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_executable(mfg_inigen src/inigen_main.cpp src/goblin_config_schema.cpp src/goblin_i18n.cpp
+  src/goblin_i18n_blob.cpp src/generated_shared/goblin_i18n_strings.cpp
+  # the i18n strings ship deflated (goblin_i18n_blob.cpp), so the tool inflates them like the DLL
+  ${miniz_SOURCE_DIR}/miniz.c
+  ${miniz_SOURCE_DIR}/miniz_tinfl.c
+  ${miniz_SOURCE_DIR}/miniz_tdef.c)
+target_include_directories(mfg_inigen PRIVATE ${CMAKE_SOURCE_DIR}/src ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/vendor_miniz)
+# MFG_INIGEN: goblin_i18n_blob.cpp reports to stderr instead of the DLL's log, which this tool lacks.
+target_compile_definitions(mfg_inigen PRIVATE MFG_INIGEN=1 MINIZ_NO_ARCHIVE_APIS MINIZ_NO_STDIO MINIZ_NO_TIME)
 target_compile_options(mfg_inigen PRIVATE /utf-8)
 # Keep the generated ini's defaults in sync with the DLL's compiled defaults.
 if(GENERATED_SUBDIR STREQUAL "generated_vanilla")

@@ -146,6 +146,8 @@ namespace goblin
     // for any reason (collected / kindling / manually hidden / a live disable or cleared
     // flag is set). The region-progress tab counts these as done. Reads the LIVE rows so
     // live-loot flag rewrites and manual hide (both keyed on the live param) are seen.
+    // A marker off the map only because of its world-state rule is NOT in here: it is not done
+    // (the Royal Capital's loot while the Ashen Capital stands is still uncollected).
     std::unordered_set<uint64_t> hidden_marker_original_ids();
 
     // (is_row_ptr_hidden(void*) was declared here for a hover-tooltip consumer that was never
@@ -187,6 +189,27 @@ namespace goblin
     void set_param_injection_active(bool active);
     // (is_param_injection_active() was declared here and had no callers: menu_auto_toggle_loop
     //  reads the static behind it directly. Its twin setter IS live and stays.)
+
+    // World-state rules (MapEntry::state_flag: Leyndell's capital, flag 300). Reads each flag the
+    // rules use and returns how many differ from the watcher's previous poll, recording the new
+    // values as it reports them; up to max_out of the changes are described in `out`. Non-zero
+    // means apply_category_visibility() has something to do: the shipping build reads the state
+    // live in its visibility test anyway, but this is what lets the engine-pin build, which can
+    // only be told through param flags, follow a switch too - and what makes an open map merge at
+    // once. Plain data and no logging, so the watcher can run it under __try and log outside.
+    struct WorldStateChange
+    {
+        uint32_t flag;
+        bool now_on;
+        bool was_known;  // false on the first read after the rows were injected: not a change anybody made
+        size_t markers;  // how many markers follow this flag
+    };
+    size_t world_state_poll(WorldStateChange *out, size_t max_out);
+
+    // The BAKED textEnableFlag2Id1..8 of one of our injected rows, by its live (remapped) row id -
+    // i.e. what the bake put there (MapEntry::data), not what the live row carries now. false = not
+    // one of ours. goblin_logic's post-event gate restores these when it lets go of a row.
+    bool injected_row_baked_group2(int32_t row_id, int out[8]);
 
     // Live marker visibility: sets each injected row's textEnableFlagId1 so the
     // primary line/icon shows only when its category is enabled AND the row is

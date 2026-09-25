@@ -86,6 +86,15 @@ enum class Category : uint8_t
     KeySpectralSteedRegalia,
 };
 
+// A marker's world-state rule: the polarity of MapEntry::state_flag it needs to be shown. The values
+// are baked by tools/mapblob.py (STATE_SHOW), so they are part of the packed format.
+enum class StateShow : uint8_t
+{
+    Always = 0,   // no rule
+    WhileOn = 1,  // shown only while state_flag is ON
+    WhileOff = 2, // shown only while state_flag is OFF
+};
+
 struct MapEntry
 {
     uint64_t row_id;
@@ -113,6 +122,13 @@ struct MapEntry
     // position on every refresh and overwrote the baked spread anyway).
     float real_posX;
     float real_posZ;
+    // World state: a marker that exists in only ONE state of the world is shown only while that
+    // state holds, read live from this event flag (Leyndell: flag 300 ON = the Ashen Capital, m11_05;
+    // OFF = the Royal Capital, m11_00). Baked from inputs/world_state_rules.json. Read by the
+    // visibility test alone (goblin_inject.cpp), never by anything that decides "collected" - a
+    // marker whose state is away still counts on the Progress page, as not collected.
+    uint32_t state_flag;   // 0 = no rule
+    StateShow state_show;
 };
 
 // Filled by goblin::generated::load_map_data() (src/goblin_map_blob.cpp) at startup, from

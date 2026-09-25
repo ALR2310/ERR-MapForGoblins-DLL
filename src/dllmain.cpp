@@ -21,6 +21,7 @@
 #include "goblin_logic.hpp"
 #include "goblin_map_blob.hpp" // load_map_data(), which every MAP_ENTRIES reader depends on
 #include "goblin_markers.hpp"
+#include "goblin_names_blob.hpp" // load_name_tables(): ENEMY_NAMES + ITEM_NAME_FALLBACK
 #include "goblin_messages.hpp"
 #include "goblin_status_line.hpp"
 #include "goblin_overlay.hpp"
@@ -104,6 +105,47 @@ static void safe_apply_category_visibility_seh()
     goblin::note_visibility_changed();
 }
 
+// Every live setting, re-derived (reapply_live_settings) - for a watcher-side change that has to
+// undo more than the category gates: a focus that ends here leaves its rows forced visible
+// (eventFlagId, group 2) until apply_map_logic runs again. reapply_live_settings bumps the
+// visibility epoch itself; the bump below covers a pass that faulted partway, as above.
+static void safe_reapply_live_settings_seh()
+{
+    __try
+    {
+        goblin::reapply_live_settings();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    goblin::note_visibility_changed();
+}
+
+// The world-state flags (which Leyndell stands) read under __try: the watcher runs at the main
+// menu and through loading screens too. What changed is said outside the guard.
+static size_t safe_world_state_poll_seh(goblin::WorldStateChange *out, size_t max_out)
+{
+    __try
+    {
+        return goblin::world_state_poll(out, max_out);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+static bool safe_world_state_changed_seh()
+{
+    goblin::WorldStateChange changes[4]{};
+    const size_t n = safe_world_state_poll_seh(changes, 4);
+    for (size_t i = 0; i < n && i < 4; ++i)
+        if (changes[i].was_known)  // the first read after injection is not a change
+            spdlog::info("[state] flag {} is now {} ({} markers follow it)", changes[i].flag,
+                         changes[i].now_on ? "ON" : "OFF", changes[i].markers);
+    return n != 0;
+}
+
 static void safe_gfx_tick_seh()
 {
     __try
@@ -131,6 +173,7 @@ static bool seh_invoke_void(InitFn fn)
 }
 
 static void init_map_data()         { goblin::generated::load_map_data(); }
+static void init_name_tables()      { goblin::generated::load_name_tables(); }
 static void init_modutils()         { modutils::initialize(); }
 static void init_from_params()      { from::params::initialize(); }
 static void init_collected()        { goblin::collected::initialize(); }
@@ -910,6 +953,11 @@ static void setup_mod()
     // plus one pass over the records (a few ms), and until it runs the table is empty, so this has
     // to come ahead of every other init rather than be done lazily by whichever reader is first.
     safe_init_step(&init_map_data,    "generated::load_map_data");
+    // The enemy names and the English item fallback, packed the same way. Their readers are
+    // setup_messages() below and the search index the menus build, so this is ahead of both.
+    // (The i18n strings are packed too but expand on first use: config load in DllMain reads them
+    // before this thread exists - see goblin_i18n_blob.cpp.)
+    safe_init_step(&init_name_tables, "generated::load_name_tables");
 
     safe_init_step(&init_modutils,    "modutils::initialize");
 
@@ -1301,7 +1349,19 @@ static void setup_mod()
                 prev_kindling = kc;
                 safe_apply_category_visibility_seh();
             }
+            // World state (which Leyndell stands, flag 300): the visibility test reads it live, but
+            // an open map only re-reads on a merge, and the engine-pin build can only be told
+            // through the param flags - so a flip re-applies and announces itself, like a pickup.
+            if (safe_world_state_changed_seh())
+                safe_apply_category_visibility_seh();
             lap(TP_VIS);
+
+            // A focus that ENDS on this thread (the slot switch drops the old character's, the
+            // prune drops an emptied one) must be undone the way the menus undo one: the full
+            // re-apply, since the focus forced its rows past the fragment and post-event gates
+            // (eventFlagId, group 2) and only apply_map_logic puts those back. A category re-apply
+            // alone left them showing until the next settings change.
+            auto focus_on = [] { return goblin::focus_category() >= 0 || goblin::focus_rows_active(); };
 
             // Per-character state: on a save-slot (character) switch, load that character's
             // focus (and, when the feature is on, their hidden set) and reapply visibility.
@@ -1311,8 +1371,14 @@ static void setup_mod()
             // file. Runs whichever way enable_manual_hide is set - the focus is its own feature.
             try
             {
+                const bool had_focus = focus_on();
                 if (goblin::sync_hidden_slot())
-                    safe_apply_category_visibility_seh();
+                {
+                    if (had_focus && !focus_on())
+                        safe_reapply_live_settings_seh();
+                    else
+                        safe_apply_category_visibility_seh();
+                }
             }
             catch (...)
             {
@@ -1323,7 +1389,7 @@ static void setup_mod()
             // flag, GEOF, etc.) so a stale "showing only ..." highlight doesn't stick around.
             // On the 2 s clock, after the slot sync of the same tick as before.
             if (regular && goblin::prune_focus_if_empty())
-                safe_apply_category_visibility_seh();
+                safe_reapply_live_settings_seh();
             lap(TP_PRUNE);
         }
         catch (const std::exception &e)

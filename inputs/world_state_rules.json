@@ -1,0 +1,17 @@
+{
+  "_comment": "World-state rules: a marker that exists in only ONE state of the world is shown only while that state holds, read live from one event flag. tools/generate_data.py bakes the matching rule into each marker's MapEntry (state_flag + state_show); the DLL applies it in the visibility test alone (goblin_inject.cpp native_row_visible) and never in anything that decides 'collected', so the Progress page still counts such a marker, as not collected, while its state is away. A focused marker (Progress focus or search pick) is shown past its rule, like the post-event gates. Keyed by profile: '*' = every profile, and a profile key REPLACES the '*' list for that profile. A rule is one tile 'mAA_BB_CC' + 'flag' + 'show_while' ('on' or 'off'); a marker matched by two rules fails the bake. Check the flag in THAT profile's EMEVD (tools/emevd_decompile.py) before adding a rule.",
+  "*": [
+    {
+      "tile": "m11_05_00",
+      "flag": 300,
+      "show_while": "on",
+      "note": "Leyndell, Ashen Capital. Flag 300 is the capital's current state (ON = ashen): common.emevd event 900 sets it at the Erdtree burn (Convergence 3: events 901/902), and ERR's two Roundtable Hold braziers (m11_10 event 11102973, after flag 120) set it ON or clear it at will. Flag 118 (Erdtree burned) stays ON once set - the only events that clear it are ERR's world resets (common.emevd 1048630909 and 3030), which clear 300 with it - so while the braziers switch back and forth it stays ON and cannot tell the two capitals apart."
+    },
+    {
+      "tile": "m11_00_00",
+      "flag": 300,
+      "show_while": "off",
+      "note": "Leyndell, Royal Capital: the map that stands while flag 300 is OFF."
+    }
+  ]
+}

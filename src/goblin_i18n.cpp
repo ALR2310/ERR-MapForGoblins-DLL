@@ -1,7 +1,8 @@
 // i18n LOGIC. The string DATA lives in per-locale JSON bundles (i18n/*.json),
 // baked into src/generated_shared/goblin_i18n_strings.cpp by tools/generate_i18n.py
 // (run from build.bat's gen_shared step, which also validates that every key is
-// present in every locale). To add/translate strings, edit the JSON - never C++.
+// present in every locale) as a packed blob that goblin_i18n_blob.cpp expands on
+// the first bundle() call. To add/translate strings, edit the JSON - never C++.
 #include "goblin_i18n.hpp"
 #include "goblin_i18n_bundle.hpp"
 #include "goblin_config.hpp"

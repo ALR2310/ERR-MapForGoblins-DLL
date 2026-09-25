@@ -4139,6 +4139,31 @@ namespace
         // exception filter. Same defect as the as_root read in v3_movie_of, one site over.
         // 0xE8 because live_count is read at parent+0xE0 - a node-header-sized window would
         // have left the very read that faults outside the gate.
+        //
+        // An anchor kept from a screen that has since closed is not read at all. The gate cannot
+        // vouch for it: safemem's verdict on a page is cached for up to kTtlMs (5 s), the close
+        // expired the parked movie, and a reopen 70-110 ms later ran this gate on the torn-down
+        // list while the cache still said readable - 2 first-chance faults, 84 and 95 ms frames
+        // spent in other modules' exception filters (vanilla ME3 2026-09-24, where the new anchor
+        // arrives ~100 ms into the open). The close released the generation, so there is nothing
+        // on that anchor to keep (an empty generation has nothing to keep either): drop it unread and let the next burst re-anchor (taking an anchor
+        // is what clears g_map_screen_gone).
+        // EXCEPT while the manager still runs a live generation on this very parent - the close did
+        // not release it (the self-detach variant off, no remove-at function, or a phase byte that
+        // read 0 while the map was up). Dropping then would strand thousands of attached children
+        // with nobody managing them; the gate below reads that anchor as it always did.
+        if (parent != 0 && g_map_screen_gone.load(std::memory_order_acquire) &&
+            !(g_v3_native.seeded && g_v3_native.parent == parent &&
+              !g_v3_native.objects.empty()))
+        {
+            v3_drop_dead_anchor("closed screen, before the gate", parent);
+            mark(g_v3_perf.head_gate_qpc);
+            const int64_t d = t_mark - t_head0;
+            g_v3_perf.head_qpc += d;
+            if (d > g_v3_perf.head_max_qpc)
+                g_v3_perf.head_max_qpc = d;
+            return;
+        }
         uint64_t wrapper_parent = 0, live_count = 0;
         if (v3_node_unusable(wrapper, 0x20) || v3_node_unusable(parent, 0xE8) ||
             !v3_read64(wrapper + 0x18, wrapper_parent) || wrapper_parent != parent ||

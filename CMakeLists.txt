@@ -36,8 +36,12 @@ FetchContent_Declare(mini
   CONFIGURE_COMMAND     ""
   BUILD_COMMAND         "")
 
-set(SPDLOG_DISABLE_DEFAULT_LOGGER ON)
-set(SPDLOG_USE_STD_FORMAT ON)
+# spdlog declares both with option() under cmake_minimum_required(3.11), i.e. CMP0077 OLD: a plain
+# set() lost to option()'s OFF on a build dir's FIRST configure and won on every later one, so the
+# same source built bundled fmt in a fresh dir and std::format in a reused one. CACHE FORCE makes it
+# one answer. Bundled fmt: std::format's float path drags in the CRT's to_chars Ryu tables (~110 KB).
+set(SPDLOG_DISABLE_DEFAULT_LOGGER ON CACHE BOOL "" FORCE)
+set(SPDLOG_USE_STD_FORMAT OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(spdlog
   GIT_REPOSITORY        https://github.com/gabime/spdlog.git
   GIT_TAG               v1.13.0)

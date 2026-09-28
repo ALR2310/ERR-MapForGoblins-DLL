@@ -13,9 +13,10 @@ build.bat still uses msbuild /m internally, so don't set --jobs too high.
 Usage:
   py tools/build_all.py [snapshot|release] [--force-all] [--scan] [--jobs N] [--profiles a,b,c] [--skip-aob-check]
 
---scan VT-scans each profile's DLL the moment ITS build finishes (via
-dashboard/vt_runner.py), so scans overlap with the still-running builds instead
-of waiting for all eight; a per-profile MS-verdict summary prints at the end.
+--scan VT-scans each profile's DLL the moment ITS build finishes (queued on the
+optional local dashboard named by dashboard_dir in tools/config.ini), so scans overlap
+with the still-running builds instead of waiting for all of them. Without
+dashboard_dir, --scan is skipped with a warning.
 
 Prints a profiling summary: gen_shared per-script, per-profile pipeline vs compile,
 slowest pipeline stages, and wall-clock vs sequential-sum (the parallel saving).
@@ -25,8 +26,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / 'tools'
-LOG = ROOT / 'scratch'
-LOG.mkdir(exist_ok=True)
+LOG = ROOT / 'scratch' / 'safe_to_delete' / 'build_logs'
+LOG.mkdir(parents=True, exist_ok=True)
+sys.path.insert(0, str(TOOLS))
+import config  # noqa: E402
 
 # The dashboard owns scanning: it maintains a queue + one rate-limited worker (one process,
 # one sqlite connection). build_all just POSTs each finished DLL to it, so scans overlap
@@ -48,9 +51,13 @@ def ensure_dashboard():
     if not. Returns True once reachable."""
     if _dash_up():
         return True
+    if config.DASHBOARD_DIR is None:
+        print('    no dashboard_dir in tools/config.ini')
+        return False
     try:
-        subprocess.Popen([sys.executable, str(TOOLS / 'dashboard' / 'app.py'), '--no-reload'],
-                         cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        subprocess.Popen([sys.executable, str(config.DASHBOARD_DIR / 'app.py'), '--no-reload'],
+                         cwd=str(config.DASHBOARD_DIR), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception as e:
         print(f'    could not start dashboard: {e}')
         return False
@@ -132,13 +139,6 @@ def main():
                   '(Pass --skip-aob-check to build without the game exe.)')
             sys.exit(1)
 
-    # Version (for the VT scan rows) read straight from CMakeLists - no bump happened here.
-    vt_ver = ''
-    if scan:
-        m = re.search(r'\n\s*VERSION\s+"([^"]+)"', (ROOT / 'CMakeLists.txt').read_text(encoding='utf-8'))
-        vt_ver = m.group(1) if m else ''
-        VT_RUNNER = TOOLS / 'dashboard' / 'vt_runner.py'
-
     # ---- Phase 1: gen_shared ONCE ----
     print('\n[1] gen_shared (once, shared)')
     gen_times = {}
@@ -148,7 +148,7 @@ def main():
         gen_times[s] = time.time() - t0
         print(f'    {s:30} {gen_times[s]:6.1f}s  {"OK" if rc == 0 else f"FAIL({rc})"}')
         if rc != 0:
-            print(f'    gen_shared FAILED ({s}); see scratch/ba_gen_{s}.log'); sys.exit(1)
+            print(f'    gen_shared FAILED ({s}); see scratch/safe_to_delete/build_logs/ba_gen_{s}.log'); sys.exit(1)
     gen_total = time.time() - wall0
 
     # ---- Phase 2: per-profile builds in parallel (--skip-shared) ----
@@ -240,7 +240,7 @@ def main():
     print(f'\nwall-clock: {wall:.1f}s   |   sequential-sum: {seq_sum:.1f}s   |   '
           f'parallel saved ~{seq_sum - wall:.1f}s')
     if any(not r[2]['success'] for r in results.values()):
-        print('\nWARNING: some builds FAILED - check scratch/ba_<profile>.log')
+        print('\nWARNING: some builds FAILED - check scratch/safe_to_delete/build_logs/ba_<profile>.log')
         sys.exit(1)
 
 

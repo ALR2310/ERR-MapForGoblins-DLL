@@ -749,8 +749,8 @@ def deduplicate(records):
     return unique, dupes
 
 
-# Profile-independent localized enemy-name table (committed; built from the
-# enemy-name source by extract_enemy_names_i18n). Used by the non-ERR builds so
+# Profile-independent localized enemy-name table (committed; a one-off extraction of the
+# wiki enemy-name list). Used by the non-ERR builds so
 # their enemy labels match the ERR-build quality; the strings themselves are
 # FromSoft / community-wiki enemy names (see the comparison notes).
 def _load_enemy_names_i18n():
@@ -1123,7 +1123,7 @@ def write_rows(records, filepath, icon_id, start_id, lot_linkage=None):
                 next_text_slot += 1
 
         # Generic enemy name - only when we don't have a specific named-NPC
-        # label. ERR: the ERR codex (TutorialTitle, +900M). Vanilla: vanilla
+        # label. ERR: the wiki enemy-name list in TutorialTitle (+900M). Vanilla: vanilla
         # has no per-type enemy names in any FMG, so we use the closest word
         # from the blood-message vocabulary (BloodMsg FMG, +950M; localized
         # in all languages). Mapping: data/enemy_bloodmsg_mapping.json.

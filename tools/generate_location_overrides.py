@@ -41,8 +41,11 @@ def _safe_unlink(path):
 
 _str = SysType.GetType("System.String")
 _read = asm.GetType("SoulsFormats.MSBE").GetMethod("Read", BindingFlags.Public|BindingFlags.Static|BindingFlags.FlattenHierarchy, None, Array[SysType]([_str]), None)
-D = os.path.join(HERE, "..", "data")          # repo data root (ERR-only artifacts)
 PROF = str(config.DATA_DIR)                    # profile data dir (data/ or data/vanilla/)
+# Every input comes from the active profile's own workspace. The ERR-only piece files simply do not
+# exist in the other profiles (the reads below skip them), and the anchor pins are the profile's own
+# WorldMapPointParam - reading data/ here used to mix the ERR workspace into every other profile.
+D = PROF
 PLACE = json.load(open(os.path.join(PROF, "PlaceName_engus.json"), encoding="utf-8"))
 VALID = set(int(k) for k in PLACE.keys())
 WMPP = {int(w["ID"]): w for w in json.load(open(os.path.join(PROF, "WorldMapPointParam.json"), encoding="utf-8"))}

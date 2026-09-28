@@ -5,7 +5,7 @@ Subterranean Shunning-Grounds reach the overworld through Leyndell (35 -> 11 -> 
 through both (12_03 -> 35 -> 11 -> 60). Two places used to read this param, and both kept only the rows
 whose destination was already an overworld tile - which silently dropped exactly the chained ones. In
 the vanilla bake that was 253 marker rows (100 in m35, 139 in m12_03, 14 more with no conv row at all),
-absent from every report with no warning: see scratch/bugs_2026-07-29_dump_conv_and_phantom_rune.md.
+absent from every report with no warning: see scratch/keep/notes/bugs_2026-07-29_dump_conv_and_phantom_rune.md.
 
 One hop is
 

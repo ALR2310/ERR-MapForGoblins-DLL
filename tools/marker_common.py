@@ -33,28 +33,31 @@ OVERWORLD_AREAS = {60, 61}
 
 # Valid PlaceName location IDs (for dungeon name fallback)
 _loc_path = DATA_DIR / 'valid_location_ids.json'
+_conv_path = DATA_DIR / 'WorldMapLegacyConvParam.json'
+# Both come from the bootstrap stages. Without them every dungeon marker silently loses its location
+# subtitle and its legacy-to-overworld conversion, so a missing file is an error, never an empty set.
+for _p in (_loc_path, _conv_path):
+    if not _p.exists():
+        raise FileNotFoundError(f'{_p} is missing - run the pipeline (its bootstrap stages create it)')
 VALID_LOCATION_IDS = set()
-if _loc_path.exists():
-    with open(_loc_path) as _f:
-        VALID_LOCATION_IDS = set(json.load(_f))
+with open(_loc_path) as _f:
+    VALID_LOCATION_IDS = set(json.load(_f))
 
 
 # Legacy dungeon coordinate conversion (WorldMapLegacyConvParam)
-_conv_path = DATA_DIR / 'WorldMapLegacyConvParam.json'
 _LEGACY_CONV = {}  # (srcArea, srcGx) -> (dstArea, dstGx, dstGz, offsetX, offsetZ)
-if _conv_path.exists():
-    with open(_conv_path) as _f:
-        for _e in json.load(_f):
-            _sa = int(_e.get('srcAreaNo', 0))
-            _sg = int(_e.get('srcGridXNo', 0))
-            if _sa == 0 or (_sa, _sg) in _LEGACY_CONV:
-                continue
-            _da = int(_e.get('dstAreaNo', 0))
-            _dg = int(_e.get('dstGridXNo', 0))
-            _dz = int(_e.get('dstGridZNo', 0))
-            _ox = float(_e.get('dstPosX', 0)) - float(_e.get('srcPosX', 0))
-            _oz = float(_e.get('dstPosZ', 0)) - float(_e.get('srcPosZ', 0))
-            _LEGACY_CONV[(_sa, _sg)] = (_da, _dg, _dz, _ox, _oz)
+with open(_conv_path) as _f:
+    for _e in json.load(_f):
+        _sa = int(_e.get('srcAreaNo', 0))
+        _sg = int(_e.get('srcGridXNo', 0))
+        if _sa == 0 or (_sa, _sg) in _LEGACY_CONV:
+            continue
+        _da = int(_e.get('dstAreaNo', 0))
+        _dg = int(_e.get('dstGridXNo', 0))
+        _dz = int(_e.get('dstGridZNo', 0))
+        _ox = float(_e.get('dstPosX', 0)) - float(_e.get('srcPosX', 0))
+        _oz = float(_e.get('dstPosZ', 0)) - float(_e.get('srcPosZ', 0))
+        _LEGACY_CONV[(_sa, _sg)] = (_da, _dg, _dz, _ox, _oz)
 
 # (area, gridX) pairs this profile's WorldMapLegacyConvParam projects onto the DLC overworld
 # (dstAreaNo=61). Keyed by (area, gridX) - NOT area alone - because an area can be mixed:

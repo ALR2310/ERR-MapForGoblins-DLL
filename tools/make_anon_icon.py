@@ -11,8 +11,6 @@ import config
 from PIL import Image
 
 SRC = config.PROJECT_DIR / "assets" / "badges" / "gray_question_mark.png"
-if not SRC.exists():
-    SRC = config.PROJECT_DIR / "scratch" / "badges" / "gray_question_mark.png"
 DST = config.PROJECT_DIR / "assets" / "badges" / "anon_qmark.png"
 SIZE = 160
 PAD = 0.86  # glyph fills 86% of the tile, small transparent margin

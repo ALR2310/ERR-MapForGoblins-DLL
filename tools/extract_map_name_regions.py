@@ -27,9 +27,9 @@ def rfb(rm, data, suf=".bin"):
     SysFile.WriteAllBytes(t, data.ToArray() if hasattr(data, "ToArray") else data)
     r = rm.Invoke(None, Array[Object]([t])); os.unlink(t); return r
 
-PLACE = json.load(open(os.path.join(config.TOOLS_DIR if hasattr(config,'TOOLS_DIR') else '.', "..", "data", "PlaceName_engus.json"), encoding="utf-8")) \
-    if os.path.exists(os.path.join("..", "data", "PlaceName_engus.json")) else \
-    json.load(open(os.path.join(os.path.dirname(__file__), "..", "data", "PlaceName_engus.json"), encoding="utf-8"))
+PLACE = json.load(open(os.path.join(config.TOOLS_DIR if hasattr(config,'TOOLS_DIR') else '.', "..", "data", "err", "PlaceName_engus.json"), encoding="utf-8")) \
+    if os.path.exists(os.path.join("..", "data", "err", "PlaceName_engus.json")) else \
+    json.load(open(os.path.join(os.path.dirname(__file__), "..", "data", "err", "PlaceName_engus.json"), encoding="utf-8"))
 
 def prop(o, name):
     p = o.GetType().GetProperty(name)
@@ -90,7 +90,7 @@ def main():
             total += len(recs)
             mno = sum(1 for x in recs if x["kind"] == "MapNameOverride")
             print(f"  {mapname}: {len(recs)} regions ({mno} MapNameOverride)")
-    dst = os.path.join(os.path.dirname(__file__), "..", "data", "map_name_regions.json")
+    dst = os.path.join(os.path.dirname(__file__), "..", "data", "err", "map_name_regions.json")
     json.dump(out, open(dst, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"\n{total} regions across {len(out)} maps -> data/map_name_regions.json")
 

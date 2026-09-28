@@ -25,7 +25,7 @@ THE PATTERNS ARE GENERATED, NOT HAND-PICKED (since report 31). They used to be a
 16-byte prefix, and 33 of 44 of those matched more places than they identified -
 clip_proxy_dtor's matched 3638 - so the resolver was choosing between copies on evidence
 that could not tell them apart, and on one player's build it called a stranger. Regenerate
-with `py scratch/anchor_patterns.py --write`: it grows each pattern instruction by
+with `py tools/exe_compat/anchor_patterns.py --write`: it grows each pattern instruction by
 instruction until it matches exactly ONCE, wildcards the build-specific operand bytes, and
 stops at the function's end. ANCHOR_KIND below records the outcome per anchor:
   pin      - the pattern matches exactly once on every exe build we hold. It identifies its
@@ -116,7 +116,7 @@ ANCHORS = [
     # silently disabled the generation release and leaked the Scaleform arena until the engine
     # panicked. These two slot FUNCTIONS are code, so the resolver finds them anywhere; the vtable
     # is then the one place in .rdata where both sit at their own slot index (goblin_anchors.cpp,
-    # vtable_with). Verified on all six builds by scratch/verify_slot_layout_all.py.
+    # vtable_with). Verified on all six builds by scratch/tools/scripts/verify_slot_layout_all.py.
     {"name": "snapshot_slot_vt_fn4", "rva": 0x11FA860,
      "bytes": "48 8B C4 48 89 58 08 48 89 78 10 55 48 8D 68 A1 48 81 EC A0",
      "used": "v3_child_releasable (snapshot-slot vtable, slot 4)"},
@@ -275,7 +275,7 @@ ANCHORS = [
 ]
 
 # Which anchors their own bytes can identify, measured across every exe build we hold
-# (2.6.2 / 2.6.1 / 2.6.0 / 2.2.3 / 2.2.0). Written by scratch/anchor_patterns.py --write;
+# (2.6.2 / 2.6.1 / 2.6.0 / 2.2.3 / 2.2.0). Written by tools/exe_compat/anchor_patterns.py --write;
 # documentation, not input - the resolver counts matches in the LIVE exe and classifies each
 # anchor from that, so an unseen build where a pin turns ambiguous degrades to a follower
 # instead of being trusted on a stale flag.

@@ -12,7 +12,7 @@ Icon images come from the custom PNGs in map_categories (png column). Everything
 profile-INDEPENDENT (no per-profile baked data read), so the generated_shared output
 is the same complete superset for all four builds. No gfx involved.
 """
-import os, re, sys, subprocess, collections, tempfile, json
+import os, re, sys
 sys.path.insert(0, os.path.dirname(__file__))
 import config
 from PIL import Image
@@ -83,7 +83,7 @@ def parse_category_to_icon():
     return out
 
 
-def icon_image(icon_id, render_cache=None):
+def icon_image(icon_id):
     """RGBA Image for an iconId from its committed custom PNG (map_categories png column). Every map
     icon is custom now - no gfx render, no composed/by_iconId fallback."""
     ov = icon_override().get(icon_id)
@@ -92,7 +92,7 @@ def icon_image(icon_id, render_cache=None):
     return None
 
 
-def render_icons(icon_ids, render_cache=None):
+def render_icons(icon_ids):
     """No gfx render. Warns about any needed iconId lacking a committed PNG (every category should
     have one in map_categories.py). Kept as a stub so callers don't change."""
     missing = [i for i in (icon_ids or []) if icon_image(i) is None]
@@ -143,25 +143,18 @@ def main():
           f"({len(key_to_var)} keys, {len(var_to_cat)} categories)")
 
     needed = sorted(set(key_to_icon.values()))
-    render_cache = PROJ / "scratch" / "overlay_icon_render"
-    render_icons(needed, render_cache)  # always render fresh (full composite)
+    render_icons(needed)  # warns on any iconId lacking committed PNG art
 
     # Two-layer icons (a category plate behind a small glyph) read visually smaller
     # than single-glyph icons at the same cell size, because the plate fills the cell
-    # and the glyph inside is small. We detect "plated" icons two ways and ZOOM their
-    # cell content (cropping the plate edges) so the inner glyph reads bigger while the
-    # on-screen icon size stays uniform: (a) a background layer (>=2 leaves, from
-    # render_map_icons) catches ring frames; (b) high bbox coverage (the plate fills
-    # most of its footprint) catches solid plates baked as one bitmap. Empirically
-    # plated >=0.77, single-glyph <=0.71.
+    # and the glyph inside is small. We detect "plated" icons by high bbox coverage (the
+    # plate fills most of its footprint) and ZOOM their cell content (cropping the plate
+    # edges) so the inner glyph reads bigger while the on-screen icon size stays
+    # uniform. Empirically plated >=0.77, single-glyph <=0.71.
     PLATE_ZOOM = 1.45
     OVERRIDE_ZOOM = 1.0   # our override icons (seal/anon) are glyph-filling; no enlarge
     COVERAGE_THR = 0.74
     override_icons = set(KEY_ICON_OVERRIDE.values()) | set(icon_override().keys())  # drawn art: no plate-zoom crop
-    layer_counts = {}
-    lc_path = render_cache / "layer_counts.json"
-    if lc_path.exists():
-        layer_counts = {int(k): v for k, v in json.load(open(lc_path, encoding="utf-8")).items()}
 
     def bbox_coverage(img):
         a = img.split()[3]
@@ -177,14 +170,14 @@ def main():
     icon_to_idx = {}
     cells = []
     for icon in needed:
-        img = icon_image(icon, render_cache)
+        img = icon_image(icon)
         if img is None:
             print(f"[overlay-icons] WARN no image for iconId {icon}; keys using it skip")
             continue
         if icon in override_icons:
             zoom = OVERRIDE_ZOOM
         else:
-            plated = layer_counts.get(icon, 1) >= 2 or bbox_coverage(img) >= COVERAGE_THR
+            plated = bbox_coverage(img) >= COVERAGE_THR
             zoom = PLATE_ZOOM if plated else 1.0
         icon_to_idx[icon] = len(cells)
         cells.append(fit_cell(img, zoom))

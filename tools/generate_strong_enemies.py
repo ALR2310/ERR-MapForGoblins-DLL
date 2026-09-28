@@ -112,8 +112,8 @@ STRONG_FOE_WORD = 30003
 
 
 def enemy_label(model, npc, name_id):
-    """textId for the enemy's name: its NpcName (+700M), else its enemy-type name - the ERR codex
-    (+900M) or, off ERR, the closest blood-message word (+950M); same rules as the loot markers -
+    """textId for the enemy's name: its NpcName (+700M), else its enemy-type name - the wiki
+    enemy-name list (+900M) or, off ERR, the closest blood-message word (+950M); same rules as the loot markers -
     and failing those, the blood-message word "strong foe"."""
     if name_id > 0:
         return name_id + 700000000

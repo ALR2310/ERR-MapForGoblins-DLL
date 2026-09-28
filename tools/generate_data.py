@@ -472,18 +472,18 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows-dir", type=str, default=None,
-                        help="Path to the generated rows directory (default: data/rows_generated; "
+                        help="Path to the generated rows directory (default: data/<profile>/rows_generated; "
                              "the pipeline passes the active profile's rows_generated)")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
     project_dir = script_dir.parent
 
+    import config
     if args.rows_dir:
         rows_dir = Path(args.rows_dir)
     else:
-        rows_dir = project_dir / "data" / "rows_generated"
-    import config
+        rows_dir = config.DATA_DIR / "rows_generated"
     output_dir = config.GENERATED_DIR  # src/generated or src/generated_vanilla
 
     output_dir.mkdir(parents=True, exist_ok=True)

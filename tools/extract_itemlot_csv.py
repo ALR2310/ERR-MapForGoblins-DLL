@@ -7,7 +7,7 @@ Usage:
     python extract_itemlot_csv.py [path/to/regulation.bin]
 
 If no path given, uses ERR_MOD_DIR from config or prompts.
-Output: ../data/ItemLotParam_map.csv
+Output: ../data/<profile>/ItemLotParam_map.csv
 """
 
 import csv

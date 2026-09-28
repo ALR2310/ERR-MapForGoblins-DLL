@@ -6,7 +6,7 @@ Outputs (into config.DATA_DIR, profile-aware):
   - tutorial_title_names.json    {id: title text}
   - enemy_tutorial_mapping.json  {"cNNNN": NNNN*1000+4} for ids matching the
         codex naming convention (base enemy entry = model digits * 1000 + 4;
-        variants add 100 per variant). ERR's codex follows this convention;
+        variants add 100 per variant). ERR's TutorialTitle enemy list (wiki names) follows it;
         vanilla has only a handful of tutorial entries, so for the vanilla
         profile these tables are small and the enemy mapping near-empty
         (vanilla enemy labels come from NpcName / BloodMsg instead).
@@ -58,7 +58,7 @@ def main():
         for e in fmg.Entries:
             t = str(e.Text) if e.Text else ''
             if t and t != '[ERROR]':
-                # ERR codex titles carry a numeric list prefix ("118. Margit,
+                # The wiki enemy-list titles carry a numeric list prefix ("118. Margit,
                 # the Fell Omen", variants "219a. Putrid Tree Spirit"). Strip
                 # it: consumers match these names against PlaceName text to
                 # resolve boss VARIANTS, and the comparison needs the bare name.

@@ -53,13 +53,13 @@ PROFILE = os.environ.get("MFG_PROFILE", "err").strip().lower()
 if PROFILE not in ("err", "vanilla", "convergence2", "convergence3", "erte", "goldenage", "goldenage361", "vins", "reborn", "graceborne", "throne"):
     PROFILE = "err"
 
-# Profile-scoped intermediate/generated data dir. Everything under data/ is WRITTEN by the pipeline
-# and gitignored; a clone regenerates it from the mod's own files.
+# Profile-scoped intermediate/generated data dir: data/<profile>/ for every profile, err included.
+# Everything under data/ is WRITTEN by the pipeline and gitignored; a clone regenerates it from the
+# mod's own files. The data/ root holds only caches shared by all profiles.
+DATA_DIR = PROJECT_DIR / "data" / PROFILE
 if PROFILE == "err":
-    DATA_DIR = PROJECT_DIR / "data"
     GENERATED_DIR = PROJECT_DIR / "src" / "generated"
 else:
-    DATA_DIR = PROJECT_DIR / "data" / PROFILE
     GENERATED_DIR = PROJECT_DIR / "src" / ("generated_" + PROFILE)
 
 # The committed inputs nothing regenerates: hand-maintained tables (unprojectable tiles, invader
@@ -100,6 +100,7 @@ THRONE_MOD_DIR = None       # Throne ER overhaul's ME2 'TL' overlay dir
 SMITHBOX_DIR = None
 DARKSCRIPT_RESOURCES = None  # path to <DarkScript3>/Resources/ (optional)
 EXE_DIR = None              # folder of alternate eldenring.exe builds (anchor rebase proof)
+DASHBOARD_DIR = None        # optional local build/scan dashboard (not part of this repo)
 
 # pngquant, which generate_map_icons.py runs to quantise every map icon to a 64-colour palette
 # (bundled like SoulsFormats; GPLv3, licence beside it). [paths] pngquant in config.ini overrides.
@@ -170,6 +171,10 @@ if _config_path.exists():
     _exes = _cfg.get("paths", "exe_dir", fallback="").strip()
     if _exes:
         EXE_DIR = Path(_exes)
+
+    _dash = _cfg.get("paths", "dashboard_dir", fallback="").strip()
+    if _dash and (Path(_dash) / "app.py").exists():
+        DASHBOARD_DIR = Path(_dash)
 
 if GAME_DIR:
     OO2CORE_DLL = GAME_DIR / "oo2core_6_win64.dll"
@@ -297,3 +302,8 @@ def require_active_save():
     if p and p.exists(): return p
     print("ERROR: no ER0000.err found in %APPDATA%/EldenRing/<steamId>/")
     sys.exit(1)
+
+if __name__ == "__main__":
+    # `py tools/config.py dashboard_dir` prints that optional path, empty when unset (for build.bat).
+    if len(sys.argv) == 2 and sys.argv[1] == "dashboard_dir":
+        print(DASHBOARD_DIR or "")

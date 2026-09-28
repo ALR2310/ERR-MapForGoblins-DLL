@@ -1,3 +1,4 @@
 pythonnet>=3.0
 pymem>=1.13
 psutil>=5.9
+capstone>=5.0

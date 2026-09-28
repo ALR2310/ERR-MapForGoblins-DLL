@@ -4,7 +4,7 @@ import pymem, struct, json, os, glob
 
 MODEL_HASH = 0x009A1C6D
 
-with open('MapForGoblins/data/rune_pieces.json') as f:
+with open('MapForGoblins/data/err/rune_pieces.json') as f:
     pieces = json.load(f)
 
 slot_to_name = {}

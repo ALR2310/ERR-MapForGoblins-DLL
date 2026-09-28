@@ -33,7 +33,7 @@ SLIDER_CELLS static cells, cell k = the texture at the position for fraction k/(
 behind one row-level mask window; showing a value is a horizontal shift of the strip, and
 cell 0 is empty so untouched instances show nothing. The texture is referenced BY NAME
 (GFX_DefineExternalImage2: the engine loads it from the global menu image sets), so its define
-is a constant here. Geometry measured once from 02_042 (scratch/recon_042_slider_geom.py):
+is a constant here. Geometry measured once from 02_042 with a one-off probe:
 image x -591.45px (0%) .. -202px (100%), mask window x -196.5..203.5, y -36..0, image y -37.15.
 
 Run by the shared stage of the build; standalone: py tools/generate_menu_icon_tags.py

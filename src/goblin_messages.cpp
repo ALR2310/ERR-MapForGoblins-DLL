@@ -588,7 +588,7 @@ void goblin::setup_messages()
     std::set<int32_t> gem_ids_needed;        // GemName FMG, slot 14
     std::set<int32_t> npc_name_ids_needed;   // NpcName FMG, slot 18 (+ DLC 328, 428)
     std::set<int32_t> action_btn_ids_needed; // ActionButtonText FMG, slot 32 (+ DLC 365, 465)
-    std::set<int32_t> tutorial_ids_needed;   // TutorialTitle FMG, slot 207 (enemy names from ERR Codex)
+    std::set<int32_t> tutorial_ids_needed;   // TutorialTitle FMG, slot 207 (wiki enemy-name list)
     std::set<int32_t> bloodmsg_ids_needed;   // BloodMsg FMG, slot 2 (vanilla enemy-type words, offset 950M)
     for (size_t i = 0; i < generated::MAP_ENTRY_COUNT; i++)
     {
@@ -945,7 +945,7 @@ void goblin::setup_messages()
     bloodmsg_ids_needed.insert(950000000 + 32004);
     copy_fmg_layered(bloodmsg_slots, bloodmsg_ids_needed, 950000000, "BloodMsg");
 
-    // TutorialTitle (ERR Codex enemy names + category labels like "Summoning
+    // TutorialTitle (wiki enemy-name list + category labels like "Summoning
     // Pools"). textId in MASSEDIT = real TutorialTitle ID + 900000000 (to
     // avoid collision with GoodsName).
     copy_fmg_layered(tutorial_slots, tutorial_ids_needed, 900000000, "TutorialTitle");

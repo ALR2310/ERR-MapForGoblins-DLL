@@ -36,7 +36,7 @@ import config
 
 REPO = Path(__file__).resolve().parent.parent
 TOOLS = REPO / 'tools'
-DATA = config.DATA_DIR                 # data/ (err) or data/<profile>/ otherwise
+DATA = config.DATA_DIR                 # data/<profile>/ (err included)
 INPUTS = config.INPUTS_DIR                  # committed, never generated (see config.py)
 PROFILE_INPUTS = config.PROFILE_INPUTS_DIR
 DATA.mkdir(parents=True, exist_ok=True)
@@ -301,15 +301,15 @@ STAGES = [
                   DATA / 'enemy_tutorial_mapping.json',
                   DATA / 'tutorial_title_ids.json',
                   DATA / 'tutorial_title_names.json',
-                  DATA / 'grace_position_index.json'],
+                  DATA / 'grace_position_index.json',
+                  DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
+                  DATA / 'npc_name_text_map.json'],
           outputs=[ROWS_OUT / 'Loot - Consumables.rows',
                    ROWS_OUT / 'Equipment - Armaments.rows',
                    ROWS_OUT / 'Quest - Progression.rows',
                    ROWS_OUT / 'World - Bosses.rows',
                    DATA / 'loot_lot_linkage.json',
-                   DATA / 'item_icon_table.json',
-                   DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
-                   REPO / 'data' / 'npc_name_text_map.json'],
+                   DATA / 'item_icon_table.json'],
           script='generate_loot.py',
           # relocating_spawns.py decides which rows are NOT created (the flee-spawn duplicates), so
           # a change to that rule has to invalidate this stage or the old rows survive as cached.
@@ -429,7 +429,7 @@ STAGES = [
           inputs=[REGULATION, MSB_DIR, config.PARAMDEF_DIR, EVENT_DIR,
                   DATA / 'items_database.json',
                   DATA / 'english_fallback.json',                       # npcname_known: NpcName ids this profile resolves
-                  REPO / 'data' / 'npc_name_text_map.json',
+                  DATA / 'npc_name_text_map.json',
                   INPUTS / 'quest_invader_overrides.json'],
           outputs=[ROWS_OUT / 'World - Hostile NPC.rows'],
           script='generate_hostile_npcs.py',
@@ -533,11 +533,10 @@ def _overlay_prepare_stage():
                  also_scripts=['config.py'])
 
 
-# Non-ERR bootstrap stages: regenerate, from the active profile's game data,
-# the committed inputs that ship pre-extracted for ERR (they don't exist under
-# data/vanilla/ or data/convergence/). Run before the stages that consume
-# them. For the err profile these are NOT added (the committed copies are
-# authoritative).
+# Bootstrap stages: extract, from the active profile's own game data, the param/text tables the
+# later stages consume. They run for EVERY profile, err included: these files once shipped
+# committed for ERR, but data/ has been a regenerated workspace since 2.1.5, so nothing else
+# creates them.
 VANILLA_BOOTSTRAP = [
     Stage('extract_param_bootstrap',
           inputs=[REGULATION, MSGBND],
@@ -564,13 +563,28 @@ VANILLA_BOOTSTRAP = [
           outputs=[DATA / 'aeg463_item_mapping.json'],
           script='extract_aeg463_mapping.py',
           also_scripts=['config.py']),
+
+    Stage('extract_npc_names',
+          inputs=[REGULATION, MSGBND, config.PARAMDEF_DIR],
+          outputs=[DATA / 'npc_name_id_map.json',
+                   DATA / 'npc_name_text_map.json'],
+          script='extract_npc_names.py',
+          also_scripts=['config.py']),
 ]
+
+
+# The later stages read the bootstrap tables without naming them (marker_common loads the
+# location ids and the legacy conversion at import), so every stage takes them as inputs: a
+# regenerated table then invalidates the cached rows instead of leaving rows baked without it.
+_BOOTSTRAP_OUT = [o for s in VANILLA_BOOTSTRAP for o in s.outputs]
+for _s in STAGES:
+    _s.inputs += [o for o in _BOOTSTRAP_OUT if o not in _s.inputs]
 
 
 def active_stages():
     """The stage list for the selected profile.
 
-    err:         the full STAGES list, unchanged (committed inputs are used as-is).
+    err:         bootstrap extractors first, then the full STAGES list.
     vanilla:     bootstrap extractors first, then STAGES minus the ERR-only ones.
     convergence: merged-source staging, then the same as vanilla.
     """
@@ -579,7 +593,7 @@ def active_stages():
     if PROFILE in ('convergence2', 'convergence3', 'erte', 'goldenage', 'goldenage361', 'vins', 'reborn', 'graceborne', 'throne'):
         return ([_overlay_prepare_stage()] + VANILLA_BOOTSTRAP
                 + [s for s in STAGES if s.name not in ERR_ONLY_STAGES])
-    return STAGES
+    return VANILLA_BOOTSTRAP + STAGES
 
 
 def check_source_completeness():

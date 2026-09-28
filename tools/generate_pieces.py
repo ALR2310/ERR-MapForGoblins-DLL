@@ -224,106 +224,16 @@ SKIP_NPC_NAMES = {
 }
 
 
-def _load_npc_param_name_ids():
-    """Build npcParamId -> nameId mapping from regulation.bin via extract_all_items
-    machinery. Cache as a JSON sidecar to avoid re-reading regulation each run."""
-    cache_path = DATA_DIR / 'npc_name_id_map.json'
-    if cache_path.exists():
-        return {int(k): int(v) for k, v in json.load(open(cache_path)).items()}
-    # Lazy build: import and reuse extract_all_items helpers
-    try:
-        import config
-        from pythonnet import load as _pyload
-        _pyload('coreclr')
-        import clr
-        from System.Reflection import Assembly
-        from System import Array, Type as SysType, Object
-        from System.IO import File as SysFile
-        import os as _os, tempfile as _tempfile
-        asm = Assembly.LoadFrom(str(config.SOULSFORMATS_DLL))
-        clr.AddReference(str(config.SOULSFORMATS_DLL))
-        import SoulsFormats
-        _str = SysType.GetType('System.String')
-        _pcls = asm.GetType('SoulsFormats.PARAM')
-        _pr = _pcls.BaseType.GetMethod('Read', Array[SysType]([_str]))
-        defs = {}
-        for xml in config.PARAMDEF_DIR.glob('*.xml'):
-            try:
-                d = SoulsFormats.PARAMDEF.XmlDeserialize(str(xml), False)
-                if d and d.ParamType:
-                    defs[str(d.ParamType)] = d
-            except Exception:
-                pass
-        bnd = SoulsFormats.SFUtil.DecryptERRegulation(str(config.ERR_MOD_DIR / 'regulation.bin'))
-        for f in bnd.Files:
-            if 'NpcParam.param' not in str(f.Name):
-                continue
-            tmp = _os.path.join(_tempfile.gettempdir(), '_np.param')
-            SysFile.WriteAllBytes(tmp, f.Bytes.ToArray())
-            p = _pr.Invoke(None, Array[Object]([tmp]))
-            pdef = defs.get(str(p.ParamType))
-            if pdef:
-                p.ApplyParamdef(pdef)
-            out = {}
-            for r in p.Rows:
-                rid = int(r.ID); nid = 0
-                for c in r.Cells:
-                    if str(c.Def.InternalName) == 'nameId':
-                        try: nid = int(c.Value)
-                        except Exception: pass
-                        break
-                if nid > 0:
-                    out[rid] = nid
-            with open(cache_path, 'w', encoding='utf-8') as fp:
-                json.dump({str(k): v for k, v in out.items()}, fp)
-            return out
-    except Exception as e:
-        print(f"  WARN: NpcParam load failed: {e}")
-    return {}
+def _load_npc_name_tables():
+    """NpcParam id -> nameId and NpcName id -> text, both from the extract_npc_names bootstrap stage."""
+    with open(DATA_DIR / 'npc_name_id_map.json', encoding='utf-8') as f:
+        ids = {int(k): int(v) for k, v in json.load(f).items()}
+    with open(DATA_DIR / 'npc_name_text_map.json', encoding='utf-8') as f:
+        texts = {int(k): v for k, v in json.load(f).items()}
+    return ids, texts
 
 
-def _load_npc_name_fmg():
-    """nameId -> text from NpcName.fmg (mod's item_dlc02.msgbnd)."""
-    cache_path = DATA_DIR / 'npc_name_text_map.json'
-    if cache_path.exists():
-        return {int(k): v for k, v in json.load(open(cache_path, encoding='utf-8')).items()}
-    try:
-        import config
-        from pythonnet import load as _pyload
-        _pyload('coreclr')
-        from System.Reflection import Assembly
-        from System import Array, Type as SysType, Object
-        from System.IO import File as SysFile
-        import os as _os, tempfile as _tempfile
-        asm = Assembly.LoadFrom(str(config.SOULSFORMATS_DLL))
-        import SoulsFormats
-        _str = SysType.GetType('System.String')
-        _fcls = asm.GetType('SoulsFormats.FMG')
-        _fr = _fcls.BaseType.GetMethod('Read', Array[SysType]([_str]))
-        _bcls = asm.GetType('SoulsFormats.BND4')
-        _br = _bcls.BaseType.GetMethod('Read', Array[SysType]([_str]))
-        out = {}
-        for mp in [config.ERR_MOD_DIR / 'msg/engus/item_dlc02.msgbnd.dcx']:
-            bnd = _br.Invoke(None, Array[Object]([str(mp)]))
-            for f in bnd.Files:
-                if 'NpcName' not in str(f.Name): continue
-                tmp = _os.path.join(_tempfile.gettempdir(), '_n.fmg')
-                SysFile.WriteAllBytes(tmp, f.Bytes.ToArray())
-                fmg = _fr.Invoke(None, Array[Object]([tmp]))
-                for e in fmg.Entries:
-                    t = str(e.Text) if e.Text else ''
-                    if t and t != '[ERROR]':
-                        out.setdefault(int(e.ID), t)
-        with open(cache_path, 'w', encoding='utf-8') as fp:
-            json.dump({str(k): v for k, v in out.items()}, fp, ensure_ascii=False)
-        return out
-    except Exception as e:
-        print(f"  WARN: NpcName load failed: {e}")
-    return {}
-
-
-NPC_PARAM_NAMEID = _load_npc_param_name_ids()
-NPC_NAME_TEXT = _load_npc_name_fmg()
+NPC_PARAM_NAMEID, NPC_NAME_TEXT = _load_npc_name_tables()
 
 
 def resolve_npc_name_id(enemy_model, npc_param, map_name, part_name):

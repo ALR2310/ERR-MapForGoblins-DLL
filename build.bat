@@ -31,7 +31,7 @@ REM Build profile (flag may be in any position). Default = ERR when no flag.
 REM Flags: --vanilla --err --convergence2 --convergence3 --erte --goldenage --goldenage361
 REM        --vins --reborn --graceborne --throne. Each profile scopes its own
 REM        data/<p>, src/generated_<p>, builds/build-<p>, releases/pre-release-<p>
-REM        (err uses the unsuffixed data/, src/generated, builds/build). MFG_PROFILE
+REM        (err: data/err, but the unsuffixed src/generated + builds/build). MFG_PROFILE
 REM        is exported so build_pipeline.py + config.py pick the data source.
 echo %*| findstr /i /c:"--vanilla" >nul && set "MFG_PROFILE=vanilla"
 echo %*| findstr /i /c:"--err" >nul && set "MFG_PROFILE=err"
@@ -47,10 +47,13 @@ REM --goldenage361 must come LAST: findstr /c:"--goldenage" above also matches i
 REM so this line overwrites MFG_PROFILE=goldenage back to goldenage361 when 361 is passed.
 echo %*| findstr /i /c:"--goldenage361" >nul && set "MFG_PROFILE=goldenage361"
 if not defined MFG_PROFILE set "MFG_PROFILE=err"
-REM Dashboard progress tracking: profile + mode, used by the :dash calls below.
+REM Dashboard progress tracking: profile + mode, used by the :dash calls below. The dashboard is
+REM optional and lives outside the repo (dashboard_dir in tools\config.ini); unset = no tracking.
 set "DASH_PROF=%MFG_PROFILE%"
 set "DASH_MODE=%~1"
 if "%DASH_MODE%"=="" set "DASH_MODE=build"
+set "DASH_DIR="
+for /f "usebackq delims=" %%d in (`py "%SCRIPT_DIR%tools\config.py" dashboard_dir 2^>nul`) do set "DASH_DIR=%%d"
 REM Per-profile output dirs / package names (vanilla first, then err, then overhauls).
 if "%MFG_PROFILE%"=="vanilla" set "BUILD_DIR=%SCRIPT_DIR%builds\build-vanilla"
 if "%MFG_PROFILE%"=="vanilla" set "GEN_SUBDIR=generated_vanilla"
@@ -184,8 +187,9 @@ echo.
 echo Running data pipeline (incremental, hash-cached)...
 echo ============================================
 py "%SCRIPT_DIR%tools\build_pipeline.py" %*
+set "GEN_RC=%ERRORLEVEL%"
 echo.
-exit /b 0
+exit /b %GEN_RC%
 
 :gen_shared
 REM Shared, profile-INDEPENDENT generated sources -> src/generated_shared. Derives from
@@ -432,7 +436,8 @@ exit /b 0
 
 :dash
 REM %1 = build phase (pipeline|compiling|ok|failed). Live dashboard progress; never fails the build.
-py "%SCRIPT_DIR%tools\dashboard\record_build.py" --profile %DASH_PROF% --phase %~1 --mode %DASH_MODE% --version %VER% >nul 2>&1
+if not defined DASH_DIR exit /b 0
+py "%DASH_DIR%\record_build.py" --profile %DASH_PROF% --phase %~1 --mode %DASH_MODE% --version %VER% >nul 2>&1
 exit /b 0
 
 :parse_version

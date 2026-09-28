@@ -34,11 +34,11 @@ backup/
 backup2/
 backup3/
 
-# Local debug scratch — never committed. ALL throwaway debug artifacts live here:
-#   scratch/scripts/ — one-off investigation scripts (disasm probes, dumps, etc.)
-#   scratch/out/     — their outputs (.txt/.out/.bin dumps, memory captures)
-# New debug/research scripts and their outputs should be written here, not at the
-# repo root or in tools/. Reusable diagnostic tools belong in tools/ (committed).
+# Local debug scratch - never committed, never at the repo root or in tools/:
+#   scratch/safe_to_delete/<topic>/ - one-off probes, dumps, logs, test builds (wipe any time)
+#   scratch/keep/<topic>/           - reusable results worth keeping
+#   scratch/tools/<tool>/           - reusable local tools not meant for git
+# Reusable diagnostic tools that belong to the project go in tools/ (committed).
 scratch/
 
 # External dependencies
@@ -60,7 +60,7 @@ tools/config.ini
 Thumbs.db
 desktop.ini
 
-# data/ is the pipeline's WORKSPACE: every file under it (and under data/<profile>/) is written by a
+# data/ is the pipeline's WORKSPACE (data/<profile>/, err included): every file under it is written by a
 # stage from the mod's own game files, and a clone regenerates all of it by building. The committed
 # inputs that nothing regenerates live in inputs/ instead, which is why nothing here is listed by name.
 data/
@@ -125,8 +125,3 @@ assets/menu/*.bak
 # belt-and-suspenders guard in case anything writes one at the repo root.
 releases/CHANGELOG.txt
 CHANGELOG.txt
-
-# Build/scan dashboard - kept local until it's finished (WIP tooling). Contains a
-# secret VT API key (.vt_key) and a regenerable local SQLite DB, so the whole dir
-# stays out of git for now. Re-track the source once the dashboard is done.
-tools/dashboard/

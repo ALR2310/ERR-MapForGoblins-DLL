@@ -257,7 +257,7 @@ def main():
                 # (2009[0]) three ids, one of them numerically equal to map lot 35000580, and this scan
                 # read that as "the lot is at the ladder" - which put a Golden Rune [1] marker on the
                 # Leyndell map that nothing in the game ever awards (the lot is cut content: its
-                # getItemFlag appears in no EMEVD at all). See scratch/bugs_2026-07-29_*.
+                # getItemFlag appears in no EMEVD at all). See scratch/keep/notes/bugs_2026-07-29_*.
                 if (bank, iid) in NON_AWARD_INSTRUCTIONS:
                     non_award_skipped[(bank, iid)] += 1
                     continue

@@ -70,3 +70,8 @@ smithbox_dir =
 # names appear as raw IDs.
 # Example: C:\Tools\Darkscript3_6_3\Resources
 darkscript_resources =
+
+# Optional: a local build/scan dashboard kept outside this repo (a folder with app.py and
+# record_build.py). When set, build.bat reports build progress to it and
+# build_all.py --scan queues VirusTotal scans on it; when empty both are skipped.
+dashboard_dir =

@@ -98,7 +98,7 @@ def extract_pickup_data(filepath, slot=2):
 
 def load_dungeon_mapping():
     script_dir = Path(__file__).parent
-    mapping_path = script_dir.parent / "data" / "dungeon_to_world.json"
+    mapping_path = script_dir.parent / "data" / "err" / "dungeon_to_world.json"
     if mapping_path.exists():
         with open(mapping_path) as f:
             return json.load(f)

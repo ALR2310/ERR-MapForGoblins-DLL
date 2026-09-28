@@ -9,7 +9,7 @@ from pathlib import Path
 import config
 
 ERR_EVENT_DIR = config.require_err_mod_dir() / "event"
-CSV_PATH = Path(__file__).parent.parent / "data" / "ItemLotParam_map.csv"
+CSV_PATH = Path(__file__).parent.parent / "data" / "err" / "ItemLotParam_map.csv"
 
 def decompress_dcx(data):
     if data[:4] != b'DCX\x00':

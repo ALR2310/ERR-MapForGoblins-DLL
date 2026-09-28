@@ -10,7 +10,8 @@ subtitles pointed at it.
 The set comes from the same dump the DLL's English fallback is baked from
 (data/<profile>/english_fallback.json, keyed 700000000 + id), which lists every NpcName the
 overhaul's engus files have. The ERR profile has no such dump - it uses the ERR FMG at
-runtime - so it is checked against data/npc_name_text_map.json, the ERR NpcName dump.
+runtime - so it is checked against its own NpcName dump (data/err/npc_name_text_map.json,
+written by the extract_npc_names bootstrap stage).
 """
 import json
 import config
@@ -32,7 +33,7 @@ def npcname_known():
                 if 700000000 <= k < 800000000 or 1600000000 <= k < 1700000000:
                     ids.add(k - 700000000)
     if not ids:
-        tm = config.PROJECT_DIR / 'data' / 'npc_name_text_map.json'
+        tm = config.DATA_DIR / 'npc_name_text_map.json'
         if tm.exists():
             with open(tm, encoding='utf-8') as f:
                 ids = {int(k) for k in json.load(f)}

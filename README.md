@@ -129,7 +129,7 @@ regulation.bin + MSB + EMEVD + FMG  (+ committed inputs/)
     │   generate_spirit_springs, generate_imp_statues, generate_stakes,
     │   extract_seal_puzzles, generate_seal_puzzles, generate_hero_tomb_statues,
     │   generate_paintings, generate_maps, generate_gestures, generate_hostile_npcs,
-    │   generate_strong_enemies                             → data/rows_generated/*.rows
+    │   generate_strong_enemies                             → data/<profile>/rows_generated/*.rows
     │
     ├─► generate_data   → goblin_map_blob_data.cpp (one deflated table) + goblin_legacy_conv.hpp
     ├─► generate_region_map, generate_geof_models, generate_location_overrides
@@ -165,9 +165,9 @@ MapForGoblins/
 ├── inputs/                 Committed pipeline inputs nothing regenerates (unprojectable tiles,
 │   └── <profile>/          invader overrides, model aliases, enemy names i18n; per-profile extras)
 ├── data/                   Pipeline workspace, gitignored: everything here is regenerated
-│   ├── <profile>/          Per-profile workspace (the ERR one is data/ itself)
-│   ├── rows_generated/     Generated marker rows (binary, one file per category)
-│   └── *.json, *.csv       Extracted game data (items, entity index, EMEVD map, ...)
+│   └── <profile>/          Per-profile workspace (err, vanilla, convergence3, ...)
+│       ├── rows_generated/ Generated marker rows (binary, one file per category)
+│       └── *.json, *.csv   Extracted game data (items, entity index, EMEVD map, ...)
 ├── i18n/                   The mod's own UI strings, one JSON per language
 ├── tools/                  Python scripts (extraction, generation, build orchestration, analysis)
 │   ├── lib/                Andre.SoulsFormats.dll + dependencies

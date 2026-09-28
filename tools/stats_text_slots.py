@@ -12,7 +12,7 @@ import rowsink
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-ROWS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'rows_generated')
+ROWS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'err', 'rows_generated')
 
 total_all = loc_all = enemy_all = both_all = 0
 

@@ -15,7 +15,7 @@ Usage: py generate_model_aliases.py
 import os, sys, io, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 HERE = os.path.dirname(os.path.abspath(__file__))
-D = os.path.join(HERE, "..", "data")
+D = os.path.join(HERE, "..", "data", "err")
 GEN = os.path.join(HERE, "..", "src", "generated")
 
 def goods_of(e):
